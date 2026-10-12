@@ -1,0 +1,7 @@
+node_modules/
+*.log
+arkengine-log-*.json
+.env
+.env.*
+.DS_Store
+Thumbs.db
