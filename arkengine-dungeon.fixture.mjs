@@ -82,6 +82,9 @@ window.renderDun = () => {
  } else {
    game.innerHTML = '<a href="/cultivate">返回修仙主殿</a><h1>秘境行记</h1><button id="refresh-dun" aria-label="刷新秘境状态">刷新</button><div aria-live="polite">今日剩余 '+dm.remaining+'/'+dm.limit+' 次</div>';
    document.getElementById('refresh-dun').onclick = () => { dm.calls.push(['refresh']); renderDun(); };
+   if(dm.cooldownLabel) {
+     const badge=document.createElement('span');badge.setAttribute('aria-label',dm.cooldownLabel);badge.textContent='倒计时';game.append(badge);
+   }
    if (dm.message) {
      const notice = document.createElement('p'); notice.setAttribute('role','status'); notice.setAttribute('aria-live','polite');
      notice.textContent=dm.message; if(dm.error) notice.className='text-destructive'; game.append(notice);

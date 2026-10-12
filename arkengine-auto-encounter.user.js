@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.1
+// @version      1.6.2
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -17,6 +17,22 @@
   // 网站 Base UI 的关闭完成回调先等 requestAnimationFrame；后台不绘制时可能一直不卸载。
   // 使用其公开代码中的开关，只在自动化路由启用期间跳过动画等待，不改写 rAF 或移除弹窗。
   const animationProperty = 'BASE_UI_ANIMATIONS_DISABLED';
+  const ACCOUNT_STOP = 'arkengine:auto:account-stop:v1';
+  const groupPrefs = ['arkengine:auto-encounter:enabled:v1', 'arkengine:auto-expedition:enabled:v1'];
+  const accountListeners = [];
+  const accountStopReason = () => localStorage.getItem(ACCOUNT_STOP) || '';
+  function pauseAccount(reason) {
+    const message = `${reason}；账号异常，已暂停全部自动操作，请处理后分别手动开始`;
+    // 先写共享停止标记；另一页即使还未收到 storage 事件，点击前也会读到。
+    localStorage.setItem(ACCOUNT_STOP, message);
+    for (const pref of groupPrefs) localStorage.setItem(pref, 'false');
+    for (const stop of accountListeners) stop(message);
+  }
+  window.addEventListener('storage', event => {
+    if (event.key === ACCOUNT_STOP && event.newValue) {
+      for (const stop of accountListeners) stop(event.newValue);
+    }
+  });
   let animationSaved = false;
   let animationDescriptor;
   function syncDialogAnimations() {
@@ -26,6 +42,7 @@
         ? localStorage.getItem('arkengine:auto-encounter:enabled:v1') !== 'false'
         : /^(?:\/activities\/expedition|\/farm)\/?$/.test(location.pathname) &&
           localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
+      wanted &&= !accountStopReason();
       if (wanted && !animationSaved) {
         animationDescriptor = Object.getOwnPropertyDescriptor(globalThis, animationProperty);
         globalThis[animationProperty] = true;
@@ -189,7 +206,7 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.1', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.2', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
@@ -197,6 +214,44 @@
       box.append(details); render();
     }
     return { add, pulse, stop, expect, receipts, mount };
+  }
+
+  function createRecovery(group, log, say) {
+    const key = `arkengine:auto-recovery:${group}:v1`;
+    // 原请求标识仅保存在本地，不写入可导出的日志。刷新不重置预算。
+    let states = JSON.parse(sessionStorage.getItem(key) || '{}');
+    const save = () => sessionStorage.setItem(key, JSON.stringify(states));
+    return {
+      ready(scope, identity, startedAt, pause, label, limit = 3) {
+        if (states[scope]?.identity !== identity) {
+          states[scope] = { identity, attempts: 0, nextAt: startedAt + 30000 };
+          save();
+        }
+        const state = states[scope];
+        if (Date.now() < state.nextAt) {
+          say(`${label}：等待原结果，约 ${Math.ceil((state.nextAt - Date.now()) / 1000)} 秒后再核对`);
+          return false;
+        }
+        if (state.attempts >= limit) {
+          pause(`${label}已达恢复上限，原记录保留，请手动核对`);
+          return false;
+        }
+        return true;
+      },
+      attempted(scope) {
+        const state = states[scope];
+        state.attempts++;
+        state.nextAt = Date.now() + (state.attempts === 1 ? 2 : 5) * 60000;
+        save();
+        log.add('recovery-attempt', '核对原结果，失败后延长等待', { scope, attempt: state.attempts, nextAt: state.nextAt });
+      },
+      nextAt: scope => states[scope]?.nextAt || 0,
+      clear(scope) {
+        if (scope ? !states[scope] : !Object.keys(states).length) return;
+        if (scope) delete states[scope]; else states = {};
+        save();
+      },
+    };
   }
 
 (() => {
@@ -207,6 +262,12 @@
   const PREF = 'arkengine:auto-encounter:enabled:v1';
   const LOCK = 'arkengine:auto-encounter:tab:v1';
   const RETRY_MS = 30000;
+  const ENCOUNTER_ACTION = 'arkengine:auto-encounter:action:v1';
+  let encounterAction = JSON.parse(sessionStorage.getItem(ENCOUNTER_ACTION) || 'null');
+  function saveEncounterAction(value) {
+    sessionStorage.setItem(ENCOUNTER_ACTION, JSON.stringify(value));
+    encounterAction = value;
+  }
   // 每次点击前单独随机等待；游戏冷却仍完全由网页按钮决定。
   const CLICK_DELAY_MIN_MS = 2000;
   const CLICK_DELAY_MAX_MS = 5000;
@@ -261,6 +322,8 @@
   let timer = null;
   let statusText = '';
   const log = createLog('cultivate');
+  const recoveryBudget = createRecovery('cultivate', log, say);
+  accountListeners.push(reason => setEnabled(false, reason));
 
   const host = document.createElement('aside');
   host.id = 'ark-auto-encounter';
@@ -305,7 +368,10 @@
   fogToggle.addEventListener('click', () => {
     fogEnabled = !fogEnabled;
     localStorage.setItem(FOG_PREF, String(fogEnabled));
-    if (fogEnabled) saveFog({ ...fog, nextAt: 0 });
+    if (fogEnabled) {
+      saveFog({ ...fog, nextAt: 0, deferrals: 0, stalls: 0 });
+      recoveryBudget.clear('fog');
+    }
     cancelPendingClick(); schedule();
   });
   function updateFogHint() {
@@ -326,6 +392,10 @@
   dungeonToggle.addEventListener('click', () => {
     dungeonEnabled = !dungeonEnabled;
     localStorage.setItem(DUNGEON_PREF, String(dungeonEnabled));
+    if (dungeonEnabled) {
+      saveDungeon({ ...dungeon, nextAt: dungeon.deferrals ? 0 : dungeon.nextAt, deferrals: 0, stalls: 0 });
+      recoveryBudget.clear('dungeon');
+    }
     cancelPendingClick();
     schedule();
   });
@@ -348,7 +418,10 @@
     }
     schedule();
   }
-  toggle.addEventListener('click', () => setEnabled(!enabled));
+  toggle.addEventListener('click', () => {
+    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); }
+    setEnabled(!enabled);
+  });
   toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
 
   const textOf = el => (el?.textContent || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
@@ -419,6 +492,7 @@
   }
 
   function recordClick(button, kind, signature, message, beforeClick, afterClick) {
+    if (accountStopReason()) { setEnabled(false, accountStopReason()); return false; }
     if (!usable(button) || !enabled || !active || !onPage()) return false;
     clickConsidered = true;
     if (!pendingClick || pendingClick.kind !== kind || pendingClick.signature !== signature) {
@@ -437,6 +511,11 @@
       return false;
     }
     cancelPendingClick();
+    if (kind === 'seek' || kind === 'choose') {
+      if (encounterAction?.kind === kind && encounterAction.signature === signature) recoveryBudget.attempted('encounter');
+      else recoveryBudget.clear('encounter');
+      saveEncounterAction({ kind, signature, at: Date.now(), refreshed: false });
+    }
     lastAction = { kind, signature, at: Date.now(), refreshed: false };
     nextActionAt = Date.now() + 1500;
     say(message);
@@ -450,17 +529,15 @@
   }
 
   function retryReady(kind, signature) {
-    if (!lastAction || lastAction.kind !== kind || lastAction.signature !== signature) return true;
-    if (Date.now() - lastAction.at < RETRY_MS) {
-      say('已提交，等待游戏返回结果');
-      return false;
-    }
+    if (!encounterAction || encounterAction.kind !== kind || encounterAction.signature !== signature) return true;
+    if (!recoveryBudget.ready('encounter', `${kind}:${signature}`, encounterAction.at,
+      reason => setEnabled(false, reason), '奇遇结果')) return false;
     // 超时先通过页面已有刷新按钮同步状态，再决定是否重试原操作。
-    if (!lastAction.refreshed) {
+    if (!encounterAction.refreshed) {
       const refresh = document.querySelector('button[aria-label="刷新修炼状态"]');
       if (!usable(refresh)) { say('等待游戏允许刷新状态'); return false; }
-      lastAction.refreshed = true;
-      lastAction.at = Date.now();
+      recoveryBudget.attempted('encounter');
+      saveEncounterAction({ ...encounterAction, refreshed: true });
       nextActionAt = Date.now() + 1500;
       say('正在核对上次操作结果');
       log.add('action', '刷新并核对上次奇遇结果');
@@ -483,6 +560,10 @@
     updateDungeonHint();
     updateFogHint();
     if (host.hidden === onPage()) host.hidden = !onPage();
+    if (accountStopReason()) {
+      if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
+      return;
+    }
     if (!onPage() || !enabled) {
       releaseLock?.();
       if (!enabled && !statusText) say('已暂停');
@@ -495,10 +576,10 @@
     if (!active) { acquire(); return; }
     log.pulse(statusText);
     const notices = [...document.querySelectorAll('[role="status"]')].filter(visible);
-    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="alert"].text-destructive')]
+    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="alert"].text-destructive, [role="status"].bg-destructive, [role="alert"].bg-destructive')]
       .filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
-      setEnabled(false, '游戏提示登录、权限或限流异常，已暂停；处理后手动开始');
+      pauseAccount('游戏提示登录、权限或限流异常');
       return;
     }
     if (inDungeon()) { checkDungeon(notices, errors); return; }
@@ -528,7 +609,9 @@
         say('等待原奇遇请求完成，稍后确认结果');
         return;
       }
-      recordClick(recovery, 'recover', operation.idempotencyKey, '正在确认原奇遇结果');
+      if (!recoveryBudget.ready('encounter-original', operation.idempotencyKey, Date.now() - RETRY_MS,
+        reason => setEnabled(false, reason), '原奇遇结果')) return;
+      recordClick(recovery, 'recover', operation.idempotencyKey, '正在确认原奇遇结果', () => recoveryBudget.attempted('encounter-original'));
       return;
     }
 
@@ -544,13 +627,18 @@
       return;
     }
 
-    if ((!fogEnabled || !fogPlan || fog.nextAt > Date.now()) && visitDungeon()) return;
-    if (visitFog()) return;
-
     const cooldown = [...document.querySelectorAll('button')].find(el =>
       visible(el) && /^奇遇冷却\s/.test(textOf(el)));
     if (cooldown) {
+      // 先确认上一轮已结束，再切秘境/迷雾；否则同样的下一轮选项会被旧重试记录挡住。
       lastAction = null;
+      if (encounterAction) saveEncounterAction(null);
+      recoveryBudget.clear('encounter');
+      recoveryBudget.clear('encounter-original');
+    }
+    if ((!fogEnabled || !fogPlan || fog.nextAt > Date.now()) && visitDungeon()) return;
+    if (visitFog()) return;
+    if (cooldown) {
       say(textOf(cooldown));
       return;
     }
@@ -610,15 +698,19 @@
     if (!usable(link)) { say('等待返回修仙主殿入口'); return; }
     recordClick(link, 'fog:return', 'hall', '返回主殿继续奇遇', () => { fogResultObserved = false; });
   }
-  function deferFog(reason, pause = false) {
+  function deferFog(reason, pause = false, stalled = false) {
     if (!fogLeaving) {
-      saveFog({ ...fog, nextAt: Date.now() + 5 * 60000 });
+      const deferrals = Math.min((fog.deferrals || 0) + 1, 4);
+      const stalls = (fog.stalls || 0) + Number(stalled);
+      pause ||= stalls >= 3;
+      const minutes = Math.min(30, 5 * 2 ** (deferrals - 1));
+      saveFog({ ...fog, deferrals, stalls, nextAt: Date.now() + minutes * 60000 });
       if (pause) {
         fogEnabled = false;
         localStorage.setItem(FOG_PREF, 'false');
       }
       fogLeaving = true;
-      last.textContent = `${reason}；${pause ? '迷雾已暂停，请手动核对' : '5 分钟后再核对迷雾'}`;
+      last.textContent = `${reason}；${pause ? '迷雾已暂停，请手动核对' : `${minutes} 分钟后再核对迷雾`}`;
       log.add('fog-deferred', reason, { paused: pause, pending: Boolean(fogPlan), retryAt: fog.nextAt });
     }
     returnFromFog();
@@ -679,14 +771,17 @@
         if (!fogPlan.deferred) {
           // 每次返回后仍保留同一原请求，但允许下一次核对获得独立的等待窗口。
           saveFogPlan({ ...fogPlan, deferred: true });
-          deferFog('迷雾 90 秒未确认结果，保留原请求回主殿'); return;
+          deferFog('迷雾 90 秒未确认结果，保留原请求回主殿', false, true); return;
         }
         saveFogPlan({ ...fogPlan, startedAt: Date.now(), deferred: false });
       }
       if (own) {
         const recover = findButton('确认原探索结果');
         if (Date.now() - fogPlan.at >= RETRY_MS && usable(recover)) {
+          if (!recoveryBudget.ready('fog', records[0].value.idempotencyKey, fogPlan.at,
+            reason => deferFog(reason, true), '原迷雾结果')) return;
           recordClick(recover, 'fog:recover', records[0].value.idempotencyKey, '确认原探索结果', () => {
+            recoveryBudget.attempted('fog');
             saveFogPlan({ ...fogPlan, at: Date.now() }); fogResultObserved = true;
           });
         } else say('等待原迷雾请求完成，不重复消耗灵力');
@@ -701,6 +796,8 @@
         const reward = receipt.match(/已到账:修为\s*(\d+)\s*·\s*法宝碎片\s*(\d+)$/);
         // 原请求已明确结束，才将对应回执计账；连续相同金额也是不同轮次。
         saveFogPlan(null); fogResultObserved = false;
+        recoveryBudget.clear('fog');
+        saveFog({ ...fog, deferrals: 0, stalls: 0 });
         log.add('fog-reward', receipt, { reward: { 修为: Number(reward[1]), 法宝碎片: Number(reward[2]) } }, true);
       } else { deferFog('迷雾结果无法可靠核对，请查看原探索结果', true); return; }
     }
@@ -711,7 +808,7 @@
     }
     if (errors) { deferFog(`迷雾提示：${errors}`); return; }
     if (!usable(refresh)) {
-      if (Date.now() - fogPageAt > 90000) deferFog('迷雾页面超过 90 秒未能加载');
+      if (Date.now() - fogPageAt > 90000) deferFog('迷雾页面超过 90 秒未能加载', false, true);
       else say('等待迷雾页面加载');
       return;
     }
@@ -729,7 +826,7 @@
     if (!usable(quick) || !settings) { deferFog('当前无法快速探索迷雾'); return; }
     const description = `消耗 20 灵力开始新局,按所选路线逐格探索。沿用当前战斗、补给和奖励规则;生命不高于 ${settings.retreatHp} 时撤离,仍可能在单次受击中失败。不会自动使用背包补品。`;
     recordClick(quick, 'fog:open', JSON.stringify(settings), '进入并快速探索迷雾', () => {
-      saveFog({ draining: true, nextAt: 0 });
+      saveFog({ ...fog, draining: true, nextAt: 0 });
       saveFogPlan({ phase: 'opening', settings, description, at: Date.now() });
       openedFogDialog = true;
       fogDialog = null;
@@ -815,13 +912,18 @@
     if (!usable(link)) { say('等待返回修仙主殿入口'); return; }
     recordClick(link, 'dungeon:return', 'hall', '返回主殿继续奇遇');
   }
-  function deferDungeon(reason, delay = 5 * 60000) {
+  function deferDungeon(reason, delay = null, stalled = false, pause = false) {
     // 返回主殿不会撤退；保留 run 和原请求，等待返回的几秒内不反复延长预约。
     if (!returningFromDungeon) {
-      saveDungeon({ ...dungeon, nextAt: Date.now() + delay });
+      const deferrals = Math.min((dungeon.deferrals || 0) + 1, 4);
+      const stalls = (dungeon.stalls || 0) + Number(stalled);
+      pause ||= stalls >= 3;
+      delay ??= Math.min(30, 5 * 2 ** (deferrals - 1)) * 60000;
+      saveDungeon({ ...dungeon, deferrals, stalls, nextAt: Date.now() + delay });
+      if (pause) { dungeonEnabled = false; localStorage.setItem(DUNGEON_PREF, 'false'); }
       returningFromDungeon = true;
-      last.textContent = `${reason}；${Math.ceil(delay / 60000)} 分钟后再检查`;
-      log.add('dungeon-deferred', reason, { retryAt: dungeon.nextAt, pending: Boolean(dungeonPlan) });
+      last.textContent = `${reason}；${pause ? '秘境已暂停，请手动核对' : `${Math.ceil(delay / 60000)} 分钟后再检查`}`;
+      log.add('dungeon-deferred', reason, { paused: pause, retryAt: dungeon.nextAt, pending: Boolean(dungeonPlan) });
     }
     returnToHall();
   }
@@ -858,7 +960,10 @@
     say('原秘境结果尚未确认，请手动核对；不会重新购买门票');
   }
   function checkDungeon(notices, errors) {
-    if (!dungeonEnabled) { say('秘境已暂停，可手动返回主殿继续奇遇'); return; }
+    if (!dungeonEnabled) {
+      if (returningFromDungeon) returnToHall(); else say('秘境已暂停，可手动返回主殿继续奇遇');
+      return;
+    }
     if (Date.now() < nextActionAt) return;
     const records = nativeDungeonRequests();
     const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
@@ -871,7 +976,7 @@
       const signature = `${progress}:${dungeonPlan?.action || ''}:${dungeonPlan?.step || 0}:${records.length}`;
       if (!dungeonProgress || dungeonProgress.signature !== signature) dungeonProgress = { signature, at: Date.now() };
       if (Date.now() - dungeonProgress.at > 90000) {
-        deferDungeon('秘境超过 90 秒没有进展，保留原操作回主殿'); return;
+        deferDungeon('秘境超过 90 秒没有进展，保留原操作回主殿', null, true); return;
       }
     }
     const busy = notices.some(n => /正在处理秘境操作|正在读取原请求/.test(textOf(n)));
@@ -896,8 +1001,12 @@
       if (Date.now() - dungeonPlan.at < RETRY_MS || !usable(recovery)) {
         say('等待原秘境请求完成，稍后确认结果'); return;
       }
-      recordClick(recovery, 'dungeon:recover', records[0].value.idempotencyKey, '确认上次秘境操作', () =>
-        saveDungeonPlan({ ...dungeonPlan, at: Date.now() }));
+      if (!recoveryBudget.ready('dungeon', records[0].value.idempotencyKey, dungeonPlan.at,
+        reason => deferDungeon(reason, null, false, true), '原秘境结果')) return;
+      recordClick(recovery, 'dungeon:recover', records[0].value.idempotencyKey, '确认上次秘境操作', () => {
+        recoveryBudget.attempted('dungeon');
+        saveDungeonPlan({ ...dungeonPlan, at: Date.now() });
+      });
       return;
     }
     if (findButton('确认上次秘境操作')) { say('秘境原请求记录无法核对，请手动处理'); return; }
@@ -919,7 +1028,8 @@
       }
       if (errors) { say(`秘境提示：${errors}，请手动核对`); return; }
       if (!dungeon.run || dungeon.run.step !== step) {
-        saveDungeon({ ...dungeon, run: { beforeResult: dungeon.run?.beforeResult ?? '', step } });
+        recoveryBudget.clear('dungeon');
+        saveDungeon({ ...dungeon, deferrals: 0, stalls: 0, run: { beforeResult: dungeon.run?.beforeResult ?? '', step } });
       }
       const choice = dungeonChoices(section);
       if (choice.error) { say(choice.error); return; }
@@ -933,7 +1043,8 @@
     if (dungeon.run?.step === 8 && (notices.some(n => /^秘境探索完成，本次累计/.test(textOf(n))) ||
         (recent && recent !== dungeon.run.beforeResult))) {
       const interval = (40 * 60000) + Math.floor(Math.random() * (10 * 60000 + 1));
-      saveDungeon({ ...dungeon, run: null, nextAt: Date.now() + interval });
+      recoveryBudget.clear('dungeon');
+      saveDungeon({ ...dungeon, deferrals: 0, stalls: 0, run: null, nextAt: Date.now() + interval });
       saveDungeonPlan(null);
       returningFromDungeon = true;
       log.add('dungeon-complete', '八节探索已完成，返回主殿', { nextAt: dungeon.nextAt });
@@ -971,7 +1082,15 @@
     if (!card) { deferDungeon('当前未找到坠星古墓入口'); return; }
     const cooldown = [...card.querySelectorAll('button')].find(b => textOf(b) === '秘境冷却中');
     if (cooldown) {
-      deferDungeon('秘境仍在冷却', 60000); return;
+      // 网站 CountdownBadge 的 aria-label 为“秘境冷却 MM:SS / HH:MM:SS”。
+      const badge = [...document.querySelectorAll('[aria-label^="秘境冷却 "]')].find(visible);
+      const match = badge?.getAttribute('aria-label').match(/^秘境冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
+      let remaining = null;
+      if (match && Number(match[2]) < 60 && (match[3] === undefined || Number(match[3]) < 60)) {
+        remaining = match[3] === undefined ? (+match[1] * 60 + +match[2]) * 1000 :
+          (+match[1] * 3600 + +match[2] * 60 + +match[3]) * 1000;
+      }
+      deferDungeon('秘境仍在冷却', Number.isSafeInteger(remaining) ? Math.max(30000, remaining + 2000) : null); return;
     }
     const enter = [...card.querySelectorAll('button')].find(b => textOf(b) === '进入秘境');
     const cost = textOf(card).match(/门票\s*(\d+)\s*钻\s*·\s*灵力\s*(\d+)/);
@@ -1121,11 +1240,26 @@
   let offered = false;
   let scheduled = false;
   let nextStepAt = 0;
-  let claimWait = null;
+  const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
+  let claimWait = JSON.parse(sessionStorage.getItem(CLAIM_JOURNAL) || 'null');
+  function saveClaimWait(value) {
+    sessionStorage.setItem(CLAIM_JOURNAL, JSON.stringify(value));
+    claimWait = value;
+  }
   const loadedDay = beijingTime().day;
   const log = createLog('expedition');
+  const recoveryBudget = createRecovery('expedition', log, message => say(message));
+  accountListeners.push(reason => setEnabled(false, reason));
   const BURST_DAY = 'arkengine:auto-expedition:burst-day:v1';
-  const QUOTA_REFRESH = 'arkengine:auto-expedition:quota-refresh:v1';
+  const QUOTA_REFRESH = 'arkengine:auto-expedition:quota-refresh:v2';
+  let expeditionObserved = false;
+  function quotaCheckState() {
+    const value = JSON.parse(localStorage.getItem(QUOTA_REFRESH) || 'null');
+    return value?.day === beijingTime().day ? value : { day: beijingTime().day, count: 0, at: Date.now() };
+  }
+  function noteQuotaSync() {
+    localStorage.setItem(QUOTA_REFRESH, JSON.stringify({ ...quotaCheckState(), at: Date.now() }));
+  }
 
   const host = document.createElement('aside');
   host.id = 'ark-auto-expedition';
@@ -1195,6 +1329,9 @@
   farmToggle.addEventListener('click', () => {
     farmEnabled = !farmEnabled;
     localStorage.setItem(FARM_PREF, String(farmEnabled));
+    if (farmEnabled) {
+      recoveryBudget.clear('farm-ready');
+    }
     cancelQueued(); schedule();
   });
   shadow.getElementById('farm-check').addEventListener('click', () => {
@@ -1213,7 +1350,10 @@
     if (!value) { if (active) log.stop(reason || '已暂停'); cancelQueued(); releaseLock?.(); say(reason || '已暂停'); }
     schedule();
   }
-  toggle.addEventListener('click', () => setEnabled(!enabled));
+  toggle.addEventListener('click', () => {
+    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); }
+    setEnabled(!enabled);
+  });
   toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
 
   function savePlan(value) {
@@ -1292,6 +1432,7 @@
       JSON.stringify(records[0].value) === JSON.stringify(plan.original.value);
   }
   function offer(key, label, perform) {
+    if (accountStopReason()) { setEnabled(false, accountStopReason()); return; }
     offered = true;
     if (!queued || queued.key !== key) {
       cancelQueued();
@@ -1325,6 +1466,8 @@
         (!plan.burst || q.burst <= plan.before.burst - plan.burst)) {
       log.add('expedition-dispatched', '派遣结果已确认', { route: plan.route, normal: plan.normal, burst: plan.burst });
       if (plan.burst) localStorage.setItem(BURST_DAY, plan.day);
+      recoveryBudget.clear('dispatch');
+      noteQuotaSync();
       savePlan(null);
       say('派遣已确认，继续监控归来奖励');
       return;
@@ -1364,8 +1507,11 @@
         say('等待原派遣结果，不重复创建队伍');
         return;
       }
+      if (!recoveryBudget.ready('dispatch', plan.original.value.idempotencyKey, plan.submittedAt || plan.at,
+        reason => setEnabled(false, reason), '原派遣结果')) return;
       // 只恢复已发送的原请求；即使已过两点，也不会创建一笔新的突发派遣。
       offer(`recover:${plan.original.value.idempotencyKey}`, '确认上次派遣结果', () => {
+        recoveryBudget.attempted('dispatch');
         savePlan({ ...plan, submittedAt: Date.now() });
         recovery.click();
       });
@@ -1547,7 +1693,7 @@
       })
       .catch(error => {
         farmMarket = null;
-        if (error.stopGroup) setEnabled(false, `${error.message}；已暂停远征与农场，请手动核对后恢复`);
+        if (error.stopGroup) pauseAccount(error.message);
         else pauseFarm(`${error.message}；本轮未种植，请核对后开启农场`);
       })
       .finally(() => { farmMarketLoading = false; schedule(); });
@@ -1712,14 +1858,15 @@
       if (s.stamina < need) { planFarmVisit(staminaReadyAt(s,need), `等待体力恢复到 ${need} 点再收获`); return; }
       const harvest = [...document.querySelectorAll('button')].find(b => usable(b) && /^一键收获\s*\(\d+\)$/.test(textOf(b)));
       if (!harvest) {
-        // 后台普通网页时钟可能滞后，按已读到的绝对成熟时间刷新一次，让原按钮更新。
-        if (Date.now() - farmEntryAt > 10000 && Date.now() - (farmState.refreshedAt || 0) > 60000) {
+        // 页面自身更新无效时，本批田地最多整页核对一次。跨刷新保留预算。
+        if (recoveryBudget.ready('farm-ready', signature, farmEntryAt + 30000, pauseFarm, '农场成熟状态', 1)) {
           offer('farm:refresh-ready', '刷新已到成熟时间的田地', () => {
-            saveFarmState({ ...farmState, refreshedAt: Date.now() }); location.reload();
+            recoveryBudget.attempted('farm-ready'); location.reload();
           });
-        } else say('已到预计成熟时间，等待页面确认可收获');
+        } else if (farmEnabled) planFarmVisit(recoveryBudget.nextAt('farm-ready'), '等待页面确认成熟状态');
         return;
       }
+      recoveryBudget.clear('farm-ready');
       const count = Number(textOf(harvest).match(/\((\d+)\)/)[1]);
       if (count !== need) { say('等待一键收获数量与成熟地块一致'); return; }
       offer(`farm:harvest:${s.ready.map(e=>e.plot).join(',')}`, `一键收获 ${count} 块田地`, () => {
@@ -1744,17 +1891,21 @@
     farmHint();
     if (host.hidden === onPage()) host.hidden = !onPage();
     if (onPage()) log.receipts();
+    if (accountStopReason()) {
+      if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
+      return;
+    }
     if (!onPage() || !enabled) { releaseLock?.(); return; }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
     log.pulse(status.textContent);
-    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive')].map(textOf).join(' ');
+    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
-      setEnabled(false, '游戏提示登录、权限或限流异常，已暂停；处理后手动开始');
+      pauseAccount('游戏提示登录、权限或限流异常');
       return;
     }
     if (Date.now() < nextStepAt) return;
-    if (inFarm()) { farmStep(); return; }
+    if (inFarm()) { expeditionObserved = false; farmStep(); return; }
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
     const q = quotas();
     const fields = form();
@@ -1762,6 +1913,7 @@
       say('等待远征页面和额度加载，请保持登录');
       return;
     }
+    if (!expeditionObserved) { noteQuotaSync(); expeditionObserved = true; }
     const records = nativePending();
     const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
     if (plan) { handlePlan(q, fields, records, dialogs); return; }
@@ -1771,10 +1923,17 @@
     if (claimWait) {
       if (q.running < claimWait.running) {
         log.add('expedition-claimed', '远征领取后队伍减少已确认', { teams: claimWait.running - q.running });
-        claimWait = null;
+        saveClaimWait(null);
+        noteQuotaSync();
       }
       else {
-        if (Date.now() - claimWait.at > 30000) offer('sync-claim', '刷新领取后的状态', () => location.reload());
+        if (claimWait.reloaded && Date.now() - claimWait.at > 60000) {
+          setEnabled(false, '原领取结果仍无法确认，已暂停并保留记录，请手动核对');
+        } else if (!claimWait.reloaded && Date.now() - claimWait.at > 30000) {
+          offer('sync-claim', '刷新领取后的状态', () => {
+            saveClaimWait({ ...claimWait, reloaded: true, at: Date.now() }); location.reload();
+          });
+        }
         else say('等待奖励领取和英雄释放');
         return;
       }
@@ -1790,7 +1949,7 @@
     const claim = usable(claimAll) ? claimAll : usable(claimOne) ? claimOne : null;
     if (claim) {
       offer(`claim:${q.running}:${textOf(claim)}`, '领取已完成的远征奖励', () => {
-        claimWait = { running: q.running, at: Date.now() };
+        saveClaimWait({ running: q.running, at: Date.now() });
         log.expect('expedition');
         claim.click();
       });
@@ -1807,12 +1966,15 @@
     const burst = q.normal === 0 && nowForBurst.canBurst && !burstUsed && q.burst > 0 && q.burst === q.burstMax;
     if (q.normal === 0 && !burst) {
       if (maybeVisitFarm(running)) return;
-      // 页面只在请求后刷新服务器额度。尚未确认当天使用时，低频重新读取以发现延后刷新的额度。
-      const checkedAt = Number(sessionStorage.getItem(QUOTA_REFRESH)) || 0;
-      if (!checkedAt) sessionStorage.setItem(QUOTA_REFRESH, String(Date.now()));
-      else if (!burstUsed && nowForBurst.canBurst && q.burst < q.burstMax && Date.now() - checkedAt >= 15 * 60000) {
+      // 优先复用正常领取、派遣及返回页面后的状态；无更新一小时才兜底，全天最多两次。
+      const quotaCheck = quotaCheckState();
+      if (!burstUsed && nowForBurst.canBurst && q.burst < q.burstMax && quotaCheck.count < 2 &&
+          Date.now() - quotaCheck.at >= 60 * 60000) {
         offer('refresh-quota', '重新读取今日突发额度', () => {
-          sessionStorage.setItem(QUOTA_REFRESH, String(Date.now())); location.reload();
+          const count = quotaCheck.count + 1;
+          localStorage.setItem(QUOTA_REFRESH, JSON.stringify({ ...quotaCheck, count, at: Date.now() }));
+          log.add('quota-refresh', '无正常状态更新，兜底检查突发额度', { count, limit: 2 });
+          location.reload();
         });
         return;
       }

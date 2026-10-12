@@ -125,7 +125,8 @@ window.renderExp = () => {
   dispatch.textContent = original ? '确认上次派遣结果' : '派出 ' + view.total + ' 支队伍';
   dispatch.disabled = model.busy || (!original && !view.total);
   dispatch.onclick = original ? () => {
-    model.calls.push({type: 'recover', idempotencyKey: JSON.parse(original).idempotencyKey}); finishDispatch();
+    model.calls.push({type: 'recover', idempotencyKey: JSON.parse(original).idempotencyKey});
+    if (!model.recoveryPending) finishDispatch();
   } : openDispatch;
 };
 renderExp();
