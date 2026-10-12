@@ -19,7 +19,7 @@ window.farmData=()=>({
  prices:fc.map(c=>({seedId:c.id,priceMilli:Math.round(fm.prices[c.id]*1000)})),
  plots:Array.from({length:12},(_,plotIndex)=>({plotIndex,growthPct:20,yieldPct:10})),
  crops:fm.crops.map(c=>({plotIndex:c.plot-1,maturesAt:new Date(c.at).toISOString(),seedKey:c.key})),
- stamina:{current:fm.stamina,max:100,regenMinutes:4,nextRegenSeconds:fm.nextRegen},
+ stamina:{current:fm.apiStamina??fm.stamina,max:100,regenMinutes:4,nextRegenSeconds:fm.nextRegen},
  staminaCosts:{plant:1,harvest:1},inventory:fc.map(c=>({seedKey:c.key,quantity:fm.inventory[c.key]})),
  seedPouch:{},soilLevel:10,growthMultiplier:.5,growSpeedMultiplier:1
 });
@@ -27,7 +27,7 @@ window.fetch=async (url,options)=>{
  if(url!=='/api/farm' || options?.method && options.method!=='GET') throw Error('意外的请求: '+url);
  fm.reads++;fm.calls.push({type:'read',prices:{...fm.prices}});
  if(fm.requestError) throw Error('fixture network failure');
- return new Response(JSON.stringify(farmData()),{status:200,headers:{'Content-Type':'application/json'}});
+ return new Response(JSON.stringify(farmData()),{status:fm.httpStatus||200,headers:{'Content-Type':'application/json'}});
 };
 window.closeSeeds=()=>{document.querySelector('[role="dialog"]')?.remove(); game.removeAttribute('inert');game.removeAttribute('aria-hidden');};
 window.openSale=()=>{
@@ -105,8 +105,15 @@ window.addFarmLink=()=>{
  const a=document.createElement('a');a.href='/farm';a.textContent='农场';a.onclick=e=>{e.preventDefault();navFarm('/farm');};game.prepend(a);
 };
 const originalRenderExp=window.renderExp;
-window.renderExp=()=>{originalRenderExp();addFarmLink();};
+window.renderFarmHeader=()=>{
+ document.getElementById('fixture-resources')?.remove();
+ const header=document.createElement('header');header.id='fixture-resources';
+ header.innerHTML='<div role="group" aria-label="我的资源"><span role="group" aria-label="体力 '+(fm.headerStamina??fm.stamina)+'/100，每 4 分钟恢复 1 点"><span>'+(fm.headerStamina??fm.stamina)+'</span><span>/100</span></span></div>';
+ document.body.prepend(header);
+};
+window.renderExp=()=>{originalRenderExp();addFarmLink();renderFarmHeader();};
 window.renderFarm=()=>{
+ renderFarmHeader();
  const ready=fm.crops.filter(c=>c.at<=clock);
  game.innerHTML='<a href="/activities/expedition">远征</a><div role="tablist" aria-label="农场功能"><button role="tab">田地</button><button role="tab">交易所</button></div><span title="每 4 分钟自然恢复 1 点体力">体力 '+fm.stamina+'/100（'+Math.floor(fm.nextRegen/60)+':'+String(fm.nextRegen%60).padStart(2,'0')+' 恢复 1 点）</span>';
  game.querySelector('a').onclick=e=>{e.preventDefault();navFarm('/activities/expedition');};

@@ -459,6 +459,113 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await drive(`fm.crops.length===12 && location.pathname==='/activities/expedition'`,'plant after stamina regeneration');
       assert.equal(await evaluate('fm.stamina'),0);
     });
+    const oldStaminaWait = `localStorage.setItem('arkengine:auto-farm:schedule:v1',JSON.stringify({nextAt:clock+15*60000,note:'等待体力恢复到 12 点再种植'}));`;
+    await t.test('农场体力：旧版还等15分钟，显示足够时提前检查且不影响成熟预约', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;${oldStaminaWait}`);
+      const oldAt=await evaluate(`${farmState}.nextAt`);
+      await drive(`fm.crops.length===12&&location.pathname==='/activities/expedition'`,'server stamina bypasses obsolete wait',35);
+      assert.ok(await evaluate('clock')<oldAt);
+      assert.equal(await evaluate('fm.stamina'),0);
+      assert.equal(await evaluate('fm.reads'),1,'只保留原有种植前行情读取，不新增体力轮询');
+      const nextAt=await evaluate(`${farmState}.nextAt`);
+      await pulse(60000);
+      assert.equal(await evaluate(`${farmState}.nextAt`),nextAt);
+      assert.equal(await evaluate('fm.reads'),1,'生长预约不轮询体力，也不因旧顶部12点提前切页');
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),2);
+    });
+    await t.test('农场体力：顶部旧12但农场8时只检查一次，不反复切页或查询接口', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=8;fm.headerStamina=12;${oldStaminaWait}`);
+      await drive(`${farmCalls('navigate')}.length===2&&location.pathname==='/activities/expedition'`,'stale top value checked once',20);
+      const nextAt=await evaluate(`${farmState}.nextAt`);
+      await pulse(5*60000);
+      assert.equal(await evaluate('fm.reads'),0);
+      assert.equal(await evaluate(`${farmState}.nextAt`),nextAt);
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),2);
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+      const snapshot=await evaluate('({fm,model,clock})');
+      await cdp.send('Page.navigate',{url:`${origin}/activities/expedition?farm-fixture=stamina-reload`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?farm-fixture=stamina-reload'&&typeof renderFarm==='function'`),'reload stamina wait');
+      await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderExp();`);
+      await evaluate(source);
+      await pulse(60000);
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),2,'刷新脚本后仍记得同一旧数值已核对');
+      assert.equal(await evaluate('fm.reads'),0);
+      await evaluate('fm.stamina=13;fm.headerStamina=13;renderExp();');
+      await drive(`fm.crops.length===12`,'new displayed value allows another check');
+      assert.equal(await evaluate('fm.reads'),1);
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1);
+    });
+    await t.test('农场体力：顶部未更新时保留原预约，到期照常检查，不额外轮询', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=0;${oldStaminaWait}`);
+      const nextAt=await evaluate(`${farmState}.nextAt`);
+      await pulse(5*60000);
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),0);
+      assert.equal(await evaluate('fm.reads'),0);
+      await evaluate(`clock=${nextAt};`);
+      await drive('fm.crops.length===12','original deadline remains valid',35);
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1);
+    });
+    await t.test('农场体力：提前收获后实际体力扣为0，不按顶部旧12点继续种植', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;
+        fm.crops=Array.from({length:12},(_,i)=>({plot:i+1,key:'crop-6',name:'蓝莓',at:clock-1}));
+        localStorage.setItem('arkengine:auto-farm:schedule:v1',JSON.stringify({nextAt:clock+15*60000,note:'等待体力恢复到 12 点再收获'}));`);
+      await drive(`${farmCalls('harvest')}.length===1&&!fm.crops.length&&location.pathname==='/activities/expedition'`,'early harvest followed by real stamina wait',35);
+      assert.equal(await evaluate('fm.stamina'),0);
+      assert.match(await evaluate(`${farmState}.note`),/12 点再种植/);
+      await pulse(60000);
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+      assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+    });
+    await t.test('农场体力：原有种植前读取失败时不因顶部足够而种植', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;fm.requestError=true;${oldStaminaWait}`);
+      await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'failed planting preflight');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+      assert.equal(await evaluate('fm.reads'),1);
+    });
+    await t.test('农场体力：顶部和农场都残留12但接口只有8时不种植', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;fm.apiStamina=8;${oldStaminaWait}`);
+      await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'authoritative preflight rejects stale farm display');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+      assert.equal(await evaluate('fm.reads'),1);
+      assert.match(await evaluate(`${farmState}.note`),/最新体力不足/);
+    });
+    await t.test('农场：状态接口401、403或429时整组暂停，远征归来后也不再自动请求', async () => {
+      for(const statusCode of [401,403,429]) {
+        await setupFarm(`addRuns(6);fm.httpStatus=${statusCode};`);
+        await drive(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')==='false'`,'farm HTTP error stops expedition group');
+        assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+        assert.equal(await evaluate('fm.reads'),1);
+        await evaluate(`closeSeeds();navFarm('/activities/expedition');model.runs.forEach(r=>r.done=true);renderExp();`);
+        const calls=await evaluate('model.calls.length');
+        await pulse(60000);
+        assert.equal(await evaluate('fm.reads'),1);
+        assert.equal(await evaluate('model.calls.length'),calls,'异常后不可继续领取派遣');
+        assert.equal(await evaluate('model.runs.length'),6);
+      }
+    });
+    await t.test('农场：状态接口发现账号切换时整组暂停，不再使用旧账号日程', async () => {
+      await setupFarm(`addRuns(6);localStorage.setItem('arkengine:auto-farm:schedule:v1',JSON.stringify({userId:88,nextAt:0}));`);
+      await drive(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')==='false'`,'account change pauses group');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+      assert.equal(await evaluate('fm.reads'),1);
+      assert.match(await expStatus(),/账号已切换/);
+    });
+    await t.test('农场体力：等待切页时体力下降或暂停，不清除旧预约', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;${oldStaminaWait}`);
+      await until(async()=>(await expStatus())?.includes('提前到农场核对'),'queued early check');
+      const oldAt=await evaluate(`${farmState}.nextAt`);
+      await evaluate('fm.headerStamina=8;renderExp();');
+      await pulse(10000);
+      assert.equal(await evaluate(`${farmState}.nextAt`),oldAt);
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),0);
+      await evaluate('fm.headerStamina=12;renderExp();');
+      await until(async()=>(await expStatus())?.includes('提前到农场核对'),'queued re-crossing threshold');
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('farm-toggle').click();`);
+      await pulse(10000);
+      assert.equal(await evaluate(`${farmState}.nextAt`),oldAt);
+      assert.equal(await evaluate(`${farmCalls('navigate')}.length`),0);
+      assert.equal(await evaluate('fm.reads'),0);
+    });
     await t.test('农场：已成熟但体力不足时预约收获，收获后再预约种植体力', async () => {
       await setupFarm(`addRuns(6);fm.stamina=5;fm.crops=Array.from({length:12},(_,i)=>({plot:i+1,key:'crop-6',name:'蓝莓',at:clock-1}));`,'/farm');
       await drive(`location.pathname==='/activities/expedition'`,'harvest waits for stamina');
@@ -706,13 +813,15 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await evaluate('fo.spirit=200;renderDun();');
       await drive('fo.runs===1','spirit replenished');
     });
-    await t.test('迷雾：主殿空闲时低频刷新真实灵力，刷新后达到200进入', async () => {
+    await t.test('迷雾：主殿不额外定时刷新，正常页面更新到200灵力后进入', async () => {
       await setupFog('fo.spirit=199;fo.freshSpirit=200;');
-      await pulse(59000);
+      for(let i=0;i<5;i++) await pulse(60000);
+      assert.equal(await evaluate(`${fogCalls('refresh-hall')}.length`),0,'不按分钟刷新或查询灵力');
+      assert.equal(await evaluate('location.pathname'),'/cultivate');
+      assert.equal(await evaluate('fo.runs'),0);
+      await evaluate('fo.spirit=200;renderDun();');
+      await drive('fo.runs===1','normal page update reaches threshold');
       assert.equal(await evaluate(`${fogCalls('refresh-hall')}.length`),0);
-      await pulse(1000);
-      await drive('fo.runs===1','refreshed threshold');
-      assert.equal(await evaluate(`${fogCalls('refresh-hall')}.length`),1);
     });
     await t.test('迷雾：请求中断和刷新后只恢复同一个原请求，继续到不足20', async () => {
       await setupFog(`fo.mode='pending';`);
@@ -884,7 +993,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.0');
+      assert.equal(exported.version,'1.6.1');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -939,7 +1048,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.0');
+      assert.equal(exported.version,'1.6.1');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);

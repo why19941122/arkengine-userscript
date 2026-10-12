@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.0
+// @version      1.6.1
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -189,7 +189,7 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.0', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.1', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
@@ -225,7 +225,6 @@
   let fogLeaving = false;
   let fogResultObserved = false;
   let fogPageAt = 0;
-  let hallSpiritSeen = { value: '', at: Date.now() };
   try {
     fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
     fog = JSON.parse(localStorage.getItem(FOG_STATE) || 'null') || fog;
@@ -632,21 +631,13 @@
     const values = [...document.querySelectorAll('span')].filter(visible).map(textOf)
       .map(text => text.match(/^灵力\s+(\d+)\s*\/\s*(\d+)$/)).filter(Boolean);
     const spirit = values.length === 1 && Number(values[0][1]) <= Number(values[0][2]) ? Number(values[0][1]) : null;
-    if (hallSpiritSeen.value !== spirit) hallSpiritSeen = { value: spirit, at: Date.now() };
     const shouldEnter = fogPlan || fog.draining || spirit !== null && spirit >= 200;
     if (Object.keys(sessionStorage).some(key => key.startsWith(RECOVERY_PREFIX) && sessionStorage.getItem(key) !== 'null')) return false;
     const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
     if (!cooldown && lastAction && !/^(dungeon|fog):/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) return false;
     if (!cooldown && !findButton('寻找奇遇')) return false;
-    if (!shouldEnter) {
-      // 主殿不会连续更新灵力；空闲时每分钟至多刷新一次真实状态，不推算恢复速度。
-      const refresh = document.querySelector('button[aria-label="刷新修炼状态"]');
-      if (spirit !== null && cooldown && Date.now() - hallSpiritSeen.at >= 60000 && usable(refresh)) {
-        recordClick(refresh, 'fog:spirit', 'refresh', '刷新主殿灵力', () => { hallSpiritSeen.at = Date.now(); });
-        return true;
-      }
-      return false;
-    }
+    // 只利用正常奇遇操作或网页自身更新的灵力，不为迷雾定时刷新主殿。
+    if (!shouldEnter) return false;
     recordClick(link, 'fog:visit', 'fog', '切换到迷雾', () => saveFog({ ...fog, draining: true }));
     return true;
   }
@@ -1437,8 +1428,27 @@
     offer('farm:return', '返回远征，按预约时间再检查农场', () => link.click());
   }
   function planFarmVisit(at, note) {
-    saveFarmState({ ...farmState, nextAt: Math.max(Date.now() + 30000, at), note });
+    // 农场已经确认不足时，记住顶部旧数值；同一旧值不能反复触发往返。
+    saveFarmState({ ...farmState, nextAt: Math.max(Date.now() + 30000, at), note,
+      staminaSeen: farmStaminaNeed(note) ? displayedStamina() : null });
     backToExpedition();
+  }
+  function farmStaminaNeed(note = farmState.note) {
+    // 兼容旧版保存的体力预约。成熟预约等其他原因绝不能提前取消。
+    const match = String(note || '').match(/^等待体力恢复到 (\d+) 点再(?:种植|收获)$/);
+    const need = Number(match?.[1]);
+    return Number.isSafeInteger(need) && need > 0 ? need : null;
+  }
+  function displayedStamina() {
+    // 网站资源栏的 aria-label 含完整数值；图标旁文字可能隐藏上限或缩写。
+    // 此值只用于唤醒农场检查，不能作为扣体力操作的依据。
+    const chips = [...document.querySelectorAll('[role="group"][aria-label="我的资源"] [role="group"][aria-label^="体力 "]')].filter(visible);
+    const values = chips.map(chip => {
+      const match = chip.getAttribute('aria-label').normalize('NFKC').match(/^体力\s+(\d+)\/(\d+)(?:,|$)/);
+      const current = Number(match?.[1]), max = Number(match?.[2]);
+      return Number.isSafeInteger(current) && Number.isSafeInteger(max) && max > 0 && current <= max ? current : null;
+    });
+    return values.length && values[0] !== null && values.every(value => value === values[0]) ? values[0] : null;
   }
   function rememberExpeditionTime(running) {
     // 突发窗口必须在农场等待期间也能被调度；远征平时常驻，因此不依赖这个估算领奖。
@@ -1453,13 +1463,33 @@
     if (farmState.expeditionAt !== nextAt) saveFarmState({ ...farmState, expeditionAt: nextAt });
   }
   function maybeVisitFarm(running) {
-    if (!farmEnabled || (farmState.nextAt > Date.now() && !farmPlan)) return false;
+    if (!farmEnabled) return false;
+    let earlyStamina = null;
+    if (farmState.nextAt > Date.now() && !farmPlan) {
+      const need = farmStaminaNeed();
+      if (!need) return false;
+      const shown = displayedStamina();
+      if (shown === null || shown === farmState.staminaSeen) return false;
+      if (shown < need) {
+        saveFarmState({ ...farmState, staminaSeen: shown });
+        return false;
+      }
+      earlyStamina = shown;
+    }
     const link = travelLink('/farm');
     if (!link) return false;
     rememberExpeditionTime(running);
     // 距离已知的归来时间只剩十几秒时，先等这一批归来，不立即切走。
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt - Date.now() < 15000) return false;
-    offer('farm:visit', '切换到农场检查收获与种植', () => link.click());
+    offer(earlyStamina === null ? 'farm:visit' : `farm:visit:stamina:${earlyStamina}`,
+      earlyStamina === null ? '切换到农场检查收获与种植' : '顶部体力有变化，提前到农场核对', () => {
+        // 只在实际切页时清除旧预约；等待期间数值下降或暂停仍可撤销。
+        if (earlyStamina !== null) {
+          saveFarmState({ ...farmState, nextAt: 0, staminaSeen: earlyStamina });
+          log.add('farm-stamina-wake', '顶部体力变化，提前检查；尚未确认实际可用体力', { displayed: earlyStamina });
+        }
+        link.click();
+      });
     return true;
   }
   function farmSnapshot() {
@@ -1500,18 +1530,26 @@
     // 只读网站原有状态接口，保留 priceMilli 精度；种植、收获仍只点网页原按钮。
     fetch('/api/farm', { cache: 'no-store', credentials: 'same-origin', signal: AbortSignal.timeout(15000) })
       .then(async response => {
-        if (!response.ok) throw new Error(`农场状态读取失败（${response.status}）`);
+        if (!response.ok) throw Object.assign(new Error(`农场状态读取失败（${response.status}）`), {
+          stopGroup: [401, 403, 429].includes(response.status)
+        });
         const data = await response.json();
         if (!Number.isSafeInteger(data.userId) || !Array.isArray(data.seeds) || !Array.isArray(data.prices) ||
             !Array.isArray(data.plots) || !Array.isArray(data.crops) || !Array.isArray(data.inventory) ||
             !data.stamina || data.staminaCosts?.plant !== 1 || data.staminaCosts?.harvest !== 1) {
           throw new Error('农场数据或体力规则变化');
         }
-        if (farmState.userId && farmState.userId !== data.userId) throw new Error('农场账号已切换，请核对日程');
+        if (farmState.userId && farmState.userId !== data.userId) {
+          throw Object.assign(new Error('农场账号已切换，请核对日程'), { stopGroup: true });
+        }
         farmMarket = { data, at: Date.now() };
         if (!farmState.userId) saveFarmState({ ...farmState, userId: data.userId });
       })
-      .catch(error => { farmMarket = null; pauseFarm(`${error.message}；本轮未种植，请核对后开启农场`); })
+      .catch(error => {
+        farmMarket = null;
+        if (error.stopGroup) setEnabled(false, `${error.message}；已暂停远征与农场，请手动核对后恢复`);
+        else pauseFarm(`${error.message}；本轮未种植，请核对后开启农场`);
+      })
       .finally(() => { farmMarketLoading = false; schedule(); });
   }
   function bestFarmSeed(dialog, s) {
@@ -1664,7 +1702,11 @@
       if (Date.now() - openingSeedsAt < 10000) { say('等待种子窗口'); return; }
       openingSeedsAt = 0; pauseFarm('种子窗口未打开，请核对农场页面'); return;
     }
-    if (farmState.nextAt > Date.now()) { backToExpedition(); return; }
+    if (farmState.nextAt > Date.now()) {
+      const need = farmStaminaNeed();
+      if (need && s.stamina >= need) saveFarmState({ ...farmState, nextAt: 0, staminaSeen: displayedStamina() });
+      else { backToExpedition(); return; }
+    }
     if (s.ready.length) {
       const need = s.ready.length;
       if (s.stamina < need) { planFarmVisit(staminaReadyAt(s,need), `等待体力恢复到 ${need} 点再收获`); return; }
