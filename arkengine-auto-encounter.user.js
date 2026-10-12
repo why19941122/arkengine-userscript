@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.5.2
+// @version      1.6.0
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
-// @description  双标签页挂机：奇遇秘境、远征农场；凌晨突发深渊及漏用补派，本地每日收益与排障日志。
+// @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
 // @match        https://game.arkengine.me/*
 // @run-at       document-idle
 // @grant        none
@@ -22,7 +22,7 @@
   function syncDialogAnimations() {
     let wanted = false;
     try {
-      wanted = /^\/cultivate(?:\/dungeon)?\/?$/.test(location.pathname)
+      wanted = /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname)
         ? localStorage.getItem('arkengine:auto-encounter:enabled:v1') !== 'false'
         : /^(?:\/activities\/expedition|\/farm)\/?$/.test(location.pathname) &&
           localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
@@ -189,7 +189,7 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.5.2', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.0', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
@@ -212,7 +212,25 @@
   const CLICK_DELAY_MAX_MS = 5000;
   const RECOVERY_PREFIX = 'cultivation:operation:';
   const inDungeon = () => /^\/cultivate\/dungeon\/?$/.test(location.pathname);
-  const onPage = () => /^\/cultivate(?:\/dungeon)?\/?$/.test(location.pathname);
+  const inFog = () => /^\/cultivate\/fog\/?$/.test(location.pathname);
+  const onPage = () => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname);
+  const FOG_PREF = 'arkengine:auto-fog:enabled:v1';
+  const FOG_STATE = 'arkengine:auto-fog:state:v1';
+  const FOG_JOURNAL = 'arkengine:auto-fog:pending:v1';
+  let fogEnabled = true;
+  let fog = { draining: false, nextAt: 0 };
+  let fogPlan = null;
+  let openedFogDialog = false;
+  let fogDialog = null;
+  let fogLeaving = false;
+  let fogResultObserved = false;
+  let fogPageAt = 0;
+  let hallSpiritSeen = { value: '', at: Date.now() };
+  try {
+    fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
+    fog = JSON.parse(localStorage.getItem(FOG_STATE) || 'null') || fog;
+    fogPlan = JSON.parse(sessionStorage.getItem(FOG_JOURNAL) || 'null');
+  } catch { fogEnabled = false; }
   const DUNGEON_PREF = 'arkengine:auto-dungeon:enabled:v1';
   const DUNGEON_STATE = 'arkengine:auto-dungeon:state:v1';
   const DUNGEON_JOURNAL = 'arkengine:auto-dungeon:pending:v1';
@@ -265,13 +283,15 @@
       a { color: #acbde1; }
     </style>
     <div class="box">
-      <strong>自动奇遇与秘境</strong>
+      <strong>自动奇遇、秘境与迷雾</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <p class="hint">最高钻石优先；无钻石时选最高修为。</p>
       <p id="last" class="hint">等待下一次奇遇</p>
       <button type="button" id="toggle"></button>
       <p id="dungeon-status" class="hint"></p>
       <button type="button" id="dungeon-toggle"></button>
+      <p id="fog-status" class="hint"></p>
+      <button type="button" id="fog-toggle"></button>
       <p class="hint"><a href="/activities/expedition" target="_blank" rel="noopener">打开远征挂机页</a></p>
     </div>`;
   document.body.append(host);
@@ -280,7 +300,22 @@
   const toggle = shadow.getElementById('toggle');
   const dungeonStatus = shadow.getElementById('dungeon-status');
   const dungeonToggle = shadow.getElementById('dungeon-toggle');
+  const fogStatus = shadow.getElementById('fog-status');
+  const fogToggle = shadow.getElementById('fog-toggle');
   log.mount(shadow);
+  fogToggle.addEventListener('click', () => {
+    fogEnabled = !fogEnabled;
+    localStorage.setItem(FOG_PREF, String(fogEnabled));
+    if (fogEnabled) saveFog({ ...fog, nextAt: 0 });
+    cancelPendingClick(); schedule();
+  });
+  function updateFogHint() {
+    const hint = !fogEnabled ? '迷雾已暂停' : fog.nextAt > Date.now() ?
+      `迷雾：约 ${Math.ceil((fog.nextAt - Date.now()) / 60000)} 分钟后再核对` :
+      fog.draining || fogPlan ? '迷雾：本轮探索到灵力不足 20' : '迷雾：主殿灵力达到 200 后进入';
+    if (fogStatus.textContent !== hint) fogStatus.textContent = hint;
+    fogToggle.textContent = fogEnabled ? '暂停迷雾' : '开启迷雾';
+  }
   function updateDungeonHint() {
     const hint = !dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
       dungeon.exhaustedDay === beijingDay() ? '秘境：今日次数已用完，明日再检查' :
@@ -305,7 +340,7 @@
   function setEnabled(value, reason = '') {
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 不阻断暂停 */ }
-    toggle.textContent = value ? '暂停奇遇与秘境' : '开始奇遇与秘境';
+    toggle.textContent = value ? '暂停修仙自动操作' : '开始修仙自动操作';
     if (!value) {
       if (active) log.stop(reason || '已暂停');
       cancelPendingClick();
@@ -315,7 +350,7 @@
     schedule();
   }
   toggle.addEventListener('click', () => setEnabled(!enabled));
-  toggle.textContent = enabled ? '暂停奇遇与秘境' : '开始奇遇与秘境';
+  toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
 
   const textOf = el => (el?.textContent || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   function visible(el) {
@@ -397,7 +432,7 @@
     }
     const remaining = pendingClick.dueAt - Date.now();
     if (remaining > 0) {
-      const action = kind.startsWith('dungeon:') ? message :
+      const action = /^(dungeon|fog):/.test(kind) ? message :
         kind === 'seek' ? '寻找奇遇' : kind === 'choose' ? '选择最高奖励' : '确认原奇遇结果';
       say(`随机等待 ${(Math.ceil(remaining / 100) / 10).toFixed(1)} 秒后${action}`);
       return false;
@@ -447,6 +482,7 @@
   function checkPage() {
     syncDialogAnimations();
     updateDungeonHint();
+    updateFogHint();
     if (host.hidden === onPage()) host.hidden = !onPage();
     if (!onPage() || !enabled) {
       releaseLock?.();
@@ -460,12 +496,16 @@
     if (!active) { acquire(); return; }
     log.pulse(statusText);
     const notices = [...document.querySelectorAll('[role="status"]')].filter(visible);
-    const errors = notices.filter(el => el.classList.contains('text-destructive')).map(textOf).join(' ');
+    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="alert"].text-destructive')]
+      .filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
       setEnabled(false, '游戏提示登录、权限或限流异常，已暂停；处理后手动开始');
       return;
     }
     if (inDungeon()) { checkDungeon(notices, errors); return; }
+    if (inFog()) { checkFog(errors); return; }
+    fogPageAt = 0;
+    fogLeaving = false;
     dungeonPageDay = '';
     returningFromDungeon = false;
     dungeonProgress = null;
@@ -505,7 +545,8 @@
       return;
     }
 
-    if (visitDungeon()) return;
+    if ((!fogEnabled || !fogPlan || fog.nextAt > Date.now()) && visitDungeon()) return;
+    if (visitFog()) return;
 
     const cooldown = [...document.querySelectorAll('button')].find(el =>
       visible(el) && /^奇遇冷却\s/.test(textOf(el)));
@@ -521,7 +562,198 @@
     recordClick(seek, 'seek', 'seek', '正在寻找奇遇');
   }
 
-  // 奇遇与秘境共享队列和标签页锁，任何时刻只执行当前页面的一步操作。
+  // 奇遇、秘境与迷雾共享队列和标签页锁，任何时刻只执行当前页面的一步操作。
+  function saveFog(value) {
+    const serialized = JSON.stringify(value);
+    localStorage.setItem(FOG_STATE, serialized);
+    if (localStorage.getItem(FOG_STATE) !== serialized) throw new Error('无法保存迷雾进度');
+    fog = value;
+  }
+  function saveFogPlan(value) {
+    const serialized = JSON.stringify(value);
+    sessionStorage.setItem(FOG_JOURNAL, serialized);
+    if (sessionStorage.getItem(FOG_JOURNAL) !== serialized) throw new Error('无法保存迷雾原操作');
+    fogPlan = value;
+  }
+  function nativeFogRequests() {
+    return Object.keys(sessionStorage).filter(key => /^fog:\d+$/.test(key))
+      .map(key => ({ key, value: JSON.parse(sessionStorage.getItem(key)) })).filter(r => r.value);
+  }
+  function fogSettings() {
+    const route = document.querySelector('select[aria-label="探索路线"]')?.value;
+    const strategy = document.querySelector('select[aria-label="战斗策略"]')?.value;
+    const rawHp = document.querySelector('input[aria-label="生命撤离线"]')?.value;
+    const retreatHp = Number(rawHp);
+    return ['east', 'south', 'explore'].includes(route) && ['guard-heavy', 'strike'].includes(strategy) &&
+      rawHp !== undefined && rawHp !== '' && Number.isInteger(retreatHp) && retreatHp >= 0 && retreatHp <= 90
+      ? { route, strategy, retreatHp } : null;
+  }
+  function bindFogRequest() {
+    if (fogPlan?.phase !== 'submitted' || fogPlan.original) return;
+    const records = nativeFogRequests();
+    if (records.length !== 1) return;
+    const { input, idempotencyKey } = records[0].value;
+    if (!idempotencyKey || typeof idempotencyKey !== 'string' || input?.action !== 'start' ||
+        Object.keys(input).length !== 2 || !input.quick || Object.keys(input.quick).length !== 3 ||
+        Object.keys(fogPlan.settings).some(key => input.quick[key] !== fogPlan.settings[key])) return;
+    saveFogPlan({ ...fogPlan, original: records[0] });
+    fogResultObserved = true;
+  }
+  function afterFogClick() {
+    bindFogRequest();
+    // 原网页先完成确认 Promise，再同步保存原请求，故紧随它的微任务绑定。
+    queueMicrotask(() => {
+      try { bindFogRequest(); } catch { setEnabled(false, '迷雾原操作保存失败，请手动核对结果'); }
+    });
+  }
+  function returnFromFog() {
+    const link = linkTo('/cultivate');
+    if (!usable(link)) { say('等待返回修仙主殿入口'); return; }
+    recordClick(link, 'fog:return', 'hall', '返回主殿继续奇遇', () => { fogResultObserved = false; });
+  }
+  function deferFog(reason, pause = false) {
+    if (!fogLeaving) {
+      saveFog({ ...fog, nextAt: Date.now() + 5 * 60000 });
+      if (pause) {
+        fogEnabled = false;
+        localStorage.setItem(FOG_PREF, 'false');
+      }
+      fogLeaving = true;
+      last.textContent = `${reason}；${pause ? '迷雾已暂停，请手动核对' : '5 分钟后再核对迷雾'}`;
+      log.add('fog-deferred', reason, { paused: pause, pending: Boolean(fogPlan), retryAt: fog.nextAt });
+    }
+    returnFromFog();
+  }
+  function visitFog() {
+    if (!fogEnabled || fog.nextAt > Date.now() || dungeon.run || dungeonPlan) return false;
+    const link = linkTo('/cultivate/fog');
+    if (!usable(link)) return false;
+    // 严格读取主殿的灵力行，避免误把顶部体力、门票或奖励数字作为灵力。
+    const values = [...document.querySelectorAll('span')].filter(visible).map(textOf)
+      .map(text => text.match(/^灵力\s+(\d+)\s*\/\s*(\d+)$/)).filter(Boolean);
+    const spirit = values.length === 1 && Number(values[0][1]) <= Number(values[0][2]) ? Number(values[0][1]) : null;
+    if (hallSpiritSeen.value !== spirit) hallSpiritSeen = { value: spirit, at: Date.now() };
+    const shouldEnter = fogPlan || fog.draining || spirit !== null && spirit >= 200;
+    if (Object.keys(sessionStorage).some(key => key.startsWith(RECOVERY_PREFIX) && sessionStorage.getItem(key) !== 'null')) return false;
+    const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
+    if (!cooldown && lastAction && !/^(dungeon|fog):/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) return false;
+    if (!cooldown && !findButton('寻找奇遇')) return false;
+    if (!shouldEnter) {
+      // 主殿不会连续更新灵力；空闲时每分钟至多刷新一次真实状态，不推算恢复速度。
+      const refresh = document.querySelector('button[aria-label="刷新修炼状态"]');
+      if (spirit !== null && cooldown && Date.now() - hallSpiritSeen.at >= 60000 && usable(refresh)) {
+        recordClick(refresh, 'fog:spirit', 'refresh', '刷新主殿灵力', () => { hallSpiritSeen.at = Date.now(); });
+        return true;
+      }
+      return false;
+    }
+    recordClick(link, 'fog:visit', 'fog', '切换到迷雾', () => saveFog({ ...fog, draining: true }));
+    return true;
+  }
+  function checkFog(errors) {
+    fogPageAt ||= Date.now();
+    if (Date.now() < nextActionAt) return;
+    const records = nativeFogRequests();
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    if (dialogs.length) {
+      const dialog = dialogs[0];
+      const title = dialog.querySelector('h2, [data-slot="alert-dialog-title"]');
+      const own = dialogs.length === 1 && !records.length && openedFogDialog && fogPlan?.phase === 'opening' &&
+        (!fogDialog || fogDialog === dialog) && textOf(title) === '快速探索' && textOf(dialog).includes(fogPlan.description);
+      if (!own) { say('请先手动处理当前弹窗'); return; }
+      fogDialog = dialog;
+      if (!fogEnabled) {
+        const cancel = [...dialog.querySelectorAll('button')].find(b => textOf(b) === '取消');
+        recordClick(cancel, 'fog:cancel', 'cancel', '取消尚未提交的迷雾探索', () => {
+          saveFogPlan(null); openedFogDialog = false;
+        });
+        return;
+      }
+      if (JSON.stringify(fogSettings()) !== JSON.stringify(fogPlan.settings)) {
+        say('迷雾预设已变化，请手动核对确认窗口'); return;
+      }
+      const confirm = [...dialog.querySelectorAll('button')].find(b => textOf(b) === '确认');
+      recordClick(confirm, 'fog:confirm', fogPlan.description, '确认快速探索（消耗 20 灵力）', () => {
+        saveFogPlan({ ...fogPlan, phase: 'submitted', at: Date.now(), startedAt: Date.now() });
+        openedFogDialog = false; fogResultObserved = false;
+      }, afterFogClick);
+      return;
+    }
+    if (!fogEnabled || fogLeaving || fog.nextAt > Date.now()) { returnFromFog(); return; }
+    const own = records.length === 1 && fogPlan?.original && JSON.stringify(records[0]) === JSON.stringify(fogPlan.original);
+    if (records.length && !own) { deferFog('存在无法核对归属的迷雾原请求', true); return; }
+    const refresh = findButton('刷新');
+    if (fogPlan?.phase === 'submitted') {
+      if (Date.now() - fogPlan.startedAt > 90000) {
+        if (!fogPlan.deferred) {
+          // 每次返回后仍保留同一原请求，但允许下一次核对获得独立的等待窗口。
+          saveFogPlan({ ...fogPlan, deferred: true });
+          deferFog('迷雾 90 秒未确认结果，保留原请求回主殿'); return;
+        }
+        saveFogPlan({ ...fogPlan, startedAt: Date.now(), deferred: false });
+      }
+      if (own) {
+        const recover = findButton('确认原探索结果');
+        if (Date.now() - fogPlan.at >= RETRY_MS && usable(recover)) {
+          recordClick(recover, 'fog:recover', records[0].value.idempotencyKey, '确认原探索结果', () => {
+            saveFogPlan({ ...fogPlan, at: Date.now() }); fogResultObserved = true;
+          });
+        } else say('等待原迷雾请求完成，不重复消耗灵力');
+        return;
+      }
+      if (!usable(refresh)) { say('等待迷雾结果同步完成'); return; }
+      if (errors) { deferFog(`迷雾提示：${errors}；本轮结果不能确认`, true); return; }
+      const receipt = [...document.querySelectorAll('[role="status"]')].filter(visible).map(textOf)
+        .find(text => /已到账:修为\s*\d+\s*·\s*法宝碎片\s*\d+$/.test(text));
+      if (fogPlan.original && fogResultObserved && receipt &&
+          (usable(findButton('进入并快速探索 · 20 灵力')) || fogSpirit()?.current < 20)) {
+        const reward = receipt.match(/已到账:修为\s*(\d+)\s*·\s*法宝碎片\s*(\d+)$/);
+        // 原请求已明确结束，才将对应回执计账；连续相同金额也是不同轮次。
+        saveFogPlan(null); fogResultObserved = false;
+        log.add('fog-reward', receipt, { reward: { 修为: Number(reward[1]), 法宝碎片: Number(reward[2]) } }, true);
+      } else { deferFog('迷雾结果无法可靠核对，请查看原探索结果', true); return; }
+    }
+    if (fogPlan?.phase === 'opening') {
+      if (Date.now() - fogPlan.at < 10000) { say('等待快速探索确认窗口'); return; }
+      saveFogPlan(null); openedFogDialog = false;
+      deferFog('快速探索确认窗口未打开或已取消'); return;
+    }
+    if (errors) { deferFog(`迷雾提示：${errors}`); return; }
+    if (!usable(refresh)) {
+      if (Date.now() - fogPageAt > 90000) deferFog('迷雾页面超过 90 秒未能加载');
+      else say('等待迷雾页面加载');
+      return;
+    }
+    if (findButton('确认原探索结果') || findButton('按策略完成本局')) {
+      deferFog('迷雾中有手动探索或其他原操作', true); return;
+    }
+    const spirit = fogSpirit();
+    if (!spirit || spirit.cost !== 20) { deferFog('迷雾灵力或入场费用无法核对'); return; }
+    if (spirit.current < 20 || !fog.draining && spirit.current < 200) {
+      saveFog({ draining: false, nextAt: 0 });
+      fogLeaving = true; returnFromFog(); return;
+    }
+    const quick = findButton('进入并快速探索 · 20 灵力');
+    const settings = fogSettings();
+    if (!usable(quick) || !settings) { deferFog('当前无法快速探索迷雾'); return; }
+    const description = `消耗 20 灵力开始新局,按所选路线逐格探索。沿用当前战斗、补给和奖励规则;生命不高于 ${settings.retreatHp} 时撤离,仍可能在单次受击中失败。不会自动使用背包补品。`;
+    recordClick(quick, 'fog:open', JSON.stringify(settings), '进入并快速探索迷雾', () => {
+      saveFog({ draining: true, nextAt: 0 });
+      saveFogPlan({ phase: 'opening', settings, description, at: Date.now() });
+      openedFogDialog = true;
+      fogDialog = null;
+    }, () => {
+      // 记住实际打开的窗口；手动关闭后重开的同名窗口也不能代为确认。
+      fogDialog = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].find(visible) || null;
+    });
+  }
+  function fogSpirit() {
+    const matches = [...document.querySelectorAll('p[aria-live="polite"]')].filter(visible).map(textOf)
+      .map(text => text.match(/^当前灵力\s+(\d+)\/(\d+)\s*·\s*入场消耗\s+(\d+)\s+灵力$/)).filter(Boolean);
+    if (matches.length !== 1 || Number(matches[0][1]) > Number(matches[0][2])) return null;
+    return { current: Number(matches[0][1]), cost: Number(matches[0][3]) };
+  }
+
   function saveDungeon(value) {
     const serialized = JSON.stringify(value);
     localStorage.setItem(DUNGEON_STATE, serialized);
@@ -580,7 +812,7 @@
       }
     }
     const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
-    if (!cooldown && lastAction && !lastAction.kind.startsWith('dungeon:') && Date.now() - lastAction.at < RETRY_MS) {
+    if (!cooldown && lastAction && !/^(dungeon|fog):/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) {
       say('先等待本次奇遇结果，再进入秘境'); return true;
     }
     if (!cooldown && !findButton('寻找奇遇')) return false;
@@ -766,7 +998,7 @@
     acquiring = true;
     navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
       if (!lock || !enabled || !onPage()) {
-        if (enabled && onPage()) say('另一游戏标签页正在自动奇遇或秘境');
+        if (enabled && onPage()) say('另一游戏标签页正在自动修仙');
         return;
       }
       active = true;
@@ -822,7 +1054,7 @@
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
-      toggle.textContent = enabled ? '暂停奇遇与秘境' : '开始奇遇与秘境';
+      toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
       if (!enabled) { cancelPendingClick(); releaseLock?.(); say('已暂停'); }
       schedule();
     }
@@ -831,6 +1063,13 @@
         dungeon = JSON.parse(localStorage.getItem(DUNGEON_STATE) || 'null') || { nextAt: 0, exhaustedDay: '', run: null };
         dungeonEnabled = localStorage.getItem(DUNGEON_PREF) !== 'false';
       } catch { dungeonEnabled = false; }
+      schedule();
+    }
+    if (event.key === FOG_STATE || event.key === FOG_PREF) {
+      try {
+        fog = JSON.parse(localStorage.getItem(FOG_STATE) || 'null') || { draining: false, nextAt: 0 };
+        fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
+      } catch { fogEnabled = false; }
       schedule();
     }
   });

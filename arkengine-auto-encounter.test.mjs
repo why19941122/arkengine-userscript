@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { expeditionMarkup } from './arkengine-expedition.fixture.mjs';
 import { dungeonMarkup } from './arkengine-dungeon.fixture.mjs';
 import { farmMarkup } from './arkengine-farm.fixture.mjs';
+import { fogMarkup } from './arkengine-fog.fixture.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
 const source = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
@@ -106,13 +107,13 @@ window.notice = (text, error = false) => {
 base();
 </script>`;
 
-test('自动奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查', { timeout: 420000 }, async t => {
+test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集成检查', { timeout: 600000 }, async t => {
   let expeditionRequests = 0;
   const server = createServer((req, res) => {
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(req.url.includes('farm-fixture') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
+    res.end(req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -650,6 +651,179 @@ test('自动奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       assert.equal(await evaluate(`dm.calls.some(c=>c[0]==='retreat')`),false);
     });
     const logBucket = (group='cultivate', day='2026-10-10') => `JSON.parse(localStorage.getItem('arkengine:auto-log:v1:${group}:${day}'))`;
+    const fogJournal = `JSON.parse(sessionStorage.getItem('arkengine:auto-fog:pending:v1'))`;
+    const fogState = `JSON.parse(localStorage.getItem('arkengine:auto-fog:state:v1'))`;
+    const fogCalls = kind => `fo.calls.filter(c=>c[0]==='${kind}')`;
+    const fogToggle = `document.getElementById('ark-auto-encounter').shadowRoot.getElementById('fog-toggle').click()`;
+    const setupFog = async (code = '', path = '/cultivate') => {
+      await cdp.send('Page.navigate', {url:`${origin}${path}?fog-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?fog-fixture=${pageSerial}'&&typeof openFog==='function'`),'fog fixture');
+      await evaluate('localStorage.clear();sessionStorage.clear();');
+      await cdp.send('Page.reload',{},tab.sessionId);
+      await until(()=>evaluate(`typeof openFog==='function'&&!document.getElementById('ark-auto-encounter')`),'fresh fog fixture');
+      await evaluate(`Math.random=()=>0;localStorage.setItem('arkengine:auto-dungeon:enabled:v1','false');${code};renderDun();`);
+      await evaluate(source);
+    };
+    await t.test('迷雾：199 灵力留在主殿，200 触发，余数不足20返回且继续奇遇', async () => {
+      await setupFog('fo.spirit=199;');
+      await pulse(10000);
+      assert.equal(await evaluate('location.pathname'),'/cultivate','体力999不触发迷雾');
+      await evaluate('fo.spirit=205;renderDun();');
+      await drive(`fo.runs===10&&location.pathname==='/cultivate'`,'consume ten runs and return',130);
+      assert.equal(await evaluate('fo.spirit'),5);
+      assert.equal(await evaluate(`${fogState}.draining`),false);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),10);
+      assert.equal(await evaluate(`${fogCalls('wrong-entry')}.length`),0);
+      assert.equal(await evaluate(`${logBucket()}.counts['fog-reward']`),10);
+      assert.deepEqual(await evaluate(`${logBucket()}.totals`),{修为:3250,法宝碎片:120});
+      await evaluate('fo.seek=true;renderDun();');
+      await drive(`${fogCalls('seek')}.length===1`,'encounters continue after fog');
+      await pulse(60000);
+      assert.equal(await evaluate('fo.runs'),10,'不能用剩余5点重新进入');
+    });
+    await t.test('迷雾：灵力恰好200时独立随机等待打开及确认，沿用当前预设', async () => {
+      await setupFog(`fo.route='south';fo.strategy='strike';fo.hp=40;`,'/cultivate/fog');
+      await until(async()=>(await status())?.includes('随机等待'),'delay before entry');
+      await pulse(1999);
+      assert.equal(await evaluate(`${fogCalls('open')}.length`),0);
+      await pulse(1);
+      assert.equal(await evaluate(`${fogCalls('open')}.length`),1);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),0);
+      await pulse(1500);await pulse(1999);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),0,'确认也独立等待2秒');
+      await pulse(1);
+      await drive('fo.runs===1','first quick request');
+      assert.deepEqual(await evaluate(`${fogCalls('start')}[0][1]`),{action:'start',quick:{route:'south',strategy:'strike',retreatHp:40}});
+      assert.equal(await evaluate('fo.spirit'),180);
+    });
+    await t.test('迷雾：先领取当前奇遇，先做已到期秘境，再按剩余灵力判断', async () => {
+      await setupFog(`dm.encounter=true;localStorage.setItem('arkengine:auto-dungeon:enabled:v1','true');`);
+      await drive(`dm.runs===1&&!dm.current&&location.pathname==='/cultivate'`,'due dungeon before fog',100);
+      assert.equal(await evaluate('dm.calls[0][0]'),'encounter');
+      assert.equal(await evaluate('fo.spirit'),180);
+      await pulse(10000);
+      assert.equal(await evaluate(`${fogCalls('open')}.length`),0,'秘境消耗后不足200不进入');
+      await evaluate('fo.spirit=200;renderDun();');
+      await drive('fo.runs===1','spirit replenished');
+    });
+    await t.test('迷雾：主殿空闲时低频刷新真实灵力，刷新后达到200进入', async () => {
+      await setupFog('fo.spirit=199;fo.freshSpirit=200;');
+      await pulse(59000);
+      assert.equal(await evaluate(`${fogCalls('refresh-hall')}.length`),0);
+      await pulse(1000);
+      await drive('fo.runs===1','refreshed threshold');
+      assert.equal(await evaluate(`${fogCalls('refresh-hall')}.length`),1);
+    });
+    await t.test('迷雾：请求中断和刷新后只恢复同一个原请求，继续到不足20', async () => {
+      await setupFog(`fo.mode='pending';`);
+      await drive('!!nativeFog()&&!fo.busy','pending quick result');
+      const record=await evaluate('nativeFog()');
+      const before=await evaluate('clock');
+      await cdp.send('Page.navigate',{url:`${origin}/cultivate/fog?fog-fixture=recover`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?fog-fixture=recover'&&typeof openFog==='function'`),'reload fog');
+      await evaluate(`clock=${before+31000};Math.random=()=>0;fo.mode='';renderDun();`);
+      await evaluate(source);
+      await drive(`fo.runs===10&&location.pathname==='/cultivate'`,'recovered complete drain',130);
+      assert.equal(await evaluate(`${fogCalls('recover')}[0][2]`),record.idempotencyKey);
+      assert.deepEqual(await evaluate(`${fogCalls('recover')}[0][1]`),record.input);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),10);
+      assert.equal(await evaluate(`${logBucket()}.counts['fog-reward']`),10);
+    });
+    await t.test('迷雾：处理中超过90秒让出主殿，五分钟后仅确认原请求', async () => {
+      await setupFog(`fo.mode='busy';`);
+      await drive('!!nativeFog()','busy fog');
+      const record=await evaluate('nativeFog()');
+      await pulse(91000);
+      await drive(`location.pathname==='/cultivate'`,'busy fog yields hall');
+      await evaluate('fo.seek=true;renderDun();');
+      await drive(`${fogCalls('seek')}.length===1`,'seek while fog deferred');
+      await pulse(60000);
+      assert.equal(await evaluate('location.pathname'),'/cultivate');
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),1);
+      await evaluate(`clock=${fogState}.nextAt;fo.busy=false;fo.mode='';renderDun();`);
+      await drive(`${fogCalls('recover')}.length===1&&fo.runs===1`,'recover deferred fog');
+      assert.equal(await evaluate(`${fogCalls('recover')}[0][2]`),record.idempotencyKey);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),1);
+    });
+    await t.test('迷雾：手动弹窗、原请求或正在探索的手动局不被接管', async () => {
+      await setupFog('openFog();','/cultivate/fog');
+      await pulse(10000);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),0);
+      assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),true);
+      for(const manual of [true,false]) {
+        await setupFog(manual?'fo.manual=true;':`sessionStorage.setItem('fog:77',JSON.stringify({idempotencyKey:'manual',input:{action:'start'}}));`,'/cultivate/fog');
+        await drive(`location.pathname==='/cultivate'`,'manual fog preserved');
+        assert.equal(await evaluate(`${fogCalls('start')}.length+${fogCalls('recover')}.length+${fogCalls('manual-taken')}.length`),0);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-fog:enabled:v1')`),'false');
+      }
+    });
+    await t.test('迷雾：单独暂停取消自己的未提交弹窗并回主殿，总暂停撤销点击', async () => {
+      await setupFog();
+      await drive(`!!document.querySelector('[role="alertdialog"]')`,'own quick dialog');
+      await evaluate(fogToggle);
+      await drive(`location.pathname==='/cultivate'`,'pause fog returns');
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),0);
+      assert.equal(await evaluate(fogJournal),null);
+      await evaluate('fo.seek=true;renderDun();');
+      await drive(`${fogCalls('seek')}.length===1`,'encounter remains enabled');
+      await setupFog('', '/cultivate/fog');
+      await until(async()=>(await status())?.includes('随机等待'),'queued fog click');
+      await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('toggle').click()`);
+      await pulse(30000);
+      assert.equal(await evaluate(`${fogCalls('open')}.length`),0);
+    });
+    await t.test('迷雾：确认等待时换成同名手动弹窗，不确认或取消替换窗口', async () => {
+      await setupFog();
+      await drive(`!!document.querySelector('[role="alertdialog"]')`,'original fog dialog');
+      await pulse(1500);
+      await evaluate(`document.querySelector('[role="alertdialog"] button').click();openFog();window.manualFogDialog=document.querySelector('[role="alertdialog"]');`);
+      await pulse(10000);
+      assert.equal(await evaluate(`${fogCalls('start')}.length`),0);
+      await evaluate(fogToggle);
+      await pulse(10000);
+      assert.equal(await evaluate('manualFogDialog.isConnected'),true);
+      assert.equal(await evaluate('location.pathname'),'/cultivate/fog');
+    });
+    await t.test('迷雾：网页刷新保留耗尽本轮的进度，即使当前灵力不足200', async () => {
+      await setupFog();
+      await drive(`fo.runs===1&&${fogJournal}===null`,'settled first run');
+      const before=await evaluate('clock');
+      await cdp.send('Page.navigate',{url:`${origin}/cultivate/fog?fog-fixture=drain`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?fog-fixture=drain'&&typeof openFog==='function'`),'reload draining');
+      await evaluate(`clock=${before};Math.random=()=>0;renderDun();`);await evaluate(source);
+      await drive(`fo.runs===10&&location.pathname==='/cultivate'`,'resumed draining below threshold',130);
+      assert.equal(await evaluate('fo.spirit'),0);
+    });
+    await t.test('迷雾：费用变化或未开放时退回主殿，失败回执不误算旧奖励', async () => {
+      for(const config of ['fo.cost=30;','fo.quick=false;',`fo.mode='reject';fo.paid='旧回执 已到账：修为 325 · 法宝碎片 12';`]) {
+        await setupFog(config);
+        await drive(`location.pathname==='/cultivate'&&${fogState}?.nextAt>clock`,'unavailable fog yields');
+        assert.equal(await evaluate(`${logBucket()}?.totals['修为']||0`),0);
+        await pulse(10000);
+        assert.equal(await evaluate('location.pathname'),'/cultivate');
+        assert.equal(await evaluate('fo.runs'),0);
+      }
+    });
+    await t.test('迷雾：后台动画帧停止、主线程定时器延迟时仍由 Worker 处理确认', async () => {
+      await setupFog(`fo.animation=true;window.requestAnimationFrame=()=>1;window.setTimeout=(callback,ms,...args)=>fixtureTimeout(callback,Math.max(ms||0,60000),...args);`,'/cultivate/fog');
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        assert.equal(await evaluate('document.visibilityState'),'hidden');
+        // 不派发 focus/DOM 事件，真正依赖后台 Worker 唤醒。
+        for(let i=0;i<3;i++) {await evaluate('clock+=6000');await delay(2300);}
+        await until(()=>evaluate('fo.runs>=1'),'worker confirms background quick request',5000);
+        assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false);
+        assert.equal(await evaluate(`${fogCalls('wrong-entry')}.length`),0);
+      } finally {await cdp.send('Target.closeTarget',{targetId:foreground.targetId});}
+    });
+    await t.test('迷雾：游戏登录限流异常暂停整组，不自动继续尝试', async () => {
+      await setupFog(`fo.error='请求频率过高';`,'/cultivate/fog');
+      await until(async()=>(await status())?.includes('已暂停'),'fog rate limit stops');
+      await pulse(100000);
+      assert.equal(await evaluate(`${fogCalls('open')}.length`),0);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
+    });
     await t.test('代币统计：奇遇按到账记录修为钻石代币，识别千位小数万亿且不猜未知金额', async () => {
       await setup(`window.clock=Date.parse('2026-10-10T10:00:00+08:00');Date.now=()=>clock;
         window.removeAfterChoice=true;
@@ -710,7 +884,7 @@ test('自动奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.5.2');
+      assert.equal(exported.version,'1.6.0');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -765,7 +939,7 @@ test('自动奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.5.2');
+      assert.equal(exported.version,'1.6.0');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
