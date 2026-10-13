@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.2
+// @version      1.6.3
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -98,6 +98,7 @@
     return result;
   }
   function createLog(group) {
+    const pageId = crypto.randomUUID();
     const heartbeatKey = `${LOG_PREFIX}${group}:heartbeat`;
     const receiptKey = `${LOG_PREFIX}${group}:receipt`;
     let checkpoint = null;
@@ -105,11 +106,13 @@
     let lastTick = 0;
     let lastWrite = 0;
     let lastState = '';
+    let lastSample = 0;
     let hint;
     let storageFailed = false;
     try {
       checkpoint = JSON.parse(localStorage.getItem(heartbeatKey) || 'null');
       pending = JSON.parse(sessionStorage.getItem(receiptKey) || 'null');
+      lastSample = checkpoint?.sampleAt || 0;
     } catch { storageFailed = true; }
     function prune() {
       const earliest = logDay(Date.now() - 86400000);
@@ -136,7 +139,8 @@
         const b = bucket();
         const now = Date.now();
         b.events.push({ at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
-          page: location.pathname, visibility: document.visibilityState, type, detail: String(detail).slice(0, 300), data });
+          page: location.pathname, pageId, version: '1.6.3', visibility: document.visibilityState,
+          type, detail: String(detail).slice(0, 300), data });
         b.counts[type] = (b.counts[type] || 0) + 1;
         if (sum) for (const [key, value] of Object.entries(data.reward || {})) b.totals[key] = (b.totals[key] || 0) + value;
         if (b.events.length > 1200) { b.dropped += b.events.length - 1200; b.events = b.events.slice(-1200); }
@@ -164,7 +168,7 @@
       add(kind, receipt, { reward: receiptReward(receipt) }, kind !== 'dungeon-node-reward');
       saveReceipt(null);
     }
-    function pulse(state) {
+    function pulse(state, diagnostic = {}) {
       const now = Date.now();
       const normalizedState = String(state).replace(/\d+(?:\.\d+)?/g, '#');
       if (state && normalizedState !== lastState) {
@@ -176,8 +180,14 @@
         { from: previous, to: now, gapMs: now - previous, previousState: checkpoint?.state || '', discarded: Boolean(document.wasDiscarded) });
       lastTick = now;
       receipts();
+      // 留下低频执行证据；只写本地日志，不访问游戏接口。
+      if (now - lastSample >= 15 * 60000) {
+        lastSample = now;
+        add('heartbeat', state, diagnostic);
+      }
       if (now - lastWrite >= 60000) {
-        checkpoint = { at: now, active: true, state: String(state).slice(0, 180), page: location.pathname, visibility: document.visibilityState };
+        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.3', active: true,
+          state: String(state).slice(0, 180), page: location.pathname, visibility: document.visibilityState, diagnostic };
         try { prune(); localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
         lastWrite = now;
         render();
@@ -185,9 +195,25 @@
     }
     function stop(reason) {
       add('pause', reason);
-      checkpoint = { at: Date.now(), active: false, state: reason };
+      checkpoint = { at: Date.now(), pageId, version: '1.6.3', active: false, state: reason };
       lastTick = 0;
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
+    }
+    function observeLifecycle(context) {
+      const record = event => {
+        const state = context();
+        if (!state) return;
+        // 生命周期事件不算调度心跳，不能掩盖恢复后发现的检查中断。
+        add('page-lifecycle', `页面事件：${event.type}`, {
+          event: event.type, persisted: Boolean(event.persisted), trusted: Boolean(event.isTrusted),
+          discarded: Boolean(document.wasDiscarded), readyState: document.readyState,
+          lastTickAt: lastTick || null, gapMs: lastTick ? Math.max(0, Date.now() - lastTick) : null,
+          ...state,
+        });
+      };
+      for (const name of ['freeze', 'resume', 'visibilitychange']) document.addEventListener(name, record, true);
+      for (const name of ['pageshow', 'pagehide']) window.addEventListener(name, record, true);
+      record({ type: 'load' });
     }
     function mount(shadow) {
       const box = shadow.querySelector('.box');
@@ -206,14 +232,14 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.2', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.3', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
       };
       box.append(details); render();
     }
-    return { add, pulse, stop, expect, receipts, mount };
+    return { add, pulse, stop, expect, receipts, mount, observeLifecycle };
   }
 
   function createRecovery(group, log, say) {
@@ -295,7 +321,8 @@
   const DUNGEON_STATE = 'arkengine:auto-dungeon:state:v1';
   const DUNGEON_JOURNAL = 'arkengine:auto-dungeon:pending:v1';
   const DUNGEON_NAME = '坠星古墓';
-  const beijingDay = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  // 秘境次数按北京时间 04:00 划日；收益日志仍按北京时间自然日记账。
+  const dungeonDay = () => new Date(Date.now() + 4 * 3600000).toISOString().slice(0, 10);
   let dungeonEnabled = true;
   let dungeon = { nextAt: 0, exhaustedDay: '', run: null };
   let dungeonPlan = null;
@@ -303,6 +330,11 @@
     dungeonEnabled = localStorage.getItem(DUNGEON_PREF) !== 'false';
     dungeon = JSON.parse(localStorage.getItem(DUNGEON_STATE) || 'null') || dungeon;
     dungeonPlan = JSON.parse(sessionStorage.getItem(DUNGEON_JOURNAL) || 'null');
+    // 旧标记采用零点划日，不能直接当作新的次数周期；只重新核对额度。
+    if (dungeon.quotaResetHour !== 4) {
+      dungeon = { ...dungeon, exhaustedDay: '', quotaResetHour: 4 };
+      localStorage.setItem(DUNGEON_STATE, JSON.stringify(dungeon));
+    }
   } catch { dungeonEnabled = false; }
   let dungeonPageDay = '';
   let openedDungeonDialog = false;
@@ -383,7 +415,7 @@
   }
   function updateDungeonHint() {
     const hint = !dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
-      dungeon.exhaustedDay === beijingDay() ? '秘境：今日次数已用完，明日再检查' :
+      dungeon.exhaustedDay === dungeonDay() ? '秘境：次数已用完，北京时间 4 点后再检查' :
       dungeon.nextAt > Date.now() ? `秘境：约 ${Math.ceil((dungeon.nextAt - Date.now()) / 60000)} 分钟后检查` :
       '秘境：准备探索坠星古墓';
     if (dungeonStatus.textContent !== hint) dungeonStatus.textContent = hint;
@@ -889,7 +921,7 @@
   }
   function visitDungeon() {
     if (!dungeonEnabled || dungeon.nextAt > Date.now() ||
-        (!dungeon.run && dungeon.exhaustedDay === beijingDay())) return false;
+        (!dungeon.run && dungeon.exhaustedDay === dungeonDay())) return false;
     const link = linkTo('/cultivate/dungeon');
     if (!usable(link)) return false;
     // 等待正在领取的奇遇落定，不在两次修炼请求之间切走。
@@ -923,7 +955,9 @@
       if (pause) { dungeonEnabled = false; localStorage.setItem(DUNGEON_PREF, 'false'); }
       returningFromDungeon = true;
       last.textContent = `${reason}；${pause ? '秘境已暂停，请手动核对' : `${Math.ceil(delay / 60000)} 分钟后再检查`}`;
-      log.add('dungeon-deferred', reason, { paused: pause, retryAt: dungeon.nextAt, pending: Boolean(dungeonPlan) });
+      log.add('dungeon-deferred', reason, { paused: pause, retryAt: dungeon.nextAt, pending: Boolean(dungeonPlan),
+        action: dungeonPlan?.action || '', phase: dungeonPlan?.phase || '', quota: dungeonQuota(),
+        error: dungeonPlan?.lastError || '' });
     }
     returnToHall();
   }
@@ -950,7 +984,18 @@
     options.sort((a, b) => hasDiamonds ? b.diamonds - a.diamonds || b.exp - a.exp : b.exp - a.exp);
     return { best: options[0] };
   }
-  function waitDungeonResult(refresh) {
+  function dungeonQuota() {
+    const quotaText = [...document.querySelectorAll('[aria-live="polite"]')].map(textOf)
+      .find(text => /^今日剩余\s*\d+\s*\/\s*\d+\s*次/.test(text));
+    const quota = quotaText?.match(/^今日剩余\s*(\d+)\s*\/\s*(\d+)\s*次/);
+    return quota && Number(quota[1]) <= Number(quota[2]) ? { remaining: +quota[1], limit: +quota[2] } : null;
+  }
+  function waitDungeonResult(refresh, errors) {
+    const error = (errors || '').slice(0, 300);
+    if (error && error !== dungeonPlan.lastError) {
+      saveDungeonPlan({ ...dungeonPlan, lastError: error });
+      log.add('dungeon-result-pending', '原秘境结果尚未确认', { action: dungeonPlan.action, error, quota: dungeonQuota() });
+    }
     if (Date.now() - dungeonPlan.at < RETRY_MS) { say('等待原秘境结果，不重复入场或选择'); return; }
     if (!dungeonPlan.refreshed && usable(refresh)) {
       recordClick(refresh, 'dungeon:refresh', 'original', '刷新并核对原秘境结果', () =>
@@ -1024,7 +1069,7 @@
       if (dungeonPlan?.phase === 'submitted') {
         if (dungeonPlan.action === 'enter' || (dungeonPlan.action === 'choose' && step > dungeonPlan.step)) {
           saveDungeonPlan(null);
-        } else { waitDungeonResult(refresh); return; }
+        } else { waitDungeonResult(refresh, errors); return; }
       }
       if (errors) { say(`秘境提示：${errors}，请手动核对`); return; }
       if (!dungeon.run || dungeon.run.step !== step) {
@@ -1057,24 +1102,34 @@
         openedDungeonDialog = false;
         saveDungeon({ ...dungeon, run: null, nextAt: Date.now() + 60000 });
         returningFromDungeon = true;
-      } else { waitDungeonResult(refresh); return; }
+      } else {
+        // 网站明确拒绝入场并已清除原请求时，可结束失败的入场意图。
+        // 单有“剩余 0”或网络错误不能证明失败，仍保留记录，不能再买门票。
+        if (dungeonPlan.action === 'enter' && (!dungeon.run || dungeon.run.step === 0) && dungeonQuota()?.remaining === 0 &&
+            /(?:今日|每日|当天).*(?:次数.*(?:用完|耗尽|不足)|(?:已达|达到).*上限)/.test(errors)) {
+          log.add('dungeon-entry-rejected', '网页明确提示次数耗尽，等待北京时间 4 点', { error: errors.slice(0, 300) });
+          saveDungeonPlan(null);
+          saveDungeon({ ...dungeon, run: null, exhaustedDay: dungeonDay(), deferrals: 0, stalls: 0 });
+          returningFromDungeon = true;
+          returnToHall(); return;
+        }
+        waitDungeonResult(refresh, errors); return;
+      }
     }
     if (dungeon.run) { say('本轮秘境进度尚未确认，请刷新秘境状态核对'); return; }
     if (errors) { deferDungeon(`秘境提示：${errors}`); return; }
-    if (dungeonPageDay && dungeonPageDay !== beijingDay()) {
-      recordClick(refresh, 'dungeon:day', beijingDay(), '刷新今日秘境次数', () => { dungeonPageDay = beijingDay(); });
+    if (dungeonPageDay && dungeonPageDay !== dungeonDay()) {
+      recordClick(refresh, 'dungeon:day', dungeonDay(), '刷新今日秘境次数', () => { dungeonPageDay = dungeonDay(); });
       return;
     }
-    dungeonPageDay ||= beijingDay();
-    const quotaText = [...document.querySelectorAll('[aria-live="polite"]')].map(textOf)
-      .find(text => /^今日剩余\s*\d+\s*\/\s*\d+\s*次/.test(text));
-    const quota = quotaText?.match(/^今日剩余\s*(\d+)\s*\/\s*(\d+)\s*次/);
-    if (!quota || Number(quota[1]) > Number(quota[2])) { say('等待网页提供今日秘境次数'); return; }
-    if (Number(quota[1]) === 0) {
-      if (dungeon.exhaustedDay !== beijingDay()) saveDungeon({ ...dungeon, exhaustedDay: beijingDay() });
+    dungeonPageDay ||= dungeonDay();
+    const quota = dungeonQuota();
+    if (!quota) { say('等待网页提供今日秘境次数'); return; }
+    if (quota.remaining === 0) {
+      if (dungeon.exhaustedDay !== dungeonDay()) saveDungeon({ ...dungeon, exhaustedDay: dungeonDay() });
       returningFromDungeon = true;
     }
-    if (returningFromDungeon || dungeon.nextAt > Date.now() || dungeon.exhaustedDay === beijingDay()) {
+    if (returningFromDungeon || dungeon.nextAt > Date.now() || dungeon.exhaustedDay === dungeonDay()) {
       returnToHall(); return;
     }
     const heading = [...document.querySelectorAll('h2')].find(h => textOf(h) === DUNGEON_NAME);
@@ -1152,6 +1207,8 @@
       worker.onerror = fallback;
     } catch { fallback(); }
   }
+  log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: statusText,
+    pendingEncounter: Boolean(encounterAction), pendingDungeon: Boolean(dungeonPlan), pendingFog: Boolean(fogPlan) } : null);
   const observer = new MutationObserver(schedule);
   observer.observe(document.body, { childList: true, subtree: true, characterData: true,
     attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'hidden', 'class'] });
@@ -1160,6 +1217,7 @@
   window.addEventListener('popstate', schedule);
   window.addEventListener('online', schedule);
   document.addEventListener('visibilitychange', schedule);
+  document.addEventListener('resume', schedule);
   window.addEventListener('pagehide', () => { cancelPendingClick(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
@@ -1246,7 +1304,13 @@
     sessionStorage.setItem(CLAIM_JOURNAL, JSON.stringify(value));
     claimWait = value;
   }
-  const loadedDay = beijingTime().day;
+  let observedDay = beijingTime().day;
+  const IDLE_JOURNAL = 'arkengine:auto-expedition:idle:v1';
+  let idleWait = JSON.parse(sessionStorage.getItem(IDLE_JOURNAL) || 'null');
+  let idleChecked = false;
+  let idleBlocked = false;
+  let idleSignature = '';
+  let diagnostic = {};
   const log = createLog('expedition');
   const recoveryBudget = createRecovery('expedition', log, message => say(message));
   accountListeners.push(reason => setEnabled(false, reason));
@@ -1343,6 +1407,79 @@
     if (queued) clearTimeout(queued.timer);
     queued = null;
   }
+  function clearIdleWait(recovered = false) {
+    if (idleWait) {
+      if (recovered) log.add('expedition-unblocked', '远征页面阻塞已解除，重新核对当前操作', {
+        reason: idleWait.reason || '', blockedSince: idleWait.since || idleWait.at,
+        blockedMs: Math.max(0, Date.now() - (idleWait.since || idleWait.at)), reloaded: idleWait.reloaded,
+      });
+      idleWait = null;
+      sessionStorage.removeItem(IDLE_JOURNAL);
+    }
+    idleSignature = '';
+  }
+  function waitForIdlePage(reason, detail = {}) {
+    idleBlocked = true;
+    const now = Date.now();
+    if (!idleWait || idleWait.reason !== reason || !idleWait.since) {
+      idleWait = { ...(idleWait || { at: now, reloaded: false }), since: idleWait?.since || idleWait?.at || now, reason };
+      sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
+    }
+    const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]').length;
+    diagnostic = { ...diagnostic, blocked: reason, blockedSince: idleWait.since,
+      blockedMs: Math.max(0, now - idleWait.since), reloaded: idleWait.reloaded, dialogs, ...detail };
+    // 同一阻塞只在原因变化时记录，持续时长由已有低频心跳和恢复事件补充。
+    const signature = JSON.stringify({ reason, dialogs, button: detail.button && {
+      found: detail.button.found, connected: detail.button.connected, disabled: detail.button.disabled,
+      visible: detail.button.visible, rectCount: detail.button.rectCount, css: detail.button.css, blockers: detail.button.blockers,
+    } });
+    if (signature !== idleSignature) {
+      idleSignature = signature;
+      log.add('expedition-blocked', reason, diagnostic);
+    }
+    // 后台未完成布局的弹窗也不能被刷新越过；可见性不足以证明它已关闭。
+    if (dialogs) {
+      say(`${reason}；弹窗尚未关闭，请先核对`);
+      return;
+    }
+    if (idleWait.reloaded && Date.now() - idleWait.at >= 5 * 60000) {
+      setEnabled(false, `${reason}；一次刷新后仍无进展，已暂停，请核对页面`);
+    } else if (!idleWait.reloaded && Date.now() - idleWait.at >= 90000) {
+      offer('idle-refresh', '刷新并核对停滞的远征页面', () => {
+        idleWait = { ...idleWait, reloaded: true, at: Date.now() };
+        sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
+        log.add('expedition-idle-refresh', reason, diagnostic);
+        location.reload();
+      });
+    } else say(`${reason}；等待页面更新${idleWait.reloaded ? '（已核对一次）' : ''}`);
+  }
+  function buttonState(button) {
+    const connected = Boolean(button?.isConnected);
+    const css = connected ? getComputedStyle(button) : null;
+    const rect = connected ? button.getBoundingClientRect() : null;
+    const blockers = [];
+    const describe = (kind, element) => {
+      let depth = 0;
+      for (let node = button; node && node !== element; node = node.parentElement) depth++;
+      blockers.push({ kind, tag: element.tagName.toLowerCase(), depth });
+    };
+    for (const [kind, selector] of [['hidden', '[hidden]'], ['aria-hidden', '[aria-hidden="true"]'], ['inert', '[inert]']]) {
+      const ancestor = button?.closest(selector);
+      if (ancestor) describe(kind, ancestor);
+    }
+    if (connected && !button.getClientRects().length) {
+      for (let node = button; node; node = node.parentElement) {
+        if (getComputedStyle(node).display === 'none') { describe('display-none', node); break; }
+      }
+    }
+    // 只保存布局数值、CSS 状态和祖先标签，不导出 DOM 文本、属性值或原请求标识。
+    return { found: Boolean(button), connected, visible: visible(button),
+      disabled: Boolean(button?.matches(':disabled, [aria-disabled="true"]')),
+      inert: Boolean(button?.closest('[inert]')), blockers,
+      rectCount: connected ? button.getClientRects().length : 0,
+      size: rect ? { width: Math.round(rect.width * 10) / 10, height: Math.round(rect.height * 10) / 10 } : null,
+      css: css ? { display: css.display, visibility: css.visibility, pointerEvents: css.pointerEvents } : null };
+  }
   function setEnabled(value, reason = '') {
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
@@ -1351,7 +1488,7 @@
     schedule();
   }
   toggle.addEventListener('click', () => {
-    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); }
+    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); clearIdleWait(); }
     setEnabled(!enabled);
   });
   toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
@@ -1608,6 +1745,22 @@
     const nextAt = dates.length ? Math.min(...dates) : 0;
     if (farmState.expeditionAt !== nextAt) saveFarmState({ ...farmState, expeditionAt: nextAt });
   }
+  function overduePatrol(running) {
+    // 巡逻卡公开的北京时间只精确到分钟，宽限两分钟再核对。
+    // 只推断短途巡逻，避免把跨日深渊的 HH:mm 当作今天。
+    const now = Date.now();
+    const day = beijingTime().day;
+    return [...(running?.querySelectorAll('button') || [])].some(button => {
+      if (textOf(button) !== '远征中') return false;
+      const card = textOf(button.parentElement);
+      const match = card.match(/预计\s*(\d{1,2}):(\d{2})\s*归来/);
+      if (!card.includes('边境巡逻') || !match || +match[1] > 23 || +match[2] > 59) return false;
+      let at = Date.parse(`${day}T${match[1].padStart(2, '0')}:${match[2]}:00+08:00`);
+      if (at - now > 12 * 3600000) at -= 86400000;
+      if (now - at > 12 * 3600000) at += 86400000;
+      return now - at >= 120000;
+    });
+  }
   function maybeVisitFarm(running) {
     if (!farmEnabled) return false;
     let earlyStamina = null;
@@ -1623,7 +1776,10 @@
       earlyStamina = shown;
     }
     const link = travelLink('/farm');
-    if (!link) return false;
+    if (!link) {
+      waitForIdlePage('农场已到预约时间，但入口不可用');
+      return true;
+    }
     rememberExpeditionTime(running);
     // 距离已知的归来时间只剩十几秒时，先等这一批归来，不立即切走。
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt - Date.now() < 15000) return false;
@@ -1898,7 +2054,7 @@
     if (!onPage() || !enabled) { releaseLock?.(); return; }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
-    log.pulse(status.textContent);
+    log.pulse(status.textContent, diagnostic);
     const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
       pauseAccount('游戏提示登录、权限或限流异常');
@@ -1909,6 +2065,8 @@
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
     const q = quotas();
     const fields = form();
+    diagnostic = { quota: q, farmEnabled, farmDueAt: farmState.nextAt || 0,
+      pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
       say('等待远征页面和额度加载，请保持登录');
       return;
@@ -1938,11 +2096,13 @@
         return;
       }
     }
-    // 午夜跨日后服务器额度可能尚未刷新；只在没有未完成操作时重新载入页面。
-    if (beijingTime().day !== loadedDay) {
-      offer('new-day', '刷新今日突发额度', () => location.reload());
-      return;
+    // 跨日不打断当前页面；优先由领取、派遣和正常切页更新额度。
+    if (beijingTime().day !== observedDay) {
+      observedDay = beijingTime().day;
+      noteQuotaSync();
+      log.add('expedition-day', '跨日继续等待归来，沿用正常操作更新额度');
     }
+    idleChecked = true;
     const running = section('进行中的远征');
     const claimAll = buttonIn(running, /^一键领取\s*\(\d+\)$/);
     const claimOne = buttonIn(running, '领取');
@@ -1956,7 +2116,15 @@
       return;
     }
     if (fields.root.querySelector('.animate-spin') || running?.querySelector('.animate-spin')) {
-      say('等待远征操作完成');
+      waitForIdlePage('等待远征页面加载完成');
+      return;
+    }
+    if ((claimAll || claimOne) && !claim) {
+      waitForIdlePage('远征已显示领取，但按钮不可用', { button: buttonState(claimAll || claimOne) });
+      return;
+    }
+    if (overduePatrol(running)) {
+      waitForIdlePage('巡逻已过预计归来时间，页面仍显示远征中');
       return;
     }
 
@@ -1984,13 +2152,15 @@
     const route = burst ? '深渊远征' : '边境巡逻';
     const maxTeams = burst ? Math.min(TEAM_LIMIT, q.burst) : TEAM_LIMIT;
     const selected = fields.routeButton(route);
-    if (!selected) { say(`未找到${route}路线，等待页面更新`); return; }
+    if (!selected) { waitForIdlePage(`未找到${route}路线`); return; }
     if (selected.getAttribute('aria-pressed') !== 'true') {
       if (usable(selected)) offer(`route:${route}`, `选择${route}`, () => selected.click());
+      else waitForIdlePage(`${route}路线按钮不可用`, { button: buttonState(selected) });
       return;
     }
     if (fields.high.getAttribute('aria-pressed') !== 'true') {
       if (usable(fields.high)) offer('high-stars', '选择高星优先', () => fields.high.click());
+      else waitForIdlePage('高星优先按钮不可用', { button: buttonState(fields.high) });
       return;
     }
     if (Number(fields.count.value) !== maxTeams) {
@@ -1999,10 +2169,12 @@
         fields.count.dispatchEvent(new Event('input', { bubbles: true }));
         fields.count.dispatchEvent(new Event('change', { bubbles: true }));
       });
+      else waitForIdlePage('派遣队数输入框不可用', { button: buttonState(fields.count) });
       return;
     }
     if (fields.burst.checked !== burst) {
       if (usable(fields.burst)) offer(`burst:${burst}`, burst ? '允许使用今日突发额度' : '关闭突发额度', () => fields.burst.click());
+      else waitForIdlePage('突发额度开关不可用', { button: buttonState(fields.burst) });
       return;
     }
     const preview = fields.forecast;
@@ -2015,7 +2187,7 @@
       return;
     }
     const dispatch = buttonIn(fields.root, new RegExp(`^派出\\s*${preview.total}\\s*支队伍$`));
-    if (!usable(dispatch)) { say('等待派遣按钮可以点击'); return; }
+    if (!usable(dispatch)) { waitForIdlePage('等待派遣按钮可以点击', { button: buttonState(dispatch) }); return; }
     const now = beijingTime();
     offer(`dispatch:${route}:${preview.total}:${q.normal}:${q.burst}:${now.day}`, `派出 ${preview.total} 队${route}`, () => {
       if (burst) log.add('burst-schedule', now.inWindow ? '凌晨优先派遣深渊' : '发现完整未用额度，补派深渊', { day: now.day });
@@ -2045,9 +2217,14 @@
     queueMicrotask(() => {
       scheduled = false;
       offered = false;
+      idleChecked = false;
+      idleBlocked = false;
       try { step(); }
       catch (error) { console.error('[自动远征] 检查失败', error); setEnabled(false, '远征检查失败，已暂停；请核对页面后重试'); }
-      finally { if (!offered) cancelQueued(); }
+      finally {
+        if (!offered) cancelQueued();
+        if (idleChecked && !idleBlocked) clearIdleWait(true);
+      }
     });
   }
   // 不使用后台会停止的动画帧；Worker 不可用时退回普通计时器。
@@ -2060,10 +2237,13 @@
     worker.onmessage = schedule;
     worker.onerror = fallback;
   } catch { fallback(); }
+  log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
+    pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan), diagnostic } : null);
   new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, characterData: true,
     attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'aria-pressed', 'aria-selected', 'hidden', 'class'] });
   for (const name of ['pageshow', 'focus', 'popstate', 'online']) window.addEventListener(name, schedule);
   document.addEventListener('visibilitychange', schedule);
+  document.addEventListener('resume', schedule);
   window.addEventListener('pagehide', () => { cancelQueued(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
