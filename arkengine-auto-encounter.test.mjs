@@ -1006,7 +1006,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.3');
+      assert.equal(exported.version,'1.6.4');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1061,7 +1061,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.3');
+      assert.equal(exported.version,'1.6.4');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -1213,6 +1213,101 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-dungeon:pending:v1')).action`),'enter');
       assert.equal(await evaluate('dm.runs'),0);
       assert.ok(await evaluate(`${logBucket()}.events.some(e=>e.type==='dungeon-deferred'&&e.data.error==='网络结果未确认'&&e.data.quota.remaining===0)`));
+    });
+    const staleDungeonEntry = `
+      localStorage.setItem('arkengine:auto-dungeon:enabled:v1','true');
+      localStorage.setItem('arkengine:auto-dungeon:state:v1',JSON.stringify({quotaResetHour:4,nextAt:0,run:{step:0,beforeResult:'旧结果'},stalls:3}));
+      sessionStorage.setItem('arkengine:auto-dungeon:pending:v1',JSON.stringify({phase:'submitted',action:'enter',at:clock-8*3600000,refreshed:true,
+        original:{key:'dungeon:77',value:{input:{action:'enter',dungeonId:9},idempotencyKey:'original-entry'}}}));`;
+    const dungeonPending = `JSON.parse(sessionStorage.getItem('arkengine:auto-dungeon:pending:v1'))`;
+    await t.test('秘境旧入场：升级后自动刷新核对并归档，继续正常探索', async () => {
+      await setupDungeon(staleDungeonEntry, '/cultivate/dungeon');
+      const original=await evaluate(`${dungeonPending}.original`);
+      await drive(`${dungeonState}.lastReconciledEntry`, 'fresh idle state reconciles stale entry');
+      assert.equal(await evaluate(dungeonPending),null);
+      assert.equal(await evaluate(`${dungeonState}.run`),null);
+      assert.deepEqual(await evaluate(`${dungeonState}.lastReconciledEntry.plan.original`),original);
+      assert.equal(await evaluate('dm.runs'),0,'刷新核对本身不入场');
+      assert.ok(await evaluate(`${logBucket()}.events.some(e=>e.type==='dungeon-entry-reconciled'&&e.data.outcome==='unknown')`));
+      await drive('dm.runs===1','normal scheduling resumes without manual confirmation');
+      assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='enter').length`),1);
+      assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='refresh').length`),1);
+    });
+    await t.test('秘境旧入场：刷新未完成、失败或未观察到加载时保留记录', async () => {
+      for (const mode of ['pending','failed','unobserved']) {
+        await setupDungeon(staleDungeonEntry+`dm.refreshMode='${mode}';`, '/cultivate/dungeon');
+        const original=await evaluate(`${dungeonPending}.original`);
+        await drive(`dm.calls.some(c=>c[0]==='refresh')`,'one native refresh');
+        await pulse(5000);
+        assert.deepEqual(await evaluate(`${dungeonPending}.original`),original);
+        assert.equal(await evaluate(`${dungeonState}.lastReconciledEntry`),undefined);
+        assert.equal(await evaluate('dm.runs'),0);
+        assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='refresh').length`),1);
+      }
+    });
+    await t.test('秘境旧入场：已有探索、原请求、弹窗或非入场记录时不归档', async () => {
+      for (const code of [
+        `dm.current={node:0,id:'running',name:'坠星古墓'};`,
+        `dm.mode='busy:enter';sessionStorage.setItem('dungeon:77',JSON.stringify(${dungeonPending}.original.value));`,
+        `openDun();`,
+        `sessionStorage.setItem('arkengine:auto-dungeon:pending:v1',JSON.stringify({phase:'submitted',action:'choose',step:1,at:clock,refreshed:true}));`
+      ]) {
+        await setupDungeon(staleDungeonEntry+code,'/cultivate/dungeon');
+        for(let i=0;i<5;i++) await pulse();
+        assert.equal(await evaluate(`${dungeonState}.lastReconciledEntry`),undefined);
+        assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='refresh').length`),0);
+        assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='enter').length`),0);
+      }
+    });
+    await t.test('秘境旧入场：刷新后出现探索则接续原探索，不归档或重入', async () => {
+      await setupDungeon(staleDungeonEntry+`dm.refreshedCurrent={node:0,id:'running',name:'坠星古墓'};`,'/cultivate/dungeon');
+      await drive('dm.current && dm.current.node===1','continue original active run');
+      assert.equal(await evaluate(`${dungeonState}.lastReconciledEntry`),undefined);
+      assert.equal(await evaluate('dm.runs'),0);
+      assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='enter').length`),0);
+    });
+    await t.test('秘境旧入场：核对期间出现原请求或错误时不归档', async () => {
+      for(const code of [
+        `sessionStorage.setItem('dungeon:77',JSON.stringify(${dungeonPending}.original.value));dm.mode='busy:enter';`,
+        `dm.error=true;dm.message='秘境状态读取失败';`
+      ]) {
+        await setupDungeon(staleDungeonEntry+`dm.refreshMode='pending';`,'/cultivate/dungeon');
+        const original=await evaluate(`${dungeonPending}.original`);
+        await drive(`dm.calls.some(c=>c[0]==='refresh')`,'refresh pending');
+        await evaluate(`${code}dm.refreshing=false;renderDun();`);
+        await pulse(5000);
+        assert.equal(await evaluate(`${dungeonState}.lastReconciledEntry`),undefined);
+        assert.deepEqual(await evaluate(`${dungeonPending}.original`),original);
+        assert.equal(await evaluate('dm.runs'),0);
+      }
+    });
+    await t.test('秘境旧入场：新近入场保留50分钟间隔，归档后迷雾可继续', async () => {
+      await setupFog(staleDungeonEntry+`
+        sessionStorage.setItem('arkengine:auto-dungeon:pending:v1',JSON.stringify({...${dungeonPending},at:clock-60000}));`,'/cultivate/dungeon');
+      const attemptedAt=await evaluate(`${dungeonPending}.at`);
+      await drive('fo.runs>0','fog resumes after state reconciliation');
+      assert.equal(await evaluate('dm.runs'),0);
+      assert.equal(await evaluate(`${dungeonState}.nextAt`),attemptedAt+50*60000);
+      assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='refresh').length`),1);
+    });
+    await t.test('秘境旧入场：暂停不自动恢复，未完成核对跨刷新不重复请求', async () => {
+      await setupDungeon(staleDungeonEntry+`localStorage.setItem('arkengine:auto-dungeon:enabled:v1','false');`,'/cultivate/dungeon');
+      await pulse(5000);
+      assert.deepEqual(await evaluate('dm.calls'),[]);
+      await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('dungeon-toggle').click()`);
+      await drive(`${dungeonState}.lastReconciledEntry`,'explicit enable resumes verification');
+      await setupDungeon(staleDungeonEntry+`dm.refreshMode='unobserved';`,'/cultivate/dungeon');
+      await drive(`dm.calls.some(c=>c[0]==='refresh')`,'unverified refresh');
+      const original=await evaluate(dungeonPending);
+      const before=await evaluate('clock');
+      await cdp.send('Page.reload',{},tab.sessionId);
+      await until(()=>evaluate(`typeof renderDun==='function' && !document.getElementById('ark-auto-encounter')`),'reload pending review');
+      await evaluate(`clock=${before+5000};Math.random=()=>0;renderDun();`);
+      await evaluate(source);
+      await pulse(35000);
+      assert.deepEqual(await evaluate(dungeonPending),original);
+      assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='refresh').length`),1);
+      assert.equal(await evaluate('dm.runs'),0);
     });
     await t.test('秘境：今日零次数或服务端仍冷却时返回主殿，不扣门票', async () => {
       for (const code of ['dm.remaining=0;', 'dm.cooledUntil=clock+50*60000;']) {

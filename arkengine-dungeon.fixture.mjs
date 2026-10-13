@@ -85,10 +85,22 @@ window.renderDun = () => {
    }
  } else {
    game.innerHTML = '<a href="/cultivate">返回修仙主殿</a><h1>秘境行记</h1><button id="refresh-dun" aria-label="刷新秘境状态">刷新</button><div aria-live="polite">今日剩余 '+dm.remaining+'/'+dm.limit+' 次</div>';
+   document.getElementById('refresh-dun').disabled = !!dm.refreshing;
    document.getElementById('refresh-dun').onclick = () => {
      dm.calls.push(['refresh']);
-     if (Number.isInteger(dm.refreshedRemaining)) { dm.remaining=dm.refreshedRemaining; delete dm.refreshedRemaining; }
+     if (dm.refreshMode === 'unobserved') { persistDun(); return; }
+     dm.refreshing=true;
      renderDun();
+     if (dm.refreshMode === 'pending') return;
+     fixtureTimeout(() => {
+       dm.refreshing=false;
+       if (dm.refreshMode === 'failed') { dm.error=true; dm.message='秘境状态读取失败'; }
+       else {
+         if (Number.isInteger(dm.refreshedRemaining)) { dm.remaining=dm.refreshedRemaining; delete dm.refreshedRemaining; }
+         if (Object.hasOwn(dm,'refreshedCurrent')) { dm.current=dm.refreshedCurrent; delete dm.refreshedCurrent; }
+       }
+       renderDun();
+     }, 20);
    };
    if(dm.cooldownLabel) {
      const badge=document.createElement('span');badge.setAttribute('aria-label',dm.cooldownLabel);badge.textContent='倒计时';game.append(badge);
@@ -116,7 +128,7 @@ window.renderDun = () => {
        card.innerHTML='<div><h2>'+name+'</h2></div><div><p>8 个节点 · 守关者</p><p>境界 1~100 · 门票 50 钻 · 灵力 20</p><button></button></div>';
        const b=card.querySelector('button');
        b.textContent=dm.remaining===0?'今日次数已用完':clock<dm.cooledUntil?'秘境冷却中':dm.entryReason||'进入秘境';
-       b.disabled=dm.busy||!!nativeDun()||dm.remaining===0||clock<dm.cooledUntil||dm.entryBlocked||!!dm.entryReason;
+       b.disabled=dm.busy||dm.refreshing||!!nativeDun()||dm.remaining===0||clock<dm.cooledUntil||dm.entryBlocked||!!dm.entryReason;
        b.onclick=()=>openDun(name); section.append(card);
      }
      game.append(section);
