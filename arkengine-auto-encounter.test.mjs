@@ -1006,7 +1006,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.4');
+      assert.equal(exported.version,'1.6.5');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1061,7 +1061,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.4');
+      assert.equal(exported.version,'1.6.5');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -1876,6 +1876,77 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1')).reloaded`),true);
     });
 
+    const claimJournal = `JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1'))`;
+    const oldClaim = `sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({running:6,at:clock-7200000,reloaded:true}));`;
+    await t.test('远征领取恢复：相同队伍数已全为新行程时解除旧等待', async () => {
+      await setupExp(`addRuns(6);${oldClaim}`);
+      await until(()=>evaluate(`${claimJournal}===null`),'old claim no longer has completed targets',2000);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),null);
+      assert.equal(await evaluate('model.calls.length'),0,'不能补领或新派一批');
+      assert.ok(await evaluate(`${logBucket('expedition')}.events.some(e=>e.type==='expedition-claim-reconciled')`));
+      await evaluate('model.runs.forEach(r=>r.done=true);renderExp();');
+      await drive(`model.calls.some(c=>c.type==='claim') && model.calls.some(c=>c.type==='dispatch')`,'next round remains usable');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+    });
+    await t.test('远征领取恢复：点击开始重新核对，保留原记录且不立即重复领取', async () => {
+      await setupExp(`addRuns(6,false,true);${oldClaim}
+        localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');
+        window.claimRuns=()=>model.calls.push({type:'claim'});`);
+      const original=await evaluate(claimJournal);
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();`);
+      await pulse(2000);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'true');
+      assert.equal(await evaluate(`${claimJournal}.submittedAt`),original.at);
+      assert.equal(await evaluate(`${claimJournal}.reloaded`),false);
+      assert.equal(await evaluate('model.calls.length'),0);
+      const snapshot=await evaluate('({model,clock:clock+35000})');
+      await pulse(31000);
+      await drive(`!document.getElementById('ark-auto-expedition')`,'explicit restart permits one state reload');
+      await until(()=>evaluate(`typeof renderExp==='function'&&!document.getElementById('ark-auto-expedition')`),'claim restart reload');
+      await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderExp();`);
+      await evaluate(source);
+      await pulse(61000);
+      await until(async ()=>(await expStatus())?.includes('原领取结果仍无法确认'),'still ambiguous pauses again');
+      assert.equal(await evaluate('model.calls.length'),0,'核对只刷新，不重新领取');
+      assert.equal(await evaluate(`${claimJournal}.submittedAt`),original.at);
+    });
+    await t.test('远征领取恢复：暂停期间手动领取再派满，开始后正常等待新行程', async () => {
+      await setupExp(`addRuns(6);${oldClaim}localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');
+        model.message='已领取 6 支远征，共获得 573 代币';`);
+      await pulse(5000);
+      assert.notEqual(await evaluate(claimJournal),null,'暂停不自行恢复');
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();`);
+      await until(()=>evaluate(`${claimJournal}===null`),'manual new batch reconciles');
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'true');
+      assert.equal(await evaluate('model.calls.length'),0);
+      assert.equal(await evaluate(`${logBucket('expedition')}.totals['代币']||0`),0,'不凭旧回执补记收益');
+    });
+    await t.test('远征领取恢复：旧回执、部分待领、加载或额度列表不一致不清除记录', async () => {
+      for(const code of [
+        `model.runs[0].done=true;model.message='已领取 6 支远征，共获得 573 代币';`,
+        `window.renderExtra=()=>document.querySelector('#running').insertAdjacentHTML('beforeend','<span class="animate-spin"></span>');`,
+        `window.renderExtra=()=>document.querySelector('#running button').parentElement.remove();`,
+        `window.renderExtra=()=>document.querySelector('#running').hidden=true;`,
+        `model.error=true;model.message='领取失败';`
+      ]) {
+        await setupExp(`addRuns(6);${oldClaim}${code}
+          const renderBase=renderExp;window.renderExp=()=>{renderBase();window.renderExtra?.();};`);
+        await pulse(2000);
+        assert.notEqual(await evaluate(claimJournal),null);
+        assert.equal(await evaluate('model.calls.length'),0);
+      }
+    });
+    await t.test('远征领取恢复：真实领取处理中不清记录，完成后继续派遣', async () => {
+      await setupExp(`addRuns(6,false,true);
+        window.claimRuns=()=>{model.calls.push({type:'claim'});model.runs.forEach(r=>r.done=false);renderExp();
+          document.querySelector('#running').insertAdjacentHTML('beforeend','<span class="animate-spin"></span>');};`);
+      await drive(`model.calls.some(c=>c.type==='claim')`,'claim starts');
+      await pulse(5000);
+      assert.notEqual(await evaluate(claimJournal),null);
+      await evaluate('model.runs=[];renderExp();');
+      await drive(`model.calls.some(c=>c.type==='dispatch')`,'claim ends');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+    });
     await t.test('减少重复操作：账号异常跨标签撤销排队点击，手动恢复只开启当前组', async () => {
       await setupExp(`addRuns(6);`);
       const cultivate=await createTab();

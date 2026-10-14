@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.4
+// @version      1.6.5
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -139,7 +139,7 @@
         const b = bucket();
         const now = Date.now();
         b.events.push({ at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
-          page: location.pathname, pageId, version: '1.6.4', visibility: document.visibilityState,
+          page: location.pathname, pageId, version: '1.6.5', visibility: document.visibilityState,
           type, detail: String(detail).slice(0, 300), data });
         b.counts[type] = (b.counts[type] || 0) + 1;
         if (sum) for (const [key, value] of Object.entries(data.reward || {})) b.totals[key] = (b.totals[key] || 0) + value;
@@ -186,7 +186,7 @@
         add('heartbeat', state, diagnostic);
       }
       if (now - lastWrite >= 60000) {
-        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.4', active: true,
+        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.5', active: true,
           state: String(state).slice(0, 180), page: location.pathname, visibility: document.visibilityState, diagnostic };
         try { prune(); localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
         lastWrite = now;
@@ -195,7 +195,7 @@
     }
     function stop(reason) {
       add('pause', reason);
-      checkpoint = { at: Date.now(), pageId, version: '1.6.4', active: false, state: reason };
+      checkpoint = { at: Date.now(), pageId, version: '1.6.5', active: false, state: reason };
       lastTick = 0;
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
     }
@@ -232,7 +232,7 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.4', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.5', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
@@ -1367,7 +1367,9 @@
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
   let claimWait = JSON.parse(sessionStorage.getItem(CLAIM_JOURNAL) || 'null');
   function saveClaimWait(value) {
-    sessionStorage.setItem(CLAIM_JOURNAL, JSON.stringify(value));
+    const serialized = JSON.stringify(value);
+    sessionStorage.setItem(CLAIM_JOURNAL, serialized);
+    if (sessionStorage.getItem(CLAIM_JOURNAL) !== serialized) throw new Error('无法保存远征领取记录');
     claimWait = value;
   }
   let observedDay = beijingTime().day;
@@ -1554,8 +1556,18 @@
     schedule();
   }
   toggle.addEventListener('click', () => {
-    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); clearIdleWait(); }
-    setEnabled(!enabled);
+    try {
+      if (!enabled) {
+        localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); clearIdleWait();
+        if (claimWait) {
+          // 用户明确开始后重新给状态核对计时；保留原领取，不再次提交领取请求。
+          saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
+            at: Date.now(), reloaded: false });
+          log.add('expedition-claim-recheck', '手动开始后重新核对原领取，最多刷新一次', { running: claimWait.running });
+        }
+      }
+      setEnabled(!enabled);
+    } catch { setEnabled(false, '无法保存原领取核对状态，已暂停；请检查站点存储'); }
   });
   toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
 
@@ -1595,6 +1607,17 @@
     const running = read('当前运行', false);
     if (!normal || !burst || !running || normal[0] > normal[1] || burst[0] > burst[1]) return null;
     return { normal: normal[0], normalMax: normal[1], burst: burst[0], burstMax: burst[1], running: running[0] };
+  }
+  function claimPageState(q, fields, errors) {
+    const running = section('进行中的远征');
+    const buttons = [...(running?.querySelectorAll('button') || [])].filter(visible);
+    const teams = buttons.filter(b => /^(领取|远征中)$/.test(textOf(b)));
+    const ready = teams.filter(b => textOf(b) === '领取').length;
+    const underway = teams.filter(b => textOf(b) === '远征中' && b.matches(':disabled')).length;
+    const loading = Boolean(fields.root.querySelector('.animate-spin') || running?.querySelector('.animate-spin'));
+    const consistent = !errors && !loading && (!running || visible(running)) && teams.length === q.running;
+    return { consistent, teams: teams.length, ready, underway, loading, error: errors.slice(0, 300),
+      allUnderway: consistent && underway === q.running && !buttons.some(b => /^一键领取/.test(textOf(b))) };
   }
   function forecast(root) {
     const node = [...(root?.querySelectorAll('[role="status"]') || [])].find(el => /^预计派遣/.test(textOf(el)));
@@ -2145,17 +2168,29 @@
     if (dialogs.length) { say('等待你处理当前弹窗'); return; }
 
     if (claimWait) {
-      if (q.running < claimWait.running) {
-        log.add('expedition-claimed', '远征领取后队伍减少已确认', { teams: claimWait.running - q.running });
+      const current = claimPageState(q, fields, errors);
+      diagnostic.claim = { beforeRunning: claimWait.running, since: claimWait.submittedAt ?? claimWait.at,
+        reloaded: Boolean(claimWait.reloaded), ...current };
+      if (current.consistent && (q.running < claimWait.running || current.allUnderway)) {
+        if (q.running < claimWait.running) {
+          log.add('expedition-claimed', '远征领取后队伍减少已确认', { teams: claimWait.running - q.running });
+        } else {
+          // 手动领取并重新派满时总数不变；完整列表均在途中，原待领奖励已无对应目标。
+          // 只结束旧等待，不推断奖励金额；收入仍仅由新的原网页到账回执确认。
+          log.add('expedition-claim-reconciled', '当前队伍均在途中，结束旧领取等待',
+            { beforeRunning: claimWait.running, running: q.running });
+        }
         saveClaimWait(null);
         noteQuotaSync();
       }
       else {
         if (claimWait.reloaded && Date.now() - claimWait.at > 60000) {
+          log.add('expedition-claim-unconfirmed', '一次刷新后仍无法确认原领取', diagnostic.claim);
           setEnabled(false, '原领取结果仍无法确认，已暂停并保留记录，请手动核对');
         } else if (!claimWait.reloaded && Date.now() - claimWait.at > 30000) {
           offer('sync-claim', '刷新领取后的状态', () => {
-            saveClaimWait({ ...claimWait, reloaded: true, at: Date.now() }); location.reload();
+            saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
+              reloaded: true, at: Date.now() }); location.reload();
           });
         }
         else say('等待奖励领取和英雄释放');
@@ -2175,7 +2210,7 @@
     const claim = usable(claimAll) ? claimAll : usable(claimOne) ? claimOne : null;
     if (claim) {
       offer(`claim:${q.running}:${textOf(claim)}`, '领取已完成的远征奖励', () => {
-        saveClaimWait({ running: q.running, at: Date.now() });
+        saveClaimWait({ running: q.running, at: Date.now(), submittedAt: Date.now() });
         log.expect('expedition');
         claim.click();
       });
