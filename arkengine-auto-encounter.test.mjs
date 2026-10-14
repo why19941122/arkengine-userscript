@@ -107,6 +107,12 @@ window.notice = (text, error = false) => {
 base();
 </script>`;
 
+// 来自公开首页的固定登录标志；没有账号或真实登录接口。
+const loginMarkup = `<!doctype html><meta charset="utf-8"><main>
+<a href="/api/auth/linuxdo">使用 LinuxDo 登录</a>
+<form aria-label="备用账号登录"><input name="login"><input type="password" name="password"></form>
+</main><script>window.loginFixture=true;</script>`;
+
 test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集成检查', { timeout: 900000 }, async t => {
   // Node 按父测试匹配名称时会包含全部子项；显式筛选用于修改后的定向复测。
   if (process.env.ARKENGINE_TEST_PATTERN) {
@@ -115,7 +121,26 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     t.test = (name, run) => register(name, { skip: !pattern.test(name) }, run);
   }
   let expeditionRequests = 0;
+  let diagnosticRequests = 0;
   const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname.startsWith('/api/')) {
+      diagnosticRequests++;
+      if (url.searchParams.has('network-error')) { req.socket.destroy(); return; }
+      if (url.searchParams.has('redirect')) {
+        res.writeHead(302, { Location: '/?login-fixture=1&token=redirect-secret' }); res.end(); return;
+      }
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        res.writeHead(Number(url.searchParams.get('code') || 200), { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ method: req.method, body, privateValue: 'response-secret' }));
+      });
+      return;
+    }
+    if (url.searchParams.has('login-fixture')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(loginMarkup); return;
+    }
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -770,6 +795,163 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`dm.calls.some(c=>c[0]==='retreat')`),false);
     });
     const logBucket = (group='cultivate', day='2026-10-10') => `JSON.parse(localStorage.getItem('arkengine:auto-log:v1:${group}:${day}'))`;
+    const requestEvents = `${logBucket()}?.events.filter(e=>e.type==='request-result')`;
+    const diagnosticSetup = `window.clock=Date.parse('2026-10-10T12:00:00+08:00');Date.now=()=>clock;
+      localStorage.setItem('arkengine:auto-encounter:enabled:v1','false');
+      localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');`;
+    await t.test('登录诊断：真实 Request、Promise、响应正文保持原样，敏感内容不入日志', async () => {
+      await setup(`${diagnosticSetup}
+        const nativeFetch=window.fetch;
+        window.fetch=function(...args){window.nativePromise=Reflect.apply(nativeFetch,this,args);return nativePromise;};`);
+      const before = diagnosticRequests;
+      await evaluate('window.installedFetch=window.fetch');
+      await evaluate(source);
+      assert.equal(await evaluate('window.fetch===installedFetch'),true,'重复注入不重复包裹请求');
+      const result = await evaluate(`(async()=>{
+        const request=new Request(location.origin+'/api/cultivation?token=query-secret#hash-secret',
+          {method:'POST',headers:{'X-Test-Private':'header-secret'},body:'password=body-secret'});
+        const promise=fetch(request);const same=promise===nativePromise;
+        const response=await promise;const unused=!response.bodyUsed;const data=await response.json();
+        return {same,unused,data,requestUsed:request.bodyUsed};
+      })()`);
+      assert.deepEqual(result,{same:true,unused:true,data:{method:'POST',body:'password=body-secret',privateValue:'response-secret'},requestUsed:true});
+      assert.equal(diagnosticRequests-before,1,'只发送网站原来的一个请求');
+      const events=await evaluate(requestEvents);
+      assert.equal(events.length,1);
+      assert.deepEqual(events[0].data,{path:'/api/cultivation',startedAt:Date.parse('2026-10-10T12:00:00+08:00'),status:200,outcome:'ok',redirected:false});
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/query-secret|hash-secret|header-secret|body-secret|response-secret/);
+    });
+    await t.test('登录诊断：只观察已知同源游戏接口，余额心跳去重且不发探测请求', async () => {
+      await setup(diagnosticSetup);
+      const before=diagnosticRequests;
+      await evaluate(`(async()=>{
+        await fetch(new URL('/api/me/balance?token=private-query',location.origin));
+        await fetch('/api/me/balance');await fetch('/api/me/balance');
+        await fetch('/api/auth/password?code=401',{method:'POST',body:'private-password'});
+        await fetch('/api/unknown/private-id?code=403');
+        try{await fetch('http://localhost:${server.address().port}/api/cultivation?code=401');}catch{}
+      })()`);
+      assert.equal(await evaluate(`${requestEvents}.length`),1);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      await evaluate(`clock+=15*60000;fetch('/api/me/balance')`);
+      assert.equal(await evaluate(`${requestEvents}.length`),2);
+      await delay(250);
+      assert.equal(diagnosticRequests-before,7);
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/private-query|private-password|private-id/);
+      for (const path of ['/api/farm/plant','/api/farm/plant-all','/api/farm/harvest','/api/farm/harvest-all','/api/farm/sell']) {
+        await evaluate(`fetch('${path}?code=503',{method:'POST',body:'farm-private-body'})`);
+        assert.equal(await evaluate(`${requestEvents}.at(-1).data.path`),path);
+        assert.equal(await evaluate(`${requestEvents}.at(-1).data.status`),503);
+      }
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/farm-private-body/);
+    });
+    await t.test('登录诊断：401、403、429 立即停止两组并保留原请求记录', async () => {
+      for (const code of [401,403,429]) {
+        await setup(`${diagnosticSetup}
+          sessionStorage.setItem('cultivation:operation:fixture','original-pending');
+          sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({at:clock,reloaded:true,submittedAt:clock-1000}));`);
+        const journals=await evaluate(`JSON.stringify(Object.fromEntries(Object.entries(sessionStorage)))`);
+        assert.equal(await evaluate(`fetch('/api/cultivation?code=${code}').then(r=>r.status)`),code);
+        assert.match(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),new RegExp(`HTTP ${code}`));
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.equal(await evaluate(`JSON.stringify(Object.fromEntries(Object.entries(sessionStorage)))`),journals);
+        assert.equal(await evaluate(`${requestEvents}.at(-1).data.status`),code);
+        await evaluate(`fetch('/api/cultivation?code=${code}')`);
+        assert.equal(await evaluate(`${requestEvents}.length`),1,'重复失败不刷屏');
+        await evaluate(`fetch('/api/cultivation')`);
+        assert.equal(await evaluate(`${requestEvents}.at(-1).data.status`),200);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false','成功响应不能自动恢复');
+      }
+    });
+    await t.test('登录诊断：网络中断、取消和 500 不误判登出，保留原异常', async () => {
+      await setup(diagnosticSetup);
+      assert.equal(await evaluate(`fetch('/api/cultivation?code=500').then(r=>r.status)`),500);
+      assert.equal(await evaluate(`fetch('/api/cultivation?network-error=1').then(()=>false,e=>e.name)`),'TypeError');
+      assert.equal(await evaluate(`(async()=>{const controller=new AbortController();controller.abort();
+        try{await fetch('/api/cultivation',{signal:controller.signal});return false;}catch(e){return e===controller.signal.reason;}})()`),true);
+      assert.deepEqual(await evaluate(`${requestEvents}.map(e=>e.data.outcome)`),['http-error','network-error','aborted']);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+    });
+    await t.test('登录诊断：请求重定向与整页跳回登录保留来源、停止两组且不自动恢复', async () => {
+      await setup(diagnosticSetup);
+      const response=await evaluate(`fetch('/api/cultivation?redirect=1').then(async r=>({status:r.status,redirected:r.redirected,text:await r.text()}))`);
+      assert.equal(response.status,200);assert.equal(response.redirected,true);assert.match(response.text,/使用 LinuxDo 登录/);
+      assert.equal(await evaluate(`${requestEvents}.at(-1).data.outcome`),'login-redirect');
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/redirect-secret/);
+      await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('toggle').click();`);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      // 全文档重载：仅延续 sessionStorage，不靠旧页面内存。
+      await cdp.send('Page.navigate',{url:`${origin}/?login-fixture=1&token=navigation-secret`},tab.sessionId);
+      await until(()=>evaluate('window.loginFixture===true'),'login landing');
+      await evaluate(`Date.now=()=>${Date.parse('2026-10-10T12:00:00+08:00')};`);
+      await evaluate(source);
+      assert.deepEqual(await evaluate(`${logBucket()}.events.find(e=>e.type==='login-page').data`),{from:'/cultivate',to:'/'});
+      assert.match(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),/进入登录页/);
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/navigation-secret/);
+      await cdp.send('Page.navigate',{url:`${origin}/cultivate?login-return=1`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?login-return=1'&&typeof base==='function'`),'manual login return');
+      await evaluate(source);
+      assert.equal(await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('toggle').textContent`),'开始修仙自动操作');
+      await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('toggle').click()`);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+    });
+    await t.test('登录诊断：首次登录、普通首页、隐藏入口不误停；SPA 出现真实入口才记录一次', async () => {
+      await setup(diagnosticSetup,'/');
+      await evaluate(`game.innerHTML=${JSON.stringify(loginMarkup)};window.dispatchEvent(new Event('focus'));`);
+      await delay(150);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      await setup(diagnosticSetup);
+      await evaluate(`history.pushState({},'','/?token=spa-secret');game.innerHTML='<div hidden><a href="/api/auth/linuxdo">使用 LinuxDo 登录</a></div>';`);
+      await delay(150);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')`),null);
+      await evaluate(`document.querySelector('#game div').hidden=false;`);
+      await until(()=>evaluate(`localStorage.getItem('arkengine:auto:account-stop:v1')!==null`),'SPA login pause');
+      await evaluate(`window.dispatchEvent(new Event('focus'));game.append(document.createElement('hr'));`);
+      await delay(150);
+      assert.equal(await evaluate(`${logBucket()}.counts['login-page']`),1);
+      assert.doesNotMatch(JSON.stringify(await evaluate(`${logBucket()}`)),/spa-secret/);
+    });
+    await t.test('登录诊断：日志存储失败不影响响应或本页暂停', async () => {
+      await setup(diagnosticSetup);
+      await evaluate(`const nativeSet=Storage.prototype.setItem;window.restoreStorage=()=>{Storage.prototype.setItem=nativeSet;};
+        Storage.prototype.setItem=function(){throw new DOMException('full','QuotaExceededError');};`);
+      try {
+        assert.equal(await evaluate(`fetch('/api/cultivation?code=401').then(r=>r.status)`),401);
+        assert.match(await status(),/HTTP 401/);
+        assert.match(await expStatus(),/HTTP 401/);
+        assert.equal(await evaluate(`fetch('/api/cultivation').then(r=>r.json()).then(x=>x.method)`),'GET');
+      } finally { await evaluate('restoreStorage()'); }
+    });
+    await t.test('登录诊断：真实 HTTP 401 跨标签撤销两个排队动作，手动恢复只开启当前组', async () => {
+      await setupExp(`addRuns(6);`);
+      const cultivate=await createTab();
+      try {
+        await cdp.send('Page.navigate',{url:`${origin}/cultivate?http-stop=1`},cultivate.sessionId);
+        await until(()=>cdp.evaluate(cultivate.sessionId,`typeof choices==='function'`),'HTTP stop cultivation');
+        await cdp.evaluate(cultivate.sessionId,`window.clock=100000;Date.now=()=>clock;Math.random=()=>0;choices(['修为 +1','钻石 +2']);`);
+        await cdp.evaluate(cultivate.sessionId,source);
+        await until(()=>cdp.evaluate(cultivate.sessionId,`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('status').textContent.includes('随机等待')`),'cultivation HTTP queue');
+        await evaluate(`model.runs.forEach(r=>r.done=true);renderExp();`);
+        await until(async ()=>(await expStatus())?.includes('随机等待'),'expedition HTTP queue');
+        await cdp.evaluate(cultivate.sessionId,`fetch('/api/cultivation?code=401').then(r=>r.status)`);
+        await until(async ()=>(await expStatus())?.includes('HTTP 401'),'HTTP cross-tab pause');
+        await pulse(10000);
+        await cdp.evaluate(cultivate.sessionId,`clock+=10000;window.dispatchEvent(new Event('focus'));`);
+        await delay(200);
+        assert.deepEqual(await evaluate('model.calls'),[]);
+        assert.deepEqual(await cdp.evaluate(cultivate.sessionId,'clicks'),[]);
+        await cdp.evaluate(cultivate.sessionId,`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('toggle').click();`);
+        await until(()=>cdp.evaluate(cultivate.sessionId,`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('status').textContent.includes('随机等待')`),'current group resumed');
+        await cdp.evaluate(cultivate.sessionId,`clock+=10000;window.dispatchEvent(new Event('focus'));`);
+        await until(()=>cdp.evaluate(cultivate.sessionId,'clicks.length===1'),'current group action');
+        assert.deepEqual(await cdp.evaluate(cultivate.sessionId,'clicks'),[1]);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.deepEqual(await evaluate('model.calls'),[]);
+      } finally { await cdp.send('Target.closeTarget',{targetId:cultivate.targetId}); }
+    });
     const fogJournal = `JSON.parse(sessionStorage.getItem('arkengine:auto-fog:pending:v1'))`;
     const fogState = `JSON.parse(localStorage.getItem('arkengine:auto-fog:state:v1'))`;
     const fogCalls = kind => `fo.calls.filter(c=>c[0]==='${kind}')`;
@@ -1006,7 +1188,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.5');
+      assert.equal(exported.version,'1.6.6');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1061,7 +1243,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.5');
+      assert.equal(exported.version,'1.6.6');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);

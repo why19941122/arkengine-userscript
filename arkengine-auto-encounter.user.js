@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.5
+// @version      1.6.6
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -20,15 +20,29 @@
   const ACCOUNT_STOP = 'arkengine:auto:account-stop:v1';
   const groupPrefs = ['arkengine:auto-encounter:enabled:v1', 'arkengine:auto-expedition:enabled:v1'];
   const accountListeners = [];
-  const accountStopReason = () => localStorage.getItem(ACCOUNT_STOP) || '';
+  let memoryAccountStop = '';
+  const accountStopReason = () => {
+    try { return localStorage.getItem(ACCOUNT_STOP) || memoryAccountStop; }
+    catch { return memoryAccountStop; }
+  };
+  function clearAccountStop() {
+    localStorage.removeItem(ACCOUNT_STOP);
+    memoryAccountStop = '';
+  }
   function pauseAccount(reason) {
     const message = `${reason}；账号异常，已暂停全部自动操作，请处理后分别手动开始`;
     // 先写共享停止标记；另一页即使还未收到 storage 事件，点击前也会读到。
-    localStorage.setItem(ACCOUNT_STOP, message);
-    for (const pref of groupPrefs) localStorage.setItem(pref, 'false');
-    for (const stop of accountListeners) stop(message);
+    memoryAccountStop = message;
+    try { localStorage.setItem(ACCOUNT_STOP, message); } catch { /* 本页仍须停止 */ }
+    for (const pref of groupPrefs) {
+      try { localStorage.setItem(pref, 'false'); } catch { /* 继续通知本页两组 */ }
+    }
+    for (const stop of accountListeners) {
+      try { stop(message); } catch { /* 一组失败不能阻止另一组暂停 */ }
+    }
   }
   window.addEventListener('storage', event => {
+    if (event.key === ACCOUNT_STOP) memoryAccountStop = event.newValue || '';
     if (event.key === ACCOUNT_STOP && event.newValue) {
       for (const stop of accountListeners) stop(event.newValue);
     }
@@ -57,6 +71,11 @@
   syncDialogAnimations();
 
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
+  const diagnosticLogs = {};
+  let observeSessionPage = () => {};
+  const pageGroup = path => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(path) ? 'cultivate' :
+    /^(?:\/activities\/expedition|\/farm)\/?$/.test(path) ? 'expedition' : '';
+  const diagnosticPage = (path = location.pathname) => path === '/' || pageGroup(path) ? path : '[其他页面]';
   const logDay = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
   const RECEIPTS = {
     encounter: /^奇遇奖励已入账[:：]/,
@@ -139,7 +158,7 @@
         const b = bucket();
         const now = Date.now();
         b.events.push({ at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
-          page: location.pathname, pageId, version: '1.6.5', visibility: document.visibilityState,
+          page: diagnosticPage(), pageId, version: '1.6.6', visibility: document.visibilityState,
           type, detail: String(detail).slice(0, 300), data });
         b.counts[type] = (b.counts[type] || 0) + 1;
         if (sum) for (const [key, value] of Object.entries(data.reward || {})) b.totals[key] = (b.totals[key] || 0) + value;
@@ -186,8 +205,8 @@
         add('heartbeat', state, diagnostic);
       }
       if (now - lastWrite >= 60000) {
-        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.5', active: true,
-          state: String(state).slice(0, 180), page: location.pathname, visibility: document.visibilityState, diagnostic };
+        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.6', active: true,
+          state: String(state).slice(0, 180), page: diagnosticPage(), visibility: document.visibilityState, diagnostic };
         try { prune(); localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
         lastWrite = now;
         render();
@@ -195,7 +214,7 @@
     }
     function stop(reason) {
       add('pause', reason);
-      checkpoint = { at: Date.now(), pageId, version: '1.6.5', active: false, state: reason };
+      checkpoint = { at: Date.now(), pageId, version: '1.6.6', active: false, state: reason };
       lastTick = 0;
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
     }
@@ -232,14 +251,103 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.5', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.6', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
       };
       box.append(details); render();
     }
-    return { add, pulse, stop, expect, receipts, mount, observeLifecycle };
+    const log = { add, pulse, stop, expect, receipts, mount, observeLifecycle };
+    diagnosticLogs[group] = log;
+    return log;
+  }
+
+  function observeSession() {
+    const contextKey = 'arkengine:auto:session-context:v1';
+    // 仅保存功能组与固定页面路径，跨整页跳转保留来源，不读取登录资料。
+    let previous = null;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(contextKey) || 'null');
+      if (saved && pageGroup(saved.page) === saved.group && saved.group) previous = saved;
+    } catch { /* 没有可靠来源时不把首次打开登录页当成掉线 */ }
+    let onLogin = false;
+    observeSessionPage = () => {
+      try {
+        const group = pageGroup(location.pathname);
+        if (group && previous?.page !== location.pathname) {
+          previous = { group, page: location.pathname };
+          try { sessionStorage.setItem(contextKey, JSON.stringify(previous)); } catch { /* 保留本页来源 */ }
+        }
+        // 2026-10-14 公开首页：LinuxDo 登录链接与备用登录表单。
+        const login = location.pathname === '/' && [...document.querySelectorAll(
+          'a[href="/api/auth/linuxdo"], form[aria-label="备用账号登录"] input[type="password"]')]
+          .some(el => !el.closest('[hidden], [inert], [aria-hidden="true"]') &&
+            el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+        if (login && !onLogin && previous) {
+          diagnosticLogs[previous.group].add('login-page', '从游戏页面进入登录页；无法仅据此判断登出原因',
+            { from: previous.page, to: '/' });
+          if (!accountStopReason()) pauseAccount('已从游戏页面进入登录页，请手动登录');
+        }
+        onLogin = login;
+      } catch { /* 诊断失败不能影响网站导航 */ }
+    };
+    observeSessionPage();
+    window.addEventListener('pagehide', observeSessionPage);
+
+    const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons', '/api/cultivation/fog',
+      '/api/activities', '/api/activities/expedition-claim-all', '/api/activities/expedition-event',
+      '/api/farm', '/api/farm/plant', '/api/farm/plant-all', '/api/farm/harvest', '/api/farm/harvest-all',
+      '/api/farm/sell', '/api/me/balance', '/api/stamina']);
+    const background = new Set(['/api/me/balance', '/api/stamina']);
+    const samples = new Map();
+    function record(info, result) {
+      // 相同错误每分钟最多一条；后台余额、体力同类响应每十五分钟一条，状态变化立即记录。
+      const key = `${info.group}:${info.path}`;
+      const signature = `${result.status}:${result.outcome}`;
+      const last = samples.get(key);
+      const interval = background.has(info.path) ? 15 * 60000 : result.outcome === 'ok' ? 0 : 60000;
+      const now = Date.now();
+      if (!last || last.signature !== signature || now - last.at >= interval) {
+        samples.set(key, { signature, at: now });
+        diagnosticLogs[info.group].add('request-result', '已有游戏请求的被动观察结果',
+          { path: info.path, startedAt: info.at, status: result.status, outcome: result.outcome,
+            redirected: Boolean(result.redirected), ...(result.to ? { to: result.to } : {}) });
+      }
+      const reason = result.outcome === 'login-redirect' ? '游戏请求跳转至登录入口，请手动核对登录' :
+        ({ 401: '游戏请求返回 HTTP 401（未授权）', 403: '游戏请求返回 HTTP 403（拒绝访问）',
+          429: '游戏请求返回 HTTP 429（限流）' })[result.status];
+      if (reason && !accountStopReason()) pauseAccount(reason);
+    }
+    const originalFetch = window.fetch;
+    window.fetch = function (...args) {
+      const at = Date.now();
+      // 原参数、this、Promise 和 Response 原样传递，不读取请求头/正文或响应正文。
+      const promise = Reflect.apply(originalFetch, this, args);
+      try {
+        const input = args[0];
+        const raw = typeof input === 'string' ? input : input instanceof URL ? input.href :
+          input instanceof Request ? input.url : null;
+        const url = raw === null ? null : new URL(raw, document.baseURI);
+        const group = pageGroup(location.pathname) || previous?.group;
+        if (url?.origin === location.origin && paths.has(url.pathname) && group) {
+          const info = { group, path: url.pathname, at };
+          promise.then(response => {
+            let loginRedirect = false;
+            if (response.redirected && response.url) {
+              const target = new URL(response.url);
+              loginRedirect = target.origin === location.origin && target.pathname === '/';
+            }
+            record(info, { status: response.status, redirected: response.redirected,
+              outcome: loginRedirect ? 'login-redirect' : response.ok ? 'ok' : 'http-error',
+              ...(loginRedirect ? { to: '/' } : {}) });
+          }, error => record(info, { status: null,
+            outcome: error?.name === 'AbortError' || error?.name === 'TimeoutError' ? 'aborted' : 'network-error' }))
+            .catch(() => { /* 日志或监听失败不能改变网站收到的结果 */ });
+        }
+      } catch { /* 诊断不可用时仍返回原始请求 */ }
+      return promise;
+    };
   }
 
   function createRecovery(group, log, say) {
@@ -457,7 +565,7 @@
     schedule();
   }
   toggle.addEventListener('click', () => {
-    if (!enabled) { localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); }
+    if (!enabled) { clearAccountStop(); recoveryBudget.clear(); }
     setEnabled(!enabled);
   });
   toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
@@ -1247,7 +1355,7 @@
     // Worker/DOM 事件已经唤醒脚本，不能再转到后台会被节流的 setTimeout。
     queueMicrotask(() => {
       scheduled = false;
-      try { tick(); } catch (error) {
+      try { observeSessionPage(); tick(); } catch (error) {
         console.error('[自动奇遇] 本次检查失败', error);
         setEnabled(false, '脚本检查失败，已暂停；请刷新后重试');
       }
@@ -1558,7 +1666,7 @@
   toggle.addEventListener('click', () => {
     try {
       if (!enabled) {
-        localStorage.removeItem(ACCOUNT_STOP); recoveryBudget.clear(); clearIdleWait();
+        clearAccountStop(); recoveryBudget.clear(); clearIdleWait();
         if (claimWait) {
           // 用户明确开始后重新给状态核对计时；保留原领取，不再次提交领取请求。
           saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
@@ -2320,7 +2428,7 @@
       offered = false;
       idleChecked = false;
       idleBlocked = false;
-      try { step(); }
+      try { observeSessionPage(); step(); }
       catch (error) { console.error('[自动远征] 检查失败', error); setEnabled(false, '远征检查失败，已暂停；请核对页面后重试'); }
       finally {
         if (!offered) cancelQueued();
@@ -2365,4 +2473,5 @@
   if (!enabled) say('已暂停');
   schedule();
 })();
+  observeSession();
 })();
