@@ -13,7 +13,9 @@ import { farmMarkup } from './arkengine-farm.fixture.mjs';
 import { fogMarkup } from './arkengine-fog.fixture.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
-const source = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
+const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
+// 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
+const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;');
 const executable = [process.env.CHROME_PATH,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(p => p && existsSync(p));
@@ -43,7 +45,8 @@ class CDP {
     });
   }
   async evaluate(session, expression) {
-    const result = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, session);
+    const result = await this.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true,
+      replMode: expression.includes('(await window.__arkTestLogs') }, session);
     if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
     return result.result.value;
   }
@@ -151,7 +154,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
   const profile = await mkdtemp(join(tmpdir(), 'ark-encounter-browser-'));
   const browser = spawn(executable, ['--headless=new', '--disable-background-networking',
     '--disable-component-update', '--disable-sync', '--no-first-run', '--no-default-browser-check',
-    '--disable-extensions', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank'],
+    '--disable-extensions', '--disable-features=BackForwardCache', `--user-data-dir=${profile}`, '--remote-debugging-port=0', 'about:blank'],
   { windowsHide: true, stdio: 'ignore' });
   let cdp;
   try {
@@ -170,10 +173,14 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const evaluate = expression => cdp.evaluate(tab.sessionId, expression);
     const status = () => evaluate(`document.getElementById('ark-auto-encounter')?.shadowRoot.getElementById('status').textContent`);
     const clickLog = () => evaluate('clicks');
+    const resetLogs = () => evaluate(`new Promise((resolve,reject)=>{
+      const req=indexedDB.deleteDatabase('arkengine-auto-log');req.onsuccess=resolve;req.onerror=()=>reject(req.error);
+    })`);
     let pageSerial = 0;
     const setup = async (code = '', path = '/cultivate') => {
       await cdp.send('Page.navigate', { url: `${origin}${path}?test=${++pageSerial}` }, tab.sessionId);
       await until(() => evaluate(`location.search === '?test=${pageSerial}' && typeof window.base === 'function'`), 'fixture ready');
+      await resetLogs();
       await evaluate(`localStorage.clear(); sessionStorage.clear(); Math.random = () => 0; ${code}`);
       await evaluate(source);
     };
@@ -413,6 +420,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const setupExp = async (code = '') => {
       await cdp.send('Page.navigate', { url: `${origin}/activities/expedition?test=${++pageSerial}` }, tab.sessionId);
       await until(() => evaluate(`location.search === '?test=${pageSerial}' && typeof renderExp === 'function'`), 'expedition fixture');
+      await resetLogs();
       await evaluate(`localStorage.clear(); sessionStorage.clear(); Math.random = () => 0; model.burst=0;
         localStorage.setItem('arkengine:auto-farm:enabled:v1','false'); ${code}; renderExp();`);
       await evaluate(source);
@@ -435,6 +443,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const setupFarm = async (code = '', path = '/activities/expedition') => {
       await cdp.send('Page.navigate', { url:`${origin}${path}?farm-fixture=${++pageSerial}` },tab.sessionId);
       await until(()=>evaluate(`location.search==='?farm-fixture=${pageSerial}' && typeof renderFarm==='function'`),'farm fixture');
+      await resetLogs();
       await evaluate(`localStorage.clear();sessionStorage.clear();Math.random=()=>0;model.burst=0;${code};
         if(location.pathname==='/farm')renderFarm();else renderExp();`);
       await evaluate(source);
@@ -555,8 +564,38 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;fm.requestError=true;${oldStaminaWait}`);
       await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'failed planting preflight');
       assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
-      assert.equal(await evaluate('fm.reads'),1);
+      assert.equal(await evaluate('fm.reads'),3,'只读网络失败最多三次，写操作始终为零');
     });
+
+    await t.test('只读恢复：离线不请求，恢复后有限重试成功且只种植一次', async () => {
+      await setupFarm(`addRuns(6);Object.defineProperty(navigator,'onLine',{configurable:true,get:()=>window.testOnline});window.testOnline=false;`, '/farm');
+      for(let i=0;i<10;i++)await pulse();
+      assert.equal(await evaluate('fm.reads'),0);
+      await evaluate(`testOnline=true;fm.httpStatus=503;window.dispatchEvent(new Event('online'));`);
+      await drive('fm.reads===1','first read failure',20);
+      await evaluate('fm.httpStatus=200');
+      await drive(`fm.crops.length===12 && location.pathname==='/activities/expedition'`,'retry succeeds',40);
+      assert.equal(await evaluate('fm.reads'),2);
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1);
+    });
+    await t.test('只读恢复：暂停或离页后迟到的行情不能改写日程或触发种植', async () => {
+      for(const leave of [false,true]) {
+        await setupFarm(`addRuns(6);window.readSignal=null;window.finishRead=null;
+          window.fetch=(url,options)=>{fm.reads++;readSignal=options.signal;return new Promise(resolve=>{finishRead=()=>resolve(new Response(JSON.stringify(farmData()),{status:200}));});};`, '/farm');
+        await drive('fm.reads===1','pending read',20);
+        if(leave)await evaluate(`navFarm('/profile')`);
+        else await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click()`);
+        await pulse();
+        assert.equal(await evaluate('readSignal.aborted'),true);
+        const before=await evaluate(`localStorage.getItem('arkengine:auto-farm:schedule:v1')`);
+        await evaluate('finishRead()');
+        await pulse(10000);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-farm:schedule:v1')`),before);
+        assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+        assert.equal(await evaluate('fm.reads'),1);
+      }
+    });
+
     await t.test('农场体力：顶部和农场都残留12但接口只有8时不种植', async () => {
       await setupFarm(`addRuns(6);fm.stamina=12;fm.headerStamina=12;fm.apiStamina=8;${oldStaminaWait}`);
       await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'authoritative preflight rejects stale farm display');
@@ -753,6 +792,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const setupDungeon = async (code = '', path = '/cultivate') => {
       await cdp.send('Page.navigate', { url: `${origin}${path}?dungeon-fixture=${++pageSerial}` }, tab.sessionId);
       await until(() => evaluate(`location.search === '?dungeon-fixture=${pageSerial}' && typeof renderDun === 'function'`), 'dungeon fixture');
+      await resetLogs();
       // 新场景不能继承上一场景保存的游戏模型。
       await evaluate(`localStorage.clear(); sessionStorage.clear();`);
       await cdp.send('Page.reload', {}, tab.sessionId);
@@ -794,11 +834,110 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`dm.calls.filter(c=>c[0]==='enter').length`),1);
       assert.equal(await evaluate(`dm.calls.some(c=>c[0]==='retreat')`),false);
     });
-    const logBucket = (group='cultivate', day='2026-10-10') => `JSON.parse(localStorage.getItem('arkengine:auto-log:v1:${group}:${day}'))`;
+    const logBucket = (group='cultivate', day='2026-10-10') => `(await window.__arkTestLogs.read('${group}','${day}',100000))`;
     const requestEvents = `${logBucket()}?.events.filter(e=>e.type==='request-result')`;
     const diagnosticSetup = `window.clock=Date.parse('2026-10-10T12:00:00+08:00');Date.now=()=>clock;
       localStorage.setItem('arkengine:auto-encounter:enabled:v1','false');
       localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');`;
+
+    await t.test('七天日志：跨日边界、迁移幂等、损坏旧桶保留并注明', async () => {
+      await setup(`${diagnosticSetup}
+        for(const day of ['2026-10-03','2026-10-04','2026-10-09'])localStorage.setItem('arkengine:auto-log:v1:cultivate:'+day,
+          JSON.stringify({day,counts:{'legacy-reward':1},totals:{代币:10},dropped:3,events:[{at:Date.parse(day+'T12:00:00+08:00'),type:'legacy-reward',detail:'已到账',data:{}}]}));
+        localStorage.setItem('arkengine:auto-log:v1:expedition:2026-10-09','{broken');`);
+      const first=await evaluate('window.__arkTestLogs.export()');
+      assert.equal(first.retentionDays,7);
+      assert.equal(first.budgetBytes,20*1024*1024);
+      assert.deepEqual(first.days.filter(d=>d.group==='cultivate').map(d=>d.day),['2026-10-04','2026-10-09','2026-10-10']);
+      assert.equal(first.days.find(d=>d.day==='2026-10-04').dropped,3);
+      assert.match(first.warnings.join(' '),/旧日志不可读/);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:expedition:2026-10-09')`),'{broken');
+      await evaluate(`window.__arkTestLogs.append({group:'cultivate',at:clock-1000,type:'state',detail:'迟到事件',data:{}},null,false)`);
+      const coverage=await evaluate(logBucket());
+      assert.equal(coverage.firstAt,await evaluate('clock-1000'));
+      assert.equal(coverage.lastAt,await evaluate('clock'),'迟到写入不能缩短覆盖终点');
+      await evaluate(`clock=Date.parse('2026-10-11T00:00:00+08:00')`);
+      const next=await evaluate('window.__arkTestLogs.export()');
+      assert.equal(next.days.some(d=>d.day==='2026-10-04'),false);
+      assert.equal(next.days.find(d=>d.day==='2026-10-09').totals['代币'],10,'重复导出不重复迁移收益');
+    });
+    await t.test('七天日志：迁移事务失败保留旧记录，恢复后仅入账一次', async () => {
+      await setup(`${diagnosticSetup}
+        localStorage.setItem('arkengine:auto-log:v1:cultivate:2026-10-09',JSON.stringify({day:'2026-10-09',counts:{reward:1},totals:{代币:7},events:[{at:clock-86400000,type:'reward',data:{}}]}));
+        const original=IDBObjectStore.prototype.add;window.restoreIDB=()=>{IDBObjectStore.prototype.add=original;};
+        IDBObjectStore.prototype.add=function(){throw new DOMException('full','QuotaExceededError');};`);
+      await until(()=>evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('log-summary').textContent.includes('日志存储失败')`),'migration failure visible');
+      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:cultivate:2026-10-09')`),null);
+      await evaluate('restoreIDB()');
+      for(let i=0;i<2;i++){
+        const value=await evaluate('window.__arkTestLogs.export()');
+        assert.equal(value.days.find(d=>d.day==='2026-10-09').totals['代币'],7);
+      }
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:cultivate:2026-10-09')`),null);
+    });
+    await t.test('七天日志：20MiB预算优先保留故障，截断不改变收益汇总', async () => {
+      await setup(diagnosticSetup);
+      await evaluate(`window.__arkTestLogs.append({group:'cultivate',at:clock,type:'pause',detail:'保留故障',data:{}},null,false)`);
+      await evaluate(`(async()=>{
+        const payload='x'.repeat(500000);
+        for(let i=0;i<50;i++)await window.__arkTestLogs.append({group:'cultivate',at:clock+i+1,type:'state',detail:'大记录',data:{payload}},{代币:1},false);
+      })()`);
+      const result=await evaluate('window.__arkTestLogs.export()');
+      const day=result.days.find(d=>d.group==='cultivate');
+      assert.ok(result.estimatedEventBytes<=result.budgetBytes);
+      assert.ok(day.dropped>0);
+      assert.equal(day.totals['代币'],50);
+      assert.equal(day.counts.state,50);
+      assert.ok(day.events.some(e=>e.detail==='保留故障'));
+    });
+    await t.test('七天日志：两个标签并发追加不丢事件或收益', async () => {
+      await setup(diagnosticSetup);
+      const second=await createTab();
+      try {
+        await cdp.send('Page.navigate',{url:`${origin}/cultivate?concurrent-log=1`},second.sessionId);
+        await until(()=>cdp.evaluate(second.sessionId,`typeof base==='function'`),'concurrent logger fixture');
+        await cdp.evaluate(second.sessionId,`window.clock=Date.parse('2026-10-10T12:00:00+08:00');Date.now=()=>clock;`);
+        await cdp.evaluate(second.sessionId,source);
+        const append=`(async()=>{for(let i=0;i<30;i++)await window.__arkTestLogs.append({group:'cultivate',at:clock,type:'audit-reward',detail:'到账',data:{}},{代币:2},false);})()`;
+        await Promise.all([evaluate(append),cdp.evaluate(second.sessionId,append)]);
+        const day=await evaluate(logBucket());
+        assert.equal(day.counts['audit-reward'],60);
+        assert.equal(day.totals['代币'],120);
+        assert.equal(day.events.filter(e=>e.type==='audit-reward').length,60);
+      } finally {await cdp.send('Target.closeTarget',{targetId:second.targetId});}
+    });
+
+    await t.test('七天日志：收益交付跨刷新且已提交回执不重复入账', async () => {
+      await setup(`${diagnosticSetup}
+        sessionStorage.setItem('arkengine:auto-log:v1:cultivate:outbox',JSON.stringify([{group:'cultivate',at:clock,type:'encounter-reward',detail:'已到账',data:{reward:{代币:9}},receiptId:'fixture-receipt'}]));`);
+      assert.equal(await evaluate(`${logBucket()}.totals['代币']`),9);
+      await evaluate(`sessionStorage.setItem('arkengine:auto-log:v1:cultivate:outbox',JSON.stringify([{group:'cultivate',at:clock,type:'encounter-reward',detail:'已到账',data:{reward:{代币:9}},receiptId:'fixture-receipt'}]));`);
+      await cdp.send('Page.reload',{},tab.sessionId);
+      await until(()=>evaluate(`typeof base==='function' && !window.__arkTestLogs`),'reload without resetting delivery');
+      await evaluate(diagnosticSetup);
+      await evaluate(source);
+      assert.equal(await evaluate(`${logBucket()}.totals['代币']`),9);
+      assert.equal(await evaluate(`${logBucket()}.counts['encounter-reward']`),1);
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-log:v1:cultivate:outbox')).length`),0);
+    });
+
+    await t.test('调度优化：单Worker，暂停组不周期扫描；重复日志采样不丢计数', async () => {
+      await setup(`${diagnosticSetup}
+        window.workerCount=0;window.scanCount=0;const OriginalWorker=Worker;
+        window.Worker=class extends OriginalWorker{constructor(...args){super(...args);workerCount++;}};
+        const originalQuery=document.querySelectorAll.bind(document);document.querySelectorAll=(...args)=>{scanCount++;return originalQuery(...args);};`);
+      assert.equal(await evaluate('workerCount'),1);
+      await delay(100);
+      const before=await evaluate('scanCount');
+      await delay(2200);
+      assert.equal(await evaluate('scanCount'),before,'暂停后Worker不调度组内扫描');
+      await evaluate(`window.__arkTestLogs.append({group:'cultivate',at:clock,type:'state',data:{},detail:'采样'},null,true)`);
+      const day=await evaluate(logBucket());
+      assert.equal(day.sampled,1);
+      assert.ok(day.counts.state>=1);
+      assert.equal(day.events.some(e=>e.detail==='采样'),false);
+    });
+
     await t.test('登录诊断：真实 Request、Promise、响应正文保持原样，敏感内容不入日志', async () => {
       await setup(`${diagnosticSetup}
         const nativeFetch=window.fetch;
@@ -959,6 +1098,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const setupFog = async (code = '', path = '/cultivate') => {
       await cdp.send('Page.navigate', {url:`${origin}${path}?fog-fixture=${++pageSerial}`},tab.sessionId);
       await until(()=>evaluate(`location.search==='?fog-fixture=${pageSerial}'&&typeof openFog==='function'`),'fog fixture');
+      await resetLogs();
       await evaluate('localStorage.clear();sessionStorage.clear();');
       await cdp.send('Page.reload',{},tab.sessionId);
       await until(()=>evaluate(`typeof openFog==='function'&&!document.getElementById('ark-auto-encounter')`),'fresh fog fixture');
@@ -1186,9 +1326,10 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
       await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
+      await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.7');
+      assert.equal(exported.version,'1.7.0');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1238,17 +1379,18 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`${logBucket()}.counts['dungeon-reward']`),1);
       assert.ok(await evaluate(`${logBucket()}.counts['dungeon-node-reward']`)>0);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:cultivate:2026-10-08')`),null);
-      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:expedition:2026-10-09')`),null);
+      assert.notEqual(await evaluate(logBucket('expedition','2026-10-09')),null,'旧日志迁移后仍可读取');
       await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
+      await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.7');
-      assert.equal(exported.days.length,2);
+      assert.equal(exported.version,'1.7.0');
+      assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
       await delay(200);
-      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:cultivate:2026-10-10')`),null);
+      assert.notEqual(await evaluate(logBucket('cultivate','2026-10-10')),null);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-log:v1:expedition:2026-10-09')`),null);
     });
     await t.test('夜间回归：暂停和离开自动化路由会恢复原动画设置', async () => {
@@ -1286,8 +1428,8 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     });
     await t.test('夜间回归：日志写入失败不阻断奇遇', async () => {
       await setup(`window.clock=Date.parse('2026-10-10T10:00:00+08:00');Date.now=()=>clock;
-        const originalSet=Storage.prototype.setItem;
-        Storage.prototype.setItem=function(key,value){if(key.startsWith('arkengine:auto-log:'))throw new DOMException('full','QuotaExceededError');return originalSet.call(this,key,value);};
+        const originalAdd=IDBObjectStore.prototype.add;
+        IDBObjectStore.prototype.add=function(value){if(this.name==='events')throw new DOMException('full','QuotaExceededError');return originalAdd.call(this,value);};
         choices(['修为 +1','钻石 +2']);`);
       await drive(`clicks.length===1`,'storage-full automation continues');
       assert.deepEqual(await clickLog(),[1]);
@@ -1725,6 +1867,59 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         game.prepend(wrapper);
       };
     `;
+
+    await t.test('稳定性优化：隐藏刷新副本不挡住奇遇，两个可见候选不盲选', async () => {
+      await setup(`window.clock=10000;Date.now=()=>clock;choices(['修为 +1','修为 +2','修为 +3']);
+        const stale=refresh.cloneNode(true);stale.removeAttribute('id');
+        const wrap=document.createElement('div');wrap.hidden=true;wrap.append(stale);game.prepend(wrap);`);
+      await drive('clicks.length===1','current cultivate controls',10);
+      assert.deepEqual(await clickLog(),[2]);
+      await setup(`window.clock=10000;Date.now=()=>clock;choices(['修为 +1','修为 +2','修为 +3']);
+        const copy=refresh.cloneNode(true);copy.id='copy';game.prepend(copy);`);
+      for(let i=0;i<5;i++)await pulse();
+      assert.deepEqual(await clickLog(),[],'两份可见刷新控件无法唯一定位，不能猜测');
+    });
+    await t.test('稳定性优化：损坏保存记录不阻断面板、不覆盖原文或恢复操作', async () => {
+      for(const [key,group] of [['arkengine:auto-encounter:action:v1','encounter'],
+          ['arkengine:auto-expedition:claim:v1','expedition'],['arkengine:auto-expedition:idle:v1','expedition'],
+          ['arkengine:auto-recovery:expedition:v1','expedition']]) {
+        await setupExp(`sessionStorage.setItem('${key}','{bad-json');`);
+        await until(()=>evaluate(`!!document.getElementById('ark-auto-${group}')?.shadowRoot.getElementById('status').textContent.includes('保存记录不可读')`),'corrupt record status');
+        assert.equal(await evaluate(`!!document.getElementById('ark-auto-encounter') && !!document.getElementById('ark-auto-expedition')`),true);
+        await evaluate(`document.getElementById('ark-auto-${group}').shadowRoot.getElementById('toggle').click()`);
+        assert.equal(await evaluate(`sessionStorage.getItem('${key}')`),'{bad-json');
+        assert.match(await evaluate(`document.getElementById('ark-auto-${group}').shadowRoot.getElementById('status').textContent`),/保存记录不可读/);
+      }
+      await setupExp(`sessionStorage.setItem('arkengine:auto-expedition:claim:v1','[]');`);
+      await until(async()=>(await expStatus())?.includes('保存记录不可读'),'valid JSON with invalid shape');
+      assert.deepEqual(await evaluate('model.calls'),[]);
+      for(const [key,body,hint] of [
+        ['arkengine:auto-fog:pending:v1',{phase:'submitted',at:10000,settings:{}},'fog-status'],
+        ['arkengine:auto-dungeon:pending:v1',{phase:'submitted',at:10000,action:'choose',step:99},'dungeon-status']]) {
+        await setup(`window.clock=10000;Date.now=()=>clock;sessionStorage.setItem('${key}',JSON.stringify(${JSON.stringify(body)}));
+          choices(['修为 +1','修为 +2','修为 +3']);`);
+        await drive('clicks.length===1','unaffected encounter continues',10);
+        assert.match(await evaluate(`document.getElementById('ark-auto-encounter').shadowRoot.getElementById('${hint}').textContent`),/保存记录不可读/);
+        assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem('${key}'))`),body);
+      }
+    });
+    await t.test('稳定性优化：远征缺项一次刷新后仍缺项会明确暂停', async () => {
+      await setupExp(`sessionStorage.setItem('arkengine:auto-expedition:idle:v1',JSON.stringify({at:clock-300001,reloaded:true}));
+        const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();document.querySelector('#auto input[type="number"]').remove();};`);
+      await until(async()=>(await expStatus())?.includes('已暂停'),'missing controls have bounded recovery');
+      assert.deepEqual(await evaluate('model.calls'),[]);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+    });
+    await t.test('稳定性优化：隐藏旧体力不改变农场种植决策', async () => {
+      await setupFarm(`addRuns(6);fm.stamina=100;
+        const renderCurrent=renderFarm;window.renderFarm=()=>{
+          renderCurrent();const wrap=document.createElement('div');wrap.hidden=true;
+          wrap.innerHTML='<span title="每 4 分钟自然恢复 1 点体力">体力 0/100（4:00 恢复 1 点）</span>';game.prepend(wrap);};`, '/farm');
+      await drive(`fm.crops.length===12 && location.pathname==='/activities/expedition'`,'use current stamina',40);
+      assert.equal(await evaluate('fm.stamina'),88);
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
+    });
+
     await t.test('远征区域定位：隐藏旧队数不遮挡当前输入框，当前禁用时仍等待', async () => {
       await setupExp(`model.maxTeams=1;window.disableCount=true;
         const renderCurrent=renderExp;window.renderExp=()=>{
@@ -1749,7 +1944,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       const foreground=await createTab();
       try {
         await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
-        for(const hide of ['wrapper.hidden=true;', "wrapper.style.display='none';"]) {
+        for(const hide of ['wrapper.hidden=true;', "wrapper.style.display='none';", "wrapper.setAttribute('aria-hidden','true');"]) {
           await setupExp(`addRuns(6,false,true);${staleExpedition(hide)}`);
           assert.equal(await evaluate('document.visibilityState'),'hidden','后台标签仍有正常布局');
           const before=expeditionRequests;

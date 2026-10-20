@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.7
+// @version      1.7.0
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -70,6 +70,133 @@
   }
   syncDialogAnimations();
 
+  // 只接受唯一的当前候选。弹窗遮住页面后，仅复用遮挡前识别过的当前区域。
+  // 不能以“仍有布局”把旧 aria-hidden 区域误当作当前表单。
+  function createLocator() {
+    let known = new WeakSet();
+    let knownAncestors = new WeakSet();
+    let path = location.pathname;
+    const rendered = el => Boolean(el?.isConnected && !el.closest('[hidden]') &&
+      el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+    const visible = el => rendered(el) && !el.closest('[aria-hidden="true"]');
+    const remember = el => {
+      known.add(el);
+      for (let parent = el.parentElement; parent; parent = parent.parentElement) knownAncestors.add(parent);
+      return el;
+    };
+    const readable = el => {
+      if (!rendered(el)) return false;
+      if (visible(el)) return true;
+      // React 可在确认期间替换控件；允许已知背景内的新节点，但每层遮挡祖先都须已知。
+      for (let parent = el; parent; parent = parent.parentElement) {
+        if (parent.matches('[aria-hidden="true"], [inert]') && !knownAncestors.has(parent) && !known.has(parent)) return false;
+      }
+      return true;
+    };
+    const resetPath = () => {
+      if (path !== location.pathname) { path = location.pathname; known = new WeakSet(); knownAncestors = new WeakSet(); }
+    };
+    function pick(elements) {
+      resetPath();
+      const candidates = [...(elements || [])];
+      const current = candidates.filter(visible);
+      if (current.length) return current.length === 1 ? remember(current[0]) : null;
+      const background = candidates.filter(readable);
+      if (background.length) return background.length === 1 ? background[0] : null;
+      // 唯一不可见候选仅用于禁用/隐藏诊断，不能据此点击。
+      return candidates.length === 1 && !rendered(candidates[0]) ? candidates[0] : null;
+    }
+    function all(elements) {
+      resetPath();
+      return [...elements].filter(el => visible(el) ? (remember(el), true) : readable(el));
+    }
+    return { pick, all, rendered, visible, readable,
+      query: (selector, root = document) => pick(root?.querySelectorAll(selector)) };
+  }
+
+  const stateFaults = new Map();
+  const objectState = v => Boolean(v && typeof v === 'object' && !Array.isArray(v));
+  const timedState = v => objectState(v) && Number.isFinite(v.at) && v.at >= 0;
+  const planState = v => timedState(v) && ['opening', 'submitted'].includes(v.phase);
+  function loadState(storage, key, fallback, scope, validate = objectState) {
+    try {
+      const raw = storage.getItem(key);
+      if (raw === null || raw === 'null') return fallback;
+      const value = JSON.parse(raw);
+      if (!validate(value)) throw new Error('InvalidState');
+      return value;
+    } catch {
+      // 不删除或改写原文，更不能把损坏的未决操作当作“没有操作”。
+      stateFaults.set(key, scope);
+      return fallback;
+    }
+  }
+  function stateFault(scope) {
+    const keys = [...stateFaults].filter(([, group]) => group === scope).map(([key]) => key);
+    return keys.length ? `保存记录不可读，已暂停；原记录保留，请修复后刷新（${keys.join('、')}）` : '';
+  }
+  function createPageWait(scope, log) {
+    const key = `arkengine:auto-page-wait:${scope}:v1`;
+    let state = loadState(sessionStorage, key, null, scope, timedState);
+    let waiting = false;
+    return {
+      begin() { waiting = false; },
+      finish() { if (!waiting) this.clear(); },
+      clear() { if (state) { state = null; sessionStorage.removeItem(key); } },
+      wait(reason, safe, say, pause) {
+        waiting = true;
+        if (!navigator.onLine) { say('网络离线，等待连接恢复'); return; }
+        if (!state || state.path !== location.pathname) {
+          state = { at: Date.now(), path: location.pathname, reloaded: false };
+          sessionStorage.setItem(key, JSON.stringify(state));
+          log.add('page-blocked', reason, { scope });
+        }
+        if (Date.now() - state.at >= (state.reloaded ? 300000 : 90000)) {
+          if (!safe) { pause(`${reason}；存在弹窗或未决操作，已暂停并保留记录`); return; }
+          if (state.reloaded) { pause(`${reason}；一次刷新后仍无进展，已暂停`); return; }
+          state = { ...state, reloaded: true, at: Date.now() };
+          sessionStorage.setItem(key, JSON.stringify(state));
+          log.add('page-refresh', reason, { scope });
+          location.reload();
+        } else say(`${reason}；等待页面更新${state.reloaded ? '（已核对一次）' : ''}`);
+      },
+    };
+  }
+
+  // 每页共享一个 Worker 和 DOM 观察器；非当前功能组不扫描整页。
+  const wakeups = [];
+  function subscribeWakeup(schedule, onPage, enabled, beforeMutation = () => {}) {
+    wakeups.push({ schedule, onPage, enabled, beforeMutation, wasOnPage: onPage() });
+    if (wakeups.length > 1) return;
+    const wake = mutation => {
+      observeSessionPage();
+      for (const item of wakeups) {
+        const current = item.onPage();
+        if ((current && (mutation || item.enabled())) || item.wasOnPage !== current) {
+          if (mutation) item.beforeMutation();
+          item.schedule();
+        }
+        item.wasOnPage = current;
+      }
+    };
+    new MutationObserver(records => {
+      if (records.some(record => !(record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement)
+        ?.closest('#ark-auto-encounter, #ark-auto-expedition'))) wake(true);
+    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
+      attributeFilter: ['disabled', 'aria-disabled', 'aria-pressed', 'aria-selected', 'aria-hidden', 'hidden', 'inert', 'class', 'style'] });
+    for (const name of ['pageshow', 'focus', 'popstate', 'online', 'offline']) window.addEventListener(name, () => wake(true));
+    for (const name of ['visibilitychange', 'resume']) document.addEventListener(name, () => wake(true));
+    let worker;
+    let timer;
+    const fallback = () => { worker?.terminate(); worker = null; if (!timer) timer = setInterval(() => wake(false), 2000); };
+    try {
+      const url = URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 2000);'], { type: 'text/javascript' }));
+      try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+      worker.onmessage = () => wake(false);
+      worker.onerror = fallback;
+    } catch { fallback(); }
+  }
+
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
   const diagnosticLogs = {};
   let observeSessionPage = () => {};
@@ -116,12 +243,241 @@
     }
     return result;
   }
+  const SCRIPT_VERSION = '1.7.0';
+  const LOG_BUDGET = 20 * 1024 * 1024;
+  const LOG_DAYS = 7;
+  const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
+  const normalLog = event => ['state', 'heartbeat'].includes(event.type) ||
+    event.type === 'request-result' && event.data?.status >= 200 && event.data.status < 400;
+  const idbResult = request => new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  async function logTransaction(db, stores, mode, run) {
+    const tx = db.transaction(stores, mode);
+    const done = new Promise((resolve, reject) => {
+      tx.oncomplete = resolve;
+      tx.onabort = () => reject(tx.error || new Error('日志事务中止'));
+      tx.onerror = () => {}; // 由 onabort 统一报告，不能把 request 成功当作提交成功。
+    });
+    // 提前接住事务错误，避免异步 run 尚未退出时产生未处理拒绝。
+    done.catch(() => {});
+    try { const result = await run(tx); await done; return result; }
+    catch (error) { try { tx.abort(); } catch { /* 已结束 */ } await done.catch(() => {}); throw error; }
+  }
+  function createLogStore() {
+    let connection;
+    let queue = Promise.resolve();
+    const warnings = new Set();
+    const blank = (group, day) => ({ key: `${group}:${day}`, group, day, counts: {}, totals: {},
+      dropped: 0, sampled: 0, firstAt: null, lastAt: null });
+    const emptyBudget = () => ({ key: 'budget', bytes: 0, normalBytes: 0, day: '' });
+    const stores = ['events', 'days', 'meta'];
+    async function open() {
+      if (connection) return connection;
+      connection = new Promise((resolve, reject) => {
+        const request = indexedDB.open('arkengine-auto-log', 1);
+        let blocked = false;
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          const events = db.createObjectStore('events', { keyPath: 'id', autoIncrement: true });
+          events.createIndex('bucket', 'bucket');
+          events.createIndex('day', 'day');
+          events.createIndex('priorityAt', ['priority', 'at']);
+          db.createObjectStore('days', { keyPath: 'key' });
+          db.createObjectStore('meta', { keyPath: 'key' });
+        };
+        request.onblocked = () => { blocked = true; reject(new Error('日志数据库升级被其他标签页阻塞')); };
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => {
+          const db = request.result;
+          if (blocked) { db.close(); return; }
+          db.onversionchange = () => { db.close(); connection = null; };
+          db.onclose = () => { connection = null; };
+          resolve(db);
+        };
+      }).catch(error => { connection = null; throw error; });
+      return connection;
+    }
+    const enqueue = work => {
+      const result = queue.then(async () => work(await open()));
+      queue = result.catch(() => {});
+      return result;
+    };
+    // 游标删除避免加载整个七天事件数组；预算按序列化 UTF-8 估算，不冒充磁盘实占。
+    const walk = (request, visit) => new Promise((resolve, reject) => {
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || visit(cursor) === false) { resolve(); return; }
+        cursor.continue();
+      };
+    });
+    async function maintain(tx, budget) {
+      const events = tx.objectStore('events');
+      const days = tx.objectStore('days');
+      const earliest = logDay(Date.now() - (LOG_DAYS - 1) * 86400000);
+      if (budget.day !== logDay()) {
+        await walk(events.index('day').openCursor(IDBKeyRange.upperBound(earliest, true)), cursor => {
+          budget.bytes -= cursor.value.bytes;
+          if (!cursor.value.priority) budget.normalBytes -= cursor.value.bytes;
+          cursor.delete();
+        });
+        await walk(days.openCursor(), cursor => { if (cursor.value.day < earliest) cursor.delete(); });
+        await walk(tx.objectStore('meta').openCursor(), cursor => {
+          if (cursor.value.day && /^(migration|receipt):/.test(cursor.value.key) && cursor.value.day < earliest) cursor.delete();
+        });
+        budget.day = logDay();
+      }
+      const dropped = new Map();
+      for (const priority of [0, 1]) {
+        if (budget.bytes <= LOG_BUDGET && budget.normalBytes <= LOG_BUDGET * 0.8) break;
+        await walk(events.index('priorityAt').openCursor(IDBKeyRange.bound([priority, 0], [priority, Number.MAX_VALUE])), cursor => {
+          if (budget.bytes <= LOG_BUDGET && budget.normalBytes <= LOG_BUDGET * 0.8) return false;
+          const event = cursor.value;
+          budget.bytes -= event.bytes;
+          if (!priority) budget.normalBytes -= event.bytes;
+          dropped.set(event.bucket, (dropped.get(event.bucket) || 0) + 1);
+          cursor.delete();
+        });
+      }
+      for (const [key, count] of dropped) {
+        const day = await idbResult(days.get(key));
+        if (day) { day.dropped += count; days.put(day); }
+      }
+      budget.bytes = Math.max(0, budget.bytes);
+      budget.normalBytes = Math.max(0, budget.normalBytes);
+      tx.objectStore('meta').put(budget);
+    }
+    async function migrate(db) {
+      const earliest = logDay(Date.now() - (LOG_DAYS - 1) * 86400000);
+      const keys = Object.keys(localStorage).filter(key => /^arkengine:auto-log:v1:(cultivate|expedition):\d{4}-\d{2}-\d{2}$/.test(key));
+      for (const key of keys) {
+        const day = key.slice(-10);
+        if (day < earliest) { localStorage.removeItem(key); continue; }
+        const raw = localStorage.getItem(key);
+        let old;
+        try {
+          old = JSON.parse(raw);
+          if (!objectState(old) || !Array.isArray(old.events)) throw new Error('InvalidLegacyLog');
+        } catch { warnings.add(`旧日志不可读，原文保留：${key}`); continue; }
+        const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw)))].map(b => b.toString(16).padStart(2, '0')).join('');
+        const group = key.split(':')[3];
+        const migrated = await logTransaction(db, stores, 'readwrite', async tx => {
+          const meta = tx.objectStore('meta');
+          const marker = await idbResult(meta.get(`migration:${key}`));
+          if (marker) return marker.digest === digest;
+          const days = tx.objectStore('days');
+          const entry = await idbResult(days.get(`${group}:${day}`)) || blank(group, day);
+          const budget = await idbResult(meta.get('budget')) || emptyBudget();
+          for (const field of ['counts', 'totals']) {
+            for (const [name, value] of Object.entries(old[field] || {})) {
+              if (Number.isFinite(value)) entry[field][name] = (entry[field][name] || 0) + value;
+            }
+          }
+          entry.dropped += Number.isSafeInteger(old.dropped) && old.dropped > 0 ? old.dropped : 0;
+          for (const event of old.events) {
+            if (!objectState(event)) { entry.dropped++; continue; }
+            const item = { ...event, at: Number.isFinite(event.at) ? event.at : Date.parse(`${day}T00:00:00+08:00`),
+              bucket: entry.key, day, priority: normalLog(event) ? 0 : 1 };
+            delete item.id;
+            item.bytes = logBytes(item);
+            tx.objectStore('events').add(item);
+            budget.bytes += item.bytes;
+            if (!item.priority) budget.normalBytes += item.bytes;
+            entry.firstAt = entry.firstAt === null ? item.at : Math.min(entry.firstAt, item.at);
+            entry.lastAt = Math.max(entry.lastAt || 0, item.at);
+          }
+          days.put(entry);
+          meta.put({ key: `migration:${key}`, digest, day });
+          await maintain(tx, budget);
+          return true;
+        });
+        // 必须等待事务提交，且旧版没有继续写此键，才可移除已迁移副本。
+        if (migrated && localStorage.getItem(key) === raw) localStorage.removeItem(key);
+        else warnings.add(`旧版日志仍有变化，原文保留：${key}`);
+      }
+    }
+    let migrated = false;
+    const ready = async db => { if (!migrated) { await migrate(db); migrated = true; } };
+    return {
+      append(event, reward, sampled) {
+        return enqueue(async db => {
+          await ready(db);
+          return logTransaction(db, stores, 'readwrite', async tx => {
+            const day = logDay(event.at);
+            const key = `${event.group}:${day}`;
+            const days = tx.objectStore('days');
+            const entry = await idbResult(days.get(key)) || blank(event.group, day);
+            const meta = tx.objectStore('meta');
+            if (event.receiptId && await idbResult(meta.get(`receipt:${event.receiptId}`))) return entry;
+            entry.counts[event.type] = (entry.counts[event.type] || 0) + 1;
+            for (const [name, value] of Object.entries(reward || {})) {
+              if (Number.isFinite(value)) entry.totals[name] = (entry.totals[name] || 0) + value;
+            }
+            entry.firstAt = entry.firstAt === null ? event.at : Math.min(entry.firstAt, event.at);
+            entry.lastAt = Math.max(entry.lastAt || 0, event.at);
+            const budget = await idbResult(tx.objectStore('meta').get('budget')) || emptyBudget();
+            if (sampled) entry.sampled++;
+            else {
+              const item = { ...event, bucket: key, day, priority: normalLog(event) ? 0 : 1 };
+              item.bytes = logBytes(item);
+              tx.objectStore('events').add(item);
+              budget.bytes += item.bytes;
+              if (!item.priority) budget.normalBytes += item.bytes;
+            }
+            days.put(entry);
+            if (event.receiptId) meta.put({ key: `receipt:${event.receiptId}`, day });
+            await maintain(tx, budget);
+            return idbResult(days.get(key));
+          });
+        });
+      },
+      read(group, day = logDay(), limit = 30) {
+        return enqueue(async db => {
+          await ready(db);
+          return logTransaction(db, ['days', 'events'], 'readonly', async tx => {
+            const key = `${group}:${day}`;
+            const entry = await idbResult(tx.objectStore('days').get(key));
+            if (!entry) return null;
+            const events = [];
+            await walk(tx.objectStore('events').index('bucket').openCursor(key, 'prev'), cursor => {
+              events.push(cursor.value); return events.length < limit;
+            });
+            return { ...entry, events: events.reverse() };
+          });
+        });
+      },
+      export() {
+        return enqueue(async db => {
+          await ready(db);
+          return logTransaction(db, stores, 'readwrite', async tx => {
+            const budget = await idbResult(tx.objectStore('meta').get('budget')) || emptyBudget();
+            await maintain(tx, budget);
+            const days = await idbResult(tx.objectStore('days').getAll());
+            for (const day of days) {
+              day.events = await idbResult(tx.objectStore('events').index('bucket').getAll(day.key));
+              day.events.sort((a, b) => a.at - b.at || a.id - b.id);
+              for (const event of day.events) { delete event.id; delete event.bytes; delete event.bucket; delete event.priority; }
+              delete day.key;
+            }
+            return { days, retentionDays: LOG_DAYS, budgetBytes: LOG_BUDGET, estimatedEventBytes: budget.bytes,
+              byteAccounting: '事件序列化 UTF-8 估算；索引、数据库元数据和每日汇总不计入', warnings: [...warnings] };
+          });
+        });
+      },
+    };
+  }
+  const logStore = createLogStore();
+
   function createLog(group) {
     const pageId = crypto.randomUUID();
     const heartbeatKey = `${LOG_PREFIX}${group}:heartbeat`;
     const receiptKey = `${LOG_PREFIX}${group}:receipt`;
     let checkpoint = null;
     let pending = null;
+    let receiptWriting = false;
+    let receiptWriteFailed = false;
     let lastTick = 0;
     let lastWrite = 0;
     let lastState = '';
@@ -133,49 +489,81 @@
       pending = JSON.parse(sessionStorage.getItem(receiptKey) || 'null');
       lastSample = checkpoint?.sampleAt || 0;
     } catch { storageFailed = true; }
-    function prune() {
-      const earliest = logDay(Date.now() - 86400000);
-      for (const key of Object.keys(localStorage)) {
-        const suffix = key.startsWith(LOG_PREFIX) && key.split(':').at(-1);
-        if (/^\d{4}-\d{2}-\d{2}$/.test(suffix) && suffix < earliest) localStorage.removeItem(key);
+    let cached = { day: logDay(), totals: {}, events: [] };
+    let failedWrites = 0;
+    const samples = new Map();
+    const outboxKey = `${LOG_PREFIX}${group}:outbox`;
+    let outbox = [];
+    let outboxWritable = true;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(outboxKey) || '[]');
+      if (!Array.isArray(saved) || saved.some(e => !objectState(e) || e.group !== group ||
+          !Number.isFinite(e.at) || typeof e.receiptId !== 'string' || !objectState(e.data))) throw new Error('InvalidOutbox');
+      outbox = saved.filter(e => logDay(e.at) >= logDay(Date.now() - 6 * 86400000));
+    } catch { storageFailed = true; outboxWritable = false; }
+    function saveOutbox() {
+      if (!outboxWritable) { failed(); return; }
+      try { sessionStorage.setItem(outboxKey, JSON.stringify(outbox)); }
+      catch { failed(); }
+    }
+    function committed(event, value) {
+      if (event.receiptId && outbox.some(e => e.receiptId === event.receiptId)) {
+        outbox = outbox.filter(e => e.receiptId !== event.receiptId); saveOutbox();
       }
+      if (value?.day === logDay()) cached = { ...value, events: cached.events };
+      render();
+      return true;
     }
-    function bucket() {
-      return JSON.parse(localStorage.getItem(`${LOG_PREFIX}${group}:${logDay()}`) || 'null') ||
-        { day: logDay(), group, totals: {}, counts: {}, dropped: 0, events: [] };
-    }
+    // 小型本地交付队列只保存收益事件；刷新后由随机回执ID去重，不保存游戏请求密钥。
+    for (const event of outbox) logStore.append(event, event.data.reward, false)
+      .then(value => committed(event, value)).catch(failed);
+    function failed() { storageFailed = true; failedWrites++; render(); }
     function render() {
       if (!hint) return;
-      try {
-        const b = bucket();
-        hint.textContent = storageFailed ? '日志存储失败，请检查站点存储空间；自动操作仍继续。' :
-          `本组今日确认收入：代币 ${b.totals['代币'] || 0} · 修为 ${b.totals['修为'] || 0} · 钻石 ${b.totals['钻石'] || 0}（毛收入，不含未完成秘境）`;
-      } catch { hint.textContent = '日志暂不可读，自动操作仍继续。'; }
+      const totals = cached.day === logDay() ? cached.totals : {};
+      const message = storageFailed ? '日志存储失败；部分事件未保存，自动操作仍继续。请检查站点空间后重新导出。' :
+        `本组今日确认收入：代币 ${totals['代币'] || 0} · 修为 ${totals['修为'] || 0} · 钻石 ${totals['钻石'] || 0}（毛收入，不含未完成秘境）`;
+      if (hint.textContent !== message) hint.textContent = message;
     }
-    function add(type, detail = '', data = {}, sum = false) {
-      try {
-        prune();
-        const b = bucket();
-        const now = Date.now();
-        b.events.push({ at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
-          page: diagnosticPage(), pageId, version: '1.6.7', visibility: document.visibilityState,
-          type, detail: String(detail).slice(0, 300), data });
-        b.counts[type] = (b.counts[type] || 0) + 1;
-        if (sum) for (const [key, value] of Object.entries(data.reward || {})) b.totals[key] = (b.totals[key] || 0) + value;
-        if (b.events.length > 1200) { b.dropped += b.events.length - 1200; b.events = b.events.slice(-1200); }
-        localStorage.setItem(`${LOG_PREFIX}${group}:${b.day}`, JSON.stringify(b));
-      } catch { storageFailed = true; }
-      render();
+    function refreshLog() {
+      return logStore.read(group).then(value => {
+        cached = value || { day: logDay(), totals: {}, events: [] }; render(); return cached;
+      }).catch(failed);
+    }
+    function add(type, detail = '', data = {}, sum = false, receiptId) {
+      const now = Date.now();
+      if (sum) receiptId ||= crypto.randomUUID();
+      const event = { at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
+        group, page: diagnosticPage(), pageId, version: SCRIPT_VERSION, visibility: document.visibilityState,
+        type, detail: String(detail).slice(0, 300), data, ...(receiptId ? { receiptId } : {}) };
+      let sampled = false;
+      if (normalLog(event)) {
+        const key = type === 'request-result' ? `${type}:${data.path}:${data.method}:${data.status}` :
+          `${type}:${event.detail.replace(/\d+(?:\.\d+)?/g, '#')}`;
+        const previous = samples.get(key);
+        sampled = previous !== undefined && now >= previous && now - previous < 30000;
+        if (!sampled) samples.set(key, now);
+        if (samples.size > 256) samples.delete(samples.keys().next().value);
+      }
+      // 结构化诊断限定体积；不让单条异常耗尽日志配额。
+      if (logBytes(data) > 32768) event.data = { truncated: true };
+      if (sum && !outbox.some(e => e.receiptId === receiptId)) {
+        if (outbox.length < 50) { outbox.push(event); saveOutbox(); }
+        else failed();
+      }
+      return logStore.append(event, sum ? data.reward : null, sampled)
+        .then(value => committed(event, value)).catch(() => { failed(); return false; });
     }
     function saveReceipt(value) {
       pending = value;
       try { sessionStorage.setItem(receiptKey, JSON.stringify(value)); } catch { storageFailed = true; }
     }
     function expect(kind) {
-      saveReceipt({ kind, at: Date.now(), before: receiptTexts(), changed: false });
+      receiptWriteFailed = false;
+      saveReceipt({ kind, at: Date.now(), before: receiptTexts(), changed: false, receiptId: crypto.randomUUID() });
     }
     function receipts() {
-      if (!pending) return;
+      if (!pending || receiptWriting || receiptWriteFailed) return;
       const texts = receiptTexts();
       const matches = texts.filter(s => RECEIPTS[pending.kind]?.test(s));
       if (!pending.changed && !matches.some(s => pending.before.includes(s))) saveReceipt({ ...pending, changed: true });
@@ -184,8 +572,15 @@
       const kind = pending.kind === 'expedition' ? 'expedition-reward' : pending.kind === 'farm-sale' ? 'farm-sale-reward' :
         receipt.startsWith('奇遇') ? 'encounter-reward' : receipt.startsWith('秘境探索完成') ? 'dungeon-reward' : 'dungeon-node-reward';
       // 秘境只把最终累计收入加入总额，节点回执仅供排障，不重复累加。
-      add(kind, receipt, { reward: receiptReward(receipt) }, kind !== 'dungeon-node-reward');
-      saveReceipt(null);
+      if (!pending.receiptId) saveReceipt({ ...pending, receiptId: crypto.randomUUID() });
+      const original = pending;
+      receiptWriting = true;
+      add(kind, receipt, { reward: receiptReward(receipt) }, kind !== 'dungeon-node-reward', original.receiptId).then(saved => {
+        receiptWriting = false;
+        if (pending !== original) return;
+        if (saved) saveReceipt(null);
+        else receiptWriteFailed = true; // 原记录保留，刷新后可重核；不在满空间时反复写。
+      });
     }
     function pulse(state, diagnostic = {}) {
       const now = Date.now();
@@ -205,16 +600,17 @@
         add('heartbeat', state, diagnostic);
       }
       if (now - lastWrite >= 60000) {
-        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.7', active: true,
+        checkpoint = { at: now, sampleAt: lastSample, pageId, version: SCRIPT_VERSION, active: true,
           state: String(state).slice(0, 180), page: diagnosticPage(), visibility: document.visibilityState, diagnostic };
-        try { prune(); localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
+        try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
         lastWrite = now;
         render();
       }
     }
     function stop(reason) {
-      add('pause', reason);
-      checkpoint = { at: Date.now(), pageId, version: '1.6.7', active: false, state: reason };
+      add('pause', reason, { reason: /账号|登录|权限|限流/.test(reason) ? 'account' : /手动|人工/.test(reason) ? 'manual' :
+        /保存记录/.test(reason) ? 'invalid-state' : /原.*结果|恢复上限/.test(reason) ? 'pending-result' : 'page-or-runtime' });
+      checkpoint = { at: Date.now(), pageId, version: SCRIPT_VERSION, active: false, state: reason };
       lastTick = 0;
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
     }
@@ -238,27 +634,36 @@
       const box = shadow.querySelector('.box');
       hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'log-summary'; box.append(hint);
       const details = document.createElement('details');
-      details.innerHTML = '<summary style="cursor:pointer">本地日志（今天＋昨天）</summary><p class="hint">仅统计观察到的到账回执；农场估值不计作收入。详细事件每组每天保留最近 1200 条，汇总不受截断影响。</p><button type="button">导出两页日志</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
-      details.addEventListener('toggle', () => {
+      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">北京时间今天及前 6 天；两组共用约 20 MiB 事件预算。重复普通状态会合并；关键故障、结果与收益汇总优先保留。导出包含采样、截断和覆盖时间。</p><button type="button">导出两页日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
+      details.addEventListener('toggle', async () => {
         if (!details.open) return;
-        try { details.querySelector('pre').textContent = bucket().events.slice(-30).map(e => `${e.beijing.slice(11,19)} ${e.type} ${e.detail}`).join('\n') || '今天暂无记录'; }
-        catch { details.querySelector('pre').textContent = '日志不可读'; }
+        const value = await refreshLog();
+        details.querySelector('pre').textContent = value ? value.events.map(e =>
+          `${e.beijing?.slice(11,19) || ''} ${e.type || ''} ${e.detail || ''}`).join('\n') || '今天暂无记录' : '日志不可读';
       });
-      details.querySelector('button').onclick = () => {
+      details.querySelector('button').onclick = async event => {
+        const button = event.currentTarget;
+        button.disabled = true;
         try {
-          prune();
-          const days = Object.keys(localStorage).filter(k => k.startsWith(LOG_PREFIX) && /:\d{4}-\d{2}-\d{2}$/.test(k))
-            .sort().map(k => JSON.parse(localStorage.getItem(k)));
+          const result = await logStore.export();
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.7', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const failures = Object.fromEntries(Object.entries(diagnosticLogs).map(([name, logger]) => [name, logger.failedWrites()]));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: SCRIPT_VERSION, exportedAt: new Date().toISOString(),
+            ...result, heartbeats, storageFailuresInThisPage: failures }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
-        } catch { storageFailed = true; render(); }
+        } catch { failed(); }
+        finally { button.disabled = false; }
       };
-      box.append(details); render();
+      box.append(details); render(); refreshLog();
+      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm'];
+      for (const [key, scope] of stateFaults) if (scopes.includes(scope)) {
+        add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
+      }
     }
-    const log = { add, pulse, stop, expect, receipts, mount, observeLifecycle };
+    const log = { add, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites };
+
     diagnosticLogs[group] = log;
     return log;
   }
@@ -353,7 +758,9 @@
   function createRecovery(group, log, say) {
     const key = `arkengine:auto-recovery:${group}:v1`;
     // 原请求标识仅保存在本地，不写入可导出的日志。刷新不重置预算。
-    let states = JSON.parse(sessionStorage.getItem(key) || '{}');
+    let states = loadState(sessionStorage, key, {}, group, value => objectState(value) &&
+      Object.values(value).every(s => objectState(s) && typeof s.identity === 'string' &&
+        Number.isInteger(s.attempts) && s.attempts >= 0 && Number.isFinite(s.nextAt)));
     const save = () => sessionStorage.setItem(key, JSON.stringify(states));
     return {
       ready(scope, identity, startedAt, pause, label, limit = 3) {
@@ -397,7 +804,8 @@
   const LOCK = 'arkengine:auto-encounter:tab:v1';
   const RETRY_MS = 30000;
   const ENCOUNTER_ACTION = 'arkengine:auto-encounter:action:v1';
-  let encounterAction = JSON.parse(sessionStorage.getItem(ENCOUNTER_ACTION) || 'null');
+  let encounterAction = loadState(sessionStorage, ENCOUNTER_ACTION, null, 'cultivate', value =>
+    timedState(value) && ['seek', 'choose'].includes(value.kind) && typeof value.signature === 'string');
   function saveEncounterAction(value) {
     sessionStorage.setItem(ENCOUNTER_ACTION, JSON.stringify(value));
     encounterAction = value;
@@ -422,8 +830,11 @@
   let fogPageAt = 0;
   try {
     fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
-    fog = JSON.parse(localStorage.getItem(FOG_STATE) || 'null') || fog;
-    fogPlan = JSON.parse(sessionStorage.getItem(FOG_JOURNAL) || 'null');
+    fog = loadState(localStorage, FOG_STATE, fog, 'fog', v => objectState(v) && Number.isFinite(v.nextAt));
+    fogPlan = loadState(sessionStorage, FOG_JOURNAL, null, 'fog', v => planState(v) && objectState(v.settings) &&
+      ['east', 'south', 'explore'].includes(v.settings.route) && ['guard-heavy', 'strike'].includes(v.settings.strategy) &&
+      Number.isInteger(v.settings.retreatHp) && v.settings.retreatHp >= 0 && v.settings.retreatHp <= 90);
+    if (stateFault('fog')) fogEnabled = false;
   } catch { fogEnabled = false; }
   const DUNGEON_PREF = 'arkengine:auto-dungeon:enabled:v1';
   const DUNGEON_STATE = 'arkengine:auto-dungeon:state:v1';
@@ -436,10 +847,13 @@
   let dungeonPlan = null;
   try {
     dungeonEnabled = localStorage.getItem(DUNGEON_PREF) !== 'false';
-    dungeon = JSON.parse(localStorage.getItem(DUNGEON_STATE) || 'null') || dungeon;
-    dungeonPlan = JSON.parse(sessionStorage.getItem(DUNGEON_JOURNAL) || 'null');
+    dungeon = loadState(localStorage, DUNGEON_STATE, dungeon, 'dungeon', v => objectState(v) && Number.isFinite(v.nextAt));
+    dungeonPlan = loadState(sessionStorage, DUNGEON_JOURNAL, null, 'dungeon', v => planState(v) &&
+      (v.phase === 'opening' ? typeof v.description === 'string' : v.action === 'enter' ||
+        v.action === 'choose' && Number.isInteger(v.step) && v.step >= 1 && v.step <= 8));
+    if (stateFault('dungeon')) dungeonEnabled = false;
     // 旧标记采用零点划日，不能直接当作新的次数周期；只重新核对额度。
-    if (dungeon.quotaResetHour !== 4) {
+    if (!stateFault('dungeon') && dungeon.quotaResetHour !== 4) {
       dungeon = { ...dungeon, exhaustedDay: '', quotaResetHour: 4 };
       localStorage.setItem(DUNGEON_STATE, JSON.stringify(dungeon));
     }
@@ -459,11 +873,11 @@
   let pendingClick = null;
   let clickConsidered = false;
   let scheduled = false;
-  let worker = null;
-  let timer = null;
   let statusText = '';
   const log = createLog('cultivate');
   const recoveryBudget = createRecovery('cultivate', log, say);
+  const pageWait = createPageWait('cultivate', log);
+  const locator = createLocator();
   accountListeners.push(reason => setEnabled(false, reason));
 
   const host = document.createElement('aside');
@@ -507,6 +921,7 @@
   const fogToggle = shadow.getElementById('fog-toggle');
   log.mount(shadow);
   fogToggle.addEventListener('click', () => {
+    if (stateFault('fog')) { say(stateFault('fog')); return; }
     fogEnabled = !fogEnabled;
     localStorage.setItem(FOG_PREF, String(fogEnabled));
     if (fogEnabled) {
@@ -516,22 +931,23 @@
     cancelPendingClick(); schedule();
   });
   function updateFogHint() {
-    const hint = !fogEnabled ? '迷雾已暂停' : dungeonPlan ? '迷雾：等待秘境原操作确认' :
+    const hint = stateFault('fog') || (!fogEnabled ? '迷雾已暂停' : dungeonPlan ? '迷雾：等待秘境原操作确认' :
       dungeon.run ? '迷雾：等待本轮秘境结束' : fog.nextAt > Date.now() ?
       `迷雾：约 ${Math.ceil((fog.nextAt - Date.now()) / 60000)} 分钟后再核对` :
-      fog.draining || fogPlan ? '迷雾：本轮探索到灵力不足 20' : '迷雾：主殿灵力达到 200 后进入';
+      fog.draining || fogPlan ? '迷雾：本轮探索到灵力不足 20' : '迷雾：主殿灵力达到 200 后进入');
     if (fogStatus.textContent !== hint) fogStatus.textContent = hint;
     fogToggle.textContent = fogEnabled ? '暂停迷雾' : '开启迷雾';
   }
   function updateDungeonHint() {
-    const hint = !dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
+    const hint = stateFault('dungeon') || (!dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
       dungeon.exhaustedDay === dungeonDay() ? '秘境：次数已用完，北京时间 4 点后再检查' :
       dungeon.nextAt > Date.now() ? `秘境：约 ${Math.ceil((dungeon.nextAt - Date.now()) / 60000)} 分钟后检查` :
-      '秘境：准备探索坠星古墓';
+      '秘境：准备探索坠星古墓');
     if (dungeonStatus.textContent !== hint) dungeonStatus.textContent = hint;
     dungeonToggle.textContent = dungeonEnabled ? '暂停秘境' : '开启秘境';
   }
   dungeonToggle.addEventListener('click', () => {
+    if (stateFault('dungeon')) { say(stateFault('dungeon')); return; }
     dungeonEntryReview = null;
     dungeonEnabled = !dungeonEnabled;
     localStorage.setItem(DUNGEON_PREF, String(dungeonEnabled));
@@ -553,11 +969,12 @@
   }
 
   function setEnabled(value, reason = '') {
+    if (value && stateFault('cultivate')) { say(stateFault('cultivate')); return; }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 不阻断暂停 */ }
     toggle.textContent = value ? '暂停修仙自动操作' : '开始修仙自动操作';
     if (!value) {
-      if (active) log.stop(reason || '已暂停');
+      if (active) log.stop(reason || '人工暂停');
       cancelPendingClick();
       releaseLock?.();
       say(reason || '已暂停');
@@ -565,6 +982,7 @@
     schedule();
   }
   toggle.addEventListener('click', () => {
+    if (stateFault('cultivate')) { say(stateFault('cultivate')); return; }
     if (!enabled) { clearAccountStop(); recoveryBudget.clear(); }
     setEnabled(!enabled);
   });
@@ -579,7 +997,7 @@
     return visible(el) && !el.matches(':disabled, [aria-disabled="true"]');
   }
   function findButton(label) {
-    return [...document.querySelectorAll('button')].find(el => textOf(el) === label && visible(el));
+    return locator.pick([...document.querySelectorAll('button')].filter(el => textOf(el) === label && visible(el)));
   }
 
   function amount(reward, label) {
@@ -680,7 +1098,7 @@
       reason => setEnabled(false, reason), '奇遇结果')) return false;
     // 超时先通过页面已有刷新按钮同步状态，再决定是否重试原操作。
     if (!encounterAction.refreshed) {
-      const refresh = document.querySelector('button[aria-label="刷新修炼状态"]');
+      const refresh = locator.query('button[aria-label="刷新修炼状态"]');
       if (!usable(refresh)) { say('等待游戏允许刷新状态'); return false; }
       recoveryBudget.attempted('encounter');
       saveEncounterAction({ ...encounterAction, refreshed: true });
@@ -695,9 +1113,11 @@
 
   function tick() {
     clickConsidered = false;
+    pageWait.begin();
     try { checkPage(); } finally {
       // 暂停、切页、处理中、重新冷却或选项失效时撤销待执行点击。
       if (!clickConsidered) cancelPendingClick();
+      if (enabled && active && onPage()) pageWait.finish();
     }
   }
 
@@ -711,6 +1131,12 @@
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
       return;
     }
+    if (stateFault('cultivate')) {
+      if (enabled) setEnabled(false, stateFault('cultivate')); else say(stateFault('cultivate'));
+      return;
+    }
+    if (inDungeon() && stateFault('dungeon')) { say(stateFault('dungeon')); return; }
+    if (inFog() && stateFault('fog')) { say(stateFault('fog')); return; }
     if (!onPage() || !enabled) {
       releaseLock?.();
       if (!enabled && !statusText) say('已暂停');
@@ -744,8 +1170,12 @@
       return;
     }
     if (Date.now() < nextActionAt) return;
-    const refresh = document.querySelector('button[aria-label="刷新修炼状态"]');
-    if (refresh && !usable(refresh)) { say('等待修炼状态刷新完成'); return; }
+    const refresh = locator.query('button[aria-label="刷新修炼状态"]');
+    if (!refresh || !usable(refresh)) {
+      pageWait.wait('等待修炼状态刷新完成', !encounterAction && !pendingOperation(), say,
+        reason => setEnabled(false, reason));
+      return;
+    }
 
     const recovery = findButton('确认原修炼结果');
     if (recovery) {
@@ -762,7 +1192,7 @@
       return;
     }
 
-    const panel = document.getElementById('cultivation-encounter');
+    const panel = locator.query('[id="cultivation-encounter"]');
     if (visible(panel)) {
       const result = choose(panel);
       if (result.error) { say(result.error); return; }
@@ -790,7 +1220,10 @@
       return;
     }
     const seek = findButton('寻找奇遇');
-    if (!seek) { say('等待修仙主殿加载，请保持登录'); return; }
+    if (!seek) {
+      pageWait.wait('等待修仙主殿加载，请保持登录', !encounterAction && !pendingOperation(), say,
+        reason => setEnabled(false, reason)); return;
+    }
     if (!usable(seek)) { say('等待游戏允许寻访奇遇'); return; }
     if (!retryReady('seek', 'seek')) return;
     recordClick(seek, 'seek', 'seek', '正在寻找奇遇');
@@ -814,9 +1247,9 @@
       .map(key => ({ key, value: JSON.parse(sessionStorage.getItem(key)) })).filter(r => r.value);
   }
   function fogSettings() {
-    const route = document.querySelector('select[aria-label="探索路线"]')?.value;
-    const strategy = document.querySelector('select[aria-label="战斗策略"]')?.value;
-    const rawHp = document.querySelector('input[aria-label="生命撤离线"]')?.value;
+    const route = locator.query('select[aria-label="探索路线"]')?.value;
+    const strategy = locator.query('select[aria-label="战斗策略"]')?.value;
+    const rawHp = locator.query('input[aria-label="生命撤离线"]')?.value;
     const retreatHp = Number(rawHp);
     return ['east', 'south', 'explore'].includes(route) && ['guard-heavy', 'strike'].includes(strategy) &&
       rawHp !== undefined && rawHp !== '' && Number.isInteger(retreatHp) && retreatHp >= 0 && retreatHp <= 90
@@ -1012,7 +1445,7 @@
         /正在处理秘境操作|正在读取原请求/.test(textOf(n)))) return null;
     if ([...document.querySelectorAll('section p')].filter(visible).some(p =>
         /^探索中\s*·|^第\s*\d+\s*\/\s*\d+\s*节/.test(textOf(p))) || findButton('撤退并保留已到账收获')) return null;
-    const refresh = document.querySelector('button[aria-label="刷新秘境状态"]');
+    const refresh = locator.query('button[aria-label="刷新秘境状态"]');
     const card = [...document.querySelectorAll('h2')].find(h => visible(h) && textOf(h) === DUNGEON_NAME)?.closest('.game-card');
     const entry = card && [...card.querySelectorAll('button')].find(b => visible(b) &&
       /^(进入秘境|今日次数已用完|秘境冷却中)$/.test(textOf(b)));
@@ -1027,7 +1460,7 @@
     const review = dungeonEntryReview;
     if (!review) return;
     if (!inDungeon() || review.plan !== JSON.stringify(dungeonPlan)) { dungeonEntryReview = null; return; }
-    const refresh = document.querySelector('button[aria-label="刷新秘境状态"]');
+    const refresh = locator.query('button[aria-label="刷新秘境状态"]');
     if (review.completedAt) {
       if (!dungeonEntryIdleState()) dungeonEntryReview = null;
       return;
@@ -1113,8 +1546,8 @@
     returnToHall();
   }
   function recentDungeonResult() {
-    return [...document.querySelectorAll('section')].find(section =>
-      [...section.querySelectorAll('h2')].some(h => textOf(h) === `最近一次探索 · ${DUNGEON_NAME}`));
+    return locator.pick([...document.querySelectorAll('section')].filter(section =>
+      [...section.querySelectorAll('h2')].some(h => textOf(h) === `最近一次探索 · ${DUNGEON_NAME}`)));
   }
   function dungeonChoices(section) {
     const buttons = [...section.querySelectorAll('button')].filter(usable);
@@ -1136,7 +1569,7 @@
     return { best: options[0] };
   }
   function dungeonQuota() {
-    const quotaText = [...document.querySelectorAll('[aria-live="polite"]')].map(textOf)
+    const quotaText = locator.all(document.querySelectorAll('[aria-live="polite"]')).map(textOf)
       .find(text => /^今日剩余\s*\d+\s*\/\s*\d+\s*次/.test(text));
     const quota = quotaText?.match(/^今日剩余\s*(\d+)\s*\/\s*(\d+)\s*次/);
     return quota && Number(quota[1]) <= Number(quota[2]) ? { remaining: +quota[1], limit: +quota[2] } : null;
@@ -1210,10 +1643,13 @@
       return;
     }
     if (findButton('确认上次秘境操作')) { say('秘境原请求记录无法核对，请手动处理'); return; }
-    const refresh = document.querySelector('button[aria-label="刷新秘境状态"]');
-    if (!usable(refresh)) { say('等待秘境状态加载完成'); return; }
-    const section = [...document.querySelectorAll('section')].find(s =>
-      [...s.querySelectorAll('p')].some(p => /^探索中 · /.test(textOf(p))));
+    const refresh = locator.query('button[aria-label="刷新秘境状态"]');
+    if (!usable(refresh)) {
+      pageWait.wait('等待秘境状态加载完成', !dungeonPlan && !records.length, say,
+        reason => deferDungeon(reason, null, false, true)); return;
+    }
+    const section = locator.pick([...document.querySelectorAll('section')].filter(s =>
+      [...s.querySelectorAll('p')].some(p => /^探索中 · /.test(textOf(p)))));
     if (section) {
       const name = [...section.querySelectorAll('p')].find(p => /^探索中 · /.test(textOf(p)));
       if (textOf(name) !== `探索中 · ${DUNGEON_NAME}`) { say('当前不是坠星古墓，请手动完成或返回'); return; }
@@ -1295,7 +1731,10 @@
     }
     dungeonPageDay ||= dungeonDay();
     const quota = dungeonQuota();
-    if (!quota) { say('等待网页提供今日秘境次数'); return; }
+    if (!quota) {
+      pageWait.wait('等待网页提供今日秘境次数', !dungeonPlan, say,
+        reason => deferDungeon(reason, null, false, true)); return;
+    }
     if (quota.remaining === 0) {
       if (dungeon.exhaustedDay !== dungeonDay()) saveDungeon({ ...dungeon, exhaustedDay: dungeonDay() });
       returningFromDungeon = true;
@@ -1303,7 +1742,7 @@
     if (returningFromDungeon || dungeon.nextAt > Date.now() || dungeon.exhaustedDay === dungeonDay()) {
       returnToHall(); return;
     }
-    const heading = [...document.querySelectorAll('h2')].find(h => textOf(h) === DUNGEON_NAME);
+    const heading = locator.pick([...document.querySelectorAll('h2')].filter(h => textOf(h) === DUNGEON_NAME));
     const card = heading?.closest('.game-card');
     if (!card) { deferDungeon('当前未找到坠星古墓入口'); return; }
     const cooldown = [...card.querySelectorAll('button')].find(b => textOf(b) === '秘境冷却中');
@@ -1356,42 +1795,17 @@
     queueMicrotask(() => {
       scheduled = false;
       try { observeSessionPage(); tick(); } catch (error) {
-        console.error('[自动奇遇] 本次检查失败', error);
+        log.add('runtime-error', '修仙检查异常，已暂停并保留原记录', { name: error?.name || 'Error', stage: 'cultivate-check' });
         setEnabled(false, '脚本检查失败，已暂停；请刷新后重试');
       }
     });
   }
 
-  // Worker 提供后台心跳，MutationObserver 在游戏更新按钮/选项时立即唤醒。
-  // 浏览器冻结、丢弃标签页或系统休眠时，两者都不能保证继续运行。
-  function startTimer() {
-    const fallback = () => {
-      worker?.terminate();
-      worker = null;
-      if (!timer) timer = setInterval(schedule, 2000);
-    };
-    try {
-      const url = URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 2000);'],
-        { type: 'text/javascript' }));
-      try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
-      worker.onmessage = schedule;
-      worker.onerror = fallback;
-    } catch { fallback(); }
-  }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: statusText,
     pendingEncounter: Boolean(encounterAction), pendingDungeon: Boolean(dungeonPlan), pendingFog: Boolean(fogPlan) } : null);
-  const observer = new MutationObserver(() => {
+  subscribeWakeup(schedule, onPage, () => enabled, () => {
     try { observeDungeonEntryReview(); } catch { dungeonEntryReview = null; }
-    schedule();
   });
-  observer.observe(document.body, { childList: true, subtree: true, characterData: true,
-    attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'hidden', 'class'] });
-  window.addEventListener('pageshow', schedule);
-  window.addEventListener('focus', schedule);
-  window.addEventListener('popstate', schedule);
-  window.addEventListener('online', schedule);
-  document.addEventListener('visibilitychange', schedule);
-  document.addEventListener('resume', schedule);
   window.addEventListener('pagehide', () => { cancelPendingClick(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
@@ -1415,7 +1829,6 @@
       schedule();
     }
   });
-  startTimer();
   if (!enabled) say('已暂停');
   schedule();
 })();
@@ -1443,8 +1856,11 @@
   try {
     farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
     farmCrop = localStorage.getItem(FARM_CROP) || 'auto';
-    farmState = JSON.parse(localStorage.getItem(FARM_STATE) || 'null') || farmState;
-    farmPlan = JSON.parse(sessionStorage.getItem(FARM_JOURNAL) || 'null');
+    farmState = loadState(localStorage, FARM_STATE, farmState, 'farm', v => objectState(v) && Number.isFinite(v.nextAt));
+    farmPlan = loadState(sessionStorage, FARM_JOURNAL, null, 'farm', v => timedState(v) &&
+      ['plant', 'harvest'].includes(v.action) && Array.isArray(v.plots) && v.plots.every(p => Number.isInteger(p) && p > 0) &&
+      (v.action === 'harvest' ? v.plots.length > 0 : typeof v.crop === 'string' && Number.isInteger(v.empty) && v.empty > 0));
+    if (stateFault('farm')) farmEnabled = false;
   } catch { farmEnabled = false; }
   let ownSeedDialog = null;
   let openingSeedsAt = 0;
@@ -1453,6 +1869,19 @@
   let farmChangedAt = 0;
   let farmMarket = null;
   let farmMarketLoading = false;
+  let farmReadGeneration = 0;
+  let farmReadController = null;
+  let farmReadAttempts = 0;
+  let farmReadNextAt = 0;
+  function cancelFarmRead() {
+    farmReadGeneration++;
+    farmReadController?.abort();
+    farmReadController = null;
+    farmMarketLoading = false;
+    farmMarket = null;
+    farmReadAttempts = 0;
+    farmReadNextAt = 0;
+  }
   const textOf = el => (el?.textContent || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   const beijingTime = () => {
     const time = new Date(Date.now() + 8 * 3600000);
@@ -1463,7 +1892,8 @@
   let plan = null;
   try {
     enabled = localStorage.getItem(PREF) !== 'false';
-    plan = JSON.parse(sessionStorage.getItem(JOURNAL) || 'null');
+    plan = loadState(sessionStorage, JOURNAL, null, 'expedition', v => planState(v) && objectState(v.before) &&
+      typeof v.route === 'string' && Number.isInteger(v.total) && v.total > 0);
   } catch { /* 存储不可用时，实际派遣前会停止 */ }
   let active = false;
   let acquiring = false;
@@ -1473,7 +1903,8 @@
   let scheduled = false;
   let nextStepAt = 0;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
-  let claimWait = JSON.parse(sessionStorage.getItem(CLAIM_JOURNAL) || 'null');
+  let claimWait = loadState(sessionStorage, CLAIM_JOURNAL, null, 'expedition', v =>
+    timedState(v) && Number.isInteger(v.running) && v.running >= 0);
   function saveClaimWait(value) {
     const serialized = JSON.stringify(value);
     sessionStorage.setItem(CLAIM_JOURNAL, serialized);
@@ -1482,13 +1913,15 @@
   }
   let observedDay = beijingTime().day;
   const IDLE_JOURNAL = 'arkengine:auto-expedition:idle:v1';
-  let idleWait = JSON.parse(sessionStorage.getItem(IDLE_JOURNAL) || 'null');
+  let idleWait = loadState(sessionStorage, IDLE_JOURNAL, null, 'expedition', timedState);
   let idleChecked = false;
   let idleBlocked = false;
   let idleSignature = '';
   let diagnostic = {};
   const log = createLog('expedition');
   const recoveryBudget = createRecovery('expedition', log, message => say(message));
+  const farmWait = createPageWait('farm', log);
+  const locator = createLocator();
   accountListeners.push(reason => setEnabled(false, reason));
   const BURST_DAY = 'arkengine:auto-expedition:burst-day:v1';
   const QUOTA_REFRESH = 'arkengine:auto-expedition:quota-refresh:v2';
@@ -1560,14 +1993,17 @@
   farmSelect.value = farmCrop;
   if (!farmSelect.value) farmSelect.value = farmCrop = 'auto';
   farmSelect.addEventListener('change', () => {
+    if (stateFault('farm')) { say(stateFault('farm')); return; }
     farmCrop = farmSelect.value;
-    farmMarket = null;
+    cancelFarmRead();
     localStorage.setItem(FARM_CROP, farmCrop);
     saveFarmState({ ...farmState, nextAt: 0, selection: '', note: '作物已更改，下次种植生效' });
     cancelQueued(); schedule();
   });
   farmToggle.addEventListener('click', () => {
+    if (stateFault('farm')) { say(stateFault('farm')); return; }
     farmEnabled = !farmEnabled;
+    cancelFarmRead();
     localStorage.setItem(FARM_PREF, String(farmEnabled));
     if (farmEnabled) {
       recoveryBudget.clear('farm-ready');
@@ -1575,6 +2011,7 @@
     cancelQueued(); schedule();
   });
   shadow.getElementById('farm-check').addEventListener('click', () => {
+    if (stateFault('farm')) { say(stateFault('farm')); return; }
     saveFarmState({ ...farmState, nextAt: 0, note: '等待检查农场' });
     schedule();
   });
@@ -1618,6 +2055,12 @@
       say(`${reason}；弹窗尚未关闭，请先核对`);
       return;
     }
+    if (!navigator.onLine) { say(`${reason}；网络离线，等待连接恢复`); return; }
+    if (plan || claimWait || nativePending().length) {
+      if (now - idleWait.since >= 90000) setEnabled(false, `${reason}；原结果未确认，已暂停并保留记录`);
+      else say(`${reason}；等待原结果，不重复提交`);
+      return;
+    }
     if (idleWait.reloaded && Date.now() - idleWait.at >= 5 * 60000) {
       setEnabled(false, `${reason}；一次刷新后仍无进展，已暂停，请核对页面`);
     } else if (!idleWait.reloaded && Date.now() - idleWait.at >= 90000) {
@@ -1657,14 +2100,17 @@
       css: css ? { display: css.display, visibility: css.visibility, pointerEvents: css.pointerEvents } : null };
   }
   function setEnabled(value, reason = '') {
+    if (value && stateFault('expedition')) { say(stateFault('expedition')); return; }
+    if (!value) cancelFarmRead();
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
     toggle.textContent = value ? '暂停远征与农场' : '开始远征与农场';
-    if (!value) { if (active) log.stop(reason || '已暂停'); cancelQueued(); releaseLock?.(); say(reason || '已暂停'); }
+    if (!value) { if (active) log.stop(reason || '人工暂停'); cancelQueued(); releaseLock?.(); say(reason || '已暂停'); }
     schedule();
   }
   toggle.addEventListener('click', () => {
     try {
+      if (stateFault('expedition')) { say(stateFault('expedition')); return; }
       if (!enabled) {
         clearAccountStop(); recoveryBudget.clear(); clearIdleWait();
         if (claimWait) {
@@ -1696,13 +2142,7 @@
   function usable(el) {
     return visible(el) && !el.closest('[inert]') && !el.matches(':disabled, [aria-disabled="true"]');
   }
-  function currentElement(elements) {
-    const candidates = [...(elements || [])];
-    // 页面可能保留排在前面的隐藏旧区域。确认弹窗会把当前表单标为 aria-hidden，
-    // 此时仍需读取有布局的底层配置；操作前照常检查 usable，不点击被屏蔽的控件。
-    // 全部不可见时保留一个候选供阻塞诊断，继续原有等待/暂停规则。
-    return candidates.find(visible) || candidates.find(rendered) || candidates[0];
-  }
+  function currentElement(elements) { return locator.pick(elements); }
   function section(title) {
     return currentElement([...document.querySelectorAll('section')].filter(el =>
       [...el.querySelectorAll('h2')].some(heading => textOf(heading) === title)));
@@ -1713,7 +2153,7 @@
   }
   function quotas() {
     const root = currentElement(document.querySelectorAll('section[aria-label="远征派遣额度"]'));
-    if (!root) return null;
+    if (!locator.readable(root)) return null;
     function read(label, ratio) {
       const node = currentElement([...root.querySelectorAll('span')].filter(el => textOf(el) === label));
       const value = textOf(node?.parentElement).slice(label.length).trim();
@@ -1890,9 +2330,10 @@
     farmPlan = value;
   }
   function farmHint() {
+    if (stateFault('farm')) farmEnabled = false;
     const remaining = Math.max(0, farmState.nextAt - Date.now());
-    const message = !farmEnabled ? `农场已暂停：${farmState.note}` :
-      remaining ? `农场：${farmState.note}；约 ${Math.ceil(remaining / 60000)} 分钟后检查` : '农场：等待检查或操作';
+    const message = stateFault('farm') || (!farmEnabled ? `农场已暂停：${farmState.note}` :
+      remaining ? `农场：${farmState.note}；约 ${Math.ceil(remaining / 60000)} 分钟后检查` : '农场：等待检查或操作');
     if (farmStatus.textContent !== message) farmStatus.textContent = message;
     farmToggle.textContent = farmEnabled ? '暂停农场' : '开启农场';
     const selected = shadow.getElementById('farm-selection');
@@ -1901,9 +2342,11 @@
     if (selected.textContent !== description) selected.textContent = description;
   }
   function pauseFarm(message) {
+    cancelFarmRead();
     farmEnabled = false;
     localStorage.setItem(FARM_PREF, 'false');
     saveFarmState({ ...farmState, note: message });
+    log.add('farm-paused', message);
     cancelQueued(); say(message);
   }
   function travelLink(path) {
@@ -2002,11 +2445,11 @@
     return true;
   }
   function farmSnapshot() {
-    const timeline = [...document.querySelectorAll('details')].find(d => /^全场成熟时间轴/.test(textOf(d.querySelector('summary'))));
-    const staminaNode = [...document.querySelectorAll('[title]')].find(el =>
-      /^每\s*\d+\s*分钟自然恢复\s*1\s*点体力$/.test(el.title) && /^体力\s/.test(textOf(el)));
+    const timeline = currentElement([...document.querySelectorAll('details')].filter(d => /^全场成熟时间轴/.test(textOf(d.querySelector('summary')))));
+    const staminaNode = currentElement([...document.querySelectorAll('[title]')].filter(el =>
+      /^每\s*\d+\s*分钟自然恢复\s*1\s*点体力$/.test(el.title) && /^体力\s/.test(textOf(el))));
     const s = textOf(staminaNode).match(/^体力\s*(\d+)\s*\/\s*(\d+)(?:\s*\((\d+):(\d+)\s*恢复 1 点\))?/);
-    if (!timeline || !s) return null;
+    if (!locator.readable(timeline) || !locator.readable(staminaNode) || !s) return null;
     const entries = [...timeline.querySelectorAll('li')].map(li => {
       const number = textOf(li).match(/^(\d+)\s*号地/);
       const time = li.querySelector('time[datetime]');
@@ -2017,10 +2460,10 @@
         at: Date.parse(time?.getAttribute('datetime') || '') };
     });
     if (entries.some(e => !Number.isFinite(e.at) || !Number.isInteger(e.plot))) return null;
-    const compact = document.querySelector('section[aria-label="紧凑经营视图"]');
+    const compact = locator.query('section[aria-label="紧凑经营视图"]');
     // 模态窗口会把背景设为 inert/aria-hidden；背景数据仍需读取，但绝不点击。
     const laidOut = el => Boolean(el?.getClientRects().length && getComputedStyle(el).display !== 'none');
-    const empty = [...document.querySelectorAll('button[aria-label="空地块，点击种植"]')].filter(laidOut);
+    const empty = locator.all(document.querySelectorAll('button[aria-label="空地块，点击种植"]')).filter(laidOut);
     if (laidOut(compact)) empty.push(...[...compact.querySelectorAll('button')].filter(b => textOf(b) === '选择种子' && laidOut(b)));
     const count = textOf(timeline.querySelector('summary')).match(/(\d+)\s*块种植中/);
     if (!count || Number(count[1]) !== entries.length || entries.length + empty.length === 0) return null;
@@ -2034,15 +2477,25 @@
   }
   function readFarmMarket() {
     if (farmMarketLoading) return;
+    if (!navigator.onLine) { say('农场行情：网络离线，等待连接恢复'); return; }
+    if (Date.now() < farmReadNextAt) { say('农场行情暂时不可用，等待有限重试'); return; }
+    const generation = farmReadGeneration;
+    const current = () => generation === farmReadGeneration && inFarm() && enabled && farmEnabled && active && !accountStopReason();
+    farmReadController = new AbortController();
+    farmReadAttempts++;
     farmMarketLoading = true;
     say('读取本轮最新行情与种植加成');
     // 只读网站原有状态接口，保留 priceMilli 精度；种植、收获仍只点网页原按钮。
-    fetch('/api/farm', { cache: 'no-store', credentials: 'same-origin', signal: AbortSignal.timeout(15000) })
+    fetch('/api/farm', { cache: 'no-store', credentials: 'same-origin',
+      signal: AbortSignal.any([farmReadController.signal, AbortSignal.timeout(15000)]) })
+      .catch(error => { throw Object.assign(error, { transient: true }); })
       .then(async response => {
+        if (!current()) return;
         if (!response.ok) throw Object.assign(new Error(`农场状态读取失败（${response.status}）`), {
-          stopGroup: [401, 403, 429].includes(response.status)
+          stopGroup: [401, 403, 429].includes(response.status), transient: response.status >= 500
         });
         const data = await response.json();
+        if (!current()) return;
         if (!Number.isSafeInteger(data.userId) || !Array.isArray(data.seeds) || !Array.isArray(data.prices) ||
             !Array.isArray(data.plots) || !Array.isArray(data.crops) || !Array.isArray(data.inventory) ||
             !data.stamina || data.staminaCosts?.plant !== 1 || data.staminaCosts?.harvest !== 1) {
@@ -2052,14 +2505,21 @@
           throw Object.assign(new Error('农场账号已切换，请核对日程'), { stopGroup: true });
         }
         farmMarket = { data, at: Date.now() };
+        farmReadAttempts = 0; farmReadNextAt = 0;
         if (!farmState.userId) saveFarmState({ ...farmState, userId: data.userId });
       })
       .catch(error => {
+        if (!current()) return;
         farmMarket = null;
         if (error.stopGroup) pauseAccount(error.message);
+        else if (error.transient && farmReadAttempts < 3) {
+          farmReadNextAt = Date.now() + (farmReadAttempts === 1 ? 5000 : 15000);
+          log.add('farm-read-retry', '只读行情暂时失败，延后核对', { attempt: farmReadAttempts, nextAt: farmReadNextAt });
+          say('农场行情暂时不可用，等待有限重试');
+        }
         else pauseFarm(`${error.message}；本轮未种植，请核对后开启农场`);
       })
-      .finally(() => { farmMarketLoading = false; schedule(); });
+      .finally(() => { if (generation === farmReadGeneration) { farmMarketLoading = false; farmReadController = null; schedule(); } });
   }
   function bestFarmSeed(dialog, s) {
     const data = farmMarket.data;
@@ -2131,14 +2591,17 @@
         ownSeedDialog = seedDialog; openingSeedsAt = 0;
       } else { say('等待你处理农场弹窗'); return; }
     }
-    const tabs = document.querySelector('[role="tablist"][aria-label="农场功能"]');
+    const tabs = locator.query('[role="tablist"][aria-label="农场功能"]');
     const plotsTab = [...(tabs?.querySelectorAll('[role="tab"]') || [])].find(b => textOf(b) === '田地');
     if (!dialogs.length && plotsTab && plotsTab.getAttribute('aria-selected') !== 'true') {
       if (usable(plotsTab)) offer('farm:plots', '切换田地页', () => plotsTab.click());
       return;
     }
     const s = farmSnapshot();
-    if (!s) { say('等待田地、成熟时间和体力数据加载'); return; }
+    if (!s) {
+      farmWait.wait('等待田地、成熟时间和体力数据加载', !farmPlan && !dialogs.length, say, pauseFarm);
+      return;
+    }
     const signature = JSON.stringify(s.entries.map(e => [e.plot,e.crop,e.at])) + ':' + s.empty.length;
     if (signature !== farmSignature) { farmSignature = signature; farmChangedAt = Date.now(); }
     if (farmPlan) {
@@ -2231,7 +2694,9 @@
       }
       recoveryBudget.clear('farm-ready');
       const count = Number(textOf(harvest).match(/\((\d+)\)/)[1]);
-      if (count !== need) { say('等待一键收获数量与成熟地块一致'); return; }
+      if (count !== need) {
+        farmWait.wait('等待一键收获数量与成熟地块一致', !farmPlan && !dialogs.length, say, pauseFarm); return;
+      }
       offer(`farm:harvest:${s.ready.map(e=>e.plot).join(',')}`, `一键收获 ${count} 块田地`, () => {
         saveFarmPlan({action:'harvest',plots:s.ready.map(e=>e.plot),at:Date.now()}); harvest.click();
       });
@@ -2258,7 +2723,11 @@
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
       return;
     }
-    if (!onPage() || !enabled) { releaseLock?.(); return; }
+    if (stateFault('expedition')) {
+      if (enabled) setEnabled(false, stateFault('expedition')); else say(stateFault('expedition'));
+      return;
+    }
+    if (!onPage() || !enabled) { if (farmMarketLoading) cancelFarmRead(); releaseLock?.(); return; }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
     log.pulse(status.textContent, diagnostic);
@@ -2269,18 +2738,21 @@
     }
     if (Date.now() < nextStepAt) return;
     if (inFarm()) { expeditionObserved = false; farmStep(); return; }
+    if (farmEntryAt || farmMarketLoading || farmReadAttempts) cancelFarmRead();
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    // 用户可在首次扫描前打开弹窗，不能要求先识别被遮住的背景表单。
+    if (!plan && dialogs.length) { say('等待你处理当前弹窗'); return; }
     const q = quotas();
     const fields = form();
     diagnostic = { quota: q, farmEnabled, farmDueAt: farmState.nextAt || 0,
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
-      say('等待远征页面和额度加载，请保持登录');
+      waitForIdlePage('等待远征页面和额度加载，请保持登录');
       return;
     }
     if (!expeditionObserved) { noteQuotaSync(); expeditionObserved = true; }
     const records = nativePending();
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
     if (plan) { handlePlan(q, fields, records, dialogs); return; }
     if (records.length) { say('存在手动派遣待确认，请先处理原请求'); return; }
     if (dialogs.length) { say('等待你处理当前弹窗'); return; }
@@ -2438,37 +2910,25 @@
       offered = false;
       idleChecked = false;
       idleBlocked = false;
+      farmWait.begin();
       try { observeSessionPage(); step(); }
-      catch (error) { console.error('[自动远征] 检查失败', error); setEnabled(false, '远征检查失败，已暂停；请核对页面后重试'); }
+      catch (error) { log.add('runtime-error', '远征检查异常，已暂停并保留原记录', { name: error?.name || 'Error', stage: 'expedition-check' }); setEnabled(false, '远征检查失败，已暂停；请核对页面后重试'); }
       finally {
         if (!offered) cancelQueued();
         if (idleChecked && !idleBlocked) clearIdleWait(true);
+        if (enabled && active && farmEnabled && inFarm()) farmWait.finish();
       }
     });
   }
-  // 不使用后台会停止的动画帧；Worker 不可用时退回普通计时器。
-  let worker;
-  let timer;
-  const fallback = () => { worker?.terminate(); if (!timer) timer = setInterval(schedule, 2000); };
-  try {
-    const url = URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 2000);'], { type: 'text/javascript' }));
-    try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
-    worker.onmessage = schedule;
-    worker.onerror = fallback;
-  } catch { fallback(); }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
     pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan), diagnostic } : null);
-  new MutationObserver(schedule).observe(document.body, { childList: true, subtree: true, characterData: true,
-    attributes: true, attributeFilter: ['disabled', 'aria-disabled', 'aria-pressed', 'aria-selected', 'hidden', 'class'] });
-  for (const name of ['pageshow', 'focus', 'popstate', 'online']) window.addEventListener(name, schedule);
-  document.addEventListener('visibilitychange', schedule);
-  document.addEventListener('resume', schedule);
-  window.addEventListener('pagehide', () => { cancelQueued(); releaseLock?.(); });
+  subscribeWakeup(schedule, onPage, () => enabled);
+  window.addEventListener('pagehide', () => { cancelFarmRead(); cancelQueued(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
       toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
-      if (!enabled) { cancelQueued(); releaseLock?.(); say('已暂停'); }
+      if (!enabled) { cancelFarmRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
     } else if ([FARM_PREF,FARM_CROP,FARM_STATE].includes(event.key)) {
       try {
         farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
