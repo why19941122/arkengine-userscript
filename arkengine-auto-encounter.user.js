@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.6.6
+// @version      1.6.7
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -158,7 +158,7 @@
         const b = bucket();
         const now = Date.now();
         b.events.push({ at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
-          page: diagnosticPage(), pageId, version: '1.6.6', visibility: document.visibilityState,
+          page: diagnosticPage(), pageId, version: '1.6.7', visibility: document.visibilityState,
           type, detail: String(detail).slice(0, 300), data });
         b.counts[type] = (b.counts[type] || 0) + 1;
         if (sum) for (const [key, value] of Object.entries(data.reward || {})) b.totals[key] = (b.totals[key] || 0) + value;
@@ -205,7 +205,7 @@
         add('heartbeat', state, diagnostic);
       }
       if (now - lastWrite >= 60000) {
-        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.6', active: true,
+        checkpoint = { at: now, sampleAt: lastSample, pageId, version: '1.6.7', active: true,
           state: String(state).slice(0, 180), page: diagnosticPage(), visibility: document.visibilityState, diagnostic };
         try { prune(); localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
         lastWrite = now;
@@ -214,7 +214,7 @@
     }
     function stop(reason) {
       add('pause', reason);
-      checkpoint = { at: Date.now(), pageId, version: '1.6.6', active: false, state: reason };
+      checkpoint = { at: Date.now(), pageId, version: '1.6.7', active: false, state: reason };
       lastTick = 0;
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
     }
@@ -251,7 +251,7 @@
             .sort().map(k => JSON.parse(localStorage.getItem(k)));
           const heartbeats = Object.fromEntries(['cultivate', 'expedition'].map(name =>
             [name, JSON.parse(localStorage.getItem(`${LOG_PREFIX}${name}:heartbeat`) || 'null')]));
-          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.6', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
+          const url = URL.createObjectURL(new Blob([JSON.stringify({ version: '1.6.7', exportedAt: new Date().toISOString(), days, heartbeats }, null, 2)], { type: 'application/json' }));
           const link = document.createElement('a'); link.href = url; link.download = `arkengine-log-${logDay()}.json`;
           link.click(); setTimeout(() => URL.revokeObjectURL(url), 10000);
         } catch { storageFailed = true; render(); }
@@ -1686,26 +1686,36 @@
     if (sessionStorage.getItem(JOURNAL) !== serialized) throw new Error('无法保存远征操作记录');
     plan = value;
   }
-  function visible(el) {
-    return Boolean(el?.isConnected && !el.closest('[hidden], [aria-hidden="true"]') &&
+  function rendered(el) {
+    return Boolean(el?.isConnected && !el.closest('[hidden]') &&
       el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
+  }
+  function visible(el) {
+    return rendered(el) && !el.closest('[aria-hidden="true"]');
   }
   function usable(el) {
     return visible(el) && !el.closest('[inert]') && !el.matches(':disabled, [aria-disabled="true"]');
   }
+  function currentElement(elements) {
+    const candidates = [...(elements || [])];
+    // 页面可能保留排在前面的隐藏旧区域。确认弹窗会把当前表单标为 aria-hidden，
+    // 此时仍需读取有布局的底层配置；操作前照常检查 usable，不点击被屏蔽的控件。
+    // 全部不可见时保留一个候选供阻塞诊断，继续原有等待/暂停规则。
+    return candidates.find(visible) || candidates.find(rendered) || candidates[0];
+  }
   function section(title) {
-    return [...document.querySelectorAll('section')].find(el =>
-      [...el.querySelectorAll('h2')].some(heading => textOf(heading) === title));
+    return currentElement([...document.querySelectorAll('section')].filter(el =>
+      [...el.querySelectorAll('h2')].some(heading => textOf(heading) === title)));
   }
   function buttonIn(root, matcher) {
-    return [...(root?.querySelectorAll('button') || [])].find(button =>
-      typeof matcher === 'string' ? textOf(button) === matcher : matcher.test(textOf(button)));
+    return currentElement([...(root?.querySelectorAll('button') || [])].filter(button =>
+      typeof matcher === 'string' ? textOf(button) === matcher : matcher.test(textOf(button))));
   }
   function quotas() {
-    const root = document.querySelector('section[aria-label="远征派遣额度"]');
+    const root = currentElement(document.querySelectorAll('section[aria-label="远征派遣额度"]'));
     if (!root) return null;
     function read(label, ratio) {
-      const node = [...root.querySelectorAll('span')].find(el => textOf(el) === label);
+      const node = currentElement([...root.querySelectorAll('span')].filter(el => textOf(el) === label));
       const value = textOf(node?.parentElement).slice(label.length).trim();
       const match = value.match(ratio ? /^(\d+)\s*\/\s*(\d+)\s*支$/ : /^(\d+)\s*支$/);
       return match ? match.slice(1).map(Number) : null;
@@ -1728,7 +1738,7 @@
       allUnderway: consistent && underway === q.running && !buttons.some(b => /^一键领取/.test(textOf(b))) };
   }
   function forecast(root) {
-    const node = [...(root?.querySelectorAll('[role="status"]') || [])].find(el => /^预计派遣/.test(textOf(el)));
+    const node = currentElement([...(root?.querySelectorAll('[role="status"]') || [])].filter(el => /^预计派遣/.test(textOf(el))));
     const match = textOf(node).match(/^预计派遣\s*(\d+)\s*支[:：]\s*常态\s*(\d+)\s*支[，,]\s*突发\s*(\d+)\s*支/);
     if (!match || Number(match[1]) !== Number(match[2]) + Number(match[3])) return null;
     return { total: Number(match[1]), normal: Number(match[2]), burst: Number(match[3]) };
@@ -1736,12 +1746,12 @@
   function form() {
     const root = section('自动组队派遣');
     const routes = section('选择路线');
-    const count = root?.querySelector('input[aria-label="最多派遣队数"]');
-    const label = [...(root?.querySelectorAll('label') || [])].find(el => textOf(el) === '允许使用今日突发额度');
-    const burst = label?.querySelector('input[type="checkbox"]');
-    const high = buttonIn(root?.querySelector('[aria-label="自动组队偏好"]'), '高星优先');
-    const routeButton = name => [...(routes?.querySelectorAll('button') || [])].find(el =>
-      [...el.querySelectorAll('span')].some(span => textOf(span) === name));
+    const count = currentElement(root?.querySelectorAll('input[aria-label="最多派遣队数"]'));
+    const label = currentElement([...(root?.querySelectorAll('label') || [])].filter(el => textOf(el) === '允许使用今日突发额度'));
+    const burst = currentElement(label?.querySelectorAll('input[type="checkbox"]'));
+    const high = buttonIn(currentElement(root?.querySelectorAll('[aria-label="自动组队偏好"]')), '高星优先');
+    const routeButton = name => currentElement([...(routes?.querySelectorAll('button') || [])].filter(el =>
+      [...el.querySelectorAll('span')].some(span => textOf(span) === name)));
     return { root, count, burst, high, routeButton, forecast: forecast(root) };
   }
   function nativePending() {

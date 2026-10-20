@@ -1188,7 +1188,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.6.6');
+      assert.equal(exported.version,'1.6.7');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1243,7 +1243,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         HTMLAnchorElement.prototype.click=function(){};
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.6.6');
+      assert.equal(exported.version,'1.6.7');
       assert.equal(exported.days.length,2);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -1699,6 +1699,113 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await drive(`${confirmed}.length===1 && model.runs.length===6`, 'normal cycle across midnight');
       assert.equal(expeditionRequests, before);
       assert.equal(await evaluate(`${logBucket('expedition','2026-10-11')}.counts['expedition-day']`),1);
+    });
+    // 模拟网页保留旧区域：副本排在当前区域前，数据冲突且不绑定真实操作。
+    const staleExpedition = (hide = 'wrapper.hidden=true;') => `
+      const renderCurrent=renderExp;
+      window.staleClicks=0;
+      window.renderExp=()=>{
+        renderCurrent();
+        const wrapper=document.createElement('div');${hide}
+        wrapper.dataset.stale='true';
+        for(const section of [...game.querySelectorAll('section')]) {
+          const copy=section.cloneNode(true);
+          copy.removeAttribute('id');copy.querySelectorAll('[id]').forEach(el=>el.removeAttribute('id'));
+          const count=copy.querySelector('input[type="number"]');if(count)count.value='1';
+          const preference=copy.querySelector('[aria-label="自动组队偏好"]');
+          preference?.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed','false'));
+          if(section.id==='routes')copy.querySelectorAll('button').forEach(b=>b.setAttribute('aria-pressed','false'));
+          if(section.id==='running')copy.insertAdjacentHTML('beforeend','<button>领取</button>');
+          if(section.hasAttribute('aria-label'))copy.innerHTML='<div><span>常态剩余</span><span>0/6 支</span></div>'+
+            '<div><span>当前运行</span><span>12 支</span></div><div><span>今日突发剩余</span><span>0/6 支</span></div>';
+          const forecast=copy.querySelector('[role="status"]');if(forecast)forecast.textContent='预计派遣 1 支：常态 1 支，突发 0 支';
+          wrapper.append(copy);
+        }
+        wrapper.addEventListener('click',()=>staleClicks++);
+        game.prepend(wrapper);
+      };
+    `;
+    await t.test('远征区域定位：隐藏旧队数不遮挡当前输入框，当前禁用时仍等待', async () => {
+      await setupExp(`model.maxTeams=1;window.disableCount=true;
+        const renderCurrent=renderExp;window.renderExp=()=>{
+          renderCurrent();const real=document.querySelector('#auto');
+          real.querySelector('input[type="number"]').disabled=disableCount;
+          const copy=real.cloneNode(true);copy.removeAttribute('id');
+          copy.querySelectorAll('[id]').forEach(el=>el.removeAttribute('id'));
+          const staleCount=copy.querySelector('input[type="number"]');staleCount.value='2';staleCount.disabled=false;
+          const wrapper=document.createElement('div');wrapper.hidden=true;wrapper.append(copy);real.before(wrapper);
+        };`);
+      await until(async()=>(await expStatus())?.includes('派遣队数输入框不可用'),'visible disabled count waits');
+      const blocked=await evaluate(`${logBucket('expedition')}.events.find(e=>e.type==='expedition-blocked')`);
+      assert.equal(blocked.data.button.visible,true);
+      assert.equal(blocked.data.button.disabled,true,'诊断指向当前输入框');
+      assert.deepEqual(await evaluate('model.calls'),[]);
+      await evaluate('disableCount=false;renderExp();');
+      await drive('model.runs.length===6&&!pendingPayload','current count changed to six',30);
+      assert.equal(await evaluate(`${confirmed}[0].input.maxTeams`),6);
+      assert.equal(await evaluate(`document.querySelector('div[hidden] input[type="number"]').value`),'2','隐藏的旧队数不被改写');
+    });
+    await t.test('远征区域定位：隐藏旧页面不影响当前额度、领取、派遣与确认弹窗', async () => {
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        for(const hide of ['wrapper.hidden=true;', "wrapper.style.display='none';"]) {
+          await setupExp(`addRuns(6,false,true);${staleExpedition(hide)}`);
+          assert.equal(await evaluate('document.visibilityState'),'hidden','后台标签仍有正常布局');
+          const before=expeditionRequests;
+          await drive(`model.runs.length===6 && model.calls.some(c=>c.type==='dispatch') && !pendingPayload`, 'visible page dispatch',30);
+          assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+          assert.deepEqual(await evaluate(`${confirmed}.map(c=>[c.route,c.total,c.input.maxTeams])`),[['边境巡逻',6,6]]);
+          assert.equal(await evaluate('staleClicks'),0);
+          assert.equal(await evaluate('model.opens'),1,'弹窗遮住底层表单仍能核对，不反复开关');
+          assert.equal(await evaluate(`sessionStorage.getItem('arkengine:auto-expedition:idle:v1')`),null);
+          assert.equal(expeditionRequests,before,'不因隐藏副本刷新页面');
+          await evaluate('model.runs.forEach(r=>r.done=true);renderExp();');
+          await drive(`${confirmed}.length===2&&!pendingPayload`,'second visible cycle',30);
+          assert.equal(await evaluate('staleClicks'),0);
+        }
+      } finally {await cdp.send('Target.closeTarget',{targetId:foreground.targetId});}
+    });
+    await t.test('远征区域定位：同一区域内隐藏控件和旧预览不挡住可见控件', async () => {
+      await setupExp(`model.route='深渊远征';model.high=false;model.maxTeams=2;model.allowBurst=true;
+        const renderCurrent=renderExp;window.staleClicks=0;
+        window.renderExp=()=>{
+          renderCurrent();
+          for(const section of [document.querySelector('#auto'),document.querySelector('#routes')]) {
+            const wrapper=document.createElement('div');wrapper.hidden=true;
+            for(const child of [...section.children]) {
+              if(child.tagName==='H2')continue;
+              const copy=child.cloneNode(true);copy.removeAttribute('id');
+              copy.querySelectorAll('[id]').forEach(el=>el.removeAttribute('id'));
+              wrapper.append(copy);
+            }
+            const count=wrapper.querySelector('input[type="number"]');if(count)count.value='99';
+            wrapper.addEventListener('click',()=>staleClicks++);section.prepend(wrapper);
+          }
+        };`);
+      await drive(`model.runs.length===6&&!pendingPayload`,'visible controls and forecast',40);
+      assert.deepEqual(await evaluate(`${confirmed}.map(c=>[c.route,c.total,c.input.maxTeams,c.input.allowBurst])`),[['边境巡逻',6,6,false]]);
+      assert.equal(await evaluate('staleClicks'),0);
+    });
+    await t.test('远征区域定位：刷新后核对旧领取，忽略隐藏的过期队伍与额度', async () => {
+      await setupExp(`${staleExpedition()}
+        sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({running:6,at:clock-40000,reloaded:true}));`);
+      await drive(`model.runs.length===6&&!pendingPayload`,'claim reconciled on current page',30);
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),0,'已领取的旧请求不能再次领取');
+      assert.equal(await evaluate(`${confirmed}.length`),1);
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1'))`),null);
+      assert.equal(await evaluate('staleClicks'),0);
+    });
+    await t.test('远征区域定位：只有隐藏表单时仍暂停，出现可见区域也须手动开始', async () => {
+      await setupExp(`model.maxTeams=1;window.hideForm=true;
+        const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();document.querySelector('#auto').hidden=hideForm;};
+        sessionStorage.setItem('arkengine:auto-expedition:idle:v1',JSON.stringify({at:clock-301000,since:clock-395000,reloaded:true,reason:'派遣队数输入框不可用'}));`);
+      await until(async()=>(await expStatus())?.includes('一次刷新后仍无进展'),'actual hidden form pauses');
+      assert.deepEqual(await evaluate('model.calls'),[]);
+      await evaluate('hideForm=false;renderExp();');await pulse(5000);
+      assert.deepEqual(await evaluate('model.calls'),[],'恢复布局不能自动解除暂停');
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();`);
+      await drive('model.runs.length===6&&!pendingPayload','manual start after layout recovery',30);
     });
     await t.test('远征停滞：不可用路线显示真实原因，恢复后后台继续派遣', async () => {
       const foreground=await createTab();
