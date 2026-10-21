@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.0
+// @version      1.7.1
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -199,6 +199,8 @@
 
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
   const diagnosticLogs = {};
+  // 仅在本脚本点击领取的同步调用期间绑定原网页请求，不读取请求正文。
+  let captureExpeditionClaim = null;
   let observeSessionPage = () => {};
   const pageGroup = path => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(path) ? 'cultivate' :
     /^(?:\/activities\/expedition|\/farm)\/?$/.test(path) ? 'expedition' : '';
@@ -243,7 +245,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.0';
+  const SCRIPT_VERSION = '1.7.1';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -727,6 +729,7 @@
     const originalFetch = window.fetch;
     window.fetch = function (...args) {
       const at = Date.now();
+      const claimCapture = captureExpeditionClaim;
       // 原参数、this、Promise 和 Response 原样传递，不读取请求头/正文或响应正文。
       const promise = Reflect.apply(originalFetch, this, args);
       try {
@@ -737,16 +740,21 @@
         const group = pageGroup(location.pathname) || previous?.group;
         if (url?.origin === location.origin && paths.has(url.pathname) && group) {
           const info = { group, path: url.pathname, at };
+          const method = String(args[1]?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+          const report = result => {
+            record(info, result);
+            if (claimCapture?.path === info.path && method === 'POST') claimCapture.result(result);
+          };
           promise.then(response => {
             let loginRedirect = false;
             if (response.redirected && response.url) {
               const target = new URL(response.url);
               loginRedirect = target.origin === location.origin && target.pathname === '/';
             }
-            record(info, { status: response.status, redirected: response.redirected,
+            report({ status: response.status, redirected: response.redirected,
               outcome: loginRedirect ? 'login-redirect' : response.ok ? 'ok' : 'http-error',
               ...(loginRedirect ? { to: '/' } : {}) });
-          }, error => record(info, { status: null,
+          }, error => report({ status: null,
             outcome: error?.name === 'AbortError' || error?.name === 'TimeoutError' ? 'aborted' : 'network-error' }))
             .catch(() => { /* 日志或监听失败不能改变网站收到的结果 */ });
         }
@@ -1903,13 +1911,75 @@
   let scheduled = false;
   let nextStepAt = 0;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
+  const claimPageId = crypto.randomUUID();
+  const claimResultValid = v => objectState(v) && ['ok', 'network-error', 'aborted', 'http-error', 'login-redirect'].includes(v.outcome) &&
+    (v.status === null || Number.isInteger(v.status) && v.status >= 100 && v.status <= 599);
   let claimWait = loadState(sessionStorage, CLAIM_JOURNAL, null, 'expedition', v =>
-    timedState(v) && Number.isInteger(v.running) && v.running >= 0);
+    timedState(v) && Number.isInteger(v.running) && v.running >= 0 &&
+    (v.retries === undefined || Number.isInteger(v.retries) && v.retries >= 0 && v.retries <= 1) &&
+    (v.ready === undefined || Number.isInteger(v.ready) && v.ready > 0 && v.ready <= v.running) &&
+    (v.reloadFrom === undefined || typeof v.reloadFrom === 'string') &&
+    (v.attemptId === undefined || typeof v.attemptId === 'string') &&
+    (v.result === undefined || claimResultValid(v.result)));
+  let claimStable = null;
+  let legacyClaimLookup = null;
   function saveClaimWait(value) {
     const serialized = JSON.stringify(value);
     sessionStorage.setItem(CLAIM_JOURNAL, serialized);
     if (sessionStorage.getItem(CLAIM_JOURNAL) !== serialized) throw new Error('无法保存远征领取记录');
     claimWait = value;
+  }
+  const transientClaim = result => result && (['network-error', 'aborted'].includes(result.outcome) ||
+    result.outcome === 'http-error' && result.status >= 500);
+  function claimReason() {
+    const result = claimWait?.result;
+    if (!result) return '领取结果尚未确认';
+    if (result.outcome === 'network-error') return '领取请求网络错误，到账结果待核对';
+    if (result.outcome === 'aborted') return '领取请求中断或超时，到账结果待核对';
+    if (result.outcome === 'http-error') return `领取请求返回 HTTP ${result.status}`;
+    return '领取响应已返回，等待页面确认结果';
+  }
+  function submitClaim(button, q, ready, retry = false) {
+    const attemptId = crypto.randomUUID();
+    const now = Date.now();
+    saveClaimWait(retry ? { ...claimWait, at: now, retries: 1, attemptId, result: undefined } :
+      { running: q.running, ready, at: now, submittedAt: now, retries: 0, attemptId });
+    claimStable = null;
+    log.expect('expedition');
+    if (retry) log.add('expedition-claim-retry', '刷新后待领队伍与额度一致，补领一次', { ready, retry: 1, limit: 1 });
+    captureExpeditionClaim = { path: /^一键领取/.test(textOf(button)) ? '/api/activities/expedition-claim-all' : '/api/activities',
+      result(result) {
+        if (claimWait?.attemptId !== attemptId) return;
+        try { saveClaimWait({ ...claimWait, result: { status: result.status, outcome: result.outcome } }); }
+        catch { setEnabled(false, '无法保存领取响应，已暂停并保留原记录'); }
+        schedule();
+      } };
+    try { button.click(); } finally { captureExpeditionClaim = null; }
+  }
+  function recoverLegacyClaimEvidence() {
+    if (!claimWait || claimWait.attemptId || claimWait.result) return false;
+    const submittedAt = claimWait.submittedAt ?? claimWait.at;
+    if (legacyClaimLookup?.at === submittedAt) return legacyClaimLookup.pending && Date.now() - legacyClaimLookup.startedAt < 5000;
+    legacyClaimLookup = { at: submittedAt, pending: true, startedAt: Date.now() };
+    const lookup = legacyClaimLookup;
+    // 旧版没有在领取记录中保存网络结果。只接受同页、同次点击对应的专用批量领取错误。
+    const days = [...new Set([logDay(submittedAt), logDay(submittedAt + 60000)])];
+    Promise.all(days.map(day => logStore.read('expedition', day, Infinity))).then(buckets => {
+      const events = buckets.flatMap(bucket => bucket?.events || []);
+      const clicks = events.filter(e => e.type === 'action' && e.data?.kind === 'claim' && Math.abs(e.at - submittedAt) <= 100);
+      if (clicks.length !== 1 || !clicks[0].pageId) return;
+      const results = events.filter(e => e.type === 'request-result' && e.pageId === clicks[0].pageId &&
+        e.data?.path === '/api/activities/expedition-claim-all' &&
+        e.data.startedAt >= submittedAt && e.data.startedAt <= submittedAt + 1000);
+      if (results.length !== 1 || !transientClaim(results[0].data) || !claimResultValid(results[0].data) ||
+          !claimWait || (claimWait.submittedAt ?? claimWait.at) !== submittedAt || claimWait.attemptId) return;
+      saveClaimWait({ ...claimWait, result: { outcome: results[0].data.outcome, status: results[0].data.status },
+        // 缺少新版刷新标记的旧记录仍须由本版重新刷新核对。
+        reloaded: false, at: Date.now() });
+      log.add('expedition-claim-evidence', '已从本地日志核对旧领取的网络错误，重新刷新确认待领状态');
+    }).catch(() => { /* 证据不可用时沿用保留原记录并暂停的规则。 */ })
+      .finally(() => { lookup.pending = false; schedule(); });
+    return true;
   }
   let observedDay = beijingTime().day;
   const IDLE_JOURNAL = 'arkengine:auto-expedition:idle:v1';
@@ -2757,10 +2827,15 @@
     if (records.length) { say('存在手动派遣待确认，请先处理原请求'); return; }
     if (dialogs.length) { say('等待你处理当前弹窗'); return; }
 
+    const running = section('进行中的远征');
+    const claimAll = buttonIn(running, /^一键领取\s*\(\d+\)$/);
+    const claimOne = buttonIn(running, '领取');
+    const claim = usable(claimAll) ? claimAll : usable(claimOne) ? claimOne : null;
     if (claimWait) {
       const current = claimPageState(q, fields, errors);
       diagnostic.claim = { beforeRunning: claimWait.running, since: claimWait.submittedAt ?? claimWait.at,
-        reloaded: Boolean(claimWait.reloaded), ...current };
+        reloaded: Boolean(claimWait.reloaded), retries: claimWait.retries || 0,
+        result: claimWait.result || null, ...current };
       if (current.consistent && (q.running < claimWait.running || current.allUnderway)) {
         if (q.running < claimWait.running) {
           log.add('expedition-claimed', '远征领取后队伍减少已确认', { teams: claimWait.running - q.running });
@@ -2771,19 +2846,39 @@
             { beforeRunning: claimWait.running, running: q.running });
         }
         saveClaimWait(null);
+        claimStable = null;
         noteQuotaSync();
       }
       else {
+        if (!navigator.onLine) { claimStable = null; say('领取结果待核对；网络离线，恢复连接后继续'); return; }
+        if (recoverLegacyClaimEvidence()) { say('正在从本地日志核对旧领取请求'); return; }
+        const freshPage = claimWait.reloaded && claimWait.reloadFrom && claimWait.reloadFrom !== claimPageId;
+        const ready = claimWait.ready ?? claimWait.running;
+        const countMatches = claim === claimAll ? Number(textOf(claimAll).match(/\((\d+)\)/)?.[1]) === ready : ready === 1;
+        const canRetry = freshPage && !claimWait.retries && transientClaim(claimWait.result) &&
+          current.consistent && q.running === claimWait.running && current.ready === ready &&
+          current.ready + current.underway === q.running && claim && countMatches;
+        if (!canRetry) claimStable = null;
+        else {
+          const signature = JSON.stringify([q, current.ready, current.underway, textOf(claim)]);
+          if (claimStable?.signature !== signature) claimStable = { signature, at: Date.now() };
+        }
         if (claimWait.reloaded && Date.now() - claimWait.at > 60000) {
+          if (canRetry) {
+            if (Date.now() - claimStable.at < 2000) { say('刷新后仍有待领奖励，等待队伍状态稳定'); return; }
+            offer('retry-claim', '补领页面已确认的待领奖励（最多一次）', () => submitClaim(claim, q, ready, true));
+            return;
+          }
           log.add('expedition-claim-unconfirmed', '一次刷新后仍无法确认原领取', diagnostic.claim);
-          setEnabled(false, '原领取结果仍无法确认，已暂停并保留记录，请手动核对');
+          setEnabled(false, claimWait.retries ? `${claimReason()}；补领一次后仍未确认，已暂停。请手动一键领取，到账后再开始` :
+            '原领取结果仍无法确认，已暂停并保留记录；请手动一键领取，到账后再开始');
         } else if (!claimWait.reloaded && Date.now() - claimWait.at > 30000) {
           offer('sync-claim', '刷新领取后的状态', () => {
             saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
-              reloaded: true, at: Date.now() }); location.reload();
+              reloaded: true, reloadFrom: claimPageId, at: Date.now() }); location.reload();
           });
         }
-        else say('等待奖励领取和英雄释放');
+        else say(`${claimReason()}；${claimWait.reloaded ? '已刷新，等待核对待领队伍' : '等待队伍变化，超时后刷新核对'}`);
         return;
       }
     }
@@ -2794,15 +2889,9 @@
       log.add('expedition-day', '跨日继续等待归来，沿用正常操作更新额度');
     }
     idleChecked = true;
-    const running = section('进行中的远征');
-    const claimAll = buttonIn(running, /^一键领取\s*\(\d+\)$/);
-    const claimOne = buttonIn(running, '领取');
-    const claim = usable(claimAll) ? claimAll : usable(claimOne) ? claimOne : null;
     if (claim) {
       offer(`claim:${q.running}:${textOf(claim)}`, '领取已完成的远征奖励', () => {
-        saveClaimWait({ running: q.running, at: Date.now(), submittedAt: Date.now() });
-        log.expect('expedition');
-        claim.click();
+        submitClaim(claim, q, claimPageState(q, fields, errors).ready);
       });
       return;
     }

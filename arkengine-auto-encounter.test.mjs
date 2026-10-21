@@ -1329,7 +1329,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.7.0');
+      assert.equal(exported.version,'1.7.1');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1385,7 +1385,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.7.0');
+      assert.equal(exported.version,'1.7.1');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -2362,6 +2362,145 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
 
     const claimJournal = `JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1'))`;
     const oldClaim = `sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({running:6,at:clock-7200000,reloaded:true}));`;
+    const networkClaim = `window.claimRuns=()=>{model.calls.push({type:'claim'});
+      fetch('/api/activities/expedition-claim-all?network-error=1',{method:'POST'}).catch(()=>{});};`;
+    const reloadedNetworkClaim = `sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({
+      running:6,ready:6,at:clock-61000,submittedAt:clock-95000,reloaded:true,reloadFrom:'previous-page',
+      retries:0,attemptId:'original-attempt',result:{outcome:'network-error',status:null}}));`;
+    const reloadClaimPage = async (after = '') => {
+      const snapshot=await evaluate('({model,clock:clock+35000})');
+      await pulse(31000);
+      await drive(`!document.getElementById('ark-auto-expedition')`,'claim reload');
+      await until(()=>evaluate(`typeof renderExp==='function'&&!document.getElementById('ark-auto-expedition')`),'claim fixture reloaded');
+      await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;${after};renderExp();`);
+      await evaluate(source);
+    };
+    await t.test('远征领取断网：请求失败后先刷新，完整待领列表稳定后仅补领一次并继续派遣', async () => {
+      await setupExp(`addRuns(6,false,true);${networkClaim}`);
+      await drive(`model.calls.length===1`,'initial batch claim');
+      await until(()=>evaluate(`${claimJournal}?.result?.outcome==='network-error'`),'capture original network result');
+      await pulse(1000);
+      assert.match(await expStatus(),/网络错误/);
+      await reloadClaimPage(`model.claimReceipts=['已领取 6 支远征，共获得 573 代币'];`);
+      await pulse(59000);
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1,'核对期内不得补领');
+      await pulse(3000);
+      await drive(`${confirmed}.length===1&&${claimJournal}===null`,'retry claim then dispatch');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),2);
+      await until(()=>evaluate(`${logBucket('expedition')}.totals['代币']===573`),'one confirmed reward');
+      assert.equal(await evaluate(`${logBucket('expedition')}.counts['expedition-claim-retry']`),1);
+    });
+    await t.test('远征领取断网：服务器已经完成但响应丢失，刷新后只核对不补领', async () => {
+      await setupExp(`addRuns(6,false,true);${networkClaim}`);
+      await drive('model.calls.length===1','lost response');
+      await until(()=>evaluate(`${claimJournal}?.result?.outcome==='network-error'`),'failure captured');
+      await reloadClaimPage('model.runs=[];');
+      await drive(`${confirmed}.length===1&&${claimJournal}===null`,'server completion reconciled');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+      assert.equal(await evaluate(`${logBucket('expedition')}.totals['代币']||0`),0,'无回执不推测收入');
+    });
+    await t.test('远征领取断网：补领失败保留次数，刷新与手动开始均不重置写入预算', async () => {
+      await setupExp(`addRuns(6,false,true);${reloadedNetworkClaim}${networkClaim}`);
+      await drive('model.calls.length===1','one retry');
+      await until(()=>evaluate(`${claimJournal}?.result?.outcome==='network-error'`),'retry failed');
+      await pulse(61000);
+      await until(async()=>/补领一次后仍未确认/.test(await expStatus()),'retry limit pause');
+      assert.equal(await evaluate(`${claimJournal}.retries`),1);
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click()`);
+      await reloadClaimPage(networkClaim);
+      await pulse(61000);
+      assert.match(await expStatus(),/补领一次后仍未确认/);
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1,'不得再提交第三次领取');
+    });
+    await t.test('远征领取断网：离线等待，恢复后重新稳定核对；人工暂停撤销补领', async () => {
+      await setupExp(`addRuns(6,false,true);${reloadedNetworkClaim}
+        Object.defineProperty(navigator,'onLine',{configurable:true,get:()=>false});`);
+      await pulse(120000);
+      assert.match(await expStatus(),/网络离线/);
+      assert.equal(await evaluate('model.calls.length'),0);
+      await evaluate(`Object.defineProperty(navigator,'onLine',{get:()=>true});window.dispatchEvent(new Event('online'));`);
+      await pulse(1000);
+      assert.equal(await evaluate('model.calls.length'),0);
+      await pulse(2000);
+      assert.match(await expStatus(),/随机等待/);
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click()`);
+      await pulse(10000);
+      assert.equal(await evaluate('model.calls.length'),0);
+    });
+    await t.test('远征领取断网：加载、旧副本、数量不符、HTTP成功或拒绝均不触发补领', async () => {
+      for(const code of [
+        `document.querySelector('#running').insertAdjacentHTML('beforeend','<span class="animate-spin"></span>');`,
+        `document.querySelector('#running').hidden=true;`,
+        `document.querySelector('#running button').textContent='一键领取（5）';`,
+        `document.querySelector('#running button').disabled=true;`,
+        `model.runs[0].done=false;renderOriginal();`,
+        `model.error=true;model.message='领取失败';renderOriginal();`,
+        `const record=${claimJournal};record.reloadFrom='same-page';crypto.randomUUID=()=> 'same-page';sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(record));`,
+        `const record=${claimJournal};record.result={outcome:'ok',status:200};sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(record));`,
+        `const record=${claimJournal};record.result={outcome:'http-error',status:403};sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(record));`
+      ]) {
+        await setupExp(`addRuns(6,false,true);${reloadedNetworkClaim}renderExp();
+          const renderOriginal=renderExp;window.renderExp=()=>{renderOriginal();${code}};`);
+        await pulse(10000);
+        assert.equal(await evaluate('model.calls.length'),0,code);
+        assert.notEqual(await evaluate(claimJournal),null);
+      }
+    });
+    await t.test('远征领取断网：旧版待领记录只凭同次请求网络错误迁移，重新刷新后恢复', async () => {
+      await setupExp(`addRuns(6,false,true);${oldClaim}
+        const at=clock-7200000;
+        const oldRecord=${claimJournal};oldRecord.submittedAt=at;oldRecord.at=clock-3000;
+        sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(oldRecord));
+        localStorage.setItem('arkengine:auto-log:v1:expedition:2026-10-10',JSON.stringify({events:[
+          {at,group:'expedition',pageId:'old-page',type:'action',data:{kind:'claim'}},
+          {at:at+5000,group:'expedition',pageId:'old-page',type:'request-result',data:{
+            path:'/api/activities/expedition-claim-all',startedAt:at,status:null,outcome:'network-error'}}]}));`);
+      await until(()=>evaluate(`${claimJournal}?.result?.outcome==='network-error'`),'legacy request evidence');
+      assert.equal(await evaluate(`${claimJournal}.reloaded`),false,'旧刷新标记必须重新核对');
+      await reloadClaimPage();
+      await pulse(61000);
+      await drive(`${confirmed}.length===1`,'legacy claim recovered');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+    });
+    await t.test('远征领取断网：其他页面的网络错误不能授权旧记录补领', async () => {
+      await setupExp(`addRuns(6,false,true);${oldClaim}
+        const at=clock-7200000;
+        localStorage.setItem('arkengine:auto-log:v1:expedition:2026-10-10',JSON.stringify({events:[
+          {at,group:'expedition',pageId:'old-page',type:'action',data:{kind:'claim'}},
+          {at:at+5000,group:'expedition',pageId:'different-page',type:'request-result',data:{
+            path:'/api/activities/expedition-claim-all',startedAt:at,status:null,outcome:'network-error'}}]}));`);
+      await pulse(10000);
+      assert.match(await expStatus(),/原领取结果仍无法确认/);
+      assert.equal(await evaluate('model.calls.length'),0);
+      assert.equal(await evaluate(`${claimJournal}.result`),undefined);
+    });
+    await t.test('远征领取断网：单队领取遇到服务器暂时错误，刷新后按当前按钮恢复', async () => {
+      await setupExp(`addRuns(1,false,true);addRuns(5);
+        window.claimRuns=()=>{model.calls.push({type:'claim'});
+          fetch('/api/activities?code=503',{method:'POST'}).catch(()=>{});};`);
+      await drive('model.calls.length===1','single claim submitted');
+      await until(()=>evaluate(`${claimJournal}?.result?.status===503`),'single HTTP result captured');
+      await reloadClaimPage();
+      await pulse(61000);
+      await drive(`${confirmed}.length===1&&${claimJournal}===null`,'single claim recovery');
+      assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),2);
+      assert.equal(await evaluate(`${confirmed}[0].normal`),1);
+    });
+    await t.test('远征领取断网：账号限流立即暂停，其他手动请求不归入脚本领取记录', async () => {
+      await setupExp(`addRuns(6,false,true);window.claimRuns=()=>model.calls.push({type:'claim'});`);
+      await drive('model.calls.length===1','unknown claim');
+      await evaluate(`fetch('/api/activities/expedition-claim-all?network-error=1',{method:'POST'}).catch(()=>{});`);
+      await pulse(1000);
+      assert.equal(await evaluate(`${claimJournal}.result`),undefined,'独立手动请求不能成为本次领取错误证据');
+      await setupExp(`addRuns(6,false,true);window.claimRuns=()=>{model.calls.push({type:'claim'});
+        fetch('/api/activities/expedition-claim-all?code=429',{method:'POST'}).catch(()=>{});};`);
+      await drive('model.calls.length===1','rate-limited claim');
+      await until(()=>evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')==='false'`),'account paused');
+      await pulse(120000);
+      assert.match(await expStatus(),/429/);
+      assert.equal(await evaluate('model.calls.length'),1);
+      assert.equal(await evaluate(`${claimJournal}.retries`),0);
+    });
     await t.test('远征领取恢复：相同队伍数已全为新行程时解除旧等待', async () => {
       await setupExp(`addRuns(6);${oldClaim}`);
       await until(()=>evaluate(`${claimJournal}===null`),'old claim no longer has completed targets',2000);
