@@ -1329,7 +1329,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.7.1');
+      assert.equal(exported.version,'1.7.2');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1385,7 +1385,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.7.1');
+      assert.equal(exported.version,'1.7.2');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -1909,6 +1909,70 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(async()=>(await expStatus())?.includes('已暂停'),'missing controls have bounded recovery');
       assert.deepEqual(await evaluate('model.calls'),[]);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+    });
+    await t.test('远征加载恢复：后台领取成功后额度迟到，超过90秒仍等待并在恢复后续派', async () => {
+      await setupExp(`addRuns(6,false,true);const originalClaim=claimRuns;
+        window.claimRuns=()=>{originalClaim();document.querySelector('[aria-label="远征派遣额度"]').remove();};`);
+      await drive(`model.calls.some(c=>c.type==='claim')`,'claim completed before loading gap');
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        await until(()=>evaluate(`document.visibilityState==='hidden'`),'expedition hidden');
+        await pulse(2000);
+        const requests=expeditionRequests;
+        await pulse(12*60000);
+        assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.match(await expStatus(),/后台.*等待页面恢复/);
+        assert.equal(expeditionRequests,requests,'后台缺项不触发额外整页刷新');
+        await evaluate('renderExp();');
+        await drive(`model.runs.length===6&&!JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1'))`,'data restored resumes without toggle');
+        assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+      } finally { await cdp.send('Target.closeTarget',{targetId:foreground.targetId}); }
+    });
+    await t.test('远征加载恢复：后台等待跨刷新保留，前台仍缺数据90秒后暂停且不误记登录异常', async () => {
+      await setupExp(`addRuns(6,false,true);const originalClaim=claimRuns;
+        window.claimRuns=()=>{originalClaim();document.querySelector('[aria-label="远征派遣额度"]').remove();};`);
+      await drive(`model.calls.some(c=>c.type==='claim')`,'successful claim');
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        await until(()=>evaluate(`document.visibilityState==='hidden'`),'hidden loading');
+        await pulse(2000);
+        await pulse(12*60000);
+        const snapshot=await evaluate('({model,clock})');
+        await cdp.send('Page.reload',{},tab.sessionId);
+        await until(()=>evaluate(`typeof renderExp==='function'&&!document.getElementById('ark-auto-expedition')`),'manual reload while hidden');
+        await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderExp();
+          document.querySelector('[aria-label="远征派遣额度"]').remove();`);
+        await evaluate(source);
+        await pulse(1000);
+        await cdp.send('Target.activateTarget',{targetId:tab.targetId});
+        await until(()=>evaluate(`document.visibilityState==='visible'`),'return to foreground');
+        await pulse(50000);
+        assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false','后台时间不耗尽前台检查窗口');
+        await pulse(41000);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.match(await expStatus(),/原结果未确认，已暂停/);
+        assert.equal(await evaluate(`${logBucket('expedition')}.events.filter(e=>e.type==='pause').at(-1).data.reason`),'pending-result');
+        assert.notEqual(await evaluate(`sessionStorage.getItem('arkengine:auto-expedition:claim:v1')`),'null');
+      } finally { await cdp.send('Target.closeTarget',{targetId:foreground.targetId}); }
+    });
+    await t.test('远征加载恢复：人工暂停后即使页面恢复也不自动继续', async () => {
+      await setupExp(`addRuns(6,false,true);const originalClaim=claimRuns;
+        window.claimRuns=()=>{originalClaim();document.querySelector('[aria-label="远征派遣额度"]').remove();};`);
+      await drive(`model.calls.some(c=>c.type==='claim')`,'claim before manual stop');
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        await until(()=>evaluate(`document.visibilityState==='hidden'`),'hidden page');
+        await pulse(2000);
+        await pulse(120000);
+        await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();renderExp();`);
+        await pulse(10000);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.equal(await evaluate('model.runs.length'),0);
+        assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+      } finally { await cdp.send('Target.closeTarget',{targetId:foreground.targetId}); }
     });
     await t.test('稳定性优化：隐藏旧体力不改变农场种植决策', async () => {
       await setupFarm(`addRuns(6);fm.stamina=100;

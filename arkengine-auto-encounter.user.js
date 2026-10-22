@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.1
+// @version      1.7.2
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -245,7 +245,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.1';
+  const SCRIPT_VERSION = '1.7.2';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -1983,7 +1983,8 @@
   }
   let observedDay = beijingTime().day;
   const IDLE_JOURNAL = 'arkengine:auto-expedition:idle:v1';
-  let idleWait = loadState(sessionStorage, IDLE_JOURNAL, null, 'expedition', timedState);
+  let idleWait = loadState(sessionStorage, IDLE_JOURNAL, null, 'expedition', v => timedState(v) &&
+    ['loadDeadline', 'loadHeldAt'].every(key => v[key] === undefined || Number.isFinite(v[key]) && v[key] >= 0));
   let idleChecked = false;
   let idleBlocked = false;
   let idleSignature = '';
@@ -2109,10 +2110,25 @@
       sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
     }
     const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]').length;
+    const pending = Boolean(plan || claimWait || nativePending().length);
+    let loadExpired = null;
+    if (detail.pageLoading) {
+      const before = JSON.stringify(idleWait);
+      idleWait.loadDeadline ??= (pending ? idleWait.since : idleWait.at) + (pending || !idleWait.reloaded ? 90000 : 5 * 60000);
+      if (document.hidden) idleWait.loadHeldAt ??= now;
+      else if (idleWait.loadHeldAt !== undefined) {
+        idleWait.loadDeadline += Math.max(0, now - idleWait.loadHeldAt);
+        delete idleWait.loadHeldAt;
+      }
+      if (JSON.stringify(idleWait) !== before) sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
+      loadExpired = now >= idleWait.loadDeadline;
+    }
     diagnostic = { ...diagnostic, blocked: reason, blockedSince: idleWait.since,
-      blockedMs: Math.max(0, now - idleWait.since), reloaded: idleWait.reloaded, dialogs, ...detail };
+      blockedMs: Math.max(0, now - idleWait.since), reloaded: idleWait.reloaded, dialogs, ...detail,
+      ...(detail.pageLoading ? { backgroundLoadWait: document.hidden, loadDeadline: idleWait.loadDeadline } : {}) };
     // 同一阻塞只在原因变化时记录，持续时长由已有低频心跳和恢复事件补充。
-    const signature = JSON.stringify({ reason, dialogs, button: detail.button && {
+    const signature = JSON.stringify({ reason, dialogs, missing: detail.missing,
+      backgroundLoadWait: diagnostic.backgroundLoadWait, button: detail.button && {
       found: detail.button.found, connected: detail.button.connected, disabled: detail.button.disabled,
       visible: detail.button.visible, rectCount: detail.button.rectCount, css: detail.button.css, blockers: detail.button.blockers,
     } });
@@ -2126,16 +2142,21 @@
       return;
     }
     if (!navigator.onLine) { say(`${reason}；网络离线，等待连接恢复`); return; }
-    if (plan || claimWait || nativePending().length) {
-      if (now - idleWait.since >= 90000) setEnabled(false, `${reason}；原结果未确认，已暂停并保留记录`);
+    // 后台刷新可能尚未完成渲染。数据未就绪期间只检查页面，不耗尽前台核对时间、不重复请求。
+    if (detail.pageLoading && document.hidden) {
+      say(`${reason}；后台数据未就绪，等待页面恢复${pending ? '，原操作记录已保留' : ''}`);
+      return;
+    }
+    if (pending) {
+      if (loadExpired ?? now - idleWait.since >= 90000) setEnabled(false, `${reason}；原结果未确认，已暂停并保留记录`);
       else say(`${reason}；等待原结果，不重复提交`);
       return;
     }
-    if (idleWait.reloaded && Date.now() - idleWait.at >= 5 * 60000) {
+    if (idleWait.reloaded && (loadExpired ?? now - idleWait.at >= 5 * 60000)) {
       setEnabled(false, `${reason}；一次刷新后仍无进展，已暂停，请核对页面`);
-    } else if (!idleWait.reloaded && Date.now() - idleWait.at >= 90000) {
+    } else if (!idleWait.reloaded && (loadExpired ?? now - idleWait.at >= 90000)) {
       offer('idle-refresh', '刷新并核对停滞的远征页面', () => {
-        idleWait = { ...idleWait, reloaded: true, at: Date.now() };
+        idleWait = { ...idleWait, reloaded: true, at: Date.now(), loadDeadline: undefined, loadHeldAt: undefined };
         sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
         log.add('expedition-idle-refresh', reason, diagnostic);
         location.reload();
@@ -2818,7 +2839,8 @@
     diagnostic = { quota: q, farmEnabled, farmDueAt: farmState.nextAt || 0,
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
-      waitForIdlePage('等待远征页面和额度加载，请保持登录');
+      waitForIdlePage('等待远征页面和额度加载', { pageLoading: true,
+        missing: { quota: !q, form: !fields.root, count: !fields.count, burst: !fields.burst, preference: !fields.high } });
       return;
     }
     if (!expeditionObserved) { noteQuotaSync(); expeditionObserved = true; }
