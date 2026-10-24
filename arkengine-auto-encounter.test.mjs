@@ -147,7 +147,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
+    res.end(req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -1329,7 +1329,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.7.2');
+      assert.equal(exported.version,'1.7.3');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1385,7 +1385,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.7.2');
+      assert.equal(exported.version,'1.7.3');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -1903,12 +1903,154 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem('${key}'))`),body);
       }
     });
-    await t.test('稳定性优化：远征缺项一次刷新后仍缺项会明确暂停', async () => {
-      await setupExp(`sessionStorage.setItem('arkengine:auto-expedition:idle:v1',JSON.stringify({at:clock-300001,reloaded:true}));
+    await t.test('加载故障恢复：远征后台刷新用尽仍保留开启，数据恢复后继续派遣', async () => {
+      await setupExp(`sessionStorage.setItem('arkengine:auto-page-wait:expedition:v1',JSON.stringify({at:clock-300001,path:location.pathname,reloaded:true,refreshes:3}));
         const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();document.querySelector('#auto input[type="number"]').remove();};`);
-      await until(async()=>(await expStatus())?.includes('已暂停'),'missing controls have bounded recovery');
+      const foreground=await createTab();
+      try {
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        await until(()=>evaluate(`document.hidden`),'expedition hidden');
+        const requests=expeditionRequests;
+        await pulse(3600000);
+        assert.match(await expStatus(),/刷新.*3.*等待页面恢复/);
+        assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        assert.equal(expeditionRequests,requests);
+        await evaluate(`window.renderExp=renderCurrent;renderExp();`);
+        await drive('model.runs.length===6','expedition resumes after loading outage');
+      } finally { await cdp.send('Target.closeTarget',{targetId:foreground.targetId}); }
+    });
+    await t.test('加载故障恢复：农场旧超时后重新开启，先等待加载再种植', async () => {
+      await setupFarm(`addRuns(6);localStorage.setItem('arkengine:auto-farm:enabled:v1','false');
+        sessionStorage.setItem('arkengine:auto-page-wait:farm:v1',JSON.stringify({at:clock-3600000,path:'/farm',reloaded:true}));
+        const renderCurrent=renderFarm;window.renderFarm=()=>{renderCurrent();document.querySelector('details').remove();};`, '/farm');
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('farm-toggle').click();`);
+      await pulse(2000);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-farm:enabled:v1')`),'true');
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),0);
+      assert.match(await expStatus(),/等待.*加载/);
+      await evaluate(`window.renderFarm=renderCurrent;renderFarm();`);
+      await drive('fm.crops.length===12','farm recovers after enable');
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
+    });
+    await t.test('加载故障恢复：修仙刷新用尽仍开启，手动刷新后数据恢复会继续', async () => {
+      const loading=`window.clock=10000;Date.now=()=>clock;refresh.remove();`;
+      await setup(`${loading}
+        sessionStorage.setItem('arkengine:auto-page-wait:cultivate:v1',JSON.stringify({at:0,path:'/cultivate',reloaded:true,refreshes:3}));`);
+      await pulse(3600000);
+      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
+      assert.match(await status(),/刷新.*3.*等待页面恢复/);
+      await cdp.send('Page.reload',{},tab.sessionId);
+      await until(()=>evaluate(`typeof base==='function'&&!document.getElementById('ark-auto-encounter')`),'manual reload after outage');
+      await evaluate(`${loading}Math.random=()=>0;`);
+      await evaluate(source);
+      await pulse(5000);
+      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
+      await evaluate(`base();choices(['修为 +1','修为 +2','钻石 +1']);`);
+      await drive('clicks.length===1','cultivate resumes after outage',10);
+      assert.deepEqual(await clickLog(),[2]);
+    });
+    await t.test('加载故障恢复：农场按90秒5分钟15分钟刷新三次，跨刷新保留上限并自动恢复', async () => {
+      const removeData=`document.querySelector('details').remove();`;
+      await setupFarm(`addRuns(6);const renderCurrent=renderFarm;window.renderFarm=()=>{renderCurrent();${removeData}};`, '/farm');
+      await until(async()=>(await expStatus())?.includes('等待田地'),'initial loading wait started');
+      for(const [index,interval] of [90000,300000,900000].entries()) {
+        await pulse(interval-1000);
+        assert.ok(await evaluate(`!!document.getElementById('ark-auto-expedition')`),'到间隔前不刷新');
+        const snapshot=await evaluate('({fm,model,clock})');snapshot.clock+=1001;
+        await pulse(1001);
+        await until(()=>evaluate(`typeof renderFarm==='function'&&!document.getElementById('ark-auto-expedition')`),'scheduled loading refresh');
+        await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderFarm();${removeData}`);
+        await evaluate(source);
+        await until(async()=>(await expStatus())?.includes('等待田地'),'wait resumes after reload');
+        assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-page-wait:farm:v1')).refreshes`),index+1);
+        assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-farm:enabled:v1')`),'false');
+      }
+      await pulse(3600000);
+      assert.match(await expStatus(),/刷新.*3.*等待页面恢复/);
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),0);
+      await evaluate(`renderFarm();`);
+      await drive('fm.crops.length===12','automatic resume after third refresh');
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
+    });
+    await t.test('加载故障恢复：离线不刷新，恢复联网和数据后继续农场', async () => {
+      await setupFarm(`addRuns(6);Object.defineProperty(navigator,'onLine',{configurable:true,get:()=>false});
+        const renderCurrent=renderFarm;window.renderFarm=()=>{renderCurrent();document.querySelector('details').remove();};`, '/farm');
+      await pulse(3600000);
+      assert.match(await expStatus(),/网络离线/);
+      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-farm:enabled:v1')`),'false');
+      await evaluate(`delete navigator.onLine;window.renderFarm=renderCurrent;renderFarm();`);
+      await drive('fm.crops.length===12','resume after network returns');
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
+    });
+    await t.test('加载故障恢复：人工暂停或账号异常后，数据恢复不自动开启', async () => {
+      for(const stop of ['manual','account']) {
+        await setupFarm(`addRuns(6);sessionStorage.setItem('arkengine:auto-page-wait:farm:v1',JSON.stringify({at:clock-3600000,path:'/farm',reloaded:true,refreshes:3}));
+          const renderCurrent=renderFarm;window.renderFarm=()=>{renderCurrent();document.querySelector('details').remove();};`, '/farm');
+        if(stop==='manual') await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();`);
+        else await evaluate(`fm.error=true;fm.message='401 登录失效';renderFarm();`);
+        await pulse(1000);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+        await evaluate(`fm.error=false;fm.message='';window.renderFarm=renderCurrent;renderFarm();`);
+        await pulse(3600000);
+        assert.equal(await evaluate(farmCalls('plant')+'.length'),0);
+        assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+      }
+    });
+    await t.test('切页故障恢复：点击农场后不连续点击，30秒后整页到目标继续种植', async () => {
+      await setupFarm(`addRuns(6);window.navFarm=path=>{fm.calls.push({type:'navigate',path});};`);
+      await drive(`${farmCalls('navigate')}.length===1`,'first SPA navigation click');
+      for(let i=0;i<5;i++) await pulse(5000);
+      assert.equal(await evaluate(farmCalls('navigate')+'.length'),1);
+      await pulse(6000);
+      await until(()=>evaluate(`location.pathname==='/farm'&&!document.getElementById('ark-auto-expedition')`),'full navigation fallback');
+      await until(()=>evaluate(`typeof renderFarm==='function'`),'farm fallback fixture');
+      await evaluate(`addRuns(6);Math.random=()=>0;`);
+      await evaluate(source);
+      await drive('fm.crops.length===12','farm planting after fallback');
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
+    });
+    await t.test('切页故障恢复：返回远征同样只点击一次，整页跳转预算跨刷新保留', async () => {
+      await setupFarm(`addRuns(6);localStorage.setItem('arkengine:auto-farm:enabled:v1','false');
+        window.navFarm=path=>{fm.calls.push({type:'navigate',path});};`, '/farm');
+      await drive(`${farmCalls('navigate')}.length===1`,'return navigation click');
+      for(let i=0;i<5;i++)await pulse(5000);
+      assert.equal(await evaluate(farmCalls('navigate')+'.length'),1);
+      await pulse(6000);
+      await until(()=>evaluate(`location.pathname==='/activities/expedition'&&!document.getElementById('ark-auto-expedition')`),'full return navigation');
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')).reloaded`),true);
+      await evaluate(`addRuns(6);model.burst=0;renderExp();Math.random=()=>0;`);
+      await evaluate(source);
+      await until(async()=>(await expStatus())?.includes('持续等待远征归来'),'arrived at expedition');
+      assert.equal(await evaluate(`sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')`),null);
+      await setupFarm(`addRuns(6);sessionStorage.setItem('arkengine:auto-expedition:navigation:v1',
+        JSON.stringify({at:clock-3600000,from:'/activities/expedition',to:'/farm',reloaded:true}));`);
+      const requests=expeditionRequests;
+      await pulse(3600000);
+      assert.equal(expeditionRequests,requests);
+      assert.equal(await evaluate(farmCalls('navigate')+'.length'),0);
+      assert.match(await expStatus(),/切换农场仍未完成/);
+    });
+    await t.test('切页故障恢复：等待中暂停农场或出现弹窗不整页跳转', async () => {
+      for(const stop of ['farm','dialog']) {
+        await setupFarm(`addRuns(6);window.navFarm=path=>{fm.calls.push({type:'navigate',path});};`);
+        await drive(`${farmCalls('navigate')}.length===1`,'navigation is pending');
+        if(stop==='farm') await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('farm-toggle').click();`);
+        else await evaluate(`openDispatch();`);
+        await pulse(60000);
+        assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+        assert.ok(await evaluate(`!!document.getElementById('ark-auto-expedition')`));
+        assert.equal(await evaluate(farmCalls('navigate')+'.length'),1);
+      }
+    });
+    await t.test('加载故障恢复：农场未决种植仍保留记录且不重种', async () => {
+      await setupFarm(`addRuns(6);sessionStorage.setItem('arkengine:auto-page-wait:farm:v1',JSON.stringify({at:clock-3600000,path:'/farm',reloaded:true}));
+        sessionStorage.setItem('arkengine:auto-farm:pending:v1',JSON.stringify({action:'plant',crop:'南瓜',empty:12,plots:[],at:clock-3600000}));
+        const renderCurrent=renderFarm;window.renderFarm=()=>{renderCurrent();document.querySelector('details').remove();};`, '/farm');
+      await pulse(1000);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-farm:enabled:v1')`),'false');
+      assert.ok(await evaluate(`sessionStorage.getItem('arkengine:auto-farm:pending:v1')`));
+      assert.equal(await evaluate(farmCalls('plant')+'.length'),0);
       assert.deepEqual(await evaluate('model.calls'),[]);
-      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
     });
     await t.test('远征加载恢复：后台领取成功后额度迟到，超过90秒仍等待并在恢复后续派', async () => {
       await setupExp(`addRuns(6,false,true);const originalClaim=claimRuns;

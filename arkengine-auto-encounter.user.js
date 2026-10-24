@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.2
+// @version      1.7.3
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -137,19 +137,36 @@
   }
   function createPageWait(scope, log) {
     const key = `arkengine:auto-page-wait:${scope}:v1`;
-    let state = loadState(sessionStorage, key, null, scope, timedState);
+    let state = loadState(sessionStorage, key, null, scope, v => timedState(v) &&
+      (v.refreshes === undefined || Number.isInteger(v.refreshes) && v.refreshes >= 0 && v.refreshes <= 3));
     let waiting = false;
     return {
       begin() { waiting = false; },
       finish() { if (!waiting) this.clear(); },
       clear() { if (state) { state = null; sessionStorage.removeItem(key); } },
-      wait(reason, safe, say, pause) {
+      wait(reason, safe, say, pause, recoverable = false) {
         waiting = true;
         if (!navigator.onLine) { say('网络离线，等待连接恢复'); return; }
+        if (recoverable) safe &&= !document.querySelector('[role="dialog"], [role="alertdialog"]');
         if (!state || state.path !== location.pathname) {
           state = { at: Date.now(), path: location.pathname, reloaded: false };
           sessionStorage.setItem(key, JSON.stringify(state));
           log.add('page-blocked', reason, { scope });
+        }
+        // 只有页面数据缺失且没有原操作/弹窗时，允许有限刷新；耗尽后仍检查 DOM，不关闭用户开关。
+        if (recoverable && safe) {
+          const refreshes = state.refreshes ?? (state.reloaded ? 1 : 0);
+          if (refreshes >= 3) { say(`${reason}；自动刷新已达 3 次，保持开启并等待页面恢复`); return; }
+          const remaining = [90000, 5 * 60000, 15 * 60000][refreshes] - (Date.now() - state.at);
+          if (remaining > 0) {
+            say(`${reason}；等待页面恢复（已刷新 ${refreshes}/3 次）`);
+            return;
+          }
+          state = { ...state, reloaded: true, refreshes: refreshes + 1, at: Date.now() };
+          sessionStorage.setItem(key, JSON.stringify(state));
+          log.add('page-refresh', reason, { scope, attempt: state.refreshes, limit: 3 });
+          location.reload();
+          return;
         }
         if (Date.now() - state.at >= (state.reloaded ? 300000 : 90000)) {
           if (!safe) { pause(`${reason}；存在弹窗或未决操作，已暂停并保留记录`); return; }
@@ -245,7 +262,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.2';
+  const SCRIPT_VERSION = '1.7.3';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -991,7 +1008,7 @@
   }
   toggle.addEventListener('click', () => {
     if (stateFault('cultivate')) { say(stateFault('cultivate')); return; }
-    if (!enabled) { clearAccountStop(); recoveryBudget.clear(); }
+    if (!enabled) { clearAccountStop(); recoveryBudget.clear(); pageWait.clear(); }
     setEnabled(!enabled);
   });
   toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
@@ -1181,7 +1198,7 @@
     const refresh = locator.query('button[aria-label="刷新修炼状态"]');
     if (!refresh || !usable(refresh)) {
       pageWait.wait('等待修炼状态刷新完成', !encounterAction && !pendingOperation(), say,
-        reason => setEnabled(false, reason));
+        reason => setEnabled(false, reason), true);
       return;
     }
 
@@ -1229,8 +1246,8 @@
     }
     const seek = findButton('寻找奇遇');
     if (!seek) {
-      pageWait.wait('等待修仙主殿加载，请保持登录', !encounterAction && !pendingOperation(), say,
-        reason => setEnabled(false, reason)); return;
+      pageWait.wait('等待修仙主殿加载', !encounterAction && !pendingOperation(), say,
+        reason => setEnabled(false, reason), true); return;
     }
     if (!usable(seek)) { say('等待游戏允许寻访奇遇'); return; }
     if (!retryReady('seek', 'seek')) return;
@@ -1992,6 +2009,11 @@
   const log = createLog('expedition');
   const recoveryBudget = createRecovery('expedition', log, message => say(message));
   const farmWait = createPageWait('farm', log);
+  const expeditionLoadWait = createPageWait('expedition', log);
+  const NAV_JOURNAL = 'arkengine:auto-expedition:navigation:v1';
+  const travelPaths = ['/farm', '/activities/expedition'];
+  let navigation = loadState(sessionStorage, NAV_JOURNAL, null, 'expedition', v => timedState(v) &&
+    travelPaths.includes(v.from) && travelPaths.includes(v.to) && v.from !== v.to && typeof v.reloaded === 'boolean');
   const locator = createLocator();
   accountListeners.push(reason => setEnabled(false, reason));
   const BURST_DAY = 'arkengine:auto-expedition:burst-day:v1';
@@ -2078,11 +2100,14 @@
     localStorage.setItem(FARM_PREF, String(farmEnabled));
     if (farmEnabled) {
       recoveryBudget.clear('farm-ready');
+      farmWait.clear();
     }
+    if (navigation?.to === '/farm') clearNavigation();
     cancelQueued(); schedule();
   });
   shadow.getElementById('farm-check').addEventListener('click', () => {
     if (stateFault('farm')) { say(stateFault('farm')); return; }
+    farmWait.clear();
     saveFarmState({ ...farmState, nextAt: 0, note: '等待检查农场' });
     schedule();
   });
@@ -2142,7 +2167,11 @@
       return;
     }
     if (!navigator.onLine) { say(`${reason}；网络离线，等待连接恢复`); return; }
-    // 后台刷新可能尚未完成渲染。数据未就绪期间只检查页面，不耗尽前台核对时间、不重复请求。
+    if (detail.pageLoading && !pending) {
+      expeditionLoadWait.wait(reason, true, say, message => setEnabled(false, message), true);
+      return;
+    }
+    // 有原操作的后台页面仍只检查数据，不耗尽前台核对时间、不重复请求。
     if (detail.pageLoading && document.hidden) {
       say(`${reason}；后台数据未就绪，等待页面恢复${pending ? '，原操作记录已保留' : ''}`);
       return;
@@ -2204,6 +2233,7 @@
       if (stateFault('expedition')) { say(stateFault('expedition')); return; }
       if (!enabled) {
         clearAccountStop(); recoveryBudget.clear(); clearIdleWait();
+        farmWait.clear(); expeditionLoadWait.clear(); clearNavigation();
         if (claimWait) {
           // 用户明确开始后重新给状态核对计时；保留原领取，不再次提交领取请求。
           saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
@@ -2446,10 +2476,39 @@
       return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path && !a.target && usable(a);
     });
   }
+  function clearNavigation() {
+    if (!navigation) return;
+    navigation = null;
+    sessionStorage.removeItem(NAV_JOURNAL);
+  }
+  function startNavigation(path, link) {
+    navigation = { from: location.pathname.replace(/\/$/, ''), to: path, at: Date.now(), reloaded: false };
+    sessionStorage.setItem(NAV_JOURNAL, JSON.stringify(navigation));
+    link.click();
+  }
+  function waitForNavigation() {
+    if (!navigation) return false;
+    const path = location.pathname.replace(/\/$/, '');
+    if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled) {
+      clearNavigation(); return false;
+    }
+    const target = navigation.to === '/farm' ? '农场' : '远征';
+    if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
+    if (document.querySelector('[role="dialog"], [role="alertdialog"]') || plan || claimWait || farmPlan || nativePending().length) {
+      say(`等待切换${target}；先核对当前弹窗或原操作`); return true;
+    }
+    if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
+      navigation = { ...navigation, reloaded: true, at: Date.now() };
+      sessionStorage.setItem(NAV_JOURNAL, JSON.stringify(navigation));
+      log.add('navigation-refresh', '切页未完成，整页打开目标一次', { from: navigation.from, to: navigation.to });
+      location.assign(navigation.to);
+    } else say(navigation.reloaded ? `切换${target}仍未完成，等待页面恢复；可手动刷新` : `等待切换${target}完成，不重复点击`);
+    return true;
+  }
   function backToExpedition() {
     const link = travelLink('/activities/expedition');
     if (!link) { say('等待返回远征入口'); return; }
-    offer('farm:return', '返回远征，按预约时间再检查农场', () => link.click());
+    offer('farm:return', '返回远征，按预约时间再检查农场', () => startNavigation('/activities/expedition', link));
   }
   function planFarmVisit(at, note) {
     // 农场已经确认不足时，记住顶部旧数值；同一旧值不能反复触发往返。
@@ -2531,7 +2590,7 @@
           saveFarmState({ ...farmState, nextAt: 0, staminaSeen: earlyStamina });
           log.add('farm-stamina-wake', '顶部体力变化，提前检查；尚未确认实际可用体力', { displayed: earlyStamina });
         }
-        link.click();
+        startNavigation('/farm', link);
       });
     return true;
   }
@@ -2690,7 +2749,7 @@
     }
     const s = farmSnapshot();
     if (!s) {
-      farmWait.wait('等待田地、成熟时间和体力数据加载', !farmPlan && !dialogs.length, say, pauseFarm);
+      farmWait.wait('等待田地、成熟时间和体力数据加载', !farmPlan && !dialogs.length, say, pauseFarm, true);
       return;
     }
     const signature = JSON.stringify(s.entries.map(e => [e.plot,e.crop,e.at])) + ':' + s.empty.length;
@@ -2818,7 +2877,10 @@
       if (enabled) setEnabled(false, stateFault('expedition')); else say(stateFault('expedition'));
       return;
     }
-    if (!onPage() || !enabled) { if (farmMarketLoading) cancelFarmRead(); releaseLock?.(); return; }
+    if (!onPage() || !enabled) {
+      if (!onPage()) clearNavigation();
+      if (farmMarketLoading) cancelFarmRead(); releaseLock?.(); return;
+    }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
     log.pulse(status.textContent, diagnostic);
@@ -2828,6 +2890,7 @@
       return;
     }
     if (Date.now() < nextStepAt) return;
+    if (waitForNavigation()) return;
     if (inFarm()) { expeditionObserved = false; farmStep(); return; }
     if (farmEntryAt || farmMarketLoading || farmReadAttempts) cancelFarmRead();
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
@@ -3022,12 +3085,14 @@
       idleChecked = false;
       idleBlocked = false;
       farmWait.begin();
+      expeditionLoadWait.begin();
       try { observeSessionPage(); step(); }
       catch (error) { log.add('runtime-error', '远征检查异常，已暂停并保留原记录', { name: error?.name || 'Error', stage: 'expedition-check' }); setEnabled(false, '远征检查失败，已暂停；请核对页面后重试'); }
       finally {
         if (!offered) cancelQueued();
         if (idleChecked && !idleBlocked) clearIdleWait(true);
         if (enabled && active && farmEnabled && inFarm()) farmWait.finish();
+        if (enabled && active && onPage()) expeditionLoadWait.finish();
       }
     });
   }
