@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.3
+// @version      1.7.4
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -262,7 +262,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.3';
+  const SCRIPT_VERSION = '1.7.4';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -1873,11 +1873,13 @@
   const FARM_CROP = 'arkengine:auto-farm:crop:v1';
   const FARM_STATE = 'arkengine:auto-farm:schedule:v1';
   const FARM_JOURNAL = 'arkengine:auto-farm:pending:v1';
+  const STAMINA_SYNC = 'arkengine:auto-farm:stamina-sync:v1';
   const CROPS = ['小麦','胡萝卜','番茄','玉米','草莓','南瓜','蓝莓','葡萄','黄金苹果','西瓜','可可豆','星辉果'];
   let farmEnabled = true;
   let farmCrop = 'auto';
   let farmState = { nextAt: 0, expeditionAt: 0, note: '等待首次检查', selection: '' };
   let farmPlan = null;
+  let staminaSync = loadState(sessionStorage, STAMINA_SYNC, null, 'farm', timedState);
   try {
     farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
     farmCrop = localStorage.getItem(FARM_CROP) || 'auto';
@@ -2101,6 +2103,7 @@
     if (farmEnabled) {
       recoveryBudget.clear('farm-ready');
       farmWait.clear();
+      clearStaminaSync();
     }
     if (navigation?.to === '/farm') clearNavigation();
     cancelQueued(); schedule();
@@ -2234,6 +2237,7 @@
       if (!enabled) {
         clearAccountStop(); recoveryBudget.clear(); clearIdleWait();
         farmWait.clear(); expeditionLoadWait.clear(); clearNavigation();
+        clearStaminaSync();
         if (claimWait) {
           // 用户明确开始后重新给状态核对计时；保留原领取，不再次提交领取请求。
           saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
@@ -2622,10 +2626,65 @@
       regen: Number(staminaNode.title.match(/\d+/)[0]) * 60000,
       nextRegen: s[3] === undefined ? null : (+s[3] * 60 + +s[4]) * 1000 };
   }
-  function staminaReadyAt(s, need) {
-    return Date.now() + (s.nextRegen ?? s.regen) + Math.max(0, need - s.stamina - 1) * s.regen + 2000;
+  function staminaReadyAt(s, need, at = Date.now()) {
+    return at + (s.nextRegen ?? s.regen) + Math.max(0, need - s.stamina - 1) * s.regen + 2000;
   }
-  function readFarmMarket() {
+  function clearStaminaSync() {
+    if (!staminaSync) return;
+    staminaSync = null;
+    sessionStorage.removeItem(STAMINA_SYNC);
+  }
+  function checkFarmStamina(s, need, action, latest = false) {
+    if (!latest && s.stamina >= need && !farmStaminaNeed()) { clearStaminaSync(); return true; }
+    if (!farmMarket || Date.now() - farmMarket.at > 15000) {
+      readFarmMarket('核对最新农场体力与田地'); return false;
+    }
+    const data = farmMarket.data.stamina;
+    if (!Number.isSafeInteger(data.current) || data.current < 0 || !Number.isSafeInteger(data.max) ||
+        data.max < need || data.current > data.max || !Number.isFinite(data.regenMinutes) || data.regenMinutes <= 0 ||
+        data.nextRegenSeconds != null && (!Number.isFinite(data.nextRegenSeconds) || data.nextRegenSeconds < 0 || data.nextRegenSeconds > data.regenMinutes * 60)) {
+      pauseFarm('最新体力或恢复时间无法核对，请检查农场状态'); return false;
+    }
+    const detail = { action, current: data.current, needed: need, pageStamina: s.stamina,
+      displayed: displayedStamina(), checkedAt: farmMarket.at };
+    if (data.current < need) {
+      const note = `等待体力恢复到 ${need} 点再${action}`;
+      const nextAt = Math.max(Date.now() + 30000, staminaReadyAt({ stamina: data.current,
+        regen: data.regenMinutes * 60000, nextRegen: data.nextRegenSeconds == null ? null : data.nextRegenSeconds * 1000 }, need, farmMarket.at));
+      if (farmState.nextAt !== nextAt || farmState.note !== note) {
+        saveFarmState({ ...farmState, nextAt, note, staminaSeen: detail.displayed });
+        log.add('farm-stamina-wait', '按最新体力预约下一次农场检查', { ...detail, nextAt });
+      }
+      if (ownSeedDialog) {
+        const close = ownSeedDialog.querySelector('button[aria-label="关闭"]');
+        if (usable(close)) offer('farm:stamina-close', '关闭种子窗口，等待体力恢复', () => close.click());
+        else say('最新体力不足，请关闭种子窗口后等待恢复');
+      } else backToExpedition();
+      return false;
+    }
+    if (s.stamina < need) {
+      if (staminaSync) {
+        if (Date.now() - farmEntryAt >= 10000) pauseFarm('最新体力已足够，但刷新后农场仍显示旧值；请核对页面后开启农场');
+        else say('已刷新核对体力，等待农场页面更新');
+      } else if (!plan && !claimWait && !nativePending().length &&
+          !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
+        offer('farm:stamina-sync', '刷新农场，核对已恢复的体力', () => {
+          staminaSync = { at: Date.now() };
+          sessionStorage.setItem(STAMINA_SYNC, JSON.stringify(staminaSync));
+          log.add('farm-stamina-refresh', '最新体力足够但农场显示不足，整页核对一次', detail);
+          location.reload();
+        });
+      } else say('体力已恢复，等待当前弹窗或原操作核对后刷新农场');
+      return false;
+    }
+    clearStaminaSync();
+    if (farmStaminaNeed()) {
+      saveFarmState({ ...farmState, nextAt: 0, note: `体力已核对，准备${action}`, staminaSeen: detail.displayed });
+      log.add('farm-stamina-ready', '最新体力与农场页面均已满足操作要求', detail);
+    }
+    return true;
+  }
+  function readFarmMarket(message = '读取本轮最新行情与种植加成') {
     if (farmMarketLoading) return;
     if (!navigator.onLine) { say('农场行情：网络离线，等待连接恢复'); return; }
     if (Date.now() < farmReadNextAt) { say('农场行情暂时不可用，等待有限重试'); return; }
@@ -2634,7 +2693,7 @@
     farmReadController = new AbortController();
     farmReadAttempts++;
     farmMarketLoading = true;
-    say('读取本轮最新行情与种植加成');
+    say(message);
     // 只读网站原有状态接口，保留 priceMilli 精度；种植、收获仍只点网页原按钮。
     fetch('/api/farm', { cache: 'no-store', credentials: 'same-origin',
       signal: AbortSignal.any([farmReadController.signal, AbortSignal.timeout(15000)]) })
@@ -2805,6 +2864,7 @@
         return;
       }
       if (!farmMarket || Date.now() - farmMarket.at > 15000) { readFarmMarket(); return; }
+      if (!checkFarmStamina(s, s.empty.length, '种植', true)) return;
       const best = bestFarmSeed(dialog,s);
       if (best.error) {
         const close = dialog.querySelector('button[aria-label="关闭"]');
@@ -2826,12 +2886,12 @@
     }
     if (farmState.nextAt > Date.now()) {
       const need = farmStaminaNeed();
-      if (need && s.stamina >= need) saveFarmState({ ...farmState, nextAt: 0, staminaSeen: displayedStamina() });
+      if (need && s.stamina >= need) { if (!checkFarmStamina(s, need, farmState.note.endsWith('收获') ? '收获' : '种植')) return; }
       else { backToExpedition(); return; }
     }
     if (s.ready.length) {
       const need = s.ready.length;
-      if (s.stamina < need) { planFarmVisit(staminaReadyAt(s,need), `等待体力恢复到 ${need} 点再收获`); return; }
+      if (!checkFarmStamina(s, need, '收获')) return;
       const harvest = [...document.querySelectorAll('button')].find(b => usable(b) && /^一键收获\s*\(\d+\)$/.test(textOf(b)));
       if (!harvest) {
         // 页面自身更新无效时，本批田地最多整页核对一次。跨刷新保留预算。
@@ -2848,16 +2908,16 @@
         farmWait.wait('等待一键收获数量与成熟地块一致', !farmPlan && !dialogs.length, say, pauseFarm); return;
       }
       offer(`farm:harvest:${s.ready.map(e=>e.plot).join(',')}`, `一键收获 ${count} 块田地`, () => {
-        saveFarmPlan({action:'harvest',plots:s.ready.map(e=>e.plot),at:Date.now()}); harvest.click();
+        saveFarmPlan({action:'harvest',plots:s.ready.map(e=>e.plot),at:Date.now()}); farmMarket = null; harvest.click();
       });
       return;
     }
     if (s.empty.length) {
       const need = s.empty.length;
-      if (s.stamina < need) { planFarmVisit(staminaReadyAt(s,need), `等待体力恢复到 ${need} 点再种植`); return; }
+      if (!checkFarmStamina(s, need, '种植')) return;
       const empty = s.empty.find(usable);
       if (!empty) { say('等待农场操作完成'); return; }
-      offer('farm:seeds', '打开空地选择种子', () => { farmMarket = null; openingSeedsAt = Date.now(); empty.click(); });
+      offer('farm:seeds', '打开空地选择种子', () => { openingSeedsAt = Date.now(); empty.click(); });
       return;
     }
     const next = Math.min(...s.entries.map(e=>e.at));
