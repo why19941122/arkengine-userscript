@@ -1,18 +1,28 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.4
+// @version      1.7.5
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
 // @match        https://game.arkengine.me/*
-// @run-at       document-idle
+// @run-at       document-start
 // @grant        none
 // @noframes
 // ==/UserScript==
 
 (() => {
   'use strict';
+  const injectedAt = Date.now();
+  const injectedReadyState = document.readyState;
+  const injectedClock = performance.now();
+  let started = false;
+  let bodyObserver;
+  function start() {
+  if (started || !document.body) return;
+  started = true;
+  bodyObserver?.disconnect();
+  const bodyWaitMs = Math.max(0, Math.round(performance.now() - injectedClock));
   if (window.top !== window.self || document.getElementById('ark-auto-encounter')) return;
   // 网站 Base UI 的关闭完成回调先等 requestAnimationFrame；后台不绘制时可能一直不卸载。
   // 使用其公开代码中的开关，只在自动化路由启用期间跳过动画等待，不改写 rAF 或移除弹窗。
@@ -135,36 +145,77 @@
     const keys = [...stateFaults].filter(([, group]) => group === scope).map(([key]) => key);
     return keys.length ? `保存记录不可读，已暂停；原记录保留，请修复后刷新（${keys.join('、')}）` : '';
   }
+  const PAGE_REFRESH_DELAYS = [90000, 5 * 60000, 15 * 60000, 60 * 60000, 120 * 60000];
+  function runtimeDiagnostic() {
+    return { online: navigator.onLine, readyState: document.readyState,
+      uptimeMs: Math.max(0, Math.round(performance.now() - injectedClock)) };
+  }
+  function navigationDiagnostic() {
+    const entry = performance.getEntriesByType('navigation')[0];
+    if (!entry) return null;
+    return { type: entry.type, ...Object.fromEntries(['responseStart', 'responseEnd', 'domInteractive',
+      'domContentLoadedEventStart', 'loadEventStart'].map(key => [key, Math.round(entry[key])])) };
+  }
   function createPageWait(scope, log) {
     const key = `arkengine:auto-page-wait:${scope}:v1`;
     let state = loadState(sessionStorage, key, null, scope, v => timedState(v) &&
-      (v.refreshes === undefined || Number.isInteger(v.refreshes) && v.refreshes >= 0 && v.refreshes <= 3));
+      (v.refreshes === undefined || Number.isInteger(v.refreshes) && v.refreshes >= 0 && v.refreshes <= PAGE_REFRESH_DELAYS.length) &&
+      (v.since === undefined || Number.isFinite(v.since) && v.since >= 0) &&
+      ['recoverable', 'exhaustedLogged'].every(key => v[key] === undefined || typeof v[key] === 'boolean'));
     let waiting = false;
+    function snapshot() {
+      if (!state) return null;
+      const attempt = state.refreshes ?? (state.reloaded ? 1 : 0);
+      const limit = state.recoverable === false ? 1 : PAGE_REFRESH_DELAYS.length;
+      const delay = state.recoverable === true ? PAGE_REFRESH_DELAYS[attempt] :
+        state.recoverable === false && !attempt ? 90000 : null;
+      return { scope, observedSince: state.since ?? state.at, blockedMs: Math.max(0, Date.now() - (state.since ?? state.at)),
+        attempt, limit, nextAt: delay == null ? null : state.at + delay,
+        lastRefreshAt: attempt ? state.at : null };
+    }
     return {
+      snapshot,
       begin() { waiting = false; },
-      finish() { if (!waiting) this.clear(); },
-      clear() { if (state) { state = null; sessionStorage.removeItem(key); } },
-      wait(reason, safe, say, pause, recoverable = false) {
+      finish() { if (!waiting) this.clear('check-advanced'); },
+      clear(cause = 'manual') {
+        if (!state) return;
+        // 仅说明调度离开了加载等待，不能据此推断游戏操作已成功。
+        log.add('page-wait-ended', '页面加载等待已结束', { ...snapshot(), cause });
+        state = null; sessionStorage.removeItem(key);
+      },
+      wait(reason, safe, say, pause, recoverable = false, beforeReload = null) {
         waiting = true;
         if (!navigator.onLine) { say('网络离线，等待连接恢复'); return; }
         if (recoverable) safe &&= !document.querySelector('[role="dialog"], [role="alertdialog"]');
         if (!state || state.path !== location.pathname) {
-          state = { at: Date.now(), path: location.pathname, reloaded: false };
+          state = { at: Date.now(), since: Date.now(), path: location.pathname, reloaded: false,
+            recoverable: Boolean(recoverable && safe) };
           sessionStorage.setItem(key, JSON.stringify(state));
-          log.add('page-blocked', reason, { scope });
+          log.add('page-blocked', reason, { ...snapshot(), runtime: runtimeDiagnostic() });
+        } else if (state.since === undefined || state.recoverable !== Boolean(recoverable && safe)) {
+          state = { ...state, since: state.since ?? state.at, recoverable: Boolean(recoverable && safe) };
+          sessionStorage.setItem(key, JSON.stringify(state));
         }
-        // 只有页面数据缺失且没有原操作/弹窗时，允许有限刷新；耗尽后仍检查 DOM，不关闭用户开关。
+        // 调用方确认可安全重新读页后才有限刷新；旧操作的记录须先保存，不能重置写入预算。
         if (recoverable && safe) {
           const refreshes = state.refreshes ?? (state.reloaded ? 1 : 0);
-          if (refreshes >= 3) { say(`${reason}；自动刷新已达 3 次，保持开启并等待页面恢复`); return; }
-          const remaining = [90000, 5 * 60000, 15 * 60000][refreshes] - (Date.now() - state.at);
+          if (refreshes >= PAGE_REFRESH_DELAYS.length) {
+            if (!state.exhaustedLogged) {
+              state = { ...state, exhaustedLogged: true };
+              sessionStorage.setItem(key, JSON.stringify(state));
+              log.add('page-refresh-exhausted', '加载恢复刷新次数已用完，保持开启等待', { ...snapshot(), runtime: runtimeDiagnostic() });
+            }
+            say(`${reason}；自动刷新已达 ${PAGE_REFRESH_DELAYS.length} 次，保持开启并等待页面恢复`); return;
+          }
+          const remaining = PAGE_REFRESH_DELAYS[refreshes] - (Date.now() - state.at);
           if (remaining > 0) {
-            say(`${reason}；等待页面恢复（已刷新 ${refreshes}/3 次）`);
+            say(`${reason}；等待页面恢复（已刷新 ${refreshes}/${PAGE_REFRESH_DELAYS.length} 次，约 ${Math.ceil(remaining / 60000)} 分钟后再核对）`);
             return;
           }
+          beforeReload?.();
           state = { ...state, reloaded: true, refreshes: refreshes + 1, at: Date.now() };
           sessionStorage.setItem(key, JSON.stringify(state));
-          log.add('page-refresh', reason, { scope, attempt: state.refreshes, limit: 3 });
+          log.add('page-refresh', reason, { ...snapshot(), runtime: runtimeDiagnostic() });
           location.reload();
           return;
         }
@@ -173,7 +224,7 @@
           if (state.reloaded) { pause(`${reason}；一次刷新后仍无进展，已暂停`); return; }
           state = { ...state, reloaded: true, at: Date.now() };
           sessionStorage.setItem(key, JSON.stringify(state));
-          log.add('page-refresh', reason, { scope });
+          log.add('page-refresh', reason, { ...snapshot(), runtime: runtimeDiagnostic() });
           location.reload();
         } else say(`${reason}；等待页面更新${state.reloaded ? '（已核对一次）' : ''}`);
       },
@@ -262,7 +313,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.4';
+  const SCRIPT_VERSION = '1.7.5';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -603,6 +654,7 @@
     }
     function pulse(state, diagnostic = {}) {
       const now = Date.now();
+      diagnostic = { ...diagnostic, runtime: runtimeDiagnostic() };
       const normalizedState = String(state).replace(/\d+(?:\.\d+)?/g, '#');
       if (state && normalizedState !== lastState) {
         lastState = normalizedState;
@@ -634,19 +686,22 @@
       try { localStorage.setItem(heartbeatKey, JSON.stringify(checkpoint)); } catch { storageFailed = true; }
     }
     function observeLifecycle(context) {
-      const record = event => {
+      const record = (event, name = event.type) => {
         const state = context();
         if (!state) return;
         // 生命周期事件不算调度心跳，不能掩盖恢复后发现的检查中断。
-        add('page-lifecycle', `页面事件：${event.type}`, {
-          event: event.type, persisted: Boolean(event.persisted), trusted: Boolean(event.isTrusted),
-          discarded: Boolean(document.wasDiscarded), readyState: document.readyState,
+        add('page-lifecycle', `页面事件：${name}`, {
+          event: name, persisted: Boolean(event.persisted), trusted: Boolean(event.isTrusted),
+          discarded: Boolean(document.wasDiscarded), ...runtimeDiagnostic(),
+          ...(name === 'load' ? { startup: { injectedAt, injectedReadyState, bodyWaitMs } } : {}),
+          ...(['load', 'DOMContentLoaded', 'document-load'].includes(name) ? { navigation: navigationDiagnostic() } : {}),
           lastTickAt: lastTick || null, gapMs: lastTick ? Math.max(0, Date.now() - lastTick) : null,
           ...state,
         });
       };
-      for (const name of ['freeze', 'resume', 'visibilitychange']) document.addEventListener(name, record, true);
-      for (const name of ['pageshow', 'pagehide']) window.addEventListener(name, record, true);
+      for (const name of ['freeze', 'resume', 'visibilitychange', 'readystatechange', 'DOMContentLoaded']) document.addEventListener(name, record, true);
+      for (const name of ['pageshow', 'pagehide', 'online', 'offline']) window.addEventListener(name, record, true);
+      window.addEventListener('load', event => { if (event.target === document) record(event, 'document-load'); });
       record({ type: 'load' });
     }
     function mount(shadow) {
@@ -735,7 +790,7 @@
       if (!last || last.signature !== signature || now - last.at >= interval) {
         samples.set(key, { signature, at: now });
         diagnosticLogs[info.group].add('request-result', '已有游戏请求的被动观察结果',
-          { path: info.path, startedAt: info.at, status: result.status, outcome: result.outcome,
+            { path: info.path, startedAt: info.at, durationMs: Math.max(0, now - info.at), status: result.status, outcome: result.outcome,
             redirected: Boolean(result.redirected), ...(result.to ? { to: result.to } : {}) });
       }
       const reason = result.outcome === 'login-redirect' ? '游戏请求跳转至登录入口，请手动核对登录' :
@@ -1172,7 +1227,7 @@
       return;
     }
     if (!active) { acquire(); return; }
-    log.pulse(statusText);
+    log.pulse(statusText, { pageRecovery: pageWait.snapshot() });
     const notices = [...document.querySelectorAll('[role="status"]')].filter(visible);
     const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="alert"].text-destructive, [role="status"].bg-destructive, [role="alert"].bg-destructive')]
       .filter(visible).map(textOf).join(' ');
@@ -1827,6 +1882,7 @@
   }
 
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: statusText,
+    pageRecovery: pageWait.snapshot(),
     pendingEncounter: Boolean(encounterAction), pendingDungeon: Boolean(dungeonPlan), pendingFog: Boolean(fogPlan) } : null);
   subscribeWakeup(schedule, onPage, () => enabled, () => {
     try { observeDungeonEntryReview(); } catch { dungeonEntryReview = null; }
@@ -2008,6 +2064,7 @@
   let idleBlocked = false;
   let idleSignature = '';
   let diagnostic = {};
+  let quotaRead = {};
   const log = createLog('expedition');
   const recoveryBudget = createRecovery('expedition', log, message => say(message));
   const farmWait = createPageWait('farm', log);
@@ -2170,11 +2227,16 @@
       return;
     }
     if (!navigator.onLine) { say(`${reason}；网络离线，等待连接恢复`); return; }
-    if (detail.pageLoading && !pending) {
-      expeditionLoadWait.wait(reason, true, say, message => setEnabled(false, message), true);
+    // 已结束的领取请求可保留原记录、重新加载只读页面；不把进行中的派遣或未知请求当作安全刷新。
+    const settledClaim = claimWait && (transientClaim(claimWait.result) || claimWait.result?.outcome === 'ok');
+    const recoverClaimLoad = settledClaim && !plan && !farmPlan && !nativePending().length && !stateFault('farm');
+    if (detail.pageLoading && (!pending || recoverClaimLoad)) {
+      expeditionLoadWait.wait(reason, true, say, message => setEnabled(false, message), true,
+        recoverClaimLoad ? () => saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
+          reloaded: true, reloadFrom: claimPageId, at: Date.now() }) : null);
       return;
     }
-    // 有原操作的后台页面仍只检查数据，不耗尽前台核对时间、不重复请求。
+    // 尚无响应证据的原操作继续等待，不打断在途请求，也不重复提交。
     if (detail.pageLoading && document.hidden) {
       say(`${reason}；后台数据未就绪，等待页面恢复${pending ? '，原操作记录已保留' : ''}`);
       return;
@@ -2277,12 +2339,16 @@
       typeof matcher === 'string' ? textOf(button) === matcher : matcher.test(textOf(button))));
   }
   function quotas() {
-    const root = currentElement(document.querySelectorAll('section[aria-label="远征派遣额度"]'));
-    if (!locator.readable(root)) return null;
+    const candidates = document.querySelectorAll('section[aria-label="远征派遣额度"]');
+    const root = currentElement(candidates);
+    quotaRead = { candidates: candidates.length, readable: locator.readable(root),
+      readyState: document.readyState, fields: {} };
+    if (!quotaRead.readable) return null;
     function read(label, ratio) {
       const node = currentElement([...root.querySelectorAll('span')].filter(el => textOf(el) === label));
       const value = textOf(node?.parentElement).slice(label.length).trim();
       const match = value.match(ratio ? /^(\d+)\s*\/\s*(\d+)\s*支$/ : /^(\d+)\s*支$/);
+      quotaRead.fields[label] = { found: Boolean(node), parsed: Boolean(match) };
       return match ? match.slice(1).map(Number) : null;
     }
     const normal = read('常态剩余', true);
@@ -2943,7 +3009,8 @@
     }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
-    log.pulse(status.textContent, diagnostic);
+    log.pulse(status.textContent, { ...diagnostic,
+      pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot() });
     const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
       pauseAccount('游戏提示登录、权限或限流异常');
@@ -2963,6 +3030,7 @@
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
       waitForIdlePage('等待远征页面和额度加载', { pageLoading: true,
+        ...(!q ? { quotaRead } : {}),
         missing: { quota: !q, form: !fields.root, count: !fields.count, burst: !fields.burst, preference: !fields.high } });
       return;
     }
@@ -3157,6 +3225,7 @@
     });
   }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
+    pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot(),
     pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan), diagnostic } : null);
   subscribeWakeup(schedule, onPage, () => enabled);
   window.addEventListener('pagehide', () => { cancelFarmRead(); cancelQueued(); releaseLock?.(); });
@@ -3180,4 +3249,11 @@
   schedule();
 })();
   observeSession();
+  }
+  // document-idle 在后台慢加载时可能迟迟不注入。正文一出现就挂载调度，不等待 load/DOMContentLoaded。
+  if (document.body) start();
+  else {
+    bodyObserver = new MutationObserver(start);
+    bodyObserver.observe(document, { childList: true, subtree: true });
+  }
 })();
