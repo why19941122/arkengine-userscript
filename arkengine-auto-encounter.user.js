@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.5
+// @version      1.7.6
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
@@ -122,6 +122,62 @@
     }
     return { pick, all, rendered, visible, readable,
       query: (selector, root = document) => pick(root?.querySelectorAll(selector)) };
+  }
+
+  // 只关闭明确的信息通知；不把通用“确认”、表单或交易窗口当作公告。
+  function createNoticeHandler(log, say, enqueue, usable) {
+    const seen = new WeakMap();
+    const attempted = new WeakSet();
+    let serial = 0;
+    const text = el => (el?.textContent || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+    return (dialogs, fallback) => {
+      const dialog = dialogs[0];
+      const title = text(dialog?.querySelector('h2, [data-slot="dialog-title"], [data-slot="alert-dialog-title"]'));
+      const category = /^(公告|系统公告|更新公告|更新说明|版本更新|通知|系统通知|提示|温馨提示|系统提示)$/.test(title) ? title : 'unknown';
+      const buttons = [...(dialog?.querySelectorAll('button, [role="button"]') || [])];
+      const dismiss = button => /^(关闭|关闭公告|关闭提示|知道了|我知道了)$/.test(button.getAttribute('aria-label') || text(button));
+      const controls = Boolean(dialog?.querySelector('form, input, select, textarea, [contenteditable="true"], a[href], [role="checkbox"], [role="switch"], [role="textbox"]'));
+      const sensitive = /登录|登陆|密码|验证|授权|购买|支付|充值|扣除|消耗|删除|重置|确认操作|是否|确定要|同意/.test(text(dialog));
+      const reason = dialogs.length !== 1 ? 'multiple-dialogs' : category === 'unknown' ? 'unknown-title' :
+        controls ? 'interactive-content' : sensitive ? 'confirmation-content' :
+          !buttons.length || buttons.some(button => !dismiss(button)) ? 'unknown-buttons' : 'notice';
+      const detail = { category, reason, dialogs: dialogs.length, buttons: buttons.length, controls,
+        dismissButtons: buttons.filter(dismiss).length };
+      if (!dialog) { say(fallback); return; }
+      let entry = seen.get(dialog);
+      const signature = JSON.stringify(detail);
+      if (!entry) { entry = { id: ++serial }; seen.set(dialog, entry); }
+      if (entry.signature !== signature) {
+        entry.signature = signature;
+        log.add('dialog-observed', '核对阻塞弹窗的类型与关闭条件', detail);
+      }
+      if (reason !== 'notice') { say(fallback); return; }
+      if (attempted.has(dialog)) { say('通知已请求关闭，等待窗口消失；若持续显示请手动关闭'); return; }
+      const button = buttons.find(usable);
+      if (!button) { say('等待通知的关闭按钮可用'); return; }
+      enqueue(button, String(entry.id), '关闭已识别的信息通知', () => {
+        attempted.add(dialog);
+        log.add('notice-dismiss', '点击信息通知的关闭按钮', detail);
+      });
+    };
+  }
+
+  // 不记录页面文本、节点 ID 或属性值，仅记录影响可读性的布局条件。
+  function layoutDiagnostic(el) {
+    if (!el) return { found: false };
+    const blockers = [];
+    let depth = 0;
+    for (let node = el; node && depth < 32; node = node.parentElement, depth++) {
+      const css = getComputedStyle(node);
+      const flags = { hidden: node.hasAttribute('hidden'), ariaHidden: node.getAttribute('aria-hidden') === 'true',
+        inert: node.hasAttribute('inert'), display: css.display, visibility: css.visibility,
+        contentVisibility: css.contentVisibility };
+      if (flags.hidden || flags.ariaHidden || flags.inert || css.display === 'none' ||
+          css.visibility !== 'visible' || css.contentVisibility && css.contentVisibility !== 'visible') blockers.push({ depth, ...flags });
+    }
+    const css = getComputedStyle(el);
+    return { found: true, connected: el.isConnected, rectCount: el.getClientRects().length,
+      css: { display: css.display, visibility: css.visibility, contentVisibility: css.contentVisibility }, blockers };
   }
 
   const stateFaults = new Map();
@@ -313,7 +369,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.5';
+  const SCRIPT_VERSION = '1.7.6';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -955,6 +1011,8 @@
   let scheduled = false;
   let statusText = '';
   const log = createLog('cultivate');
+  const handleNotice = createNoticeHandler(log, message => say(message), (button, id, message, before) =>
+    recordClick(button, 'notice:close', id, message, before), usable);
   const recoveryBudget = createRecovery('cultivate', log, say);
   const pageWait = createPageWait('cultivate', log);
   const locator = createLocator();
@@ -1149,7 +1207,7 @@
     }
     const remaining = pendingClick.dueAt - Date.now();
     if (remaining > 0) {
-      const action = /^(dungeon|fog):/.test(kind) ? message :
+      const action = /^(dungeon|fog|notice):/.test(kind) ? message :
         kind === 'seek' ? '寻找奇遇' : kind === 'choose' ? '选择最高奖励' : '确认原奇遇结果';
       say(`随机等待 ${(Math.ceil(remaining / 100) / 10).toFixed(1)} 秒后${action}`);
       return false;
@@ -1242,8 +1300,9 @@
     dungeonPageDay = '';
     returningFromDungeon = false;
     dungeonProgress = null;
-    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)) {
-      say('请先处理当前弹窗'); return;
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    if (dialogs.length) {
+      handleNotice(dialogs, '请先处理当前弹窗'); return;
     }
     if (notices.some(el => /正在处理修炼操作|正在恢复原请求/.test(textOf(el)))) {
       say('游戏正在处理修炼操作，等待原结果');
@@ -1403,7 +1462,7 @@
       const title = dialog.querySelector('h2, [data-slot="alert-dialog-title"]');
       const own = dialogs.length === 1 && !records.length && openedFogDialog && fogPlan?.phase === 'opening' &&
         (!fogDialog || fogDialog === dialog) && textOf(title) === '快速探索' && textOf(dialog).includes(fogPlan.description);
-      if (!own) { say('请先手动处理当前弹窗'); return; }
+      if (!own) { handleNotice(dialogs, '请先手动处理当前弹窗'); return; }
       fogDialog = dialog;
       if (!fogEnabled) {
         const cancel = [...dialog.querySelectorAll('button')].find(b => textOf(b) === '取消');
@@ -1698,7 +1757,7 @@
       const dialog = dialogs[0];
       if (records.length || dialogs.length !== 1 || !openedDungeonDialog || dungeonPlan?.phase !== 'opening' ||
           !textOf(dialog).includes(dungeonPlan.description)) {
-        say('请先手动处理当前弹窗'); return;
+        handleNotice(dialogs, '请先手动处理当前弹窗'); return;
       }
       const confirm = [...dialog.querySelectorAll('button')].find(b => textOf(b) === '确认');
       if (!usable(confirm)) { say('等待秘境入场确认按钮'); return; }
@@ -1935,7 +1994,8 @@
   let farmCrop = 'auto';
   let farmState = { nextAt: 0, expeditionAt: 0, note: '等待首次检查', selection: '' };
   let farmPlan = null;
-  let staminaSync = loadState(sessionStorage, STAMINA_SYNC, null, 'farm', timedState);
+  let staminaSync = loadState(sessionStorage, STAMINA_SYNC, null, 'farm', v => timedState(v) &&
+    (v.reloadFrom === undefined || typeof v.reloadFrom === 'string'));
   try {
     farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
     farmCrop = localStorage.getItem(FARM_CROP) || 'auto';
@@ -2066,6 +2126,8 @@
   let diagnostic = {};
   let quotaRead = {};
   const log = createLog('expedition');
+  const handleNotice = createNoticeHandler(log, message => say(message), (button, id, message, before) =>
+    offer(`notice:${id}`, message, () => { before(); button.click(); }), usable);
   const recoveryBudget = createRecovery('expedition', log, message => say(message));
   const farmWait = createPageWait('farm', log);
   const expeditionLoadWait = createPageWait('expedition', log);
@@ -2212,7 +2274,7 @@
       blockedMs: Math.max(0, now - idleWait.since), reloaded: idleWait.reloaded, dialogs, ...detail,
       ...(detail.pageLoading ? { backgroundLoadWait: document.hidden, loadDeadline: idleWait.loadDeadline } : {}) };
     // 同一阻塞只在原因变化时记录，持续时长由已有低频心跳和恢复事件补充。
-    const signature = JSON.stringify({ reason, dialogs, missing: detail.missing,
+    const signature = JSON.stringify({ reason, dialogs, missing: detail.missing, quotaRead: detail.quotaRead,
       backgroundLoadWait: diagnostic.backgroundLoadWait, button: detail.button && {
       found: detail.button.found, connected: detail.button.connected, disabled: detail.button.disabled,
       visible: detail.button.visible, rectCount: detail.button.rectCount, css: detail.button.css, blockers: detail.button.blockers,
@@ -2343,6 +2405,7 @@
     const root = currentElement(candidates);
     quotaRead = { candidates: candidates.length, readable: locator.readable(root),
       readyState: document.readyState, fields: {} };
+    if (!quotaRead.readable) quotaRead.layout = [...candidates].slice(0, 3).map(layoutDiagnostic);
     if (!quotaRead.readable) return null;
     function read(label, ratio) {
       const node = currentElement([...root.querySelectorAll('span')].filter(el => textOf(el) === label));
@@ -2735,9 +2798,9 @@
       } else if (!plan && !claimWait && !nativePending().length &&
           !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
         offer('farm:stamina-sync', '刷新农场，核对已恢复的体力', () => {
-          staminaSync = { at: Date.now() };
+          staminaSync = { at: Date.now(), reloadFrom: claimPageId };
           sessionStorage.setItem(STAMINA_SYNC, JSON.stringify(staminaSync));
-          log.add('farm-stamina-refresh', '最新体力足够但农场显示不足，整页核对一次', detail);
+          log.add('farm-stamina-refresh', '最新体力足够但农场显示不足，整页核对一次', { ...detail, reloadFrom: claimPageId });
           location.reload();
         });
       } else say('体力已恢复，等待当前弹窗或原操作核对后刷新农场');
@@ -2864,7 +2927,7 @@
       const seedDialog = dialogs.find(d => [...d.querySelectorAll('h2')].some(h => textOf(h).startsWith('选择种子')));
       if (openingSeedsAt && Date.now() - openingSeedsAt < 10000 && seedDialog && dialogs.length === 1) {
         ownSeedDialog = seedDialog; openingSeedsAt = 0;
-      } else { say('等待你处理农场弹窗'); return; }
+      } else { handleNotice(dialogs, '等待你处理农场弹窗'); return; }
     }
     const tabs = locator.query('[role="tablist"][aria-label="农场功能"]');
     const plotsTab = [...(tabs?.querySelectorAll('[role="tab"]') || [])].find(b => textOf(b) === '田地');
@@ -3017,13 +3080,17 @@
       return;
     }
     if (Date.now() < nextStepAt) return;
+    // reload 不会同步销毁当前文档。旧页面不能按“刷新后仍旧值”暂停农场或继续操作。
+    if (staminaSync?.reloadFrom === claimPageId) {
+      say('农场刷新已发起，等待新页面接管'); return;
+    }
     if (waitForNavigation()) return;
     if (inFarm()) { expeditionObserved = false; farmStep(); return; }
     if (farmEntryAt || farmMarketLoading || farmReadAttempts) cancelFarmRead();
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
     const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
     // 用户可在首次扫描前打开弹窗，不能要求先识别被遮住的背景表单。
-    if (!plan && dialogs.length) { say('等待你处理当前弹窗'); return; }
+    if (!plan && dialogs.length) { handleNotice(dialogs, '等待你处理当前弹窗'); return; }
     const q = quotas();
     const fields = form();
     diagnostic = { quota: q, farmEnabled, farmDueAt: farmState.nextAt || 0,
