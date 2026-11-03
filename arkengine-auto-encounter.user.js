@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.7.6
+// @version      1.8.0
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
-// @description  双标签页挂机：奇遇秘境迷雾、远征农场；灵力满200快速探索，突发深渊补派，本地收益与排障日志。
+// @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所；避难所收取与人员建议，七日本地收益与排障日志。
 // @match        https://game.arkengine.me/*
 // @run-at       document-start
 // @grant        none
@@ -64,7 +64,7 @@
     try {
       wanted = /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname)
         ? localStorage.getItem('arkengine:auto-encounter:enabled:v1') !== 'false'
-        : /^(?:\/activities\/expedition|\/farm)\/?$/.test(location.pathname) &&
+        : /^(?:\/activities\/expedition|\/farm|\/shelter)\/?$/.test(location.pathname) &&
           localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
       wanted &&= !accountStopReason();
       if (wanted && !animationSaved) {
@@ -325,9 +325,10 @@
   const diagnosticLogs = {};
   // 仅在本脚本点击领取的同步调用期间绑定原网页请求，不读取请求正文。
   let captureExpeditionClaim = null;
+  let captureShelterAction = null;
   let observeSessionPage = () => {};
   const pageGroup = path => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(path) ? 'cultivate' :
-    /^(?:\/activities\/expedition|\/farm)\/?$/.test(path) ? 'expedition' : '';
+    /^(?:\/activities\/expedition|\/farm|\/shelter)\/?$/.test(path) ? 'expedition' : '';
   const diagnosticPage = (path = location.pathname) => path === '/' || pageGroup(path) ? path : '[其他页面]';
   const logDay = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
   const RECEIPTS = {
@@ -369,7 +370,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.7.6';
+  const SCRIPT_VERSION = '1.8.0';
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -787,7 +788,7 @@
         finally { button.disabled = false; }
       };
       box.append(details); render(); refreshLog();
-      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm'];
+      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm', 'shelter'];
       for (const [key, scope] of stateFaults) if (scopes.includes(scope)) {
         add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
       }
@@ -833,7 +834,7 @@
     const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons', '/api/cultivation/fog',
       '/api/activities', '/api/activities/expedition-claim-all', '/api/activities/expedition-event',
       '/api/farm', '/api/farm/plant', '/api/farm/plant-all', '/api/farm/harvest', '/api/farm/harvest-all',
-      '/api/farm/sell', '/api/me/balance', '/api/stamina']);
+      '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action']);
     const background = new Set(['/api/me/balance', '/api/stamina']);
     const samples = new Map();
     function record(info, result) {
@@ -858,6 +859,7 @@
     window.fetch = function (...args) {
       const at = Date.now();
       const claimCapture = captureExpeditionClaim;
+      const shelterCapture = captureShelterAction;
       // 原参数、this、Promise 和 Response 原样传递，不读取请求头/正文或响应正文。
       const promise = Reflect.apply(originalFetch, this, args);
       try {
@@ -872,6 +874,7 @@
           const report = result => {
             record(info, result);
             if (claimCapture?.path === info.path && method === 'POST') claimCapture.result(result);
+            if (shelterCapture && info.path === '/api/shelter/action' && method === 'POST') shelterCapture(result);
           };
           promise.then(response => {
             let loginRedirect = false;
@@ -1977,13 +1980,14 @@
 (() => {
   'use strict';
   if (window.top !== window.self || document.getElementById('ark-auto-expedition')) return;
-  // 根据网站公开前端 v1.29.1 的 DOM 和原请求记录实现，不自行请求游戏接口。
+  // 复用网页原生写入按钮；农场与避难所只读状态用于核对与预约。
   const PREF = 'arkengine:auto-expedition:enabled:v1';
   const JOURNAL = 'arkengine:auto-expedition:pending:v1';
   const LOCK = 'arkengine:auto-expedition:tab:v1';
   const TEAM_LIMIT = 6;
   const inFarm = () => /^\/farm\/?$/.test(location.pathname);
-  const onPage = () => /^\/(?:activities\/expedition|farm)\/?$/.test(location.pathname);
+  const inShelter = () => /^\/shelter\/?$/.test(location.pathname);
+  const onPage = () => /^\/(?:activities\/expedition|farm|shelter)\/?$/.test(location.pathname);
   const FARM_PREF = 'arkengine:auto-farm:enabled:v1';
   const FARM_CROP = 'arkengine:auto-farm:crop:v1';
   const FARM_STATE = 'arkengine:auto-farm:schedule:v1';
@@ -2132,7 +2136,7 @@
   const farmWait = createPageWait('farm', log);
   const expeditionLoadWait = createPageWait('expedition', log);
   const NAV_JOURNAL = 'arkengine:auto-expedition:navigation:v1';
-  const travelPaths = ['/farm', '/activities/expedition'];
+  const travelPaths = ['/farm', '/activities/expedition', '/shelter'];
   let navigation = loadState(sessionStorage, NAV_JOURNAL, null, 'expedition', v => timedState(v) &&
     travelPaths.includes(v.from) && travelPaths.includes(v.to) && v.from !== v.to && typeof v.reloaded === 'boolean');
   const locator = createLocator();
@@ -2170,11 +2174,12 @@
       select:focus-visible { outline: 2px solid white; outline-offset: 2px; }
     </style>
     <div class="box">
-      <strong>自动远征与农场</strong>
+      <strong>自动远征、农场与避难所</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <p class="hint">常态：边境巡逻，最多 6 队。<br>突发：北京时间 01:00～02:00 优先；错过且额度完整未用时补派深渊。</p>
       <p class="hint">自动领取 · 完整行程 · 点击前随机等 2～5 秒</p>
       <button type="button" id="toggle"></button>
+      <p class="hint">主开关同时控制远征、农场和避难所。</p>
       <p class="hint" id="farm-status"></p>
       <label for="farm-crop">种植作物</label>
       <select id="farm-crop">
@@ -2184,6 +2189,10 @@
       <p class="hint" id="farm-selection">每次种植前读取最新行情，每块扣除留种 1 份。</p>
       <button type="button" id="farm-toggle"></button>
       <button type="button" id="farm-check">检查农场</button>
+      <p class="hint" id="shelter-status"></p>
+      <button type="button" id="shelter-toggle"></button>
+      <button type="button" id="shelter-check">检查避难所</button>
+      <details><summary>避难所人员建议</summary><p class="hint" id="shelter-advice">首次检查后显示生产和生育建议。</p></details>
       <p class="hint"><a href="/cultivate" target="_blank" rel="noopener">打开奇遇挂机页</a></p>
     </div>`;
   document.body.append(host);
@@ -2233,6 +2242,359 @@
     saveFarmState({ ...farmState, nextAt: 0, note: '等待检查农场' });
     schedule();
   });
+
+  // 避难所只在远征组运行。读取原有状态接口，所有写入只点击原网页按钮。
+  const SHELTER_PREF = 'arkengine:auto-shelter:enabled:v1';
+  const SHELTER_STATE = 'arkengine:auto-shelter:schedule:v1';
+  const SHELTER_PENDING = 'arkengine:auto-shelter:pending:v1';
+  const shelterKinds = ['collect', 'tutorial', 'daily', 'season', 'achievement'];
+  let shelterEnabled = localStorage.getItem(SHELTER_PREF) === 'true';
+  let shelterState = loadState(localStorage, SHELTER_STATE, { nextAt: 0, note: '等待首次检查' }, 'shelter',
+    v => objectState(v) && Number.isFinite(v.nextAt) && typeof v.note === 'string' &&
+      (v.vaultNo === undefined || Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0));
+  const validShelterPending = v => timedState(v) &&
+    typeof v.id === 'string' && shelterKinds.includes(v.kind) && Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0 &&
+    Array.isArray(v.targets) && v.targets.length > 0 &&
+    v.targets.every(x => typeof x === 'string' || Number.isSafeInteger(x)) && objectState(v.before) &&
+    Number.isFinite(v.before.collected) && typeof v.before.day === 'string' && typeof v.before.month === 'string' &&
+    (v.kind !== 'collect' || Array.isArray(v.before.rooms) && v.before.rooms.length > 0 &&
+      v.before.rooms.every(r => Number.isSafeInteger(r.id) && Number.isFinite(r.stored) && r.stored > 0));
+  // 同组只持有一把运行锁；未决记录跨标签共享，避免接力标签重放未知领取。
+  let shelterPending = loadState(localStorage, SHELTER_PENDING, null, 'shelter', validShelterPending);
+  let shelterRead = null, shelterController = null, shelterGeneration = 0, shelterReadAt = 0;
+  let shelterEntryAt = 0, shelterStage = 0, shelterActions = 0, shelterLeave = false;
+  const shelterToggle = shadow.getElementById('shelter-toggle');
+  const shelterResources = { power: '电力', food: '食物', water: '净水', scrap: '废料', parts: '零件', stimpak: '治疗针' };
+  // 2026-11-03 公开前端：属性、基础小时产出、每批数量；等级倍率 1 / 1.5 / 2.1。
+  const shelterRooms = { power: ['str','power',12,30], diner: ['agi','food',8,25], water: ['per','water',8,25],
+    scrap: ['end','scrap',8,30], medbay: ['int','stimpak',.5,2], workshop: ['int','parts',.6,3],
+    door: [], elevator: [], quarters: [], storage: [], training: [], armory: [], tailor: [], radio: [] };
+  const achievementIds = Object.fromEntries([
+    ['向下十层','depth-10'],['小小社区','pop-20'],['勤快管家','collect-10k'],['废土常客','explore-10'],
+    ['消防队','incident-20'],['新生命','birth-1'],['第一件作品','craft-1'],['老手','resident-10'],
+    ['五脏俱全','rooms-6'],['见多识广','codex-15'],['身经百战','wins-50'],['初具规模','level-5'],
+    ['赛季起步','season-5'],['深入地底','depth-30'],['繁荣小镇','pop-60'],['仓储专家','collect-200k'],
+    ['废土老兵','explore-500h'],['临危不乱','incident-200'],['人丁兴旺','birth-50'],['能工巧匠','craft-30'],
+    ['资深居民','resident-30'],['精良装备','gear-4'],['任务专家','quests-20'],['赛季中坚','season-20'],
+    ['地下城市','level-12'],['深渊行者','depth-60'],['总工程师','builder'],['大家长','family'],
+    ['收藏家','collector'],['传奇居民','resident-50'],['薪火相传','legacy-20'],['赛季满档','season-30'],['废土巨富','collect-2m']
+  ]);
+  function saveShelter(value) {
+    const raw = JSON.stringify(value);
+    localStorage.setItem(SHELTER_STATE, raw);
+    if (localStorage.getItem(SHELTER_STATE) !== raw) throw new Error('无法保存避难所预约');
+    shelterState = value;
+  }
+  function saveShelterPending(value) {
+    const raw = JSON.stringify(value);
+    localStorage.setItem(SHELTER_PENDING, raw);
+    if (localStorage.getItem(SHELTER_PENDING) !== raw) throw new Error('无法保存避难所领取记录');
+    shelterPending = value;
+  }
+  function cancelShelterRead() {
+    shelterGeneration++; shelterController?.abort(); shelterController = null; shelterRead = null; shelterReadAt = 0;
+  }
+  function shelterHint() {
+    if (stateFault('shelter')) shelterEnabled = false;
+    const left = Math.max(0, shelterState.nextAt - Date.now());
+    const message = stateFault('shelter') || `避难所${shelterEnabled ? '' : '已暂停'}：${shelterState.note}${
+      shelterEnabled && left ? `；约 ${Math.ceil(left / 60000)} 分钟后检查` : ''}`;
+    shadow.getElementById('shelter-status').textContent = message;
+    shelterToggle.textContent = shelterEnabled ? '暂停避难所' : '开启避难所';
+    shadow.getElementById('shelter-advice').textContent = shelterState.advice || '首次检查后显示生产和生育建议；人员由你安排。';
+  }
+  function pauseShelter(message) {
+    shelterEnabled = false;
+    cancelShelterRead(); cancelQueued();
+    shelterState = { ...shelterState, note: message };
+    try { localStorage.setItem(SHELTER_PREF, 'false'); saveShelter(shelterState); } catch { /* 内存暂停仍然生效 */ }
+    log.add('shelter-paused', message, { pending: Boolean(shelterPending) }); say(message);
+    schedule();
+  }
+  shelterToggle.addEventListener('click', () => {
+    if (stateFault('shelter')) { say(stateFault('shelter')); return; }
+    shelterEnabled = !shelterEnabled; localStorage.setItem(SHELTER_PREF, String(shelterEnabled));
+    cancelShelterRead(); cancelQueued(); shelterLeave = false;
+    saveShelter({ ...shelterState, nextAt: 0, note: shelterEnabled ? '等待检查' : '人工暂停' }); schedule();
+  });
+  shadow.getElementById('shelter-check').addEventListener('click', () => {
+    if (!shelterEnabled || stateFault('shelter')) { say('请先开启避难所'); return; }
+    saveShelter({ ...shelterState, nextAt: 0, note: '等待检查' });
+    if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false; }
+    schedule();
+  });
+  function shelterModel(view) {
+    const s = view?.state, now = view?.serverTime;
+    const finite = x => Number.isFinite(x) && x >= 0;
+    if (!Number.isSafeInteger(view?.vaultNo) || view.vaultNo <= 0 || !finite(now) || !s ||
+        !finite(s.lastSettledAt) || !finite(s.stats?.collected) || !Number.isSafeInteger(view.progress?.level) ||
+        !Array.isArray(s.rooms) || !Array.isArray(s.residents) || !Array.isArray(s.items) || !Array.isArray(s.births) ||
+        !Array.isArray(s.achievements) || !Array.isArray(s.daily?.claimed) || typeof s.daily.day !== 'string' ||
+        !Array.isArray(s.season?.claimedFree) || !finite(s.season.points) || typeof s.season.month !== 'string' ||
+        (s.tutorial != null && !Array.isArray(s.tutorial.claimed)) || typeof view.switches?.frozen !== 'boolean' ||
+        !Object.keys(shelterResources).every(key => finite(s.resources?.[key]))) throw new Error('避难所状态结构变化');
+    if (new Set(s.rooms.map(r => r.id)).size !== s.rooms.length || s.rooms.some(r => !Number.isSafeInteger(r.id) ||
+        !Object.hasOwn(shelterRooms, r.type) || ![1,2,3].includes(r.level) || ![1,2,3].includes(r.width) ||
+        !finite(r.builtAt) || !finite(r.stored) || !(r.upgradeAt === null || finite(r.upgradeAt)))) throw new Error('避难所房间规则变化');
+    if (s.residents.some(p => !Number.isSafeInteger(p.id) || !(p.deadAt === null || finite(p.deadAt)) ||
+        !(p.away === null || typeof p.away === 'object') || !finite(p.adultAt)) ||
+        s.births.some(b => !finite(b.dueAt))) throw new Error('避难所居民数据不完整');
+    const multiplier = r => [0,1,1.5,2.1][r.level];
+    const built = s.rooms.filter(r => r.builtAt <= now);
+    const storage = built.filter(r => r.type === 'storage').reduce((n,r) => n+r.width*r.level, 0);
+    const perk = key => {
+      const n = s.legacy?.perks?.[key] ?? 0;
+      if (!Number.isInteger(n) || n < 0 || n > 10) throw new Error('避难所传承规则变化');
+      return n;
+    };
+    const caps = Object.fromEntries(Object.keys(shelterResources).map(key => {
+      const [base,warehouse,room] = key === 'scrap' ? [1500,1200,600] : key === 'parts' ? [100,60,40] :
+        key === 'stimpak' ? [10,5,5] : [600,400,250];
+      const cells = built.filter(r => shelterRooms[r.type][1] === key).reduce((n,r) => n+r.width*multiplier(r),0);
+      return [key, Math.floor((base+warehouse*storage+room*cells)*(1+.05*perk('storage')))];
+    }));
+    const atHome = s.residents.filter(p => p.away === null && p.deadAt === null);
+    if (atHome.some(p => !finite(p.adultAt) || !finite(p.xp) || !finite(p.happiness) ||
+        !['str','per','end','cha','int','agi','lck'].every(key => finite(p.stats?.[key])))) throw new Error('避难所居民数据不完整');
+    const production = Object.fromEntries(Object.keys(shelterResources).map(k => [k,0]));
+    const rooms = built.map(r => {
+      const [stat,resource,base,batchBase] = shelterRooms[r.type];
+      const workers = atHome.filter(p => p.roomId === r.id && p.adultAt <= now).slice(0,r.width*2);
+      let rate = 0;
+      if (resource && !r.incident && !r.unpowered && r.upgradeAt === null) {
+        rate = workers.reduce((n,p) => {
+          const outfit = s.items.find(item => item.id === p.outfitId);
+          const bonus = outfit?.bonus?.[stat] ?? 0;
+          if (!finite(bonus)) throw new Error('避难所装备规则变化');
+          return n+base*multiplier(r)*(.5+Math.min(17,p.stats[stat]+bonus)/10)*(.6+.4*Math.min(100,p.happiness)/100)*
+            (1+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*.01);
+        },0)*(1+.03*perk('production'));
+        const events = (view.env?.events || []).filter(e => e.kind === 'production' && e.startsAt <= now && now < e.endsAt);
+        rate *= Math.min(150,Math.max(100,...events.map(e => e.percent)))/100;
+        if (!finite(rate)) throw new Error('避难所活动规则变化');
+        production[resource] += rate;
+      }
+      const batch = resource ? batchBase*r.width*multiplier(r) : 0;
+      const stored = batch ? Math.min(4*batch,r.stored+rate*Math.max(0,now-s.lastSettledAt)/3600000) : 0;
+      return { id:r.id, resource, rate, batch, stored, workers:workers.length };
+    });
+    const mouths = atHome.reduce((n,p) => n+(p.adultAt <= now ? 1 : .5),0);
+    const power = built.reduce((n,r) => n+(['door','elevator','power'].includes(r.type) ? 0 :
+      (shelterRooms[r.type][1] ? 1 : .5)*r.width*r.level),0);
+    return { view, state:s, now, caps, rooms, production, demand:{power,food:mouths,water:mouths}, itemCap:20+10*storage };
+  }
+  function readShelter() {
+    if (shelterController || Date.now() < shelterReadAt || !navigator.onLine) return;
+    const generation = shelterGeneration;
+    const current = () => generation === shelterGeneration && enabled && shelterEnabled && active && inShelter() && !accountStopReason();
+    shelterController = new AbortController();
+    say('核对避难所最新库存与领取记录');
+    fetch('/api/shelter', { cache:'no-store', credentials:'same-origin',
+      signal:AbortSignal.any([shelterController.signal,AbortSignal.timeout(12000)]) })
+      .then(async response => {
+        if (!current()) return;
+        if ([401,403,429].includes(response.status) || response.redirected && new URL(response.url).pathname === '/') {
+          pauseAccount('避难所状态返回登录、权限或限流异常'); return;
+        }
+        if (!response.ok) { finishShelter(null,`避难所读取失败（HTTP ${response.status}），稍后检查`); return; }
+        const view = await response.json(); if (!current()) return;
+        const model = shelterModel(view);
+        if (shelterState.vaultNo && shelterState.vaultNo !== view.vaultNo || shelterPending && shelterPending.vaultNo !== view.vaultNo) {
+          pauseAccount('避难所账号已切换，请核对原领取记录'); return;
+        }
+        shelterRead = { model, at:Date.now() };
+        if (!shelterState.vaultNo) saveShelter({ ...shelterState, vaultNo:view.vaultNo });
+      }).catch(error => {
+        if (!current()) return;
+        if (['TypeError','TimeoutError','AbortError'].includes(error.name)) finishShelter(null,'避难所读取中断，稍后检查');
+        else pauseShelter('避难所状态无法核对，已暂停并保留原记录');
+      })
+      .finally(() => { if (generation === shelterGeneration) { shelterController = null; schedule(); } });
+  }
+  function shelterAdvice(m) {
+    const deficits = Object.keys(m.demand).filter(k => m.production[k] < m.demand[k]);
+    const waiting = m.state.residents.filter(p => p.away === null && p.deadAt === null && p.adultAt <= m.now && p.roomId === null).length;
+    const pairs = new Set(m.state.residents.filter(p => p.romance && p.deadAt === null && p.away === null)
+      .map(p => [p.id,p.romance.partnerId].sort((a,b)=>a-b).join(':'))).size;
+    const cooldown = m.state.residents.filter(p => p.familyCooldownUntil > m.now && p.away === null && p.deadAt === null).length;
+    return `${deficits.length ? deficits.map(k => `${shelterResources[k]}净缺 ${(m.demand[k]-m.production[k]).toFixed(1)}/小时，库存约可撑 ${(m.state.resources[k]/(m.demand[k]-m.production[k])).toFixed(1)} 小时`).join('；') : '当前基础供应可覆盖消耗'}。`+
+      `废料约 ${m.production.scrap.toFixed(1)}/小时；闲置成人 ${waiting} 人；培养感情 ${pairs} 对，待产 ${m.state.births.length} 个。`+
+      `${cooldown ? `${cooldown} 人处于生育冷却，可在确认待产不受影响后参与生产。` : ''}优先补供应缺口，再安排耐力高的居民回收；第一版由你调岗。`;
+  }
+  function finishShelter(m, note = '本轮检查完成') {
+    let delay = 15*60000; // 无到期事件时十五分钟兜底；不逐秒访问接口或切页。
+    if (m) {
+      const events = m.rooms.filter(r => r.rate > 0 && r.batch > r.stored).map(r => (r.batch-r.stored)/r.rate*3600000);
+      for (const b of m.state.births) if (b.dueAt > m.now) events.push(b.dueAt-m.now);
+      for (const p of m.state.residents) {
+        if (p.adultAt > m.now) events.push(p.adultAt-m.now);
+        if (p.familyCooldownUntil > m.now) events.push(p.familyCooldownUntil-m.now);
+      }
+      const midnight = Date.parse(`${logDay(m.now+86400000)}T00:00:00+08:00`);
+      events.push(midnight-m.now);
+      if (events.length) delay = Math.max(60000,Math.min(delay,...events)+2000);
+    }
+    saveShelter({ ...shelterState, nextAt:Date.now()+delay, note, ...(m ? { advice:shelterAdvice(m) } : {}) });
+    log.add('shelter-check', note, { nextAt:shelterState.nextAt, actions:shelterActions,
+      ...(m ? { resources:m.state.resources, production:m.production, demand:m.demand,
+        population:m.state.residents.filter(p=>p.deadAt===null).length, births:m.state.births.length } : {}) });
+    shelterLeave = true; cancelShelterRead();
+  }
+  function leaveShelter() {
+    const link = travelLink('/activities/expedition');
+    offer('shelter:return','返回远征，等待下一次避难所预约',() => {
+      if (link) startNavigation('/activities/expedition',link);
+      else location.assign('/activities/expedition');
+    });
+  }
+  function maybeVisitShelter(running) {
+    if (!shelterEnabled || stateFault('shelter') || shelterState.nextAt > Date.now() || farmPlan) return false;
+    rememberExpeditionTime(running);
+    if (farmState.expeditionAt > Date.now() && farmState.expeditionAt-Date.now() < 15000) return false;
+    const link = travelLink('/shelter');
+    offer('shelter:visit','切换避难所收取产出和奖励',() => {
+      if (link) startNavigation('/shelter',link); else location.assign('/shelter');
+    });
+    return true;
+  }
+  function shelterFits(m, reward, items = 0) {
+    return Object.entries(reward).every(([k,n]) => Number.isFinite(n) && n >= 0 && m.state.resources[k]+n <= m.caps[k]) &&
+      m.state.items.length+items <= m.itemCap;
+  }
+  function shelterReward(text) {
+    const reward = {}; let items = 0;
+    for (const part of text.replace(/,/g,'').split(/[·、]/).map(s=>s.trim()).filter(Boolean)) {
+      const match = part.match(/^(\d+)\s*(废料|零件|治疗针)$/);
+      if (match) reward[Object.keys(shelterResources).find(k=>shelterResources[k]===match[2])] = +match[1];
+      else if (/^\d+ 档装备$/.test(part)) items++;
+      else if (!/^\d+ 赛季积分$|^称号「[^」]+」$/.test(part)) return null;
+    }
+    return Object.keys(reward).length || items ? { reward, items } : null;
+  }
+  function shelterSubmit(button, kind, targets, m, label) {
+    if (!usable(button)) return;
+    const key = `shelter:${kind}:${targets.join(',')}`;
+    // 随机等待结束时再读一次，避免沿用等待前的库存和奖励档位。
+    if (queued?.key === key && Date.now() >= queued.dueAt && Date.now()-shelterRead.at > 1500) {
+      offered = true; readShelter(); return;
+    }
+    offer(key,label,() => {
+      const id = crypto.randomUUID();
+      saveShelterPending({ at:Date.now(), id, kind, targets, vaultNo:m.view.vaultNo,
+        before:{ collected:m.state.stats.collected, day:m.state.daily.day, month:m.state.season.month,
+          ...(kind === 'collect' ? { rooms:m.rooms.filter(r => r.batch && r.stored >= r.batch &&
+            (targets[0] === 'all' || targets.includes(r.id))).map(r => ({id:r.id,stored:r.stored})) } : {}) } });
+      shelterRead = null; shelterReadAt = Date.now()+2000; shelterActions++;
+      captureShelterAction = result => {
+        if (shelterPending?.id !== id) return;
+        try { saveShelterPending({ ...shelterPending, result:{status:result.status,outcome:result.outcome} }); }
+        catch { pauseShelter('无法保存避难所响应，请核对原结果'); }
+        schedule();
+      };
+      log.add('shelter-submitted',label,{kind,targets});
+      try { button.click(); } finally { captureShelterAction = null; }
+    });
+  }
+  function shelterConfirmed(m) {
+    const p = shelterPending, s = m.state;
+    if (p.kind === 'collect') return s.stats.collected > p.before.collected && (p.result?.outcome === 'ok' ||
+      p.before.rooms.every(before => m.rooms.some(r => r.id === before.id && r.stored < before.stored)));
+    const claimed = p.kind === 'tutorial' ? (s.tutorial?.claimed || []) : p.kind === 'achievement' ? s.achievements :
+      p.kind === 'daily' && p.before.day === s.daily.day ? s.daily.claimed :
+        p.kind === 'season' && p.before.month === s.season.month ? s.season.claimedFree : [];
+    return p.targets.length > 0 && p.targets.every(id => claimed.includes(id));
+  }
+  function shelterStep() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')];
+    if (dialogs.length) { say('避难所弹窗需要先处理，自动操作等待'); return; }
+    if (!shelterEnabled || stateFault('shelter')) {
+      if (shelterEntryAt) leaveShelter(); else say('避难所未开启，可在面板开启'); return;
+    }
+    if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0; shelterLeave = false; }
+    if (shelterLeave) { leaveShelter(); return; }
+    if (!navigator.onLine) { say('避难所：网络离线，等待恢复'); return; }
+    if (plan || claimWait || farmPlan || nativePending().length) { pauseShelter('其他功能有未决操作，请先回远征核对'); return; }
+    if (!shelterPending && (Date.now()-shelterEntryAt > 60000 || shelterActions >= 12)) {
+      finishShelter(shelterRead?.model,'本轮处理已到上限，稍后继续避难所'); return;
+    }
+    if (!shelterRead || Date.now()-shelterRead.at > 10000) { readShelter(); return; }
+    const m = shelterRead.model;
+    if (shelterPending) {
+      if (shelterConfirmed(m)) {
+        log.add('shelter-confirmed','避难所领取状态已确认',{kind:shelterPending.kind,targets:shelterPending.targets,resources:m.state.resources});
+        saveShelterPending(null);
+      } else if (Date.now()-shelterPending.at >= 30000) pauseShelter('避难所领取仍未确认，保留记录；不重复领取');
+      else { shelterRead = null; shelterReadAt = Date.now()+5000; say('等待避难所原领取结果，不重复点击'); }
+      return;
+    }
+    if (m.view.switches.frozen || m.view.nameRequired) { finishShelter(m,'避难所维护或尚未命名，等待你处理'); return; }
+    const tabs = locator.query('[role="tablist"][aria-label="避难所"]');
+    const names = ['避难所','目标','图鉴'];
+    const tab = buttonIn(tabs,names[Math.min(shelterStage,2)]);
+    if (!usable(tab)) { finishShelter(m,'未识别避难所页签，稍后再检查'); return; }
+    if (shelterStage >= names.length) { finishShelter(m); return; }
+    if (tab.getAttribute('aria-selected') !== 'true') {
+      offer(`shelter:tab:${shelterStage}`,`查看避难所${names[shelterStage]}`,() => tab.click()); return;
+    }
+    if (shelterStage === 0) {
+      const ready = m.rooms.filter(r => r.batch && r.stored >= r.batch);
+      const reward = {};
+      // 预留在途十秒的下一批；批量还可能收进目前未满、在途才满的房间。
+      const amount = r => Math.floor(Math.min(4*r.batch,r.stored+r.rate*(Date.now()-shelterRead.at+10000)/3600000)/r.batch+1e-9)*r.batch;
+      for (const r of m.rooms.filter(r => r.batch)) reward[r.resource] = (reward[r.resource]||0)+amount(r);
+      const all = locator.pick([...document.querySelectorAll('button')].filter(b => textOf(b)==='全部收取'));
+      // 满仓资源不能拖住其他房间，批量不合适时逐房收取原生图标按钮。
+      if (ready.length && usable(all) && shelterFits(m,reward)) {
+        shelterSubmit(all,'collect',['all'],m,'收取避难所已满批产出'); return;
+      }
+      for (const r of ready) {
+        if (!shelterFits(m,{[r.resource]:amount(r)})) continue;
+        const root = locator.query(`[data-room="${r.id}"]`);
+        const button = root?.querySelector(`button[aria-label="收取${shelterResources[r.resource]}"]`);
+        if (usable(button)) { shelterSubmit(button,'collect',[r.id],m,`收取避难所${shelterResources[r.resource]}`); return; }
+      }
+      const tutorial = locator.pick([...document.querySelectorAll('section')].filter(el=>/^新手引导/.test(textOf(el.querySelector('h2')))));
+      const button = buttonIn(tutorial,'领取');
+      const step = textOf(tutorial).match(/第\s*(\d+)\s*步/);
+      const rewardText = [...(tutorial?.querySelectorAll('p') || [])].map(textOf).find(t => /^奖励\s/.test(t));
+      const parsed = rewardText && shelterReward(rewardText.replace(/^奖励\s+/,''));
+      if (step && parsed && usable(button) && !(m.state.tutorial?.claimed || []).includes(+step[1]) && shelterFits(m,parsed.reward,parsed.items)) {
+        shelterSubmit(button,'tutorial',[+step[1]],m,'领取已完成的新手引导奖励'); return;
+      }
+    } else if (shelterStage === 1) {
+      const daily = section('今日目标');
+      const rows = [...(daily?.querySelectorAll('li') || [])].filter(visible);
+      for (const [index,row] of rows.entries()) {
+        const parsed = shelterReward(textOf(row).split('奖励 ')[1]?.replace(/领取$|已领$/,'').trim() || '');
+        const button = buttonIn(row,'领取');
+        if (rows.length === 3 && parsed && usable(button) && !m.state.daily.claimed.includes(index) && shelterFits(m,parsed.reward,parsed.items)) {
+          shelterSubmit(button,'daily',[index],m,'领取已完成的避难所今日目标'); return;
+        }
+      }
+      const free = locator.pick([...document.querySelectorAll('button')].filter(b=>/^领取免费档\s*\(\d+\)$/.test(textOf(b))));
+      const tiers = Array.from({length:Math.min(30,Math.floor(m.state.season.points/150))},(_,i)=>i+1).filter(i=>!m.state.season.claimedFree.includes(i));
+      const reward = {scrap:0,parts:0}; let items = 0;
+      for (const tier of tiers) {
+        if (tier%10===0) reward.scrap+=200*tier;
+        else if (tier%5===0) items++;
+        else { reward.scrap+=60*tier; reward.parts+=Math.ceil(tier/4); }
+      }
+      if (tiers.length && usable(free) && +textOf(free).match(/\((\d+)\)/)[1]===tiers.length && shelterFits(m,reward,items)) {
+        shelterSubmit(free,'season',tiers,m,'领取避难所已达成的免费赛季档'); return;
+      }
+    } else {
+      const roots = [...document.querySelectorAll('section[aria-label$="成就"]')].filter(visible);
+      for (const root of roots) for (const row of root.querySelectorAll('li')) {
+        const id = achievementIds[textOf(row.querySelector('p'))];
+        const parsed = shelterReward(textOf(row).split('奖励 ')[1]?.replace(/领取$|已领$|未达成$/,'').trim() || '');
+        const button = buttonIn(row,'领取');
+        if (id && parsed && usable(button) && !m.state.achievements.includes(id) && shelterFits(m,parsed.reward,parsed.items)) {
+          shelterSubmit(button,'achievement',[id],m,'领取已达成的避难所成就'); return;
+        }
+      }
+    }
+    shelterStage++; schedule();
+  }
 
   function cancelQueued() {
     if (queued) clearTimeout(queued.timer);
@@ -2348,7 +2710,7 @@
   }
   function setEnabled(value, reason = '') {
     if (value && stateFault('expedition')) { say(stateFault('expedition')); return; }
-    if (!value) cancelFarmRead();
+    if (!value) { cancelFarmRead(); cancelShelterRead(); }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
     toggle.textContent = value ? '暂停远征与农场' : '开始远征与农场';
@@ -2622,10 +2984,10 @@
   function waitForNavigation() {
     if (!navigation) return false;
     const path = location.pathname.replace(/\/$/, '');
-    if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled) {
+    if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled || navigation.to === '/shelter' && !shelterEnabled) {
       clearNavigation(); return false;
     }
-    const target = navigation.to === '/farm' ? '农场' : '远征';
+    const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : '远征';
     if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
     if (document.querySelector('[role="dialog"], [role="alertdialog"]') || plan || claimWait || farmPlan || nativePending().length) {
       say(`等待切换${target}；先核对当前弹窗或原操作`); return true;
@@ -3056,6 +3418,10 @@
   function step() {
     syncDialogAnimations();
     farmHint();
+    shelterHint();
+    if (!inShelter() && (shelterEntryAt || shelterController || shelterRead)) {
+      cancelShelterRead(); shelterEntryAt = 0; shelterStage = 0; shelterActions = 0; shelterLeave = false;
+    }
     if (host.hidden === onPage()) host.hidden = !onPage();
     if (onPage()) log.receipts();
     if (accountStopReason()) {
@@ -3068,7 +3434,9 @@
     }
     if (!onPage() || !enabled) {
       if (!onPage()) clearNavigation();
-      if (farmMarketLoading) cancelFarmRead(); releaseLock?.(); return;
+      if (farmMarketLoading) cancelFarmRead();
+      if (shelterController) cancelShelterRead();
+      releaseLock?.(); return;
     }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
@@ -3085,6 +3453,13 @@
       say('农场刷新已发起，等待新页面接管'); return;
     }
     if (waitForNavigation()) return;
+    if (inShelter()) {
+      expeditionObserved = false;
+      if (farmEntryAt || farmMarketLoading) { cancelFarmRead(); farmEntryAt = 0; }
+      try { shelterStep(); }
+      catch { pauseShelter('避难所检查异常，已暂停并保留原记录'); }
+      return;
+    }
     if (inFarm()) { expeditionObserved = false; farmStep(); return; }
     if (farmEntryAt || farmMarketLoading || farmReadAttempts) cancelFarmRead();
     farmEntryAt = 0; farmSignature = ''; ownSeedDialog = null; openingSeedsAt = 0; farmMarket = null;
@@ -3094,6 +3469,7 @@
     const q = quotas();
     const fields = form();
     diagnostic = { quota: q, farmEnabled, farmDueAt: farmState.nextAt || 0,
+      shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending),
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
       waitForIdlePage('等待远征页面和额度加载', { pageLoading: true,
@@ -3194,6 +3570,7 @@
     const burst = q.normal === 0 && nowForBurst.canBurst && !burstUsed && q.burst > 0 && q.burst === q.burstMax;
     if (q.normal === 0 && !burst) {
       if (maybeVisitFarm(running)) return;
+      if (maybeVisitShelter(running)) return;
       // 优先复用正常领取、派遣及返回页面后的状态；无更新一小时才兜底，全天最多两次。
       const quotaCheck = quotaCheckState();
       if (!burstUsed && nowForBurst.canBurst && q.burst < q.burstMax && quotaCheck.count < 2 &&
@@ -3240,6 +3617,7 @@
     const preview = fields.forecast;
     if (!preview || preview.total < 1) {
       if (maybeVisitFarm(running)) return;
+      if (maybeVisitShelter(running)) return;
       say('等待符合条件的英雄或可用名额'); return;
     }
     if (burst ? preview.normal !== 0 || preview.burst !== maxTeams : preview.burst !== 0 || preview.normal > q.normal) {
@@ -3264,9 +3642,10 @@
     acquiring = true;
     navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
       if (!lock || !enabled || !onPage()) { if (enabled && onPage()) say('另一远征标签页正在运行'); return; }
+      shelterPending = loadState(localStorage,SHELTER_PENDING,null,'shelter',validShelterPending);
       active = true;
       try { await new Promise(resolve => { releaseLock = resolve; schedule(); }); }
-      finally { active = false; releaseLock = null; cancelQueued(); }
+      finally { active = false; releaseLock = null; cancelShelterRead(); cancelQueued(); }
     }).catch(() => setEnabled(false, '无法取得远征运行锁，请刷新后重试'))
       .finally(() => { acquiring = false; });
   }
@@ -3293,14 +3672,15 @@
   }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
     pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot(),
-    pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan), diagnostic } : null);
+    pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan),
+    shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending), diagnostic } : null);
   subscribeWakeup(schedule, onPage, () => enabled);
-  window.addEventListener('pagehide', () => { cancelFarmRead(); cancelQueued(); releaseLock?.(); });
+  window.addEventListener('pagehide', () => { cancelFarmRead(); cancelShelterRead(); cancelQueued(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
       toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
-      if (!enabled) { cancelFarmRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
+      if (!enabled) { cancelFarmRead(); cancelShelterRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
     } else if ([FARM_PREF,FARM_CROP,FARM_STATE].includes(event.key)) {
       try {
         farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
@@ -3309,6 +3689,13 @@
         farmState = JSON.parse(localStorage.getItem(FARM_STATE) || 'null') || farmState;
       } catch { farmEnabled = false; }
       cancelQueued();
+    } else if ([SHELTER_PREF,SHELTER_STATE,SHELTER_PENDING].includes(event.key)) {
+      shelterEnabled = localStorage.getItem(SHELTER_PREF) === 'true';
+      shelterState = loadState(localStorage,SHELTER_STATE,shelterState,'shelter',v => objectState(v) &&
+        Number.isFinite(v.nextAt) && typeof v.note === 'string' &&
+        (v.vaultNo === undefined || Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0));
+      shelterPending = loadState(localStorage,SHELTER_PENDING,null,'shelter',validShelterPending);
+      cancelShelterRead(); cancelQueued();
     } else return;
     schedule();
   });

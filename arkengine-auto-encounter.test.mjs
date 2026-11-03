@@ -11,6 +11,8 @@ import { expeditionMarkup } from './arkengine-expedition.fixture.mjs';
 import { dungeonMarkup } from './arkengine-dungeon.fixture.mjs';
 import { farmMarkup } from './arkengine-farm.fixture.mjs';
 import { fogMarkup } from './arkengine-fog.fixture.mjs';
+import { shelterMarkup } from './arkengine-shelter.fixture.mjs';
+import { shelterTests } from './arkengine-shelter.tests.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
 const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
@@ -161,7 +163,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
+    res.end(req.url.includes('shelter-fixture') ? shelterMarkup : req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -462,7 +464,28 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         if(location.pathname==='/farm')renderFarm();else renderExp();`);
       await evaluate(source);
     };
+    const setupShelter = async (code = '', path = '/shelter') => {
+      await cdp.send('Page.navigate', { url:`${origin}${path}?shelter-fixture=${++pageSerial}` },tab.sessionId);
+      await until(()=>evaluate(`location.search==='?shelter-fixture=${pageSerial}' && typeof renderShelter==='function'`),'shelter fixture');
+      await resetLogs();
+      await evaluate(`localStorage.clear();sessionStorage.clear();Math.random=()=>0;model.burst=0;addRuns(6);
+        localStorage.setItem('arkengine:auto-farm:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','true');
+        ${code};if(location.pathname==='/shelter')renderShelter();else renderExp();`);
+      await evaluate(source);
+    };
+    const reloadShelter = async () => {
+      const state = await evaluate('({sm,clock})');
+      await cdp.send('Page.reload', {},tab.sessionId);
+      await until(()=>evaluate(`typeof renderShelter==='function' && !document.getElementById('ark-auto-expedition')`),'reloaded shelter');
+      await evaluate(`Object.assign(window,${JSON.stringify(state)});clock+=120000;sm.busy=false;Math.random=()=>0;renderShelter();`);
+      await evaluate(source);
+    };
+    await shelterTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus });
     await t.test('启动恢复：正文迟到且页面一直加载时仍启动农场，保留人工暂停', async () => {
+      // 此项在文档头部注入，不能像普通 setup 那样注入前清库；先卸载上一页并隔离其日志。
+      await cdp.send('Page.navigate', { url:`${origin}/?test=${++pageSerial}` },tab.sessionId);
+      await until(()=>evaluate(`location.search==='?test=${pageSerial}' && typeof base==='function' && !window.__arkTestLogs`),'clean startup fixture');
+      await resetLogs();
       await cdp.send('Page.enable', {}, tab.sessionId);
       const hook = await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source: `
         window.startupErrors=[];window.addEventListener('error',e=>startupErrors.push(e.message));
@@ -1542,7 +1565,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.7.6');
+      assert.equal(exported.version,'1.8.0');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1598,7 +1621,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.7.6');
+      assert.equal(exported.version,'1.8.0');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
@@ -3033,6 +3056,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
           {at:at+5000,group:'expedition',pageId:'different-page',type:'request-result',data:{
             path:'/api/activities/expedition-claim-all',startedAt:at,status:null,outcome:'network-error'}}]}));`);
       await pulse(10000);
+      await until(async()=>/原领取结果仍无法确认/.test(await expStatus()),'legacy log lookup rejects another page');
       assert.match(await expStatus(),/原领取结果仍无法确认/);
       assert.equal(await evaluate('model.calls.length'),0);
       assert.equal(await evaluate(`${claimJournal}.result`),undefined);
