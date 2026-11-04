@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.8.0
+// @version      1.14.38
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
-// @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所；避难所收取与人员建议，七日本地收益与排障日志。
+// @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
 // @match        https://game.arkengine.me/*
 // @run-at       document-start
 // @grant        none
@@ -64,7 +64,7 @@
     try {
       wanted = /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname)
         ? localStorage.getItem('arkengine:auto-encounter:enabled:v1') !== 'false'
-        : /^(?:\/activities\/expedition|\/farm|\/shelter)\/?$/.test(location.pathname) &&
+        : /^(?:\/activities\/expedition|\/farm|\/shelter|\/stock)\/?$/.test(location.pathname) &&
           localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
       wanted &&= !accountStopReason();
       if (wanted && !animationSaved) {
@@ -321,14 +321,249 @@
     } catch { fallback(); }
   }
 
+  // STOCK_CORE_BEGIN — pure calculations also exercised by the Node tests.
+  const stockCore = (() => {
+    const whole = n => Number.isSafeInteger(n) && n >= 0;
+    const positive = n => whole(n) && n > 0;
+    const id = n => positive(n) || typeof n === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(n) && !['__proto__','constructor','prototype'].includes(n);
+    const time = s => typeof s === 'string' ? Date.parse(s) : NaN;
+    const distinct = (xs,key) => new Set(xs.map(key)).size === xs.length;
+    const fee = p => typeof p === 'number' && p >= 0 && p < 100 && /^\d+(?:\.\d{1,4})?$/.test(String(p));
+    // Integer cents and rational percentages avoid floating point rounding at fee boundaries.
+    function quote(price, shares, percent, buy) {
+      if (!positive(price) || !positive(shares) || shares > 2147483647 || !fee(percent)) return null;
+      const [a,b=''] = String(percent).split('.'), scale = 10n ** BigInt(b.length);
+      const gross = BigInt(price)*BigInt(shares), numerator = gross*BigInt(a+b), denominator = 100n*scale;
+      const charge = (numerator+(buy ? denominator-1n : 0n))/denominator;
+      const tokens = buy ? (gross+charge+99n)/100n : (gross-charge)/100n;
+      return tokens <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(tokens) : null;
+    }
+    function sharesFor(price, percent, budget) {
+      if (!positive(price) || !fee(percent) || !whole(budget)) return 0;
+      let low=0, high=2147483647;
+      while(low<high) { const mid=Math.ceil((low+high)/2), cost=quote(price,mid,percent,true);
+        if(cost!==null && cost<=budget) low=mid; else high=mid-1; }
+      return low;
+    }
+    function model(v,balance) {
+      if (!v || !positive(v.userId) || typeof v.enabled!=='boolean' || !Number.isFinite(balance?.tokens) ||
+          balance.tokens<0 || balance.tokens>Number.MAX_SAFE_INTEGER ||
+          !['stocks','positions','ticks','rounds','myBets'].every(k=>Array.isArray(v[k])&&v[k].every(x=>x&&typeof x==='object'&&!Array.isArray(x)))) return null;
+      if (!v.stocks.every(s=>id(s.id) && typeof s.modelName==='string' && s.modelName.length>0 && s.modelName.length<=200 &&
+          positive(s.priceCents)) || !distinct(v.stocks,s=>String(s.id)) || !distinct(v.stocks,s=>s.modelName) ||
+          !v.positions.every(p=>id(p.stockId) && whole(p.shares) && p.shares<=2147483647 &&
+            (p.costBasisTokens==null || whole(p.costBasisTokens)) && (p.holdUntil==null || Number.isFinite(time(p.holdUntil)))) ||
+          !distinct(v.positions,p=>String(p.stockId))) return null;
+      const r=v.rules;
+      if (!r || !fee(r.buyFeePct) || !fee(r.sellFeePct) ||
+          !['maxTradeTokens','maxDailyBuyTokens','maxPositionTokens','reserveTokens'].every(k=>whole(r[k]))) return null;
+      // Other game income can contain decimals. Only whole tokens are available for stock orders.
+      return {view:v,balance:Math.floor(balance.tokens),rules:r};
+    }
+    function uniqueBet(v,betId) {
+      if(!id(betId)||!Array.isArray(v?.myBets))return null;
+      const matches=v.myBets.filter(b=>id(b?.id)&&String(b.id)===String(betId));
+      return matches.length===1&&matches[0].id===betId?matches[0]:null;
+    }
+    function trend(v,s,now) {
+      if(s.stale || s.suspended || !Number.isFinite(s.volume24h) || s.volume24h<=0) return null;
+      const ticks=v.ticks.filter(t=>t.stockId===s.id).map(t=>({at:time(t.createdAt),price:t.priceCents}))
+        .sort((a,b)=>a.at-b.at).slice(-12);
+      if(ticks.length<6 || !ticks.every(t=>Number.isFinite(t.at) && positive(t.price)) ||
+          now-ticks.at(-1).at>10*60000 || ticks.at(-1).at>now+5000 || now-ticks[0].at>2*3600000 ||
+          ticks.at(-1).at-ticks[0].at<20*60000 || Math.abs(s.priceCents/ticks.at(-1).price-1)>.05) return null;
+      let up=0,down=0;
+      for(let i=1;i<ticks.length;i++) {
+        const delta=ticks[i].price/ticks[i-1].price-1, gap=ticks[i].at-ticks[i-1].at;
+        if(gap<=0 || gap>15*60000 || Math.abs(delta)>.2) return null;
+        if(delta>0)up++; if(delta<0)down++;
+      }
+      const avg=xs=>xs.reduce((sum,t)=>sum+t.price,0)/xs.length;
+      const change=avg(ticks.slice(-3))/avg(ticks.slice(0,3))-1;
+      const direction=change>=.02 && up/(ticks.length-1)>=.6 ? 'up' : change<=-.02 && down/(ticks.length-1)>=.6 ? 'down' : null;
+      return direction ? {direction,change,samples:ticks.length,at:ticks.at(-1).at} : null;
+    }
+    // Server receipts do not expose an execution time. First successful confirmation is a conservative bound.
+    const entryTime = e => Math.max(e.at,e.confirmedAt??0);
+    function spend(entries,action,now) {
+      return entries.filter(e=>e.action===action && entryTime(e)>now-86400000 && e.result!=='rejected').reduce((sum,e)=>sum+e.debit,0);
+    }
+    function sellPlan(m,s,owned,now) {
+      const o=owned[String(s.id)],p=m.view.positions.find(p=>p.stockId===s.id),r=m.rules;
+      if(!m.view.enabled || !o || o.manual || !p || p.shares!==o.shares || p.costBasisTokens!==o.cost || !o.cost ||
+          s.suspended || s.stale || p.holdUntil && time(p.holdUntil)>now)return null;
+      const net=quote(s.priceCents,p.shares,r.sellFeePct,false),t=trend(m.view,s,now);
+      if(net===null || !(net/o.cost>=1.08 || net/o.cost<=.94 || t?.direction==='down'))return null;
+      const cap=BigInt(Math.min(r.maxTradeTokens,r.reserveTokens))*100n/BigInt(s.priceCents);
+      const shares=Number(cap<BigInt(p.shares)?cap:BigInt(p.shares));
+      if(shares<=0)return null;
+      const proceeds=quote(s.priceCents,shares,r.sellFeePct,false);
+      if(proceeds===null)return null;
+      // Whole-token rounding applies to each partial sale, not to the original full position.
+      if(proceeds===0)return {blocked:true,reason:`${s.modelName}当前可卖 ${shares} 股，扣费取整后预计净到账为0代币，暂不卖出`};
+      return {action:'sell',stockId:s.id,modelName:s.modelName,shares,debit:0,
+        reason:net/o.cost>=1.08?'净收益达到8%':net/o.cost<=.94?'净亏损达到6%':'行情转弱'};
+    }
+    function choose(m,config,ledger,now) {
+      const v=m.view,r=m.rules,own=ledger.owned;
+      if(!v.enabled)return null;
+      // Alternate new spending when both modules have candidates; predictions cannot starve buying.
+      if(config.trade && config.predict && ledger.entries.at(-1)?.action==='predict') {
+        const trade=choose(m,{...config,predict:false},ledger,now);if(trade)return trade;
+      }
+      // No averaging down or mixing with manual positions. Each model has at most one script lot.
+      if(config.trade) for(const s of v.stocks) {
+        const sale=sellPlan(m,s,own,now);if(sale?.action)return sale;
+      }
+      const trends=v.stocks.map(s=>({s,t:trend(v,s,now)})).filter(x=>x.t).sort((a,b)=>Math.abs(b.t.change)-Math.abs(a.t.change)||String(a.s.id).localeCompare(String(b.s.id)));
+      const free=Math.max(0,m.balance-config.reserve);
+      if(config.predict && config.stake>0 && config.stake<=free &&
+          spend(ledger.entries,'predict',now)+config.stake<=config.predictionLimit) {
+        for(const {s,t} of trends) for(const round of v.rounds.filter(x=>x.stockId===s.id)) {
+          if(!id(round.id) || round.ruleVersion!==2 || !Number.isFinite(time(round.lockAt)) || !Number.isFinite(time(round.closeAt)) ||
+            time(round.lockAt)-now<60000 || time(round.closeAt)<=time(round.lockAt) ||
+            round.openAt!=null && (!Number.isFinite(time(round.openAt)) || time(round.openAt)>now) ||
+            !positive(round.oddsBp) || round.oddsBp<100 ||
+            BigInt(config.stake)*BigInt(round.oddsBp)>BigInt(Number.MAX_SAFE_INTEGER)*100n ||
+            ledger.entries.some(e=>e.roundId===round.id) || v.myBets.some(b=>b.roundId===round.id)) continue;
+          return {action:'predict',roundId:round.id,stockId:s.id,modelName:s.modelName,direction:t.direction,
+            betTokens:config.stake,debit:config.stake,reason:`近期${t.samples}笔行情${t.direction==='up'?'上行':'下行'}`};
+        }
+      }
+      if(!config.trade || !config.tradeLimit || v.positions.filter(p=>p.shares>0 && own[String(p.stockId)] && !own[String(p.stockId)].manual).length>=3)return null;
+      const positions=v.positions.filter(p=>p.shares>0);
+      if(positions.some(p=>!whole(p.costBasisTokens)))return null;
+      const held=positions.reduce((sum,p)=>sum+p.costBasisTokens,0);
+      // Ten percent quote buffer is a reservation, not a server-enforced limit price.
+      const reserveBudget=Math.floor(Math.min(config.tradeLimit-spend(ledger.entries,'buy',now),
+        config.tradeLimit-held,config.tradeLimit/3,free,r.maxTradeTokens,r.maxDailyBuyTokens-spend(ledger.entries,'buy',now),r.maxPositionTokens-held));
+      if(reserveBudget<=0)return null;
+      for(const {s,t} of trends) {
+        if(t.direction!=='up' || t.change*100<r.buyFeePct+r.sellFeePct+1 ||
+          positions.some(p=>p.stockId===s.id) || own[String(s.id)]?.manual ||
+          ledger.entries.some(e=>e.stockId===s.id && e.action==='sell' && e.result!=='rejected' && entryTime(e)>now-3600000))continue;
+        const shares=sharesFor(s.priceCents,r.buyFeePct,Math.floor(reserveBudget/1.1));
+        if(!shares)continue;
+        const estimate=quote(s.priceCents,shares,r.buyFeePct,true),debit=Math.ceil(estimate*1.1);
+        if(debit<=reserveBudget)return {action:'buy',stockId:s.id,modelName:s.modelName,shares,debit,estimate,reason:`近期${t.samples}笔上涨，预留10%报价余量`};
+      }
+      return null;
+    }
+    // Confirming a native intent can still execute it. Recheck changed funding limits without counting its reservation twice.
+    function recoveryWait(m,config,ledger,p,now) {
+      const a=p.choice;
+      if(p.manualTouched)return '原交易期间持仓被手动操作，保留原请求供手动核对';
+      if(a.action!=='predict') {
+        const before=p.beforeShares,after=before+(a.action==='buy'?a.shares:-a.shares);
+        if(!whole(before)||!positive(a.shares)||!whole(after))return '原交易持仓快照无法核对，保留原请求';
+        const pos=m.view.positions.find(s=>s.stockId===a.stockId),shares=pos?.shares||0;
+        // An unchanged position or the possible original result may be retried with the same key, never treated as a receipt.
+        if(shares!==before&&shares!==after)return '当前持仓数量与原交易前后均不符，保留原请求，等待同步或手动核对';
+        if(a.action==='sell') {
+          const owned=ledger.owned[String(a.stockId)];
+          if(!owned||owned.manual||owned.shares!==before)return '原卖出持仓归属无法核对，保留原请求供手动核对';
+          if(shares===before&&pos?.costBasisTokens!==owned.cost)return '原卖出持仓成本已改变，保留原请求，等待同步或手动核对';
+        }
+      }
+      if(a.action==='sell') {
+        const stock=m.view.stocks.find(s=>s.id===a.stockId&&s.modelName===a.modelName);
+        if(!stock||stock.stale||stock.suspended)return '原卖出当前报价无法核对，保留原单等待';
+        const proceeds=quote(stock.priceCents,a.shares,m.rules.sellFeePct,false);
+        if(proceeds===null)return '原卖出当前扣费后金额无法核对，保留原单等待';
+        if(proceeds===0)return '原卖出扣费取整后预计净到账为0代币，保留原请求，等待报价恢复或手动核对';
+        return null;
+      }
+      if(!positive(a.debit))return '原交易预留金额无法核对，保留原请求';
+      if(a.action==='predict'&&config.stake!==a.betTokens)return '固定单注已改变，原交易使用旧单注；等待设置一致或手动核对';
+      const limit=a.action==='buy'?config.tradeLimit:config.predictionLimit;
+      if(spend(ledger.entries.filter(e=>e.id!==p.id),a.action,now)+a.debit>limit)
+        return '原交易预留超过当前24小时额度，等待额度恢复或手动核对';
+      if(a.action==='buy') {
+        const stock=m.view.stocks.find(s=>s.id===a.stockId&&s.modelName===a.modelName);
+        if(!stock||stock.stale||stock.suspended)return '原买入当前报价无法核对，保留原单等待';
+        const cost=quote(stock.priceCents,a.shares,m.rules.buyFeePct,true);
+        if(cost===null)return '原买入当前含费成本无法核对，保留原单等待';
+        if(cost>a.debit)return `原买入当前预计含费成本 ${cost} 超过原预留 ${a.debit}，等待报价恢复或手动核对`;
+        const positions=m.view.positions.filter(pos=>pos.shares>0);
+        if(positions.some(pos=>!whole(pos.costBasisTokens)))return '持仓成本不完整，原交易等待同步后再核对';
+        const otherCost=positions.filter(pos=>pos.stockId!==a.stockId).reduce((sum,pos)=>sum+pos.costBasisTokens,0);
+        const ownCost=positions.find(pos=>pos.stockId===a.stockId)?.costBasisTokens||0;
+        if(otherCost+Math.max(ownCost,a.debit)>config.tradeLimit)return '原交易预留与当前持仓超过设置上限，等待资金条件恢复或手动核对';
+      }
+      // A lower balance cannot prove this intent executed: another feature may have spent it.
+      // Unknown outcomes may be resubmitted only within current funds; an actual receipt is reconciled without another POST.
+      if(m.balance-config.reserve<a.debit)
+        return '原交易确认可能动用当前保留余额，等待余额恢复或手动核对';
+      return null;
+    }
+    // Only explain a completed no-action check; these messages do not change eligibility, limits, or scheduling.
+    function waitReason(m,config,ledger,now) {
+      if(!m.view.enabled)return '股市暂未开放';
+      const blocked=config.trade&&m.view.stocks.map(s=>sellPlan(m,s,ledger.owned,now)).find(s=>s?.blocked);
+      if(blocked)return blocked.reason;
+      const messages=[],free=Math.max(0,m.balance-config.reserve),r=m.rules;
+      const budgetWait=(action,limit,needed,label)=>{
+        let used=spend(ledger.entries,action,now);
+        const expiring=ledger.entries.filter(e=>e.action===action&&e.result!=='rejected'&&e.debit>0&&entryTime(e)>now-86400000)
+          .slice().sort((a,b)=>entryTime(a)-entryTime(b));
+        for(const e of expiring){
+          used-=e.debit;
+          if(used+needed<=limit)return `；按当前记录约${Math.max(1,Math.ceil((entryTime(e)+86400000-now)/60000))}分钟后${label}`;
+        }
+        return '';
+      };
+      if(config.trade) {
+        const positions=m.view.positions.filter(p=>p.shares>0),spent=spend(ledger.entries,'buy',now);
+        const held=positions.reduce((sum,p)=>sum+(p.costBasisTokens??0),0);
+        let reason;
+        if(!config.tradeLimit)reason='未设置股票额度';
+        else if(positions.some(p=>!whole(p.costBasisTokens)))reason='持仓成本不完整，等待同步';
+        else if(positions.filter(p=>ledger.owned[String(p.stockId)]&&!ledger.owned[String(p.stockId)].manual).length>=3)reason='已有3只脚本持仓，继续核对现有持仓';
+        else if(held>=config.tradeLimit)reason='当前持仓成本已达设置上限';
+        else if(held>=r.maxPositionTokens)reason='已达网站总持仓成本上限';
+        else if(spent>=config.tradeLimit)reason='24小时买入额度已用完'+budgetWait('buy',config.tradeLimit,1,'开始释放');
+        else if(spent>=r.maxDailyBuyTokens)reason='网站买入额度暂无余量，按已记录支出保守等待';
+        else if(free<=0)reason='可用余额已到保留线';
+        else if(!r.maxTradeTokens)reason='网站单笔交易额度为0';
+        else reason='暂无同时满足行情、持仓和资金条件的股票';
+        messages.push('买入：'+reason);
+      }
+      if(config.predict) {
+        let reason;
+        if(!config.stake)reason='尚未设置有效固定单注';
+        else if(config.stake>config.predictionLimit)reason='固定单注超过预测额度';
+        else if(spend(ledger.entries,'predict',now)+config.stake>config.predictionLimit)
+          reason='24小时额度不足一注'+budgetWait('predict',config.predictionLimit,config.stake,'可容纳一注');
+        else if(free<config.stake)reason='可用余额不足固定单注，保留余额不动用';
+        else reason='暂无同时满足行情、轮次和去重条件的预测';
+        messages.push('预测：'+reason);
+      }
+      return messages.join('；') || '股市自动操作未开启';
+    }
+    const input = (a,userId) => a.action==='predict' ? {roundId:a.roundId,direction:a.direction,betTokens:a.betTokens,action:a.action,expectedUserId:userId} :
+      {modelName:a.modelName,shares:a.shares,action:a.action,expectedUserId:userId};
+    const same = (a,b) => a && b && Object.keys(a).length===Object.keys(b).length && Object.keys(a).every(k=>a[k]===b[k]);
+    function receipt(p,status,r) {
+      if(!p.key || r?.userId!==p.input.expectedUserId || r.action!==p.input.action || r.idempotencyKey!==p.key)return null;
+      if(status>=200 && status<300 && r.ok===true)return 'success';
+      if(status===400 && r.executed===false && r.code!=='idempotency_conflict')return 'rejected';
+      return null;
+    }
+    return {whole,positive,id,time,quote,sharesFor,model,uniqueBet,trend,entryTime,spend,sellPlan,choose,recoveryWait,waitReason,input,same,receipt};
+  })();
+  // STOCK_CORE_END
+
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
   const diagnosticLogs = {};
   // 仅在本脚本点击领取的同步调用期间绑定原网页请求，不读取请求正文。
   let captureExpeditionClaim = null;
   let captureShelterAction = null;
+  let continueShelterAction = null;
+  let captureStockAction = null;
+  let observeStockPost = null;
   let observeSessionPage = () => {};
   const pageGroup = path => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(path) ? 'cultivate' :
-    /^(?:\/activities\/expedition|\/farm|\/shelter)\/?$/.test(path) ? 'expedition' : '';
+    /^(?:\/activities\/expedition|\/farm|\/shelter|\/stock)\/?$/.test(path) ? 'expedition' : '';
   const diagnosticPage = (path = location.pathname) => path === '/' || pageGroup(path) ? path : '[其他页面]';
   const logDay = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
   const RECEIPTS = {
@@ -370,7 +605,43 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.8.0';
+  const SCRIPT_VERSION = '1.14.38';
+  function mountPanelControls(shadow,group) {
+    const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
+    const key=`arkengine:auto-panel:${group}:collapsed:v1`;
+    const style=document.createElement('style');
+    style.textContent=`.panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+      .panel-heading{min-width:0}.panel-heading strong{display:block;font-size:13px}
+      .panel-version{display:block;color:#acbde1;font-size:11px}
+      #panel-fold{flex-shrink:0;min-height:28px;padding:2px 8px}
+      #panel-content[hidden]{display:none}`;
+    shadow.append(style);
+    const header=document.createElement('header');header.className='panel-header';
+    const heading=document.createElement('div');heading.className='panel-heading';
+    const version=document.createElement('span');version.id='script-version';version.className='panel-version';
+    version.textContent=`v${SCRIPT_VERSION}`;heading.append(title,version);
+    const fold=document.createElement('button');fold.id='panel-fold';fold.type='button';
+    fold.setAttribute('aria-controls','panel-content');header.append(heading,fold);
+    const content=document.createElement('div');content.id='panel-content';
+    while(box.firstChild)content.append(box.firstChild);
+    box.append(header,content);
+    const render=collapsed=>{
+      content.hidden=collapsed;
+      title.textContent=collapsed?(group==='cultivate'?'修仙助手':'远征助手'):fullTitle;
+      fold.textContent=collapsed?'展开':'折叠';
+      fold.setAttribute('aria-expanded',String(!collapsed));
+      fold.title=collapsed?'展开脚本面板':'折叠面板，脚本继续运行';
+      box.scrollTop=0;
+    };
+    let collapsed=false;
+    try{collapsed=localStorage.getItem(key)==='true';}catch{ /* 面板偏好不可读时仍可使用默认展开状态 */ }
+    render(collapsed);
+    fold.addEventListener('click',()=>{
+      render(!content.hidden);
+      try{localStorage.setItem(key,String(content.hidden));}
+      catch{fold.title+='；本次状态仅在当前页面生效';}
+    });
+  }
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
@@ -788,7 +1059,7 @@
         finally { button.disabled = false; }
       };
       box.append(details); render(); refreshLog();
-      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm', 'shelter'];
+      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm', 'shelter', 'stock'];
       for (const [key, scope] of stateFaults) if (scopes.includes(scope)) {
         add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
       }
@@ -834,7 +1105,7 @@
     const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons', '/api/cultivation/fog',
       '/api/activities', '/api/activities/expedition-claim-all', '/api/activities/expedition-event',
       '/api/farm', '/api/farm/plant', '/api/farm/plant-all', '/api/farm/harvest', '/api/farm/harvest-all',
-      '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action']);
+      '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action', '/api/stock']);
     const background = new Set(['/api/me/balance', '/api/stamina']);
     const samples = new Map();
     function record(info, result) {
@@ -859,9 +1130,61 @@
     window.fetch = function (...args) {
       const at = Date.now();
       const claimCapture = captureExpeditionClaim;
-      const shelterCapture = captureShelterAction;
-      // 原参数、this、Promise 和 Response 原样传递，不读取请求头/正文或响应正文。
+      let shelterCapture = captureShelterAction;
+      // 免费赛季原生按钮逐档await；后续请求仍属于同一批次，普通读取不加入捕获。
+      if(!shelterCapture&&continueShelterAction){
+        try{
+          const input=args[0],url=new URL(typeof input==='string'?input:input instanceof URL?input.href:input?.url,document.baseURI);
+          const method=String(args[1]?.method??(input instanceof Request?input.method:'GET')).toUpperCase();
+          let body;try{body=JSON.parse(args[1]?.body);}catch{ /* 地址仍可识别 */ }
+          if(url.pathname==='/api/shelter/action'&&method!=='GET'||body?.action?.type==='claim_season')shelterCapture=continueShelterAction;
+        }catch{ /* 其他页面的非避难所请求不接管 */ }
+      }
+      let stockCapture = captureStockAction;
+      // 自动点击只接受能同步核对的原生JSON请求，地址、方法或正文变化时在发送前停止。
+      // 人工Request正文仅从副本被动观察，不消费原流，也不延迟网站请求。
+      let stockBound = false;
+      let observedStockBody = null;
+      let observedStockNative;
+      if (stockCapture || observeStockPost) {
+        try {
+          const input = args[0], raw = typeof input === 'string' ? input : input instanceof URL ? input.href : input?.url;
+          const url = new URL(raw, document.baseURI);
+          const method=String(args[1]?.method??(input instanceof Request?input.method:'GET')).toUpperCase();
+          const matches=url.origin===location.origin&&url.pathname==='/api/stock'&&method==='POST';
+          if(stockCapture) {
+            if(!matches||typeof args[1]?.body!=='string')throw Error('股市请求格式无法同步核对');
+            stockCapture.bind(JSON.parse(args[1].body));stockBound=true;
+          }else if(matches) {
+            if(typeof args[1]?.body==='string') {
+              stockCapture=observeStockPost?.(JSON.parse(args[1].body));stockBound=Boolean(stockCapture);
+            }else if(input instanceof Request&&args[1]?.body==null) {
+              observedStockNative=observeStockPost?.snapshot();
+              observedStockBody=input.clone().json().catch(()=>null);
+            }
+          }
+        } catch (error) { if(captureStockAction){captureStockAction.fail();return Promise.reject(error);} }
+      }
+      if(shelterCapture?.validate) {
+        try {
+          const input=args[0],url=new URL(typeof input==='string'?input:input instanceof URL?input.href:input?.url,document.baseURI);
+          const method=String(args[1]?.method??(input instanceof Request?input.method:'GET')).toUpperCase();
+          if(url.origin!==location.origin||url.pathname!=='/api/shelter/action'||method!=='POST'||typeof args[1]?.body!=='string')
+            throw Error('避难所请求格式无法同步核对');
+          shelterCapture.validate(JSON.parse(args[1].body));
+        }catch(error){shelterCapture.fail(error);return Promise.reject(error);}
+      }
       const promise = Reflect.apply(originalFetch, this, args);
+      if (stockBound) promise.then(response => response.clone().json().then(body => stockCapture.result(response.status,body)),
+        () => stockCapture.result(null,null)).catch(() => stockCapture.result(null,null));
+      if(observedStockBody) {
+        // Clone the response as soon as it arrives; the site's own reader may consume it next.
+        const receipt=promise.then(response=>response.clone().json().then(body=>({status:response.status,body})),()=>null).catch(()=>null);
+        observedStockBody.then(body=>{
+          const observer=body&&observeStockPost?.(body,observedStockNative);if(!observer)return;
+          return receipt.then(result=>observer.result(result?.status??null,result?.body??null));
+        }).catch(()=>{ /* 被动观察失败不能改变网站收到的结果 */ });
+      }
       try {
         const input = args[0];
         const raw = typeof input === 'string' ? input : input instanceof URL ? input.href :
@@ -871,10 +1194,15 @@
         if (url?.origin === location.origin && paths.has(url.pathname) && group) {
           const info = { group, path: url.pathname, at };
           const method = String(args[1]?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
-          const report = result => {
+          const report = (result,response) => {
             record(info, result);
             if (claimCapture?.path === info.path && method === 'POST') claimCapture.result(result);
-            if (shelterCapture && info.path === '/api/shelter/action' && method === 'POST') shelterCapture(result);
+            if (shelterCapture && info.path === '/api/shelter/action' && method === 'POST') {
+              let request=null;try{request=JSON.parse(args[1]?.body);}catch{ /* 无可核对的原生正文 */ }
+              shelterCapture(result,request);
+              if(response && result.outcome==='ok')response.clone().json().then(body=>shelterCapture(result,request,body))
+                .catch(()=>{ shelterCapture.end?.(); /* 缺少正文保留未知结果，后续按目标状态核对 */ });
+            }
           };
           promise.then(response => {
             let loginRedirect = false;
@@ -884,7 +1212,7 @@
             }
             report({ status: response.status, redirected: response.redirected,
               outcome: loginRedirect ? 'login-redirect' : response.ok ? 'ok' : 'http-error',
-              ...(loginRedirect ? { to: '/' } : {}) });
+              ...(loginRedirect ? { to: '/' } : {}) },response);
           }, error => report({ status: null,
             outcome: error?.name === 'AbortError' || error?.name === 'TimeoutError' ? 'aborted' : 'network-error' }))
             .catch(() => { /* 日志或监听失败不能改变网站收到的结果 */ });
@@ -1061,6 +1389,7 @@
   const fogStatus = shadow.getElementById('fog-status');
   const fogToggle = shadow.getElementById('fog-toggle');
   log.mount(shadow);
+  mountPanelControls(shadow,'cultivate');
   fogToggle.addEventListener('click', () => {
     if (stateFault('fog')) { say(stateFault('fog')); return; }
     fogEnabled = !fogEnabled;
@@ -1987,7 +2316,8 @@
   const TEAM_LIMIT = 6;
   const inFarm = () => /^\/farm\/?$/.test(location.pathname);
   const inShelter = () => /^\/shelter\/?$/.test(location.pathname);
-  const onPage = () => /^\/(?:activities\/expedition|farm|shelter)\/?$/.test(location.pathname);
+  const inStock = () => /^\/stock\/?$/.test(location.pathname);
+  const onPage = () => /^\/(?:activities\/expedition|farm|shelter|stock)\/?$/.test(location.pathname);
   const FARM_PREF = 'arkengine:auto-farm:enabled:v1';
   const FARM_CROP = 'arkengine:auto-farm:crop:v1';
   const FARM_STATE = 'arkengine:auto-farm:schedule:v1';
@@ -2050,6 +2380,7 @@
   let scheduled = false;
   let nextStepAt = 0;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
+  let pageFrozen = false;
   const claimPageId = crypto.randomUUID();
   const claimResultValid = v => objectState(v) && ['ok', 'network-error', 'aborted', 'http-error', 'login-redirect'].includes(v.outcome) &&
     (v.status === null || Number.isInteger(v.status) && v.status >= 100 && v.status <= 599);
@@ -2136,7 +2467,7 @@
   const farmWait = createPageWait('farm', log);
   const expeditionLoadWait = createPageWait('expedition', log);
   const NAV_JOURNAL = 'arkengine:auto-expedition:navigation:v1';
-  const travelPaths = ['/farm', '/activities/expedition', '/shelter'];
+  const travelPaths = ['/farm', '/activities/expedition', '/shelter', '/stock'];
   let navigation = loadState(sessionStorage, NAV_JOURNAL, null, 'expedition', v => timedState(v) &&
     travelPaths.includes(v.from) && travelPaths.includes(v.to) && v.from !== v.to && typeof v.reloaded === 'boolean');
   const locator = createLocator();
@@ -2172,14 +2503,16 @@
       select { box-sizing: border-box; width: 100%; min-height: 36px; margin-top: 4px;
         color: #e6edf9; background: #1b2033; border: 1px solid #616e9c; border-radius: 3px; }
       select:focus-visible { outline: 2px solid white; outline-offset: 2px; }
+      .staff-option { display: block; margin-top: 6px; }
+      #shelter-population { width: 64px; margin-left: 6px; }
     </style>
     <div class="box">
-      <strong>自动远征、农场与避难所</strong>
+      <strong>自动远征、农场、避难所与股市</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <p class="hint">常态：边境巡逻，最多 6 队。<br>突发：北京时间 01:00～02:00 优先；错过且额度完整未用时补派深渊。</p>
       <p class="hint">自动领取 · 完整行程 · 点击前随机等 2～5 秒</p>
       <button type="button" id="toggle"></button>
-      <p class="hint">主开关同时控制远征、农场和避难所。</p>
+      <p class="hint">主开关同时控制远征、农场、避难所和股市。</p>
       <p class="hint" id="farm-status"></p>
       <label for="farm-crop">种植作物</label>
       <select id="farm-crop">
@@ -2192,7 +2525,36 @@
       <p class="hint" id="shelter-status"></p>
       <button type="button" id="shelter-toggle"></button>
       <button type="button" id="shelter-check">检查避难所</button>
+      <label class="staff-option"><input type="checkbox" id="shelter-explore-claim"> 自动领取已归来的探险</label>
+      <p class="hint" id="shelter-explore-status">领取并释放归来的居民；出发、召回、救援和废土小队仍由你安排。</p>
+      <label for="shelter-staff">避难所人员管理</label>
+      <select id="shelter-staff">
+        <option value="off">仅收取奖励，人员由我安排</option>
+        <option value="production">自动生产：保障供应，优先废料</option>
+        <option value="family">自动生产＋已有配对生育轮换</option>
+        <option value="population">自动生产＋人口发展（安排新配对）</option>
+      </select>
+      <label class="staff-option">人口发展目标<input id="shelter-population" type="number" min="2" max="200" step="1" value="14"> 人</label>
+      <p class="hint" id="shelter-population-status">人口发展模式才使用此目标；默认 14 人。</p>
+      <label class="staff-option"><input type="checkbox" id="shelter-gear"> 自动穿戴闲置生产服装</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-optimize"> 优化满员生产房间</label>
+      <p class="hint" id="shelter-staff-status"></p>
       <details><summary>避难所人员建议</summary><p class="hint" id="shelter-advice">首次检查后显示生产和生育建议。</p></details>
+      <details><summary>避难所发展规划</summary><p class="hint" id="shelter-development" style="white-space:pre-line">检查避难所后比较建造、升级和扩容。建议不会自动花费资源。</p></details>
+      <details><summary>避难所运行提醒</summary><p class="hint" id="shelter-operations" style="white-space:pre-line">检查后显示停产、供应、施工和废土返程情况。</p></details>
+      <details id="stock-settings"><summary>模型股市</summary>
+        <p class="hint" id="stock-status"></p>
+        <label class="staff-option"><input type="checkbox" id="stock-trade"> 自动择股与管理脚本持仓</label>
+        <label class="staff-option"><input type="checkbox" id="stock-predict"> 自动涨跌预测（可能亏损）</label>
+        <label class="staff-option">股票24小时买入／持仓成本上限 <input id="stock-trade-limit" type="number" min="0" step="1" style="width:90px"></label>
+        <label class="staff-option">预测24小时下注上限 <input id="stock-prediction-limit" type="number" min="0" step="1" style="width:90px"></label>
+        <label class="staff-option">预测每注固定代币 <input id="stock-stake" type="number" min="0" step="1" style="width:90px"></label>
+        <label class="staff-option">账号保留代币 <input id="stock-reserve" type="number" min="0" step="1" style="width:90px"></label>
+        <p class="hint">默认关闭、额度为0。每5分钟检查，最多3只股票；净盈利8%、净亏损6%或趋势转弱时尝试卖出，须满足持有期。预测按近期趋势固定下注，每轮一次，不加倍追损。</p>
+        <p class="hint">交易按市价成交，无最高成交价保证；预留10%报价余量仍可能超出预估。上限只统计脚本支出，卖出及预测返还不补回24小时额度。手动持仓和历史仓由你处理。</p>
+        <button type="button" id="stock-save">保存股市设置</button>
+        <button type="button" id="stock-check">检查股市</button>
+      </details>
       <p class="hint"><a href="/cultivate" target="_blank" rel="noopener">打开奇遇挂机页</a></p>
     </div>`;
   document.body.append(host);
@@ -2203,6 +2565,7 @@
   const farmSelect = shadow.getElementById('farm-crop');
   const farmToggle = shadow.getElementById('farm-toggle');
   log.mount(shadow);
+  mountPanelControls(shadow,'expedition');
   // 只监听用户实际点击确认卖出，既不发售卖请求，也不替用户确认。暂停自动操作后仍可记账。
   document.addEventListener('click', event => {
     if (!inFarm()) return;
@@ -2243,32 +2606,433 @@
     schedule();
   });
 
-  // 避难所只在远征组运行。读取原有状态接口，所有写入只点击原网页按钮。
+  // 股市与远征共用运行锁；预算、持仓与原请求在同一条持久记录内原子保存。
+  const STOCK_CONFIG = 'arkengine:auto-stock:config:v1';
+  const STOCK_LEDGER = 'arkengine:auto-stock:ledger:v1';
+  const stockDefault = {trade:false,predict:false,tradeLimit:0,predictionLimit:0,stake:0,reserve:0};
+  const validStockConfig = v => objectState(v) && typeof v.trade==='boolean' && typeof v.predict==='boolean' &&
+    ['tradeLimit','predictionLimit','stake','reserve'].every(k=>stockCore.whole(v[k]) && v[k]<=1e12);
+  // 结算记录是历史清理的完成凭据，损坏字段不能被当作已经结算。
+  const validStockLedger = v => objectState(v) && v.version===1 && (v.userId===null || stockCore.positive(v.userId)) &&
+    stockCore.whole(v.nextAt) && typeof v.note==='string' && typeof v.hold==='boolean' && objectState(v.owned) &&
+    (v.holdReason==null || typeof v.holdReason==='string') &&
+    Object.values(v.owned).every(o=>objectState(o) && stockCore.whole(o.shares) && stockCore.whole(o.cost) &&
+      typeof o.modelName==='string' && typeof o.manual==='boolean') && Array.isArray(v.entries) && v.entries.length<=2000 &&
+    v.entries.every(e=>objectState(e) && typeof e.id==='string' && stockCore.whole(e.at) && stockCore.whole(e.debit) &&
+      (e.confirmedAt===undefined || stockCore.whole(e.confirmedAt)&&e.confirmedAt>=e.at) &&
+      ['buy','sell','predict'].includes(e.action) && ['reserved','success','rejected'].includes(e.result) &&
+      (e.settlement==null || objectState(e.settlement) && e.action==='predict' && e.result==='success' &&
+        stockCore.id(e.betId) && stockCore.whole(e.settlement.payout) && stockCore.whole(e.settlement.at))) &&
+    (v.pending===null || objectState(v.pending) && typeof v.pending.id==='string' && stockCore.whole(v.pending.at) &&
+      Number.isInteger(v.pending.retries) && v.pending.retries>=0 && v.pending.retries<=2 &&
+      objectState(v.pending.input) && stockCore.same(v.pending.input,stockCore.input(v.pending.choice,v.userId)) &&
+      (v.pending.confirmedAt===undefined || stockCore.whole(v.pending.confirmedAt)&&v.pending.confirmedAt>=v.pending.at) &&
+      (v.pending.reserveFloor===undefined || stockCore.whole(v.pending.reserveFloor)&&v.pending.reserveFloor<=1e12) &&
+      v.entries.some(e=>e.id===v.pending.id && e.action===v.pending.input.action) &&
+      (v.pending.key===null || typeof v.pending.key==='string' && /^[a-zA-Z0-9-]{8,64}$/.test(v.pending.key)) &&
+      [null,'success','rejected'].includes(v.pending.result));
+  const emptyStockLedger = () => ({version:1,userId:null,nextAt:0,note:'未配置资金，不会自动交易',hold:false,owned:{},entries:[],pending:null});
+  let stockConfig=loadState(localStorage,STOCK_CONFIG,stockDefault,'stock',validStockConfig);
+  let stockLedger=loadState(localStorage,STOCK_LEDGER,emptyStockLedger(),'stock',validStockLedger);
+  let stockFault='',stockRead=null,stockController=null,stockGeneration=0,stockReadAt=0,stockReadStarted=0;
+  let stockEntryAt=0,stockLeave=false,stockActions=0,stockManualUntil=0;
+  const stockEnabled = () => stockConfig.trade || stockConfig.predict;
+  const stockActionEnabled = action => action==='predict' ? stockConfig.predict : stockConfig.trade;
+  // Keep the stop cause separate from temporary wait/status messages, including legacy records.
+  const stockHoldReason = () => stockLedger.hold ? stockLedger.holdReason || stockLedger.note : null;
+  // Legacy capacity stops may resume reads; other holds and pending requests keep their existing protections.
+  const stockCapacityWait = () => !stockLedger.pending && stockHoldReason()==='股市账本达到容量上限，请导出日志后核对';
+  function stockPersist(value) {
+    // 通知可能迟到；发现共享记录已改变时，不能把按旧状态算出的值写回。
+    const changed=stockReload();
+    if(stateFault('stock'))throw Error('股市共享记录不可读，已撤销旧状态写入');
+    if(changed)throw Object.assign(Error('股市共享记录已更新，已撤销旧状态写入'),{code:'stock-state-changed'});
+    value={...value,holdReason:value.hold?value.holdReason||value.note:null};
+    if(!validStockLedger(value))throw Error('股市账本校验失败');
+    const text=JSON.stringify(value);localStorage.setItem(STOCK_LEDGER,text);
+    if(localStorage.getItem(STOCK_LEDGER)!==text)throw Error('股市账本写入失败');
+    stockLedger=value;
+  }
+  function stockReload() {
+    const previous=JSON.stringify([stockConfig,stockLedger]);
+    stockConfig=loadState(localStorage,STOCK_CONFIG,stockDefault,'stock',validStockConfig);
+    stockLedger=loadState(localStorage,STOCK_LEDGER,emptyStockLedger(),'stock',validStockLedger);
+    return previous!==JSON.stringify([stockConfig,stockLedger]);
+  }
+  function stockHint() {
+    const c=stockConfig,l=stockLedger;
+    const reason=stockHoldReason();
+    const text=stateFault('stock') || stockFault || `股市${stockEnabled()?'':'已暂停'}：${l.note}${reason&&reason!==l.note?`；停止原因：${reason}`:''}。24小时买入 ${stockCore.spend(l.entries,'buy',Date.now())}/${c.tradeLimit}；预测 ${stockCore.spend(l.entries,'predict',Date.now())}/${c.predictionLimit}${l.pending?'；有原交易待核对':''}`;
+    const el=shadow.getElementById('stock-status');if(el.textContent!==text)el.textContent=text;
+  }
+  function stockFillSettings() {
+    for(const [key,id] of [['trade','stock-trade'],['predict','stock-predict']])shadow.getElementById(id).checked=stockConfig[key];
+    for(const [key,id] of [['tradeLimit','stock-trade-limit'],['predictionLimit','stock-prediction-limit'],['stake','stock-stake'],['reserve','stock-reserve']])shadow.getElementById(id).value=String(stockConfig[key]);
+  }
+  stockFillSettings();
+  shadow.getElementById('stock-save').addEventListener('click',()=>{
+    try {
+      stockReload();
+      if(stateFault('stock')){say(stateFault('stock'));return;}
+      const c={trade:shadow.getElementById('stock-trade').checked,predict:shadow.getElementById('stock-predict').checked};
+      for(const [key,id] of [['tradeLimit','stock-trade-limit'],['predictionLimit','stock-prediction-limit'],['stake','stock-stake'],['reserve','stock-reserve']]) {
+        const raw=shadow.getElementById(id).value;c[key]=/^\d+$/.test(raw)?Number(raw):NaN;
+      }
+      if(!validStockConfig(c) || c.predict && (!c.stake || c.stake>c.predictionLimit)) {say('请填写有效整数额度；预测每注必须大于0且不超过预测上限');return;}
+      localStorage.setItem(STOCK_CONFIG,JSON.stringify(c));
+      if(localStorage.getItem(STOCK_CONFIG)!==JSON.stringify(c))throw Error('设置保存失败');
+      stockConfig=c;stockFault='';cancelStockRead();cancelQueued();
+      stockPersist({...stockLedger,nextAt:0,hold:stockLedger.pending?stockLedger.hold:false,
+        holdReason:stockHoldReason(),note:'设置已保存，等待检查'});
+      if(navigation?.to==='/stock' && !stockEnabled())clearNavigation();
+      schedule();
+    }catch(error){if(!stockRetryChange(error)){stockFault='股市设置保存失败，停止股市操作';say(stockFault);}}
+  });
+  shadow.getElementById('stock-check').addEventListener('click',()=>{
+    stockReload();
+    if(stateFault('stock') || stockFault || !stockEnabled()){say('请先配置并开启股市');return;}
+    try{stockPersist({...stockLedger,nextAt:0});cancelStockRead();cancelQueued();schedule();}
+    catch(error){if(!stockRetryChange(error))stockFault='无法保存股市预约';}
+  });
+  // 人工操作优先；不改用户筛选或接管用户原请求。正在发送的交易仍保留原记录。
+  for(const name of ['pointerdown','keydown','input'])document.addEventListener(name,event=>{
+    if(!event.isTrusted || !inStock() || event.composedPath().includes(host))return;
+    stockManualUntil=Date.now()+60000;cancelQueued();schedule();
+  },true);
+  function cancelStockRead() {
+    stockGeneration++;stockController?.abort();stockController=null;stockRead=null;stockReadAt=0;stockReadStarted=0;
+  }
+  function stockFinish(note,hold=false) {
+    stockReload();
+    stockPersist({...stockLedger,nextAt:Date.now()+300000,note,hold:hold || stockLedger.hold,
+      holdReason:hold?note:stockHoldReason()});
+    log.add(hold?'stock-held':'stock-check',note,{pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),
+      buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now())});
+    stockLeave=true;cancelStockRead();
+  }
+  function stockRetryChange(error) {
+    if(error?.code!=='stock-state-changed')return false;
+    cancelStockRead();cancelQueued();
+    // 只预约重新读取，不重放旧计算或清理原请求；预约仍冲突则交回调用方安全停止。
+    try{stockFinish('股市共享记录已更新，本轮操作已撤销，五分钟后重新检查');schedule();return true;}
+    catch{return false;}
+  }
+  function stockBack() {
+    offer('stock:return','返回远征，股市按预约再检查',()=>{
+      startNavigation('/activities/expedition',travelLink('/activities/expedition'));
+    });
+  }
+  function maybeVisitStock(running) {
+    if(stockReload()){cancelStockRead();cancelQueued();}
+    // A paused feature keeps its original journal for reconciliation, without blocking unrelated work.
+    if(!stockEnabled() || stockFault || stateFault('stock') || stockLedger.hold && !stockLedger.pending?.result && !stockCapacityWait() && !stockCanConfirmHere() || stockLedger.nextAt>Date.now() ||
+      farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait())return false;
+    rememberExpeditionTime(running);
+    if(farmState.expeditionAt>Date.now() && farmState.expeditionAt-Date.now()<15000)return false;
+    offer('stock:visit','检查股市行情、持仓与预测',()=>{
+      startNavigation('/stock',travelLink('/stock'));
+    });return true;
+  }
+  function readStock() {
+    if(stockController || Date.now()<stockReadAt)return;
+    const generation=++stockGeneration,controller=new AbortController();stockController=controller;stockReadStarted=Date.now();
+    const timeout=setTimeout(()=>controller.abort(),10000);
+    const read=async path=>{const response=await fetch(path,{cache:'no-store',signal:controller.signal});
+      if(!response.ok || response.redirected)throw Error('股市状态读取失败');return response.json();};
+    Promise.all([read('/api/stock'),read('/api/me/balance')]).then(([view,balance])=>{
+      if(generation!==stockGeneration || !enabled || !active || !inStock() || accountStopReason())return;
+      if(stockReload() || stateFault('stock')){cancelStockRead();cancelQueued();schedule();return;}
+      const m=stockCore.model(view,balance);if(!m)throw Error('股市字段不完整');
+      if(stockLedger.userId!==null && stockLedger.userId!==view.userId){stockFinish('股市账号已变化，保留原账本，请核对账号',true);return;}
+      if(stockLedger.userId===null)stockPersist({...stockLedger,userId:view.userId});
+      stockRead={at:Date.now(),model:m};
+    }).catch(error=>{
+      if(generation!==stockGeneration || !enabled || !inStock() || accountStopReason())return;
+      if(error?.code==='stock-state-changed'){
+        if(!stockRetryChange(error))stockFault='股市记录无法保存';
+        return;
+      }
+      try{stockFinish('股市行情或余额未能完整读取，五分钟后再检查');}
+      catch(error){if(!stockRetryChange(error))stockFault='股市记录无法保存';}
+    }).finally(()=>{clearTimeout(timeout);if(generation===stockGeneration){stockController=null;stockReadAt=Date.now()+2000;schedule();}});
+  }
+  function stockNative() {
+    const records=[];
+    for(let i=0;i<sessionStorage.length;i++) {
+      const key=sessionStorage.key(i);if(!/^stock:request:\d+$/.test(key || ''))continue;
+      const raw=sessionStorage.getItem(key);if(raw===null || raw==='null')continue;
+      try{records.push({key,value:JSON.parse(raw)});}catch{records.push({key,value:null});}
+    }
+    return records;
+  }
+  function stockOwnNative(p,records=stockNative()) {
+    return records.length===1 && records[0].key===`stock:request:${stockLedger.userId}` &&
+      records[0].value?.idempotencyKey===p.key && stockCore.same(records[0].value.input,p.input);
+  }
+  function stockCanConfirmHere() {
+    const p=stockLedger.pending;
+    return Boolean(p?.key&&p.retries<2&&stockOwnNative(p));
+  }
+  function stockCapture(p) {
+    return {
+      bind(body) {
+        // The native handler runs after reservation; another tab can still change limits or ownership before fetch.
+        const changed=stockReload(),current=stockLedger.pending;
+        if(changed || !enabled || localStorage.getItem(PREF)==='false' || !active || !stockActionEnabled(p.input.action) || stockFault || accountStopReason() || !current || current.id!==p.id ||
+          !/^[a-zA-Z0-9-]{8,64}$/.test(body?.idempotencyKey || ''))throw Error('股市请求未绑定');
+        const {idempotencyKey,...input}=body;
+        if(!stockCore.same(input,current.input) || current.key && current.key!==idempotencyKey)throw Error('股市请求不一致');
+        const bound={...current,key:idempotencyKey};if(!stockOwnNative(bound))throw Error('原生记录不一致');
+        stockPersist({...stockLedger,pending:bound});
+      },
+      fail(){stockFault='股市原请求绑定失败，保留记录，请核对原交易';schedule();},
+      result(status,body) {
+        try {
+          stockReload();const current=stockLedger.pending;if(!current || current.id!==p.id)return;
+          const result=stockCore.receipt(current,status,body);
+          const resolved=current.result || result;
+          const confirmedAt=resolved==='success'?current.confirmedAt??Math.max(current.at,
+            current.result==='success'&&stockCore.whole(current.responseAt)?current.responseAt:Date.now()):null;
+          stockPersist({...stockLedger,
+            entries:confirmedAt!==null?stockLedger.entries.map(e=>e.id===current.id?{...e,confirmedAt}:e):stockLedger.entries,
+            pending:{...current,result:resolved,...(confirmedAt!==null?{confirmedAt}:{}),responseAt:Date.now(),httpStatus:status}});
+          stockRead=null;stockReadAt=Date.now()+1000;
+          log.add('stock-response',result==='success'?'股市原交易回执已核对':result==='rejected'?'股市原交易明确未执行':'股市交易结果仍未知',
+            {action:current.input.action,status,confirmed:Boolean(result),...(confirmedAt!==null?{confirmedAt}:{})});schedule();
+        }catch{stockFault='无法保存股市响应，原交易保留';schedule();}
+      }
+    };
+  }
+  function stockClick(button,p) {
+    captureStockAction=stockCapture(p);
+    try{button.click();}finally{captureStockAction=null;}
+  }
+  observeStockPost = (body,nativeAtSend) => {
+    try {
+      stockReload();if(stateFault('stock'))return null;
+      const {idempotencyKey,...input}=body || {},p=stockLedger.pending;
+      // 用户在原生页手动确认脚本原请求时，仍只接收精确匹配的回执。
+      if(p?.key && p.key===idempotencyKey && stockCore.same(input,p.input) && stockOwnNative(p,nativeAtSend))return stockCapture(p);
+      if(['buy','sell'].includes(input.action) && input.expectedUserId===stockLedger.userId) {
+        const owned={...stockLedger.owned};let changed=false;
+        for(const [id,o] of Object.entries(owned))if(o.modelName===input.modelName && !o.manual){owned[id]={...o,manual:true};changed=true;}
+        const touched=p?.choice.modelName===input.modelName && p.input.action!=='predict';
+        if(changed || touched)stockPersist({...stockLedger,owned,pending:touched?{...p,manualTouched:true}:p,note:'检测到手动交易，相关模型交回人工管理'});
+      }
+    }catch{stockFault='手动交易后的持仓归属无法核对，停止股市操作';}
+    return null;
+  };
+  // Native successful requests can clear sessionStorage before an asynchronous body copy finishes.
+  observeStockPost.snapshot=stockNative;
+  function stockRoundSignature(round) {
+    const fmt=s=>new Date(s).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
+    return `${fmt(round.lockAt)}～${fmt(round.closeAt)}|${(round.oddsBp/100).toFixed(2)}x`.normalize('NFKC');
+  }
+  function stockControls(a,m) {
+    if(a.action!=='predict') {
+      const input=locator.pick([...document.querySelectorAll('input')].filter(n=>n.getAttribute('aria-label')===`${a.modelName} 交易数量`));
+      const root=input?.parentElement?.parentElement;
+      return {input,button:buttonIn(root,new RegExp(`^${a.action==='buy'?'买':'卖'} ${a.shares}$`))};
+    }
+    const root=section('涨跌预测'),round=m.view.rounds.find(r=>r.id===a.roundId);
+    if(!root || !round)return {};
+    const signature=stockRoundSignature(round);
+    if(m.view.rounds.filter(r=>r.stockId===a.stockId && stockRoundSignature(r)===signature).length!==1)return {};
+    const cards=[];
+    for(const title of [...root.querySelectorAll('p')].filter(n=>textOf(n)===a.modelName)) {
+      let card=title.parentElement;
+      while(card && card!==root && ![...card.querySelectorAll('button')].some(b=>/^(涨|跌) \d+$/.test(textOf(b))))card=card.parentElement;
+      if(card && card!==root && signature.split('|').every(s=>textOf(card).replace(/\s/g,'').includes(s)))cards.push(card);
+    }
+    const card=locator.pick([...new Set(cards)]);
+    return {input:locator.pick([...root.querySelectorAll('input')].filter(n=>n.getAttribute('aria-label')==='预测下注代币数量')),
+      button:buttonIn(card,new RegExp(`^${a.direction==='up'?'涨':'跌'} ${a.betTokens}$`))};
+  }
+  function stockReconcile(m) {
+    const p=stockLedger.pending;if(!p)return false;
+    if(p.result) {
+      if(p.result==='success' && p.manualTouched){stockFinish('原交易期间持仓被手动操作，成本无法独立核对，保留原记录',true);return true;}
+      const owned={...stockLedger.owned},entries=stockLedger.entries.map(e=>({...e})),entry=entries.find(e=>e.id===p.id),a=p.choice;
+      entry.result=p.result;
+      if(p.result==='success')entry.confirmedAt=Math.max(p.at,p.confirmedAt??entry.confirmedAt??
+        (stockCore.whole(p.responseAt)?p.responseAt:Date.now()));
+      if(p.result==='success' && a.action!=='predict') {
+        const pos=m.view.positions.find(s=>s.stockId===a.stockId),expected=p.beforeShares+(a.action==='buy'?a.shares:-a.shares);
+        if((pos?.shares || 0)!==expected || expected && !(a.action==='buy'?stockCore.positive(pos.costBasisTokens):stockCore.whole(pos.costBasisTokens))) {
+          // A newly bought positive-price lot cannot prove its actual debit with a zero cost basis.
+          const zeroBuyCost=a.action==='buy'&&pos?.shares===expected&&pos.costBasisTokens===0;
+          if(Date.now()-p.at>30000)stockFinish(zeroBuyCost?'新买入持仓成本为0，保留预算及原记录，等待实际成本更新':'交易已执行，等待对应持仓和成本更新；保留原记录，稍后核对');
+          else {stockRead=null;stockReadAt=Date.now()+2000;say(zeroBuyCost?'新买入持仓成本为0，保留预算并等待同步':'交易已执行，等待持仓和成本更新');}
+          return true;
+        }
+        if(a.action==='buy')entry.debit=pos.costBasisTokens;
+        if(expected)owned[String(a.stockId)]={shares:pos.shares,cost:pos.costBasisTokens,modelName:a.modelName,manual:false};
+        else delete owned[String(a.stockId)];
+      }else if(p.result==='success') {
+        const matches=m.view.myBets.filter(b=>b.roundId===a.roundId && b.direction===a.direction && b.betTokens===a.betTokens && !p.beforeBets.includes(b.id));
+        if(matches.length!==1 || !stockCore.uniqueBet(m.view,matches[0].id)) {
+          if(Date.now()-p.at>30000)stockFinish('下注已执行，等待对应下注记录更新；保留原记录，稍后核对');
+          else {stockRead=null;stockReadAt=Date.now()+2000;say('下注已执行，等待对应下注记录，不再次下注');}
+          return true;
+        }
+        entry.betId=matches[0].id;
+      }
+      const over=p.result==='success' && a.action==='buy' && (entry.debit>a.debit || stockCore.spend(entries,'buy',Date.now())>stockConfig.tradeLimit);
+      const resolvedWait=p.result==='success'&&!p.manualTouched&&
+        (stockHoldReason()==='本页没有匹配的原交易，请回原标签页核对；不新建交易'||
+          a.action!=='predict'&&stockHoldReason()==='交易已执行，但持仓成本或数量尚未对应，保留原记录');
+      const reason=over?'实际买入超过预留金额，已停止后续自动交易':stockLedger.hold&&!resolvedWait?stockHoldReason():null;
+      stockPersist({...stockLedger,owned,entries,pending:null,hold:Boolean(reason),holdReason:reason,
+        note:p.result==='rejected'?'交易被网站拒绝，未执行':reason||`${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测下注'}已确认`});
+      log.add('stock-confirmed',stockLedger.note,{action:a.action,model:a.modelName,result:p.result,
+        submittedAt:entry.at,...(entry.confirmedAt!==undefined?{confirmedAt:entry.confirmedAt}:{}),
+        ...(a.action==='sell'?{shares:a.shares}:{debitTokens:entry.debit})});
+      stockRead=null;stockReadAt=Date.now()+2000;
+      if(p.result==='rejected' || over)stockFinish(stockLedger.note,true);
+      return true;
+    }
+    if(!p.key) {if(Date.now()-p.at>10000)stockFinish('尚未捕获属于脚本的原交易编号，保留记录，请核对',true);else say('等待原网页提交股市交易');return true;}
+    if(!stockActionEnabled(p.input.action)){stockFinish('原交易所属功能已暂停，保留原请求供手动核对');return true;}
+    if(!stockOwnNative(p)) {stockFinish('本页没有匹配的原交易，请回原标签页核对；不新建交易',true);return true;}
+    const fundingWait=stockCore.recoveryWait(m,stockConfig,stockLedger,p,Date.now());
+    if(fundingWait){stockFinish(fundingWait);return true;}
+    const wait=p.retries?120000:30000;
+    if(Date.now()-(p.lastRetryAt || p.at)<wait){say('等待股市原交易结果，不重复下单');return true;}
+    if(p.retries>=2){stockFinish('原交易已核对两次仍未知，保留记录，请手动确认原交易',true);return true;}
+    const button=locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b)==='确认原交易'));
+    if(!usable(button)) {stockFinish('原交易确认按钮尚不可用，保留记录，稍后核对');return true;}
+    const key=`stock:recover:${p.id}:${p.retries}`;
+    if(queued?.key===key&&Date.now()>=queued.dueAt&&Date.now()-stockRead.at>1500){offered=true;readStock();return true;}
+    offer(key,'核对同一笔股市原交易',()=>{
+      const next={...p,retries:p.retries+1,lastRetryAt:Date.now()};stockPersist({...stockLedger,pending:next});stockClick(button,next);
+    });return true;
+  }
+  function stockStep() {
+    if(stockReload()){cancelStockRead();cancelQueued();}
+    if(!stockEnabled() && !stockEntryAt){say('股市自动操作未开启，可在面板配置额度与开关');return;}
+    if(!stockEntryAt){stockEntryAt=Date.now();stockActions=0;stockLeave=false;}
+    if(stockLeave){stockBack();return;}
+    if(!stockEnabled() || stockFault || stateFault('stock')){stockBack();return;}
+    const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    if(dialogs.length){handleNotice(dialogs,'股市弹窗等待你处理');return;}
+    if(Date.now()<stockManualUntil){say('股市正在手动操作，自动操作等待一分钟');return;}
+    if(!navigator.onLine){stockFinish('网络离线，保留股市记录，稍后检查');return;}
+    if(plan || claimWait || farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait() || nativePending().length){stockFinish('其他玩法有原操作待核对，先返回远征');return;}
+    if(stockLedger.hold && !stockLedger.pending?.result && !stockCapacityWait() && !stockCanConfirmHere()){stockFinish(stockLedger.note);return;}
+    if(stockLedger.pending && Date.now()-stockEntryAt>60000 && !stockLedger.pending.result){stockFinish('原交易待核对，先回远征，下次只核对同一请求');return;}
+    if(stockController && Date.now()-stockReadStarted>12000){cancelStockRead();stockFinish('股市读取超时，稍后再检查');return;}
+    if(!stockRead || Date.now()-stockRead.at>10000){readStock();return;}
+    const m=stockRead.model;
+    if(stockReconcile(m))return;
+    if(stockNative().length){stockFinish('存在手动股市原请求，请先在网页核对',true);return;}
+    // 手动改变持仓后停止管理该模型，避免出售人工买入的股票。
+    const owned={...stockLedger.owned},capacityWait=stockCapacityWait();let changed=capacityWait;
+    for(const [id,o] of Object.entries(owned)) {
+      const p=m.view.positions.find(p=>String(p.stockId)===id);
+      if(!o.manual && (p?.shares!==o.shares || p?.costBasisTokens!==o.cost)) {owned[id]={...o,manual:true};changed=true;}
+    }
+    const settlements=[];
+    const entries=stockLedger.entries.filter(e=>stockCore.entryTime(e)>Date.now()-7*86400000 || e.action==='predict' && e.result!=='rejected' && !e.settlement).map(entry=>{
+      if(entry.action!=='predict' || entry.result!=='success' || !entry.betId || entry.settlement)return entry;
+      const bet=stockCore.uniqueBet(m.view,entry.betId);
+      if(bet?.settled===true && bet.roundId===entry.roundId && bet.betTokens===entry.debit && stockCore.whole(bet.payoutTokens)) {
+        const next={...entry,settlement:{payout:bet.payoutTokens,at:Date.now()}};changed=true;
+        settlements.push(next);return next;
+      }
+      return entry;
+    });
+    if(changed || entries.length!==stockLedger.entries.length)stockPersist({...stockLedger,owned,entries,
+      ...(capacityWait?{hold:false,holdReason:null,note:'股市账本容量等待已恢复核对'}:{})});
+    // A failed ledger write must not mutate the live ledger or announce a completed settlement.
+    for(const entry of settlements)log.add('stock-prediction-settled','预测已结算，返还不补回下注额度',
+      {stake:entry.debit,payout:entry.settlement.payout,net:entry.settlement.payout-entry.debit});
+    if(stockLedger.entries.length>=2000){stockFinish('股市账本暂满，暂停新交易，五分钟后核对结算与到期记录');return;}
+    if(Date.now()-stockEntryAt>60000 || stockActions>=3){stockFinish('本轮股市检查结束，五分钟后继续');return;}
+    const a=stockCore.choose(m,stockConfig,stockLedger,Date.now());
+    if(!a){stockFinish(stockCore.waitReason(m,stockConfig,stockLedger,Date.now()));return;}
+    const control=stockControls(a,m),quantity=a.action==='predict'?a.betTokens:a.shares;
+    if(!usable(control.input)){stockFinish('目标模型控件不可见或不唯一，请检查手动筛选');return;}
+    if(Number(control.input.value)!==quantity) {
+      offer(`stock:quantity:${a.action}:${a.stockId}:${quantity}`,'填写股市原生数量',()=>{
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(control.input,String(quantity));
+        control.input.dispatchEvent(new Event('input',{bubbles:true}));control.input.dispatchEvent(new Event('change',{bubbles:true}));
+      });return;
+    }
+    if(!usable(control.button)){stockFinish('目标交易按钮尚不可用，稍后再检查');return;}
+    const key=`stock:submit:${JSON.stringify(a)}`;
+    if(queued?.key===key && Date.now()>=queued.dueAt && Date.now()-stockRead.at>1500){offered=true;readStock();return;}
+    offer(key,`${a.action==='predict'?'预测'+(a.direction==='up'?'涨':'跌'):a.action==='buy'?'买入':'卖出'} ${a.modelName}`,()=>{
+      const p={id:crypto.randomUUID(),at:Date.now(),retries:0,key:null,result:null,choice:a,input:stockCore.input(a,m.view.userId),
+        beforeShares:m.view.positions.find(p=>p.stockId===a.stockId)?.shares || 0,beforeBets:m.view.myBets.map(b=>b.id)};
+      stockPersist({...stockLedger,pending:p,entries:[...stockLedger.entries,{id:p.id,at:p.at,action:a.action,stockId:a.stockId,roundId:a.roundId,debit:a.debit,result:'reserved'}]});
+      stockActions++;stockRead=null;stockReadAt=Date.now()+2000;
+      log.add('stock-submit',a.reason,{action:a.action,model:a.modelName,shares:a.shares,stake:a.betTokens,reservedDebit:a.debit});
+      stockClick(control.button,p);
+    });
+  }
+
+  // 避难所只在远征组运行。读取原有状态接口，所有写入使用原网页控件。
   const SHELTER_PREF = 'arkengine:auto-shelter:enabled:v1';
   const SHELTER_STATE = 'arkengine:auto-shelter:schedule:v1';
   const SHELTER_PENDING = 'arkengine:auto-shelter:pending:v1';
-  const shelterKinds = ['collect', 'tutorial', 'daily', 'season', 'achievement'];
+  const SHELTER_STAFF = 'arkengine:auto-shelter:staff:v1';
+  const SHELTER_GEAR = 'arkengine:auto-shelter:gear:v1';
+  const SHELTER_OPTIMIZE = 'arkengine:auto-shelter:optimize:v1';
+  const SHELTER_POPULATION = 'arkengine:auto-shelter:population:v1';
+  const SHELTER_EXPLORE_CLAIM = 'arkengine:auto-shelter:explore-claim:v1';
+  function populationTarget() {
+    const raw = localStorage.getItem(SHELTER_POPULATION), value = raw === null ? 14 : Number(raw);
+    return Number.isInteger(value) && value >= 2 && value <= 200 ? value : null;
+  }
+  let shelterPopulationTarget = populationTarget(), shelterPopulationNote = '';
+  let shelterGear = localStorage.getItem(SHELTER_GEAR) === 'true';
+  let shelterOptimize = localStorage.getItem(SHELTER_OPTIMIZE) === 'true';
+  let shelterExploreClaim = localStorage.getItem(SHELTER_EXPLORE_CLAIM) === 'true',shelterExploreNote='',shelterExploreManualUntil=0;
+  const shelterExploreSkipped=new Set();
+  const staffModes = ['off','production','family','population'];
+  let shelterStaffMode = localStorage.getItem(SHELTER_STAFF) || 'off';
+  if (!staffModes.includes(shelterStaffMode)) shelterStaffMode = 'off';
+  let shelterWork = null, shelterStaffHold = false, shelterStaffNote = '';
+  const shelterKinds = ['collect', 'tutorial', 'daily', 'season', 'achievement', 'assign', 'equip', 'explore'];
   let shelterEnabled = localStorage.getItem(SHELTER_PREF) === 'true';
-  let shelterState = loadState(localStorage, SHELTER_STATE, { nextAt: 0, note: '等待首次检查' }, 'shelter',
-    v => objectState(v) && Number.isFinite(v.nextAt) && typeof v.note === 'string' &&
-      (v.vaultNo === undefined || Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0));
+  let shelterStopFault='';
+  const validShelterState = v => objectState(v) && Number.isFinite(v.nextAt) && typeof v.note === 'string' &&
+    (v.pendingReadOnly === undefined || typeof v.pendingReadOnly === 'string' && v.pendingReadOnly.length > 0) &&
+    (v.vaultNo === undefined || Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0);
+  let shelterState = loadState(localStorage, SHELTER_STATE, { nextAt: 0, note: '等待首次检查' }, 'shelter',validShelterState);
   const validShelterPending = v => timedState(v) &&
     typeof v.id === 'string' && shelterKinds.includes(v.kind) && Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0 &&
     Array.isArray(v.targets) && v.targets.length > 0 &&
-    v.targets.every(x => typeof x === 'string' || Number.isSafeInteger(x)) && objectState(v.before) &&
+    (v.sentCount === undefined || v.kind === 'season' && Number.isSafeInteger(v.sentCount) && v.sentCount > 0 && v.sentCount <= v.targets.length) &&
+    v.targets.every((x,i) => typeof x === 'string' || Number.isSafeInteger(x) || v.kind === 'assign' && i === 1 && x === null) && objectState(v.before) &&
     Number.isFinite(v.before.collected) && typeof v.before.day === 'string' && typeof v.before.month === 'string' &&
+    (v.kind !== 'assign' || v.targets.length === 2 && Number.isSafeInteger(v.targets[0]) && v.targets[0] > 0 &&
+      (v.targets[1] === null || Number.isSafeInteger(v.targets[1]) && v.targets[1] > 0) &&
+      (v.before.room === null || Number.isSafeInteger(v.before.room))) &&
+    (v.kind !== 'equip' || v.targets.length === 2 && v.targets.every(x => Number.isSafeInteger(x) && x > 0) &&
+      (v.before.outfit === null || Number.isSafeInteger(v.before.outfit))) &&
+    (v.kind !== 'explore' || v.targets.length===2&&v.targets.every(x=>Number.isSafeInteger(x)&&x>0)&&
+      objectState(v.before.explorer)&&v.before.explorer.id===v.targets[0]&&v.before.explorer.residentId===v.targets[1]&&
+      Number.isFinite(v.before.explorer.startedAt)&&Number.isFinite(v.before.explorer.returnAt)&&
+      v.before.explorer.returnAt>=v.before.explorer.startedAt) &&
     (v.kind !== 'collect' || Array.isArray(v.before.rooms) && v.before.rooms.length > 0 &&
       v.before.rooms.every(r => Number.isSafeInteger(r.id) && Number.isFinite(r.stored) && r.stored > 0));
   // 同组只持有一把运行锁；未决记录跨标签共享，避免接力标签重放未知领取。
   let shelterPending = loadState(localStorage, SHELTER_PENDING, null, 'shelter', validShelterPending);
+  function shelterReadOnlyWait() { return Boolean(shelterPending && shelterState.pendingReadOnly === shelterPending.id); }
   let shelterRead = null, shelterController = null, shelterGeneration = 0, shelterReadAt = 0;
-  let shelterEntryAt = 0, shelterStage = 0, shelterActions = 0, shelterLeave = false;
+  let shelterEntryAt = 0, shelterStage = 0, shelterActions = 0, shelterLeave = false, shelterVisitPeriod = null;
+  let shelterBatchReloading = false;
   const shelterToggle = shadow.getElementById('shelter-toggle');
   const shelterResources = { power: '电力', food: '食物', water: '净水', scrap: '废料', parts: '零件', stimpak: '治疗针' };
   // 2026-11-03 公开前端：属性、基础小时产出、每批数量；等级倍率 1 / 1.5 / 2.1。
   const shelterRooms = { power: ['str','power',12,30], diner: ['agi','food',8,25], water: ['per','water',8,25],
     scrap: ['end','scrap',8,30], medbay: ['int','stimpak',.5,2], workshop: ['int','parts',.6,3],
     door: [], elevator: [], quarters: [], storage: [], training: [], armory: [], tailor: [], radio: [] };
+  // Public 2026-11-03 room definitions: label, base scrap price, unlock level.
+  const shelterBuildRules = {power:['发电站',100,1],diner:['餐厅',100,1],water:['净水站',100,1],scrap:['废料回收站',80,1],
+    quarters:['宿舍',120,1],storage:['仓库',80,2],medbay:['医务室',300,3],training:['训练室',400,4],
+    workshop:['工坊',500,5],armory:['武器工坊',600,6],tailor:['服装工坊',600,6],radio:['电台',800,8]};
   const achievementIds = Object.fromEntries([
     ['向下十层','depth-10'],['小小社区','pop-20'],['勤快管家','collect-10k'],['废土常客','explore-10'],
     ['消防队','incident-20'],['新生命','birth-1'],['第一件作品','craft-1'],['老手','resident-10'],
@@ -2279,50 +3043,211 @@
     ['地下城市','level-12'],['深渊行者','depth-60'],['总工程师','builder'],['大家长','family'],
     ['收藏家','collector'],['传奇居民','resident-50'],['薪火相传','legacy-20'],['赛季满档','season-30'],['废土巨富','collect-2m']
   ]);
+  function shelterReload() {
+    const snapshot=()=>JSON.stringify([shelterEnabled,shelterState,shelterPending,shelterStaffMode,
+      shelterGear,shelterOptimize,shelterPopulationTarget,shelterExploreClaim]);
+    const previous=snapshot(),mode=shelterStaffMode,gear=shelterGear,optimize=shelterOptimize,
+      target=shelterPopulationTarget,explore=shelterExploreClaim,hadSwap=Boolean(shelterState.swap);
+    shelterEnabled=localStorage.getItem(SHELTER_PREF)==='true';
+    shelterState=loadState(localStorage,SHELTER_STATE,shelterState,'shelter',validShelterState);
+    shelterPending=loadState(localStorage,SHELTER_PENDING,null,'shelter',validShelterPending);
+    if(stateFault('shelter')||shelterStopFault)shelterEnabled=false;
+    const staff=localStorage.getItem(SHELTER_STAFF);
+    shelterStaffMode=staffModes.includes(staff)?staff:'off';
+    shelterGear=localStorage.getItem(SHELTER_GEAR)==='true';
+    shelterOptimize=localStorage.getItem(SHELTER_OPTIMIZE)==='true';
+    shelterExploreClaim=localStorage.getItem(SHELTER_EXPLORE_CLAIM)==='true';
+    shelterPopulationTarget=populationTarget();
+    if(mode!==shelterStaffMode||gear!==shelterGear||optimize!==shelterOptimize){
+      shelterStaffHold=hadSwap;
+      shelterStaffNote=hadSwap?'其他页面已改变设置，本轮停止人员调整。':'';
+    }
+    if(target!==shelterPopulationTarget){shelterStaffHold=false;shelterStaffNote='';shelterPopulationNote='';}
+    if(explore!==shelterExploreClaim){shelterExploreNote='';shelterExploreSkipped.clear();}
+    return previous!==snapshot();
+  }
+  function shelterWriteGuard() {
+    const changed=shelterReload();
+    if(stateFault('shelter'))throw Error('避难所共享记录不可读，保留原文');
+    if(shelterStopFault)throw Error(shelterStopFault);
+    if(changed)throw Object.assign(Error('避难所共享记录已更新，已撤销旧写入'),{code:'shelter-state-changed'});
+  }
   function saveShelter(value) {
+    shelterWriteGuard();
     const raw = JSON.stringify(value);
     localStorage.setItem(SHELTER_STATE, raw);
     if (localStorage.getItem(SHELTER_STATE) !== raw) throw new Error('无法保存避难所预约');
     shelterState = value;
   }
   function saveShelterPending(value) {
+    shelterWriteGuard();
     const raw = JSON.stringify(value);
     localStorage.setItem(SHELTER_PENDING, raw);
-    if (localStorage.getItem(SHELTER_PENDING) !== raw) throw new Error('无法保存避难所领取记录');
+    if (localStorage.getItem(SHELTER_PENDING) !== raw) throw new Error('无法保存避难所操作记录');
     shelterPending = value;
   }
   function cancelShelterRead() {
     shelterGeneration++; shelterController?.abort(); shelterController = null; shelterRead = null; shelterReadAt = 0;
   }
   function shelterHint() {
-    if (stateFault('shelter')) shelterEnabled = false;
+    if (stateFault('shelter')||shelterStopFault) shelterEnabled = false;
     const left = Math.max(0, shelterState.nextAt - Date.now());
-    const message = stateFault('shelter') || `避难所${shelterEnabled ? '' : '已暂停'}：${shelterState.note}${
+    const message = stateFault('shelter') || shelterStopFault || `避难所${shelterEnabled ? '' : '已暂停'}：${shelterState.note}${
       shelterEnabled && left ? `；约 ${Math.ceil(left / 60000)} 分钟后检查` : ''}`;
     shadow.getElementById('shelter-status').textContent = message;
     shelterToggle.textContent = shelterEnabled ? '暂停避难所' : '开启避难所';
     shadow.getElementById('shelter-advice').textContent = shelterState.advice || '首次检查后显示生产和生育建议；人员由你安排。';
+    shadow.getElementById('shelter-development').textContent = shelterState.development || '检查避难所后比较建造、升级和扩容。建议不会自动花费资源。';
+    shadow.getElementById('shelter-operations').textContent = shelterState.operations || '检查后显示停产、供应、施工和废土返程情况。';
+    shadow.getElementById('shelter-staff').value = shelterStaffMode;
+    shadow.getElementById('shelter-gear').checked = shelterGear;
+    shadow.getElementById('shelter-optimize').checked = shelterOptimize;
+    shadow.getElementById('shelter-explore-claim').checked = shelterExploreClaim;
+    shadow.getElementById('shelter-explore-status').textContent=shelterExploreClaim?
+      shelterExploreNote||shelterState.exploreNote||'库存足够时领取已归来的探险；小队、出发、召回和救援由你安排。':'探险自动领取未开启。';
+    const target = shadow.getElementById('shelter-population');
+    if (shadow.activeElement !== target) target.value = shelterPopulationTarget ?? '';
+    shadow.getElementById('shelter-population-status').textContent = shelterStaffMode === 'population' ?
+      shelterPopulationNote || `目标 ${shelterPopulationTarget ?? '未设置'} 人；先保供应，再安排无已知亲缘关系的新配对。` :
+      '人口发展模式才使用此目标；正在培养感情或待产的家庭保持原安排。';
+    shadow.getElementById('shelter-staff-status').textContent = shelterStaffMode === 'off' ? '人员自动管理未开启。' :
+      shelterStaffNote || '先保障电、水、食物，并留 20% 时产余量；保护培养感情、待产和特殊岗位。';
   }
   function pauseShelter(message) {
+    try{shelterReload();}catch{ /* 读取失败也须保留原文并暂停 */ }
     shelterEnabled = false;
     cancelShelterRead(); cancelQueued();
-    shelterState = { ...shelterState, note: message };
-    try { localStorage.setItem(SHELTER_PREF, 'false'); saveShelter(shelterState); } catch { /* 内存暂停仍然生效 */ }
+    try {
+      localStorage.setItem(SHELTER_PREF, 'false');
+      if(localStorage.getItem(SHELTER_PREF)!=='false')throw Error('暂停设置未保存');
+    }catch{ shelterStopFault='避难所暂停设置无法保存，本页已停止；修复存储后刷新再开启'; }
+    try { saveShelter({...shelterState,note:message}); }
+    catch { shelterEnabled=false; /* 内存暂停仍然生效，不覆盖损坏原文 */ }
     log.add('shelter-paused', message, { pending: Boolean(shelterPending) }); say(message);
     schedule();
   }
-  shelterToggle.addEventListener('click', () => {
-    if (stateFault('shelter')) { say(stateFault('shelter')); return; }
+  function shelterRetryChange(error) {
+    if(error?.code!=='shelter-state-changed')return false;
+    cancelShelterRead();cancelQueued();
+    try{finishShelter(null,'避难所共享记录已更新，本轮操作已撤销，一分钟后重新检查',60000);schedule();return true;}
+    catch{return false;}
+  }
+  function shelterControl(id,event,handler) {
+    shadow.getElementById(id).addEventListener(event,e=>{
+      try{
+        if(shelterReload()){cancelShelterRead();cancelQueued();}
+        if(stateFault('shelter')||shelterStopFault){say(stateFault('shelter')||shelterStopFault);return;}
+        handler(e);
+      }catch(error){if(!shelterRetryChange(error))pauseShelter('避难所设置无法保存，已暂停并保留原记录');}
+    });
+  }
+  shelterControl('shelter-toggle','click', () => {
     shelterEnabled = !shelterEnabled; localStorage.setItem(SHELTER_PREF, String(shelterEnabled));
     cancelShelterRead(); cancelQueued(); shelterLeave = false;
     saveShelter({ ...shelterState, nextAt: 0, note: shelterEnabled ? '等待检查' : '人工暂停' }); schedule();
   });
-  shadow.getElementById('shelter-check').addEventListener('click', () => {
-    if (!shelterEnabled || stateFault('shelter')) { say('请先开启避难所'); return; }
+  shelterControl('shelter-check','click', () => {
+    if (!shelterEnabled) { say('请先开启避难所'); return; }
     saveShelter({ ...shelterState, nextAt: 0, note: '等待检查' });
-    if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false; }
+    if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false;shelterExploreSkipped.clear();shelterExploreNote=''; }
     schedule();
   });
+  shelterControl('shelter-explore-claim','change',event=>{
+    shelterExploreClaim=event.target.checked;localStorage.setItem(SHELTER_EXPLORE_CLAIM,String(shelterExploreClaim));
+    shelterExploreNote='';shelterExploreSkipped.clear();cancelShelterRead();cancelQueued();
+    saveShelter({...shelterState,exploreNote:'',nextAt:0,note:'探险归来领取设置已更新'});schedule();
+  });
+  for(const name of ['pointerdown','keydown','input','change'])document.addEventListener(name,event=>{
+    if(!event.isTrusted||!shelterExploreClaim||!inShelter()||event.composedPath().includes(host))return;
+    shelterExploreManualUntil=Date.now()+60000;cancelQueued();schedule();
+  },true);
+  shelterControl('shelter-staff','change', event => {
+    shelterStaffMode = event.target.value;
+    localStorage.setItem(SHELTER_STAFF,shelterStaffMode);
+    shelterStaffHold = Boolean(shelterState.swap);
+    shelterStaffNote = shelterStaffHold ? '设置已改变，本轮停止人员调整；已完成的换位步骤保留。' : '';
+    cancelShelterRead(); cancelQueued();
+    saveShelter({ ...shelterState,swap:null,nextAt:0,note:'人员管理设置已更新' }); schedule();
+  });
+  shelterControl('shelter-population','change',event => {
+    const value = Number(event.target.value);
+    if (!Number.isInteger(value) || value < 2 || value > 200) {
+      say('人口目标请输入 2～200 的整数'); event.target.value = shelterPopulationTarget ?? ''; return;
+    }
+    localStorage.setItem(SHELTER_POPULATION,String(value)); shelterPopulationTarget = value;
+    shelterPopulationNote = ''; shelterStaffHold = false; shelterStaffNote = '';
+    cancelShelterRead(); cancelQueued();
+    saveShelter({...shelterState,nextAt:0,note:'人口目标已更新'}); schedule();
+  });
+  for (const [id,key] of [['shelter-gear',SHELTER_GEAR],['shelter-optimize',SHELTER_OPTIMIZE]]) {
+    shelterControl(id,'change',event => {
+      localStorage.setItem(key,String(event.target.checked));
+      if (key === SHELTER_GEAR) shelterGear = event.target.checked;
+      else shelterOptimize = event.target.checked;
+      shelterStaffHold = Boolean(shelterState.swap);
+      shelterStaffNote = shelterStaffHold ? '设置已改变，本轮停止人员调整；已完成的换位步骤保留。' : '';
+      cancelShelterRead(); cancelQueued();
+      saveShelter({...shelterState,swap:null,nextAt:0,note:'生产强化设置已更新'}); schedule();
+    });
+  }
+  function shelterWorkerRate(s, now, env, p, r) {
+    const [stat,resource,base] = shelterRooms[r.type] || [];
+    if (!resource || r.builtAt > now || r.incident || r.unpowered || r.upgradeAt !== null) return 0;
+    const bonus = s.items.find(item => item.id === p.outfitId)?.bonus?.[stat] ?? 0;
+    if (!Number.isFinite(bonus) || bonus < 0) throw new Error('避难所装备规则变化');
+    const events = (env?.events || []).filter(e => e.kind === 'production' && e.startsAt <= now && now < e.endsAt);
+    return base*[0,1,1.5,2.1][r.level]*(.5+Math.min(17,p.stats[stat]+bonus)/10)*(.6+.4*Math.min(100,p.happiness)/100)*
+      (1+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*.01)*(1+.03*(s.legacy?.perks?.production || 0))*
+      Math.min(150,Math.max(100,...events.map(e => e.percent)))/100;
+  }
+  function shelterStoredProjection(s,r,now,env,cap) {
+    const [,resource,,batchBase]=shelterRooms[r.type],batch=(batchBase || 0)*r.width*[0,1,1.5,2.1][r.level];
+    const elapsed=Math.max(0,now-s.lastSettledAt),steps=Math.floor(Math.min(86400000,elapsed)/600000);
+    const nextTickAt=s.lastSettledAt+(Math.floor(elapsed/600000)+1)*600000;
+    const result={stored:resource?r.stored:0,autoCollected:0,scrapConsumed:0,nextTickAt};
+    if(!resource || !steps)return result;
+    // Public page's ty(): 10-minute ticks, at most 24 hours, rate sampled at the start of that window.
+    const from=Math.max(s.lastSettledAt,now-86400000);
+    const workers=s.residents.filter(p=>p.roomId===r.id && p.away===null && p.deadAt===null && p.adultAt<=from).slice(0,r.width*2);
+    const increment=workers.reduce((sum,p)=>sum+shelterWorkerRate(s,from,env,p,r),0)/6;
+    const automatic=(s.handies || []).some(h=>h.floor===r.floor),maxStored=4*batch;
+    let scrap=s.resources.scrap,capacity=cap-s.resources[resource];
+    for(let i=0;i<steps;i++) {
+      if(increment>0) {
+        let made=Math.min(increment,Math.max(0,maxStored-result.stored));
+        if(r.type==='workshop') {made=Math.min(made,scrap/6);scrap-=6*made;result.scrapConsumed+=6*made;}
+        result.stored+=Math.max(0,made);
+      }
+      if(automatic) {
+        const collected=Math.min(Math.floor(result.stored/batch+1e-9)*batch,Math.max(0,Math.floor(capacity)));
+        if(collected>0){result.stored=Math.max(0,result.stored-collected);capacity-=collected;result.autoCollected+=collected;}
+      }
+      if(increment<=0 && !automatic)break;
+    }
+    return result;
+  }
+  function shelterFutureCollection(m,afterMs=0) {
+    const amounts={},automatic={};
+    for(const room of m.state.rooms.filter(r=>r.builtAt<=m.now+afterMs)) {
+      const [,resource,,batchBase]=shelterRooms[room.type];if(!resource)continue;
+      const batch=batchBase*room.width*[0,1,1.5,2.1][room.level];
+      const projected=shelterStoredProjection(m.state,room,m.now+afterMs,m.view.env,m.caps[resource]);
+      amounts[room.id]=Math.floor(projected.stored/batch+1e-9)*batch;
+      automatic[resource]=(automatic[resource] || 0)+projected.autoCollected;
+    }
+    return {amounts,automatic};
+  }
+  function shelterCapacity(rooms,storagePerk,extraStorage=0) {
+    const storage=rooms.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width*r.level,extraStorage);
+    const caps=Object.fromEntries(Object.keys(shelterResources).map(key=>{
+      const [base,warehouse,room]=key==='scrap'?[1500,1200,600]:key==='parts'?[100,60,40]:
+        key==='stimpak'?[10,5,5]:[600,400,250];
+      const cells=rooms.filter(r=>shelterRooms[r.type][1]===key).reduce((n,r)=>n+r.width*[0,1,1.5,2.1][r.level],0);
+      return [key,Math.floor((base+warehouse*storage+room*cells)*(1+.05*storagePerk))];
+    }));
+    return {caps,itemCap:20+10*storage,populationCap:Math.min(200,
+      rooms.filter(r=>r.type==='quarters').reduce((n,r)=>n+r.width*(2+2*r.level),0))};
+  }
   function shelterModel(view) {
     const s = view?.state, now = view?.serverTime;
     const finite = x => Number.isFinite(x) && x >= 0;
@@ -2339,20 +3264,16 @@
     if (s.residents.some(p => !Number.isSafeInteger(p.id) || !(p.deadAt === null || finite(p.deadAt)) ||
         !(p.away === null || typeof p.away === 'object') || !finite(p.adultAt)) ||
         s.births.some(b => !finite(b.dueAt))) throw new Error('避难所居民数据不完整');
+    if(s.handies!==undefined && (!Array.isArray(s.handies) || s.handies.some(h=>!Number.isSafeInteger(h?.floor) || h.floor<0)) ||
+        s.handies?.length && s.rooms.some(r=>!Number.isSafeInteger(r.floor) || r.floor<0))throw new Error('避难所机器人楼层无法核对');
     const multiplier = r => [0,1,1.5,2.1][r.level];
     const built = s.rooms.filter(r => r.builtAt <= now);
-    const storage = built.filter(r => r.type === 'storage').reduce((n,r) => n+r.width*r.level, 0);
     const perk = key => {
       const n = s.legacy?.perks?.[key] ?? 0;
       if (!Number.isInteger(n) || n < 0 || n > 10) throw new Error('避难所传承规则变化');
       return n;
     };
-    const caps = Object.fromEntries(Object.keys(shelterResources).map(key => {
-      const [base,warehouse,room] = key === 'scrap' ? [1500,1200,600] : key === 'parts' ? [100,60,40] :
-        key === 'stimpak' ? [10,5,5] : [600,400,250];
-      const cells = built.filter(r => shelterRooms[r.type][1] === key).reduce((n,r) => n+r.width*multiplier(r),0);
-      return [key, Math.floor((base+warehouse*storage+room*cells)*(1+.05*perk('storage')))];
-    }));
+    const capacity=shelterCapacity(built,perk('storage')), {caps}=capacity;
     const atHome = s.residents.filter(p => p.away === null && p.deadAt === null);
     if (atHome.some(p => !finite(p.adultAt) || !finite(p.xp) || !finite(p.happiness) ||
         !['str','per','end','cha','int','agi','lck'].every(key => finite(p.stats?.[key])))) throw new Error('避难所居民数据不完整');
@@ -2362,55 +3283,1148 @@
       const workers = atHome.filter(p => p.roomId === r.id && p.adultAt <= now).slice(0,r.width*2);
       let rate = 0;
       if (resource && !r.incident && !r.unpowered && r.upgradeAt === null) {
-        rate = workers.reduce((n,p) => {
-          const outfit = s.items.find(item => item.id === p.outfitId);
-          const bonus = outfit?.bonus?.[stat] ?? 0;
-          if (!finite(bonus)) throw new Error('避难所装备规则变化');
-          return n+base*multiplier(r)*(.5+Math.min(17,p.stats[stat]+bonus)/10)*(.6+.4*Math.min(100,p.happiness)/100)*
-            (1+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*.01);
-        },0)*(1+.03*perk('production'));
-        const events = (view.env?.events || []).filter(e => e.kind === 'production' && e.startsAt <= now && now < e.endsAt);
-        rate *= Math.min(150,Math.max(100,...events.map(e => e.percent)))/100;
+        perk('production');
+        rate = workers.reduce((n,p) => n+shelterWorkerRate(s,now,view.env,p,r),0);
         if (!finite(rate)) throw new Error('避难所活动规则变化');
         production[resource] += rate;
       }
       const batch = resource ? batchBase*r.width*multiplier(r) : 0;
-      const stored = batch ? Math.min(4*batch,r.stored+rate*Math.max(0,now-s.lastSettledAt)/3600000) : 0;
-      return { id:r.id, resource, rate, batch, stored, workers:workers.length };
+      const projected=shelterStoredProjection(s,r,now,view.env,caps[resource]);
+      return { id:r.id, resource, rate, batch, ...projected, automatic:(s.handies || []).some(h=>h.floor===r.floor), workers:workers.length };
     });
     const mouths = atHome.reduce((n,p) => n+(p.adultAt <= now ? 1 : .5),0);
     const power = built.reduce((n,r) => n+(['door','elevator','power'].includes(r.type) ? 0 :
       (shelterRooms[r.type][1] ? 1 : .5)*r.width*r.level),0);
-    return { view, state:s, now, caps, rooms, production, demand:{power,food:mouths,water:mouths}, itemCap:20+10*storage };
+    return { view, state:s, now, ...capacity, rooms, production, demand:{power,food:mouths,water:mouths} };
+  }
+  function shelterProductionWithout(m,ids) {
+    const absent=new Set(ids),reserved=new Set(m.reservedResidents || []),s=m.state,projected={...m.production};
+    const workers=s.residents.filter(p=>p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&!reserved.has(p.id));
+    // 按原生顺序和房间容量重算；多名家人一起离岗时，替补只能计入一次。
+    for(const id of new Set(workers.filter(p=>absent.has(p.id)).map(p=>p.roomId))) {
+      const room=s.rooms.find(r=>r.id===id),resource=room&&shelterRooms[room.type][1];
+      if(!resource)continue;
+      const occupants=workers.filter(p=>p.roomId===id);
+      const output=people=>people.slice(0,room.width*2).reduce((n,p)=>n+shelterWorkerRate(s,m.now,m.view.env,p,room),0);
+      projected[resource]+=output(occupants.filter(p=>!absent.has(p.id)))-output(occupants);
+    }
+    return projected;
+  }
+  function shelterDepartureSafe(m,ids) {
+    const projected=shelterProductionWithout(m,ids);
+    return Object.keys(m.demand).every(k=>projected[k]>=Math.min(m.production[k],m.demand[k]*1.2)-1e-9);
+  }
+  // 倒下记录仍在时保留恢复名额；不凭本地期限推断已经安葬，也不计入当前产出/消耗。
+  function shelterRecoveringPopulation(s) {
+    return s.residents.filter(p => p.deadAt !== null).length;
+  }
+  function shelterFamilyExpecting(s,a,b) {
+    // 多对家庭可同住宿舍；只有父母匹配的待产记录才能抵消该家庭的感情预留。
+    return a!==b&&[a,b].every(id=>Number.isSafeInteger(id)&&id>0)&&s.births.some(birth=>
+      Array.isArray(birth.parents)&&birth.parents.length===2&&birth.parents.includes(a)&&birth.parents.includes(b));
+  }
+  function shelterDevelopmentPlan(m,target=14) {
+    const s=m.state, now=m.now, candidates=[], notes=[], fmt=n=>Number(n.toFixed(1));
+    const built=s.rooms.filter(r=>r.builtAt<=now), living=s.residents.filter(p=>p.deadAt===null);
+    const population=living.length+s.births.length, recovering=shelterRecoveringPopulation(s);
+    const construction=s.rooms.filter(r=>r.type!=='elevator'&&(r.builtAt>now||r.upgradeAt!==null));
+    const storagePerk=s.legacy?.perks?.storage??0;
+    const committedRooms=s.rooms.map(r=>r.builtAt<=now&&r.upgradeAt!==null?{...r,level:Math.min(3,r.level+1)}:r);
+    const committed=shelterCapacity(committedRooms,storagePerk),committedCapacity=committed.populationCap;
+    const capacityPending=committed.itemCap>m.itemCap||Object.keys(m.caps).some(k=>committed.caps[k]>m.caps[k]);
+    const pairs=new Set(living.filter(p=>p.romance&&Number.isSafeInteger(p.romance.partnerId)&&
+      !shelterFamilyExpecting(s,p.id,p.romance.partnerId)).map(p=>[p.id,p.romance.partnerId].sort((a,b)=>a-b).join(':')));
+    const futureMouths=population+recovering+pairs.size;
+    const requestedTarget=Number.isInteger(target)&&target>=2&&target<=200?target:null;
+    const wanted=Math.max(requestedTarget??0,futureMouths);
+    if(pairs.size)notes.push(`已有 ${pairs.size} 对培养感情的家庭，另预留 ${pairs.size} 个出生名额、床位及成年口粮；转为待产后不重复预留。`);
+    if(recovering)notes.push(`倒下居民 ${recovering} 人仍在名单中，已预留恢复后的床位与成年口粮；记录移除后才释放预留，当前产出和消耗不包含他们。`);
+    // Current demand already includes built rooms at their current level; reserve only unfinished additions.
+    const committedPower=construction.reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:
+      (shelterRooms[r.type][1]?1:.5)*r.width*(r.builtAt>now?r.level:r.level<3?1:0)),0);
+    const demand={power:m.demand.power+committedPower,food:Math.max(m.demand.food,futureMouths),water:Math.max(m.demand.water,futureMouths)};
+    const shortages=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9);
+    const netScrap=m.production.scrap-6*m.production.parts;
+    const active=r=>r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
+    const idle=living.filter(p=>p.away===null&&p.adultAt<=now&&p.roomId===null&&!p.romance&&
+      Number.isFinite(p.hp)&&p.hp>=.6*Math.round(100+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*(2+.5*p.stats.end)));
+    // Layout is advisory-only: old or incomplete snapshots must not stop collection/staffing.
+    let layout=Number.isInteger(s.depth)&&s.depth>=1&&s.depth<=1000&&s.rooms.every(r=>
+      Number.isInteger(r.floor)&&r.floor>=0&&r.floor<=s.depth&&Number.isInteger(r.col)&&r.col>=0&&r.col+r.width<=8);
+    if(layout)layout=!s.rooms.some((r,i)=>s.rooms.slice(i+1).some(o=>r.floor===o.floor&&r.col<o.col+o.width&&o.col<r.col+r.width));
+    const spots=[];
+    if(layout)for(let floor=1;floor<=s.depth;floor++) {
+      if(!s.rooms.some(r=>r.floor===floor&&r.col<=1&&r.col+r.width>1))continue;
+      let col=2,previous=null;
+      while(col<8){const r=s.rooms.find(r=>r.floor===floor&&r.col<=col&&r.col+r.width>col);if(!r)break;
+        if(r.col!==col){layout=false;break;}previous=r;col+=r.width;}
+      if(col<8)spots.push({floor,col,previous});
+    }
+    if(!layout){spots.length=0;notes.push('布局资料不完整，暂不指定建造位置或判断是否需要下挖；领取与人员管理照常。');}
+    else notes.push(spots.length?`现有 ${spots.length} 层还有右侧可建空位，先利用空位；不必为扩建立即下挖。`:'现有楼层没有可接续建造的空位。');
+    if(construction.length)notes.push(`施工或升级 ${construction.length}/2 项；未完成的宿舍容量已计入规划，避免重复扩容。`);
+    if(committedPower>0)notes.push(`已在施工或升级的房间完工后还需 ${fmt(committedPower)} 电力/小时，已为这部分耗电预留供应。`);
+    if(construction.some(r=>r.type==='power'))notes.push('在建或升级中的发电站尚未提前计入新增产能，完工后按实际人员重算，先核对结果再决定是否继续扩建。');
+    if(shortages.includes('power'))notes.push('电力产出尚未覆盖现有及已开工房间完工后所需的 20% 供应余量，优先补足。');
+    const mouthShortages=shortages.filter(k=>k!=='power');
+    if(mouthShortages.length)notes.push(`${mouthShortages.map(k=>shelterResources[k]).join('、')}尚未覆盖外出居民归来、倒下居民恢复、现有儿童成年、待产及已配对人口所需的 20% 供应余量，优先补足。`);
+    const awayAssigned=living.filter(p=>p.away!==null&&p.adultAt<=now&&built.some(r=>r.id===p.roomId&&['power','diner','water','scrap'].includes(r.type))).length;
+    if(awayAssigned)notes.push(`${awayAssigned} 名外出居民仍登记在生产房间，原生调岗按记录占位，这些位置不能直接补员；当前不计他们的产出，归来或岗位释放后再核对空位。`);
+    if(built.some(r=>r.incident||r.unpowered))notes.push('有房间因事件或停电停产，先恢复现有产能，再按正常产量重算扩建收益。');
+    if(netScrap<=0)notes.push('工坊每生产 1 零件消耗 6 废料；当前废料净增不为正，不能按回收站毛产量推算攒料时间。');
+    const assess=c=>{
+      c.blocks??=[];c.cost??={scrap:0,parts:0};
+      c.shortage=Object.fromEntries(Object.entries(c.cost).map(([k,v])=>[k,Math.max(0,Math.ceil(v-s.resources[k]))]));
+      if(c.kind!=='staff'&&c.kind!=='dig'&&construction.length>=2)c.blocks.push('先等一个施工名额空出');
+      if(c.kind!=='staff') {
+        const limits=Object.entries(c.cost).filter(([k,v])=>v>m.caps[k]);
+        if(limits.some(([k,v])=>v>committed.caps[k]))c.blocks.push('所需资源超过当前及已开工工程完工后的库存容量，先扩仓');
+        else if(limits.length)c.blocks.push('先等已开工工程完工，所需库存容量尚未生效');
+      }
+      c.saveHours=c.shortage.scrap>0&&netScrap>0&&c.cost.scrap<=m.caps.scrap?c.shortage.scrap/netScrap:null;
+      candidates.push(c);
+    };
+    const powerCheck=extra=>extra>0&&m.production.power<(demand.power+extra)*1.2-1e-9?['扩建后电力余量不足，先补发电']:[];
+    const vacancy=type=>built.filter(r=>r.type===type&&active(r)).reduce((n,r)=>n+Math.max(0,r.width*2-
+      living.filter(p=>p.adultAt<=now&&p.roomId===r.id).length),0);
+    const labels=type=>shelterBuildRules[type][0];
+    const build=(type,priority,benefit)=>{
+      if(!layout||!spots.length)return;
+      const [label,base,unlock]=shelterBuildRules[type];
+      const spot=spots.find(p=>p.previous?.type===type&&p.previous.level===1&&p.previous.width<3&&active(p.previous))||spots[0];
+      const cells=s.rooms.filter(r=>r.type===type).reduce((n,r)=>n+r.width,0);
+      const extra=shelterRooms[type][1]?type==='power'?0:1:.5;
+      const blocks=powerCheck(extra);
+      if(m.view.progress.level<unlock)blocks.push(`避难所 ${unlock} 级解锁`);
+      assess({kind:'build',type,priority,floor:spot.floor,col:spot.col,hours:1/6,
+        title:`第 ${spot.floor} 层右侧新建一格${label}`,cost:{scrap:Math.ceil(base*(1+.2*cells)),parts:0},benefit:`${benefit}；施工约 10 分钟`,blocks});
+    };
+    const upgrade=(r,priority,benefit)=>{
+      if(r.level>=3||!active(r))return;
+      const next=r.level+1,hours=r.width*(next===2?1:3),resource=shelterRooms[r.type][1];
+      const row=m.rooms.find(x=>x.id===r.id),extra=resource?r.type==='power'?0:r.width:.5*r.width;
+      const blocks=powerCheck(extra), outages=[];
+      for(const k of Object.keys(demand)) {
+        const left=m.production[k]-(resource===k?row.rate:0),need=Math.max(0,demand[k]-left)*hours+2*demand[k];
+        if(s.resources[k]<need)outages.push(`${shelterResources[k]}需至少 ${Math.ceil(need)} 库存（含两小时余量）`);
+      }
+      if(outages.length)blocks.push(`停产期间${outages.join('、')}`);
+      if(resource==='parts'&&s.resources.scrap<6*row.rate*hours)blocks.push('工坊废料供应不足，实际增产待核对');
+      assess({kind:'upgrade',type:r.type,id:r.id,priority,hours,title:`${Number.isInteger(r.floor)?`第 ${r.floor} 层` : ''}${labels(r.type)}升至 ${next} 级`,
+        cost:{scrap:Math.ceil(shelterBuildRules[r.type][1]*r.width*(next===2?2.5:6)),parts:next===3?15*r.width:0},
+        benefit:`${benefit}；整间施工 ${hours} 小时${resource?'，期间停产':''}`,blocks});
+    };
+    for(const type of ['power','diner','water','scrap']) {
+      const resource=shelterRooms[type][1],deficit=shortages.includes(resource),priority=deficit?10:resource==='scrap'?50:90;
+      if(!deficit&&resource!=='scrap')continue;
+      const vacancies=vacancy(type);
+      if(vacancies)assess({kind:'staff',type,priority:deficit?5:15,title:`先补现有${labels(type)}岗位`,
+        benefit:`已有 ${vacancies} 个空岗；${idle.length?`可先评估 ${idle.length} 名健康闲置成人`:'暂无可直接安排的健康闲置成人，先评估调岗或等待孩子成年'}，不用先造新房`,blocks:[]});
+      if(!vacancies&&idle.length) {
+        const hypothetical={type,width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
+        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        build(type,priority,`安排现有闲置成人后约增加 ${fmt(gain)} ${shelterResources[resource]}/小时；空房本身不增产`);
+      }
+      if(!vacancies&&!idle.length&&deficit&&!built.some(r=>r.type===type))
+        build(type,priority,'尚无可直接安排的健康闲置成人，先确认调岗人选；建成空房不会增加产量');
+      const upgrades=built.filter(r=>r.type===type&&active(r)&&r.level<3).map(r=>{
+        const rate=m.rooms.find(x=>x.id===r.id).rate,gain=rate*([0,1,1.5,2.1][r.level+1]/[0,1,1.5,2.1][r.level]-1);
+        return {r,gain};}).filter(x=>x.gain>0).sort((a,b)=>b.gain/b.r.width-a.gain/a.r.width);
+      if(upgrades.length){const {r,gain}=upgrades[0];upgrade(r,priority+1,`按当前人员约增加 ${fmt(gain)} ${shelterResources[resource]}/小时`);}
+    }
+    if(committedCapacity<wanted) {
+      const benefit=`人口容量增加 ${Math.min(200,committedCapacity+4)-committedCapacity}，当前及施工后容量 ${m.populationCap}/${committedCapacity}，规划至少 ${wanted}；不加快培养感情`;
+      build('quarters',shortages.length?65:30,benefit);
+      const room=built.filter(r=>r.type==='quarters'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
+      if(room)upgrade(room,shortages.length?66:31,`人口容量增加 ${Math.min(200,committedCapacity+2*room.width)-committedCapacity}；不加快培养感情`);
+    }
+    const full=Object.keys(m.caps).filter(k=>s.resources[k]>=.9*m.caps[k]&&m.production[k]>0);
+    const equipmentFull=s.items.length>=.9*m.itemCap;
+    if(full.length||equipmentFull) {
+      const afterFull=full.filter(k=>s.resources[k]>=.9*committed.caps[k]),afterEquipmentFull=equipmentFull&&s.items.length>=.9*committed.itemCap;
+      const pending=full.filter(k=>committed.caps[k]>m.caps[k]).map(k=>`${shelterResources[k]} ${m.caps[k]}→${committed.caps[k]}`);
+      if(equipmentFull&&committed.itemCap>m.itemCap)pending.push(`装备 ${m.itemCap}→${committed.itemCap}`);
+      notes.push(`${[...full.map(k=>shelterResources[k]),...(equipmentFull?['装备']:[])].join('、')}当前接近满仓。`);
+      if(pending.length)notes.push(`已开工工程完工后的容量：${pending.join('、')}（当前→完工后）；尚未生效，领取仍按当前容量。`);
+      if(!afterFull.length&&!afterEquipmentFull)notes.push('先等现有工程完工，可缓解当前满仓压力，暂不建议重复扩仓；期间留意库存变化。');
+      else {
+        notes.push(`${construction.length?'完工后仍有':''}${[...afterFull.map(k=>shelterResources[k]),...(afterEquipmentFull?['装备']:[])].join('、')}接近满仓，可比较先消费库存与继续扩仓。`);
+        const storageGain=cells=>{
+          const next=shelterCapacity(committedRooms,storagePerk,cells);
+          return `${capacityPending?'在已开工工程完工后的基础上，':''}容量增加：${Object.keys(m.caps).map(k=>`${shelterResources[k]} ${next.caps[k]-committed.caps[k]}`).join('、')}、装备 ${next.itemCap-committed.itemCap}；增加容量不会直接产生资源`;
+        };
+        build('storage',20,storageGain(1));
+        const room=built.filter(r=>r.type==='storage'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
+        if(room)upgrade(room,21,storageGain(room.width));
+      }
+    }
+    // 升级方案是备选项：先说明推进其中一项所需的最小零件缺口，不把费用累加。
+    const partsShortages=candidates.filter(c=>c.kind==='upgrade'&&c.shortage.parts>0).map(c=>c.shortage.parts);
+    if(partsShortages.length) {
+      const needed=Math.min(...partsShortages),feed=6*needed,workshops=s.rooms.filter(r=>r.type==='workshop');
+      notes.push(`备选升级至少还缺 ${needed} 零件；先选定一项，其他方案的零件需求不累加。工坊每生产 1 零件消耗 6 废料，补足这部分至少另外消耗 ${feed} 废料，须与升级、建造费用分别预留。`);
+      if(s.resources.scrap<feed)notes.push(`仅这部分零件的供料废料不足，尚差 ${Math.ceil(feed-s.resources.scrap)}；先保证基础供应和回收净产量。`);
+      if(m.production.parts>0)notes.push(`当前工坊约 ${fmt(m.production.parts)} 零件/小时；在持续供料和收取、产量不变时，补足至少约需 ${(needed/m.production.parts).toFixed(1)} 小时。已有房间先继续生产，不为这笔需求重复建造。`);
+      else if(workshops.some(r=>r.builtAt>now||r.upgradeAt!==null))notes.push('已有工坊正在施工或升级，先等现有工程完工，再核对值班人员和产量。');
+      else if(workshops.some(active)) {
+        const vacancies=vacancy('workshop');
+        if(vacancies)assess({kind:'staff',type:'workshop',priority:25,title:'先补现有工坊岗位',
+          benefit:`已有 ${vacancies} 个空岗，先评估智力高的健康成人；每生产 1 零件消耗 6 废料，工坊人员由你安排`,blocks:[]});
+        else notes.push('工坊岗位仍被外出成人占用，等待归来或手动释放岗位后再核对，不把占位当空岗。');
+      } else if(workshops.length)notes.push('先恢复现有工坊的事件或停电，再核对产量，不重复建造。');
+      else {
+        const hypothetical={type:'workshop',width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
+        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        build('workshop',25,gain>0?`安排现有闲置成人后约产 ${fmt(gain)} 零件/小时，同时消耗 ${fmt(6*gain)} 废料/小时；人员由你安排`:
+          '先确认智力高的值班人选和废料供应；空工坊不会生产零件，人员由你安排');
+      }
+    }
+    const homeHurt=living.filter(p=>{
+      const health=p.away===null?shelterHealth(p):null;
+      return health&&health.hp<health.max;
+    });
+    if(homeHurt.length&&s.resources.stimpak<1) {
+      const medbays=s.rooms.filter(r=>r.type==='medbay');
+      notes.push(`在家 ${homeHurt.length} 名伤员且治疗针不足 1 支，先准备医疗供应；医务室有人值班时伤员恢复更快，岗位和治疗由你安排。`);
+      if(m.rooms.some(r=>r.resource==='stimpak'&&r.stored+1e-9>=r.batch))
+        notes.push('医务室已存整批治疗针，先回房间核对领取状态，领取后再核对库存和伤员；无需为这次缺针重复建造。');
+      else if(m.production.stimpak>0)
+        notes.push(`当前医务室约 ${fmt(m.production.stimpak)} 治疗针/小时，先维持生产并按整批收取；治疗效果和伤员恢复时间以网页为准，不重复建造。`);
+      else if(medbays.some(active)) {
+        const vacancies=vacancy('medbay');
+        if(vacancies)assess({kind:'staff',type:'medbay',priority:18,title:'先补现有医务室岗位',
+          benefit:`已有 ${vacancies} 个空岗，先评估智力高的健康成人，保住食物、净水和电力供应；医务室人员由你安排`,blocks:[]});
+        else notes.push('医务室岗位仍被外出成人占用，等待归来或手动释放岗位后再核对，不把占位当空岗。');
+      } else if(medbays.some(r=>r.builtAt>now||r.upgradeAt!==null))
+        notes.push('已有医务室正在施工或升级，先等现有工程完工，再核对值班人员和产量。');
+      else if(medbays.length)notes.push('先恢复现有医务室的事件或停电，再核对产量，不重复建造。');
+      else {
+        const hypothetical={type:'medbay',width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
+        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        build('medbay',18,gain>0?`安排现有闲置成人后约产 ${fmt(gain)} 治疗针/小时；人员由你安排`:
+          '先确认智力高的健康值班人选并保住基础供应；空医务室不会生产治疗针，人员由你安排');
+      }
+    }
+    if(Number.isInteger(s.depth)&&s.depth>=1&&s.depth<=1000) {
+      const cost=Math.ceil(120*Math.pow(s.depth+1,1.4));
+      if(s.digging&&Number.isFinite(s.digging.doneAt))notes.push(`正在下挖，约 ${Math.max(0,Math.ceil((s.digging.doneAt-now)/60000))} 分钟后完成，先等现有工程。`);
+      else if(s.digging===null&&layout&&!spots.length)assess({kind:'dig',type:'elevator',priority:40,
+        title:`向下扩至第 ${s.depth+1} 层`,cost:{scrap:cost,parts:0},benefit:'新增建造空间；下挖本身不增加废料产量，工期以网站确认为准',blocks:[]});
+      else if(layout&&spots.length)notes.push(`下挖一层需 ${cost} 废料；目前有空位，暂缓这项开支。`);
+    }
+    candidates.sort((a,b)=>a.priority-b.priority||a.cost.scrap-b.cost.scrap);
+    return {at:now,population,recovering,reservedBirths:pairs.size,requestedTarget,capacity:m.populationCap,committedCapacity,target:wanted,netScrap,notes,candidates:candidates.slice(0,8)};
+  }
+  function shelterDevelopmentText(plan) {
+    const lines=[`人口 ${plan.population}/${plan.capacity}（含外出与待产），${plan.requestedTarget===null?'人口目标未设置':`设置目标 ${plan.requestedTarget}`}，规划容量至少 ${plan.target}；废料扣除工坊消耗后约 ${plan.netScrap.toFixed(1)}/小时。`,...plan.notes];
+    for(const [i,c] of plan.candidates.entries()) {
+      const price=c.kind==='staff'?'无需建造费用':`${c.cost.scrap} 废料${c.cost.parts?` + ${c.cost.parts} 零件`:''}`;
+      const missing=Object.entries(c.shortage).filter(([,v])=>v>0).map(([k,v])=>`${v} ${shelterResources[k]}`);
+      lines.push(`${i+1}. ${c.title}：${price}。${c.benefit}。${missing.length?`尚缺 ${missing.join('、')}。`:''}${
+        c.saveHours!==null?`按当前净产量且持续收取、不再消费，废料约还需 ${c.saveHours.toFixed(1)} 小时。`:''}${
+        c.blocks.length?`先决条件：${c.blocks.join('；')}。`:''}`);
+    }
+    if(!plan.candidates.length)lines.push('暂未发现必须立即投入的扩建；先保持生产，资料更新后重新评估。');
+    lines.push('这些是备选方案，收益不能叠加；本面板只给建议，不自动建造、升级或下挖。');
+    return lines.join('\n');
+  }
+  function shelterCollectProof(p,status,request,body) {
+    if(p.kind!=='collect'||!Number.isInteger(status)||status<200||status>=300||body?.code==='retry'||body?.view?.vaultNo!==p.vaultNo||
+      !/^[A-Za-z0-9-]{8,64}$/.test(request?.idempotencyKey||''))return null;
+    const action=request.action,all=p.targets.length===1&&p.targets[0]==='all';
+    if(!action||Object.keys(action).length!==(all?1:2)||action.type!==(all?'collect_all':'collect')||
+      !all&&(p.targets.length!==1||action.roomId!==p.targets[0]))return null;
+    let after;try{after=shelterModel(body.view);}catch{return null;}
+    if(after.now<(p.before.serverTime??0)||after.state.stats.collected<=p.before.collected||
+      !p.before.rooms.every(r=>after.state.rooms.some(x=>x.id===r.id&&x.stored<r.stored)))return null;
+    return {key:request.idempotencyKey,vaultNo:p.vaultNo,collected:after.state.stats.collected,at:after.now};
+  }
+  function shelterRewardProof(p,status,request,body) {
+    if(!['daily','season'].includes(p.kind)||!Number.isInteger(status)||status<200||status>=300||body?.code==='retry'||
+      body?.view?.vaultNo!==p.vaultNo||typeof request?.idempotencyKey!=='string'||!/^[A-Za-z0-9-]{8,64}$/.test(request.idempotencyKey))return null;
+    const daily=p.kind==='daily',action=request.action,target=daily?action?.index:action?.tier,
+      period=daily?p.before.day:p.before.month;
+    if(!action||Object.keys(action).length!==(daily?2:3)||action.type!==(daily?'claim_objective':'claim_season')||
+      !daily&&action.premium!==false||!Number.isSafeInteger(target)||target<(daily?0:1)||!p.targets.includes(target))return null;
+    let after;try{after=shelterModel(body.view);}catch{return null;}
+    const state=after.state[p.kind],claimed=daily?state.claimed:state.claimedFree;
+    if(after.now<(p.before.serverTime??0)||state[daily?'day':'month']!==period||!claimed.includes(target))return null;
+    return {kind:p.kind,operationId:p.id,target,period,key:request.idempotencyKey,vaultNo:p.vaultNo,at:after.now};
+  }
+  function shelterRewardPeriodCurrent(kind,serverTime,readAt,now=Date.now()) {
+    if(!['daily','season'].includes(kind))return true;
+    if(![serverTime,readAt,now].every(Number.isFinite))return false;
+    const start=new Date(serverTime+8*3600000),end=new Date(serverTime+Math.max(0,now-readAt)+8*3600000);
+    if(!Number.isFinite(start.getTime())||!Number.isFinite(end.getTime()))return false;
+    const length=kind==='daily'?10:7;
+    return start.toISOString().slice(0,length)===end.toISOString().slice(0,length);
+  }
+  function shelterRewardConfirmed(p,m) {
+    if(!['daily','season'].includes(p.kind)||m.view.vaultNo!==p.vaultNo)return false;
+    const daily=p.kind==='daily',period=daily?p.before.day:p.before.month,state=m.state[p.kind],
+      claimed=state[daily?'day':'month']===period?(daily?state.claimed:state.claimedFree):[],
+      proofs=Array.isArray(p.result?.rewardProofs)?p.result.rewardProofs:[];
+    return p.targets.length>0&&p.targets.every(target=>claimed.includes(target)||proofs.some(proof=>
+      proof?.kind===p.kind&&proof.operationId===p.id&&proof.target===target&&proof.period===period&&
+      proof.vaultNo===p.vaultNo&&typeof proof.key==='string'&&/^[A-Za-z0-9-]{8,64}$/.test(proof.key)&&Number.isFinite(proof.at)&&
+      proof.at>=(p.before.serverTime??0)&&proof.at<=m.now));
+  }
+  function shelterExplorerCandidates(m) {
+    const s=m.state,ready=[],notes=[],positive=x=>Number.isSafeInteger(x)&&x>0;
+    const normalize=x=>String(x??'').normalize('NFKC').replace(/\s+/g,' ').trim();
+    if(!Array.isArray(s.explorers))return {ready,notes:['探险资料不完整，本轮仍可处理其他避难所任务。']};
+    if(s.explorers.some(e=>!e||!positive(e.id)||!positive(e.residentId))||
+      new Set(s.explorers.map(e=>e.id)).size!==s.explorers.length||
+      new Set(s.explorers.map(e=>e.residentId)).size!==s.explorers.length)
+      return {ready,notes:['探险编号或人员对应不唯一，保留归来奖励。']};
+    for(const e of s.explorers) {
+      if(!Number.isFinite(e.returnAt)||e.returnAt>m.now)continue;
+      const people=s.residents.filter(p=>p.id===e.residentId),p=people[0],loot=e.loot;
+      if(people.length!==1||p.deadAt!==null||p.away?.kind!=='explore'||p.adultAt>m.now)continue;
+      if(typeof p.name!=='string'||!normalize(p.name)||s.residents.filter(o=>normalize(o.name)===normalize(p.name)).length!==1||
+        !Number.isFinite(e.startedAt)||e.startedAt<0||e.returnAt<e.startedAt||
+        !Number.isSafeInteger(e.tier)||e.tier<0||typeof e.abyss!=='boolean'||
+        !Number.isFinite(e.stimpaks)||e.stimpaks<0||!loot||
+        !['scrap','parts','stimpak'].every(k=>Number.isFinite(loot[k])&&loot[k]>=0)||!Array.isArray(loot.items)||
+        Object.keys(loot).some(k=>!['scrap','parts','stimpak','items'].includes(k))) {
+        notes.push('归来探险的人员或背包资料无法完整核对，保留奖励。');continue;
+      }
+      const zone=['锈蚀街区','沉没港口','晶体平原','方舟残骸','静默高架'][e.tier]||`深渊裂谷 第 ${e.tier-4} 段`;
+      ready.push({id:e.id,residentId:p.id,title:normalize(`${p.name} · ${e.abyss?'深渊 ':''}${zone}`),
+        before:{id:e.id,residentId:p.id,startedAt:e.startedAt,returnAt:e.returnAt},
+        // Conservative capacity reservation covers both loot and any unused carried stimpaks.
+        reward:{scrap:Math.ceil(loot.scrap),parts:Math.ceil(loot.parts),stimpak:Math.ceil(loot.stimpak+e.stimpaks)},items:loot.items.length});
+    }
+    return {ready,notes};
+  }
+  function shelterExplorerReleased(p,m) {
+    return m.view.vaultNo===p.vaultNo&&Array.isArray(m.state.explorers)&&
+      m.state.explorers.every(e=>e&&Number.isSafeInteger(e.id)&&e.id!==p.targets[0])&&
+      m.state.residents.filter(r=>r.id===p.targets[1]).length===1&&
+      m.state.residents.some(r=>r.id===p.targets[1]&&r.away===null&&r.deadAt===null);
+  }
+  function shelterExplorerConfirmed(p,m) {
+    // A successful response cannot make a stale listing safe to claim again as a new operation.
+    if(m.view.vaultNo!==p.vaultNo||m.now<(p.before.serverTime??0)||!Array.isArray(m.state.explorers)||
+      !m.state.explorers.every(e=>e&&Number.isSafeInteger(e.id)&&e.id>0&&e.id!==p.targets[0]))return false;
+    const proof=p.result?.proof;
+    return shelterExplorerReleased(p,m)||proof?.kind==='explore'&&proof.vaultNo===p.vaultNo&&
+      proof.explorerId===p.targets[0]&&proof.residentId===p.targets[1]&&Number.isFinite(proof.at)&&
+      proof.at>=(p.before.serverTime??0)&&proof.at<=m.now&&/^[A-Za-z0-9-]{8,64}$/.test(proof.key||'');
+  }
+  function shelterExplorerProof(p,status,request,body) {
+    if(p.kind!=='explore'||!Number.isInteger(status)||status<200||status>=300||body?.code==='retry'||
+      !/^[A-Za-z0-9-]{8,64}$/.test(request?.idempotencyKey||'')||request?.action?.type!=='explore_claim'||
+      request.action.explorerId!==p.targets[0]||Object.keys(request.action).length!==2)return null;
+    let m;try{m=shelterModel(body.view);}catch{return null;}
+    if(m.now<(p.before.serverTime??0)||!shelterExplorerReleased(p,m))return null;
+    return {kind:'explore',key:request.idempotencyKey,vaultNo:p.vaultNo,explorerId:p.targets[0],residentId:p.targets[1],at:m.now};
+  }
+  function shelterPendingWait(p,m) {
+    const data={kind:p.kind,reason:'result-unconfirmed',snapshotAt:m.now,requestSnapshotAt:p.before.serverTime??null};
+    if(p.kind!=='explore'){
+      if(m.now<(p.before.serverTime??0)){
+        data.reason='snapshot-before-request';return {note:'避难所快照时间早于原操作，等待数据同步',data};
+      }
+      return {note:'避难所操作仍未确认',data};
+    }
+    const proof=p.result?.proof,hasSuccessProof=Boolean(proof?.kind==='explore'&&proof.vaultNo===p.vaultNo&&
+      proof.explorerId===p.targets[0]&&proof.residentId===p.targets[1]&&Number.isFinite(proof.at)&&
+      proof.at>=(p.before.serverTime??0)&&/^[A-Za-z0-9-]{8,64}$/.test(proof.key||''));
+    const readable=Array.isArray(m.state.explorers)&&m.state.explorers.every(e=>e&&Number.isSafeInteger(e.id)&&e.id>0);
+    Object.assign(data,{hasSuccessProof,proofAt:hasSuccessProof?proof.at:null,explorerListReadable:readable,
+      explorerListed:readable?m.state.explorers.some(e=>e.id===p.targets[0]):null});
+    let note='探险原领取结果仍未确认';
+    if(m.now<(p.before.serverTime??0)){data.reason='snapshot-before-request';note='探险快照时间早于原操作，等待数据同步';}
+    else if(!readable){data.reason='explorer-list-unavailable';note='探险列表暂不可核对，等待资料恢复';}
+    else if(data.explorerListed){data.reason='explorer-still-listed';note=hasSuccessProof?
+      '探险已收到原领取成功凭据，当前列表仍含原探险':`${note}，当前列表仍含原探险`;}
+    else if(hasSuccessProof&&proof.at>m.now){data.reason='snapshot-before-proof';note='探险快照时间早于原领取成功凭据，等待数据同步';}
+    return {note,data};
+  }
+  function shelterHealth(p) {
+    if(![p.hp,p.xp,p.stats?.end].every(n=>Number.isFinite(n)&&n>=0))return null;
+    const max=Math.round(100+(Math.min(50,1+Math.floor(Math.sqrt(Math.max(0,p.xp)/3)))-1)*(2+.5*p.stats.end));
+    return Number.isFinite(max)&&max>0&&p.hp<=max?{hp:p.hp,max,critical:p.hp<max/2}:null;
+  }
+  function shelterOperations(m) {
+    const s=m.state,now=m.now,messages=[],urgent=[],events=[],counts={incidents:0,unpowered:0,lowSupply:0,awayHurt:0,returned:0,down:0,
+      homeHurt:0,homeCritical:0,homeDown:0,healthUnknown:0,relief:0,romancePaused:0};
+    const future=at=>{if(Number.isFinite(at)&&at>now)events.push(at-now);};
+    const roomLabel=r=>`${Number.isInteger(r.floor)?`第 ${r.floor} 层` : ''}${shelterBuildRules[r.type]?.[0]||'房间'}`;
+    if(m.view.reliefAvailable===true) {
+      counts.relief=1;urgent.push('网页已开放“物资快耗尽了，向方舟求援”，可回避难所核对并领取；补给数量和冷却以网页结果为准。');
+    }
+    const explorerIds=new Set((Array.isArray(s.explorers)?s.explorers:[]).filter(e=>e&&Number.isSafeInteger(e.residentId)).map(e=>e.residentId));
+    for(const p of s.residents.filter(p=>p.away===null&&p.deadAt!==null&&!explorerIds.has(p.id))) {
+      counts.homeDown++;
+      const name=typeof p.name==='string'?p.name:'居民',deadline=p.deadAt+86400000,remaining=deadline-now;
+      urgent.push(`${name}在家已倒下；${remaining>0?`按网页24小时期限约剩 ${Math.ceil(remaining/60000)} 分钟，请在居民详情核对废料救回。`:
+        '已到网页提示的24小时期限，请在居民详情核对当前状态和可用操作。'}`);
+      future(deadline);
+    }
+    for(const p of s.residents.filter(p=>p.away===null&&p.deadAt===null)) {
+      const health=shelterHealth(p),name=typeof p.name==='string'?p.name:'居民';
+      if(!health){counts.healthUnknown++;continue;}
+      if(health.hp>=health.max)continue;
+      counts.homeHurt++;if(health.critical)counts.homeCritical++;
+      (health.critical?urgent:messages).push(`${name}在家血量 ${Number(health.hp.toFixed(1))}/${health.max}${health.critical?'，不足一半':''}；${
+        s.resources.stimpak>=1?'可在居民详情核对“用治疗针”按钮。':'治疗针不足，可检查医务室的值班和产出。'}`);
+    }
+    if(counts.healthUnknown)messages.push(`${counts.healthUnknown} 名在家居民的血量资料不完整，未按健康状态判断；请核对居民详情。`);
+    const romances=new Set();
+    for(const p of s.residents) {
+      if(!Number.isSafeInteger(p.romance?.partnerId))continue;
+      const other=s.residents.find(o=>o.id===p.romance.partnerId);
+      if(!other||other.id===p.id)continue;
+      const key=[p.id,other.id].sort((a,b)=>a-b).join(':');if(romances.has(key))continue;romances.add(key);
+      const pair=[p,other],reasons=[],room=s.rooms.find(r=>r.id===p.roomId);
+      if(pair.some(o=>o.away!==null||o.deadAt!==null))reasons.push('有人外出或倒下');
+      if(pair.some(o=>o.adultAt>now))reasons.push('有人尚未成年');
+      if(pair.some(o=>Number.isFinite(o.happiness)&&o.happiness<50))reasons.push('两人的心情都需要达到 50');
+      if(pair.some(o=>o.familyCooldownUntil>now))reasons.push('生育冷却尚未结束');
+      if(!room||room.type!=='quarters'||p.roomId!==other.roomId)reasons.push('两人需要在同一间宿舍');
+      else {
+        if(room.builtAt>now)reasons.push('宿舍尚未建成');
+        if(room.incident)reasons.push('宿舍事件尚未处理');
+      }
+      if(reasons.length){counts.romancePaused++;messages.push(`${p.name}与${other.name}感情暂停：${reasons.join('；')}。保留现有关系，请核对居民详情。`);}
+    }
+    for(const r of s.rooms) {
+      future(r.builtAt);future(r.upgradeAt);future(r.craft?.doneAt);
+      if(r.incident) {
+        counts.incidents++;
+        const adults=s.residents.filter(p=>p.roomId===r.id&&p.away===null&&p.deadAt===null&&p.adultAt<=now).length;
+        messages.push(`${roomLabel(r)}发生事件，已停产；${adults?`${adults} 名成人在场处理，注意血量`:'没有成人在场，需安排人员处理以免蔓延'}。`);
+      }
+      if(r.unpowered){counts.unpowered++;messages.push(`${roomLabel(r)}停电，先恢复电力供应。`);}
+    }
+    future(s.digging?.doneAt);
+    for(const k of Object.keys(m.demand)) {
+      const drain=m.demand[k]-m.production[k];
+      if(drain>0) {
+        const hours=s.resources[k]/drain;
+        messages.push(`${shelterResources[k]}净缺 ${drain.toFixed(1)}/小时，按当前消耗库存约可撑 ${hours.toFixed(1)} 小时。`);
+        if(hours<=2){counts.lowSupply++;events.push(Math.max(60000,hours*1800000));}
+      }
+    }
+    for(const r of s.rooms.filter(r=>r.builtAt>now||r.upgradeAt!==null)) {
+      const at=r.builtAt>now?r.builtAt:r.upgradeAt;
+      if(Number.isFinite(at))messages.push(`${roomLabel(r)}${r.builtAt>now?'施工':'升级'}${at>now?`约 ${Math.ceil((at-now)/60000)} 分钟后完成`:'已到预计完成时间，等待网站结算'}。`);
+    }
+    if(s.digging&&Number.isFinite(s.digging.doneAt))messages.push(`下挖${s.digging.doneAt>now?`约 ${Math.ceil((s.digging.doneAt-now)/60000)} 分钟后完成`:'已到预计完成时间'}。`);
+    if(!Array.isArray(s.explorers)||!Array.isArray(s.quests))messages.push('废土资料不完整，尚不能核对全部探险和小队返程。');
+    if(Array.isArray(s.explorers))for(const e of s.explorers) {
+      if(!e||!Number.isSafeInteger(e.residentId))continue;
+      const p=s.residents.find(p=>p.id===e.residentId);if(!p)continue;
+      const name=typeof p.name==='string'?p.name:'探险居民';
+      future(e.returnAt);
+      if(p.deadAt!==null){counts.down++;urgent.push(`${name}探险中倒下，需在废土页核对救援；不会自动花废料救回。`);continue;}
+      if(Number.isFinite(e.returnAt)&&e.returnAt<=now){counts.returned++;messages.push(`${name}已归来，去废土页领取后可重新安排岗位。`);continue;}
+      if(shelterHealth(p)?.critical) {
+        counts.awayHurt++;urgent.push(`${name}探险血量不足一半，携带治疗针 ${Number.isFinite(e.stimpaks)?e.stimpaks:'未知'} 支；请评估召回，返程仍需时间。`);
+      }
+      if(Number.isFinite(e.returnAt)&&e.returnAt>now)messages.push(`${name}约 ${Math.ceil((e.returnAt-now)/60000)} 分钟后归来。`);
+    }
+    if(Array.isArray(s.quests))for(const q of s.quests) {
+      if(!q)continue;future(q.returnAt);if(q.status==='active')future(q.nextStageAt);
+      if(Number.isFinite(q.returnAt)&&q.returnAt<=now){counts.returned++;messages.push(`废土小队${q.status==='failed'?'带伤':'完成任务后'}已归来，去废土页领取并释放队员。`);}
+      else if(Number.isFinite(q.returnAt))messages.push(`废土小队约 ${Math.ceil((q.returnAt-now)/60000)} 分钟后归来。`);
+    }
+    if(counts.incidents||counts.unpowered||counts.lowSupply||counts.awayHurt||counts.down||counts.homeCritical||counts.homeDown||counts.relief||counts.romancePaused)events.push(5*60000);
+    const all=[...urgent,...messages];
+    if(!all.length)all.push('当前已知状态没有紧急供应或停产提醒；有施工、返程等时间点时会提前预约。');
+    return {messages:all.length>24?[...all.slice(0,23),`另有 ${all.length-23} 条提醒，请回避难所检查。`]:all,events,counts};
   }
   function readShelter() {
     if (shelterController || Date.now() < shelterReadAt || !navigator.onLine) return;
     const generation = shelterGeneration;
     const current = () => generation === shelterGeneration && enabled && shelterEnabled && active && inShelter() && !accountStopReason();
     shelterController = new AbortController();
-    say('核对避难所最新库存与领取记录');
+    say('核对避难所库存、岗位与原操作');
     fetch('/api/shelter', { cache:'no-store', credentials:'same-origin',
       signal:AbortSignal.any([shelterController.signal,AbortSignal.timeout(12000)]) })
       .then(async response => {
         if (!current()) return;
+        if(shelterReload()){cancelShelterRead();cancelQueued();schedule();return;}
         if ([401,403,429].includes(response.status) || response.redirected && new URL(response.url).pathname === '/') {
           pauseAccount('避难所状态返回登录、权限或限流异常'); return;
         }
         if (!response.ok) { finishShelter(null,`避难所读取失败（HTTP ${response.status}），稍后检查`); return; }
-        const view = await response.json(); if (!current()) return;
+        let view;
+        try { view = await response.json(); }
+        catch (error) {
+          if (error.name !== 'SyntaxError') throw error;
+          if (current()) finishShelter(null,'避难所响应解析失败，稍后重新读取');
+          return;
+        }
+        if (!current()) return;
+        if(shelterReload()){cancelShelterRead();cancelQueued();schedule();return;}
         const model = shelterModel(view);
         if (shelterState.vaultNo && shelterState.vaultNo !== view.vaultNo || shelterPending && shelterPending.vaultNo !== view.vaultNo) {
-          pauseAccount('避难所账号已切换，请核对原领取记录'); return;
+          pauseAccount('避难所账号已切换，请核对原操作记录'); return;
         }
         shelterRead = { model, at:Date.now() };
         if (!shelterState.vaultNo) saveShelter({ ...shelterState, vaultNo:view.vaultNo });
       }).catch(error => {
         if (!current()) return;
-        if (['TypeError','TimeoutError','AbortError'].includes(error.name)) finishShelter(null,'避难所读取中断，稍后检查');
-        else pauseShelter('避难所状态无法核对，已暂停并保留原记录');
+        if(shelterRetryChange(error))return;
+        try{
+          if (['TypeError','TimeoutError','AbortError'].includes(error.name)) finishShelter(null,'避难所读取中断，稍后检查');
+          else pauseShelter('避难所状态无法核对，已暂停并保留原记录');
+        }catch(error){if(!shelterRetryChange(error))pauseShelter('避难所记录无法保存，已暂停并保留原记录');}
       })
       .finally(() => { if (generation === shelterGeneration) { shelterController = null; schedule(); } });
   }
+  const staffRoomTypes = ['power','diner','water','scrap'];
+  const staffRoomNames = { power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍' };
+  function shelterNameUnique(s,p) {
+    const normalized = name => name.normalize('NFKC').replace(/\s+/g,' ').trim();
+    return s.residents.filter(other => normalized(other.name) === normalized(p.name)).length === 1;
+  }
+  function shelterGearPlan(m,pool) {
+    if (!shelterGear) return null;
+    const s = m.state, used = new Set(s.residents.flatMap(p => [p.weaponId,p.outfitId]));
+    if (s.residents.some(p => ![p.weaponId,p.outfitId].every(id => id === null || Number.isSafeInteger(id) && id > 0)) ||
+        new Set(s.items.map(item => item.id)).size !== s.items.length) throw new Error('装备归属无法核对');
+    const outfits = s.items.filter(item => item.slot === 'outfit' && !used.has(item.id));
+    if (outfits.some(item => !Number.isSafeInteger(item.id) || item.id <= 0 || !objectState(item.bonus) ||
+        Object.entries(item.bonus).some(([key,n]) => !['str','per','end','cha','int','agi','lck'].includes(key) || !Number.isFinite(n) || n < 0))) {
+      throw new Error('服装属性无法核对');
+    }
+    const choices = [];
+    for (const p of pool) {
+      const room = s.rooms.find(r => r.id === p.roomId && staffRoomTypes.includes(r.type));
+      if (!room || p.outfitId !== null && !s.items.some(item => item.id === p.outfitId && item.slot === 'outfit')) continue;
+      const workers = s.residents.filter(other => other.roomId === room.id && other.deadAt === null && other.away === null && other.adultAt <= m.now);
+      if (workers.indexOf(p) >= room.width*2) continue;
+      const resource = shelterRooms[room.type][1], current = shelterWorkerRate(s,m.now,m.view.env,p,room);
+      if (!current) continue;
+      for (const item of outfits) {
+        const gain = shelterWorkerRate(s,m.now,m.view.env,{...p,outfitId:item.id},room)-current;
+        if (gain <= 1e-6) continue;
+        const priority = Object.hasOwn(m.demand,resource) && m.production[resource] < m.demand[resource]*1.2 ? 2 : resource === 'scrap' ? 1 : 0;
+        choices.push({kind:'equip',id:p.id,item:item.id,fromItem:p.outfitId,room:p.roomId,from:p.roomId,name:p.name,
+          reason:`穿戴闲置服装，增加${shelterResources[resource]}产出`,gain,priority});
+      }
+    }
+    return choices.sort((a,b) => b.priority-a.priority || (Math.abs(b.gain-a.gain) > 1e-6 ? b.gain-a.gain : 0) || a.id-b.id || a.item-b.item)[0] || null;
+  }
+  function shelterSwapSequences(a,b) {
+    const move = (p,room) => ({id:p.id,room});
+    if (a.room === null) return [[move(b,null),move(a,b.room)]];
+    return [
+      [move(b,a.room),move(a,b.room)],
+      [move(a,null),move(b,a.room),move(a,b.room)],
+      [move(b,null),move(a,b.room),move(b,a.room)]
+    ];
+  }
+  // 模拟每一步的房间容量与供应；不能安全腾位的满员房间保留原安排。
+  function shelterSwapProjection(m,moves,futureSupply = false) {
+    const s = m.state, assigned = new Map(s.residents.map(p => [p.id,p.roomId])), projected = {...(m.actualProduction || m.production)};
+    const demand = futureSupply && m.currentDemand ? m.currentDemand : m.demand;
+    for (const move of moves) {
+      const p = s.residents.find(p => p.id === move.id), old = s.rooms.find(r => r.id === assigned.get(move.id));
+      const room = move.room === null ? null : s.rooms.find(r => r.id === move.room);
+      if (!p || move.room !== null && (!room || !staffRoomTypes.includes(room.type) || room.builtAt > m.now ||
+          room.incident || room.unpowered || room.upgradeAt !== null ||
+          s.residents.filter(other => other.id !== p.id && other.deadAt === null && other.adultAt <= m.now && assigned.get(other.id) === room.id).length >= room.width*2)) return null;
+      if (old && shelterRooms[old.type][1]) projected[shelterRooms[old.type][1]]-=shelterWorkerRate(s,m.now,m.view.env,p,old);
+      if (room) projected[shelterRooms[room.type][1]]+=shelterWorkerRate(s,m.now,m.view.env,p,room);
+      assigned.set(p.id,move.room);
+      if (!Object.keys(demand).every(key => projected[key] >= demand[key]*1.2-1e-9)) return null;
+    }
+    return projected;
+  }
+  function shelterSwapStep(m,eligible) {
+    let swap = shelterState.swap;
+    if (!swap) return null;
+    const validRoom = room => room === null || Number.isSafeInteger(room) && room > 0;
+    if (!objectState(swap) || typeof swap.id !== 'string' || !Number.isFinite(swap.at) ||
+        !(swap.futureSupply === undefined || typeof swap.futureSupply === 'boolean') ||
+        !(swap.prepareFamily === undefined || Array.isArray(swap.prepareFamily) && swap.prepareFamily.length === 3 &&
+          swap.prepareFamily.every(id => Number.isSafeInteger(id) && id > 0) && swap.prepareFamily[0] < swap.prepareFamily[1]) ||
+        !Array.isArray(swap.people) || swap.people.length !== 2 || swap.people.some(p => !p || !Number.isSafeInteger(p.id) || p.id <= 0 || !validRoom(p.room)) ||
+        swap.people[0].id === swap.people[1].id || swap.people[1].room === null || swap.people[0].room === swap.people[1].room ||
+        !Array.isArray(swap.moves) || !shelterSwapSequences(...swap.people).some(sequence => JSON.stringify(sequence) === JSON.stringify(swap.moves)) ||
+        !Number.isInteger(swap.step) || swap.step < 0 || swap.step > swap.moves.length) throw new Error('换位记录无法核对');
+    if (swap.prepareFamily && JSON.stringify(swap.prepareFamily) !== JSON.stringify(m.prepareFamily)) {
+      holdShelterStaff('原家庭的返宿舍条件已改变，取消剩余接替换位，保留当前岗位'); return null;
+    }
+    const matches = step => {
+      const expected = new Map(swap.people.map(p => [p.id,p.room]));
+      for (const move of swap.moves.slice(0,step)) expected.set(move.id,move.room);
+      return swap.people.every(p => m.state.residents.some(current => current.id === p.id && current.roomId === expected.get(p.id)));
+    };
+    if (swap.step < swap.moves.length && matches(swap.step+1)) {
+      swap = {...swap,step:swap.step+1}; saveShelter({...shelterState,swap});
+    } else if (!matches(swap.step)) {
+      holdShelterStaff('换位期间人员岗位已改变，本轮停止调整，保留现有安排'); return null;
+    }
+    if (swap.step === swap.moves.length) {
+      saveShelter({...shelterState,swap:null});
+      log.add('shelter-optimization','满员房间人员优化已完成',{steps:swap.moves.length}); return null;
+    }
+    if (!shelterOptimize || swap.people.some(p => {
+      const current = m.state.residents.find(current => current.id === p.id);
+      return !current || !eligible(current);
+    }) || !shelterSwapProjection(m,swap.moves.slice(swap.step),swap.futureSupply)) {
+      holdShelterStaff('换位所需供应、人员或房间条件已变化，本轮停止调整'); return null;
+    }
+    const move = swap.moves[swap.step], p = m.state.residents.find(p => p.id === move.id);
+    return {id:p.id,room:move.room,from:p.roomId,name:p.name,
+      reason:`${swap.prepareFamily ? '为原家庭返宿舍安排接替' : swap.futureSupply ? '补足未来供应，优化满员岗位' : '优化满员岗位'}（${swap.step+1}/${swap.moves.length}）`};
+  }
+  function planShelterSwap(m,pool) {
+    const keys = Object.keys(m.demand), futureSupply = Boolean(m.currentDemand && keys.some(key => m.production[key] < m.demand[key]*1.2-1e-9));
+    const demand = futureSupply ? m.currentDemand : m.demand;
+    if (!shelterOptimize || !keys.every(key => (m.actualProduction || m.production)[key] >= demand[key]*1.2-1e-9)) return null;
+    const gap = output => keys.reduce((n,key) => n+Math.max(0,m.demand[key]*1.2-output[key]),0);
+    const beforeGap = gap(m.production);
+    let best = null;
+    const s = m.state, available = p => p.roomId === null || s.rooms.some(r => r.id === p.roomId && staffRoomTypes.includes(r.type) &&
+      r.builtAt <= m.now && !r.incident && !r.unpowered && r.upgradeAt === null);
+    const workers = pool.filter(available);
+    const rooms = new Map(s.rooms.map(r => [r.id,r])), occupied = new Map(), rates = new Map();
+    for (const p of s.residents) if (p.deadAt === null && p.adultAt <= m.now) occupied.set(p.roomId,(occupied.get(p.roomId)||0)+1);
+    const rate = (p,room) => {
+      if (!room || m.reservedResidents?.includes(p.id)) return 0;
+      const key = `${p.id}:${room.type}:${room.level}`;
+      if (!rates.has(key)) rates.set(key,shelterWorkerRate(s,m.now,m.view.env,p,room));
+      return rates.get(key);
+    };
+    for (const a of workers) for (const b of workers) {
+      if (a.id === b.id || b.roomId === null || a.roomId === b.roomId) continue;
+      const target = rooms.get(b.roomId), source = rooms.get(a.roomId);
+      if (occupied.get(target.id) !== target.width*2) continue;
+      // 先筛最终收益，再模拟腾位。补未来供应时可少产废料，但不能扩大任何基础资源缺口。
+      const change = {power:0,food:0,water:0,scrap:0};
+      if (source) change[shelterRooms[source.type][1]]+=rate(b,source)-rate(a,source);
+      change[shelterRooms[target.type][1]]+=rate(a,target)-rate(b,target);
+      const scrap = change.scrap, basic = change.power+change.food+change.water;
+      const after = Object.fromEntries(keys.map(key => [key,m.production[key]+change[key]])), supplyGain = beforeGap-gap(after);
+      if (futureSupply ? supplyGain <= 1e-6 : !(scrap > 1 || Math.abs(scrap) < 1e-6 && basic > 1)) continue;
+      if (!keys.every(key => after[key] >= (futureSupply ? Math.min(m.production[key],m.demand[key]*1.2) : m.demand[key]*1.2)-1e-9)) continue;
+      const people = [a,b].map(p => ({id:p.id,room:p.roomId}));
+      for (const moves of shelterSwapSequences(...people)) {
+        if (!shelterSwapProjection(m,moves,futureSupply)) continue;
+        if (!best || supplyGain > best.supplyGain+1e-6 || Math.abs(supplyGain-best.supplyGain) < 1e-6 &&
+            (scrap > best.scrap+1e-6 || Math.abs(scrap-best.scrap) < 1e-6 &&
+              (basic > best.basic+1e-6 || Math.abs(basic-best.basic) < 1e-6 && moves.length < best.moves.length))) {
+          best = {people,moves,scrap,basic,supplyGain};
+        }
+      }
+    }
+    if (!best) return null;
+    const swap = {id:crypto.randomUUID(),at:Date.now(),people:best.people,moves:best.moves,step:0,futureSupply,
+      ...(m.prepareFamily ? {prepareFamily:m.prepareFamily} : {})};
+    saveShelter({...shelterState,swap});
+    log.add('shelter-optimization',futureSupply ? '开始满员岗位调整，补足未来供应' : '开始满员房间人员优化',
+      {steps:swap.moves.length,scrapGain:best.scrap,futureSupply,supplyGain:best.supplyGain,
+        ...(m.prepareFamily ? {prepareFamily:m.prepareFamily} : {})});
+    return swap;
+  }
+  function rememberShelterFamilies(m) {
+    const s = m.state, stored = shelterState.families || [];
+    if (!Array.isArray(stored) || stored.some(f => !f || ![f.a,f.b,f.room].every(x => Number.isSafeInteger(x) && x > 0) || f.a === f.b) ||
+        new Set(stored.flatMap(f => [f.a,f.b])).size !== stored.length*2) throw new Error('配对记录无法核对');
+    let families = stored.filter(f => [f.a,f.b].every(id => {
+      const p = s.residents.find(p => p.id === id);
+      // 倒下仍可救回；只有居民记录消失或关系明确改变时才取消已记住的家庭。
+      return p && (!p.romance || p.romance.partnerId === (id === f.a ? f.b : f.a));
+    }));
+    const candidates = s.residents.filter(p => p.romance).map(p => [p.id,p.romance.partnerId]);
+    for (const child of s.residents) if (child.parents.length === 2) candidates.push(child.parents);
+    for (const ids of candidates) {
+      const [a,b] = ids.map(id => s.residents.find(p => p.id === id));
+      if (!a || !b || a.id === b.id || a.roomId !== b.roomId || a.deadAt !== null || b.deadAt !== null ||
+          a.away !== null || b.away !== null || a.adultAt > m.now || b.adultAt > m.now ||
+          a.romance && a.romance.partnerId !== b.id || b.romance && b.romance.partnerId !== a.id) continue;
+      const room = s.rooms.find(r => r.id === a.roomId && r.type === 'quarters');
+      if (!room || families.some(f => [f.a,f.b].includes(a.id) || [f.a,f.b].includes(b.id))) continue;
+      families.push({a:Math.min(a.id,b.id),b:Math.max(a.id,b.id),room:room.id});
+    }
+    families.sort((a,b) => a.a-b.a);
+    if (JSON.stringify(families) !== JSON.stringify(stored)) saveShelter({...shelterState,families});
+    return families;
+  }
+  const familyKey = (a,b) => [a,b].sort((x,y)=>x-y).join(':');
+  function populationBudget(m,families,exclude = '') {
+    const s = m.state, reserved = new Map();
+    const add = (a,b) => { if (!shelterFamilyExpecting(s,a,b)) reserved.set(familyKey(a,b),[a,b]); };
+    for (const p of s.residents) if (p.deadAt === null && p.romance) add(p.id,p.romance.partnerId);
+    for (const f of families) {
+      const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id));
+      if (pair.every(p => p && p.deadAt === null && !(p.familyCooldownUntil > m.now)) && pair.some(p => p.roomId === f.room)) add(f.a,f.b);
+    }
+    const plan = shelterState.pair;
+    if (plan && !plan.release) add(plan.a,plan.b);
+    reserved.delete(exclude);
+    const living = s.residents.filter(p => p.deadAt === null).length, recovering = shelterRecoveringPopulation(s);
+    return {living,recovering,reserved,future:living+recovering+s.births.length+reserved.size,limit:Math.min(shelterPopulationTarget ?? 0,m.populationCap)};
+  }
+  function populationHousingSupply(m,families,pair) {
+    const budget = populationBudget(m,families,familyKey(pair[0].id,pair[1].id)), future = budget.future+1;
+    // 预留所有已安排家庭离岗后的产量，以及儿童、外出/倒下居民恢复和新生儿成年后的口粮。
+    const absent = new Set([...budget.reserved.values()].flat().concat(pair.map(p => p.id)));
+    const projected = shelterProductionWithout(m,absent);
+    const demand = {...m.demand,food:future,water:future};
+    return {production:projected,demand,reservedResidents:[...absent],
+      allowed:future <= budget.limit && Object.keys(demand).every(k => m.state.resources[k] >= demand[k]*2)};
+  }
+  function populationCanHouse(m,families,pair) {
+    const supply = populationHousingSupply(m,families,pair);
+    return supply.allowed && Object.keys(supply.demand).every(k => supply.production[k] >= supply.demand[k]*1.2-1e-9);
+  }
+  function populationKinship(s) {
+    const people = new Map(s.residents.map(p => [p.id,p])), cache = new Map();
+    const ancestors = (id,path = new Set()) => {
+      if (cache.has(id)) return cache.get(id);
+      const p = people.get(id);
+      if (!p || path.has(id) || ![0,2].includes(p.parents.length) || new Set(p.parents).size !== p.parents.length ||
+          p.parents.some(parent => !Number.isSafeInteger(parent) || parent <= 0)) return null;
+      const result = new Set([id]), next = new Set([...path,id]);
+      for (const parent of p.parents) {
+        const lineage = ancestors(parent,next);
+        if (!lineage) { cache.set(id,null); return null; }
+        for (const ancestor of lineage) result.add(ancestor);
+      }
+      cache.set(id,result); return result;
+    };
+    return (a,b) => {
+      const left = ancestors(a.id), right = ancestors(b.id);
+      return Boolean(left && right && ![...left].some(id => right.has(id)));
+    };
+  }
+  function stopPopulationPlan(message) {
+    saveShelter({...shelterState,pair:null}); shelterPopulationNote = message;
+    log.add('shelter-population',message,{phase:'cancelled'}); holdShelterStaff(message);
+  }
+  function shelterPopulationPlan(m,families,{eligible,home,healthy},create = false) {
+    if (shelterStaffMode !== 'population') return null;
+    const s = m.state, blocks = shelterState.pairBlocks || [];
+    if (!Array.isArray(blocks) || blocks.length > 200 || blocks.some(b => !b || ![b.a,b.b].every(id => Number.isSafeInteger(id) && id > 0) ||
+        b.a === b.b || !Number.isFinite(b.until))) throw new Error('配对等待记录无法核对');
+    const activeBlocks = blocks.filter(b => b.until > Date.now());
+    if (activeBlocks.length !== blocks.length) saveShelter({...shelterState,pairBlocks:activeBlocks});
+    let plan = shelterState.pair;
+    const validRoom = id => id === null || Number.isSafeInteger(id) && id > 0;
+    const roomUnchanged = (room,ids) => room?.type === 'quarters' && room.builtAt <= m.now && !s.births.some(b => b.roomId === room.id) &&
+      !s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === room.id && !ids.includes(p.id));
+    const roomReady = (room,ids) => roomUnchanged(room,ids) && !room.incident && !room.unpowered && room.upgradeAt === null;
+    const key = plan && familyKey(plan.a,plan.b);
+    if (plan) {
+      if (!objectState(plan) || ![plan.a,plan.b,plan.room].every(id => Number.isSafeInteger(id) && id > 0) || plan.a >= plan.b ||
+          ![plan.fromA,plan.fromB].every(validRoom) || [plan.fromA,plan.fromB].includes(plan.room) ||
+          !(plan.first===undefined || [plan.a,plan.b].includes(plan.first)) ||
+          ![0,1,2].includes(plan.step) || !Number.isFinite(plan.at) || !(plan.waitAt === null || Number.isFinite(plan.waitAt)) ||
+          !(plan.roomWaitAt == null || Number.isFinite(plan.roomWaitAt)) ||
+          typeof plan.release !== 'boolean' || typeof plan.failed !== 'boolean') throw new Error('新配对计划无法核对');
+      const pair = [plan.a,plan.b].map(id => s.residents.find(p => p.id === id)), room = s.rooms.find(r => r.id === plan.room);
+      if (pair.some((p,i) => !p || p.deadAt !== null || p.romance && p.romance.partnerId !== [plan.b,plan.a][i])) {
+        stopPopulationPlan('新配对人员或关系已变化，保留当前安排'); return null;
+      }
+      const relation = pair.some((p,i) => p.romance?.partnerId === pair[1-i].id) ||
+        s.residents.some(child => child.parents.length === 2 && child.parents.includes(plan.a) && child.parents.includes(plan.b));
+      if (relation) {
+        if (families.some(f => familyKey(f.a,f.b) !== key && [f.a,f.b].some(id => [plan.a,plan.b].includes(id)))) {
+          stopPopulationPlan('新配对与原家庭记录冲突，本轮等待核对'); return null;
+        }
+        const next = families.some(f => familyKey(f.a,f.b) === key) ? families : [...families,{a:plan.a,b:plan.b,room:plan.room}];
+        saveShelter({...shelterState,pair:null,families:next});
+        shelterPopulationNote = '网站已确认新家庭，后续按生育冷却轮换。';
+        log.add('shelter-population','网站已确认新家庭',{phase:'confirmed',residents:[plan.a,plan.b],room:plan.room});
+        return null;
+      }
+      if (pair.some(p => p.romance) || s.births.some(b => b.roomId === plan.room)) {
+        shelterPopulationNote = '宿舍已出现感情或待产状态，保留人员并等待家庭关系确认。'; return null;
+      }
+      if (plan.release) {
+        if (room?.type !== 'quarters' ||
+            s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === plan.room && ![plan.a,plan.b].includes(p.id)) ||
+            pair.some((p,i) => ![plan.room,i ? plan.fromB : plan.fromA,null].includes(p.roomId))) {
+          stopPopulationPlan('结束配对时人员或宿舍已被改变，取消剩余步骤并保留现状'); return null;
+        }
+        const p = pair.find(p => p.roomId === plan.room);
+        if (p) {
+          if (!home(p) || !healthy(p) || !shelterNameUnique(s,p) || !roomReady(room,[plan.a,plan.b])) {
+            shelterPopulationNote = '等待人员和宿舍恢复后结束未确认配对。'; return null;
+          }
+          const from = p.id === plan.a ? plan.fromA : plan.fromB, old = s.rooms.find(r => r.id === from);
+          const available = old && staffRoomTypes.includes(old.type) && old.builtAt <= m.now && !old.incident && !old.unpowered && old.upgradeAt === null &&
+            s.residents.filter(other => other.deadAt === null && other.adultAt <= m.now && other.roomId === old.id).length < old.width*2;
+          return {id:p.id,room:available ? old.id : null,from:p.roomId,name:p.name,reason:'结束未确认的新配对，恢复生产安排'};
+        }
+        if (plan.failed) {
+          const next = activeBlocks.filter(b => familyKey(b.a,b.b) !== key).concat({a:plan.a,b:plan.b,until:Date.now()+86400000}).slice(-200);
+          saveShelter({...shelterState,pairBlocks:next});
+        }
+        stopPopulationPlan(plan.failed ? '未观察到网站确认感情，已结束尝试；此组合 24 小时内不重试' : '心情、人口或供应条件已变化，已结束本次配对安排');
+        return null;
+      }
+      const ordered=plan.first===plan.b?[pair[1],pair[0]]:pair;
+      const matches = step => ordered.every((p,i)=>p.roomId===(i<step?plan.room:p.id===plan.a?plan.fromA:plan.fromB));
+      if (plan.step < 2 && matches(plan.step+1)) {
+        plan = {...plan,step:plan.step+1,waitAt:plan.step === 1 ? Date.now() : null}; saveShelter({...shelterState,pair:plan});
+      } else if (!matches(plan.step)) {
+        stopPopulationPlan('安排新配对期间岗位已被改变，取消剩余步骤'); return null;
+      }
+      if (!roomReady(room,[plan.a,plan.b])) {
+        if (roomUnchanged(room,[plan.a,plan.b])) {
+          const reasons=[room.unpowered&&'停电',room.incident&&'事件尚未处理',room.upgradeAt!==null&&'升级尚未完成'].filter(Boolean);
+          if (plan.roomWaitAt == null) {
+            saveShelter({...shelterState,pair:{...plan,roomWaitAt:Date.now()}});
+            log.add('shelter-population','新配对宿舍暂时受阻，保留原计划',{phase:'room-wait',room:plan.room,step:plan.step,reasons});
+          }
+          shelterPopulationNote = `新配对宿舍${reasons.join('、')}，保留原计划，条件恢复后继续。`; return null;
+        }
+        stopPopulationPlan('新配对宿舍条件已改变，保留当前人员安排'); return null;
+      }
+      if (plan.roomWaitAt != null) {
+        // 无法从当前快照确定宿舍受阻的完整时长，恢复后重新给足感情等待时间。
+        plan = {...plan,roomWaitAt:null,waitAt:plan.step === 2 ? Date.now() : plan.waitAt};
+        saveShelter({...shelterState,pair:plan});
+        log.add('shelter-population','新配对宿舍已恢复，重新核对原安排',{phase:'room-resumed',room:plan.room,step:plan.step});
+      }
+      const canContinue = pair.every(p => home(p) && healthy(p) && p.happiness >= 50 && shelterNameUnique(s,p) && !(p.familyCooldownUntil > m.now) &&
+        (p.roomId === plan.room || eligible(p))) && populationCanHouse(m,families,pair) && populationKinship(s)(...pair);
+      // 只有两人均已入住才开始等感情；挂起期间尚未入住或条件失效不能算配对失败。
+      const failed = plan.step === 2 && canContinue && Date.now()-(plan.waitAt ?? plan.at) >= 30*60000;
+      if (failed || !canContinue) {
+        saveShelter({...shelterState,pair:{...plan,release:true,failed}});
+        return shelterPopulationPlan(m,families,{eligible,home,healthy});
+      }
+      if (plan.step === 2) { shelterPopulationNote = '两人已到宿舍，等待网站确认感情；本次先不安排其他新配对。'; return null; }
+      let p = ordered[plan.step];
+      if(!shelterDepartureSafe(m,[p.id])) {
+        const alternate=plan.step===0&&ordered.find(person=>shelterDepartureSafe(m,[person.id]));
+        if(!alternate){shelterPopulationNote='当前离岗步骤会降低基础供应，保留配对计划，先检查生产安排。';return null;}
+        plan={...plan,first:alternate.id};saveShelter({...shelterState,pair:plan});p=alternate;
+      }
+      return {id:p.id,room:plan.room,from:p.roomId,name:p.name,reason:`安排新配对（${plan.step+1}/2）`};
+    }
+    if (!create) return null;
+    const budget = populationBudget(m,families);
+    shelterPopulationNote = `人口 ${budget.living}；待产及已预约名额 ${budget.future-budget.living-budget.recovering}；${budget.recovering ? `倒下居民预留 ${budget.recovering}；` : ''}目标 ${budget.limit}。`;
+    if (budget.future >= budget.limit) { shelterPopulationNote+='已有名额达到目标，停止安排新增生育。'; return null; }
+    const rooms = s.rooms.filter(r => roomReady(r,[]) && !families.some(f => f.room === r.id)).sort((a,b) => a.id-b.id);
+    if (!rooms.length) { shelterPopulationNote+='暂无未被原家庭占用的空宿舍。'; return null; }
+    // 原生居民详情明确要求双方心情 >= 50；不能先调离生产，再等无效配对超时。
+    const unrelated = populationKinship(s), candidates = s.residents.filter(p => eligible(p) && p.happiness >= 50 &&
+      (p.roomId === null || s.rooms.some(r => r.id === p.roomId && staffRoomTypes.includes(r.type))) &&
+      !(p.familyCooldownUntil > 0) && !families.some(f => [f.a,f.b].includes(p.id)) && !s.residents.some(child => child.parents.includes(p.id)))
+      .sort((a,b) => a.id-b.id);
+    const loss = pair => {
+      // 人选排序同样比较两人离岗后的实际产量；容量外驻留和接替者不能按个人理论产量计损失。
+      const projected=shelterProductionWithout(m,pair.map(p=>p.id));
+      return {idle:pair.filter(p=>p.roomId===null).length,scrap:m.production.scrap-projected.scrap,
+        total:Object.keys(m.production).reduce((n,key)=>n+m.production[key]-projected[key],0)};
+    };
+    let best = null;
+    for (let i=0;i<candidates.length;i++) for (let j=i+1;j<candidates.length;j++) {
+      const pair = [candidates[i],candidates[j]], key = familyKey(pair[0].id,pair[1].id);
+      if (activeBlocks.some(b => familyKey(b.a,b.b) === key) || !unrelated(...pair) || !populationCanHouse(m,families,pair)) continue;
+      const first=pair.find(p=>shelterDepartureSafe(m,[p.id]));if(!first)continue;
+      const score = loss(pair);
+      if (!best || score.idle > best.score.idle || score.idle === best.score.idle &&
+          (score.scrap < best.score.scrap-1e-6 || Math.abs(score.scrap-best.score.scrap) < 1e-6 && score.total < best.score.total-1e-6)) best = {pair,score,first:first.id};
+    }
+    if (!best) { shelterPopulationNote+='当前没有双方心情均达50、亲缘资料完整且离岗后供应仍充足的新组合。'; return null; }
+    const [a,b] = best.pair;
+    plan = {a:a.id,b:b.id,room:rooms[0].id,fromA:a.roomId,fromB:b.roomId,step:0,at:Date.now(),waitAt:null,release:false,failed:false,
+      ...(best.first!==a.id?{first:best.first}:{})};
+    saveShelter({...shelterState,pair:plan});
+    log.add('shelter-population','开始安排一对未配对成人',{phase:'placing',residents:[a.id,b.id],firstResident:plan.first??plan.a,room:plan.room,target:shelterPopulationTarget});
+    return shelterPopulationPlan(m,families,{eligible,home,healthy});
+  }
+  function shelterStaffPlan(m,skippedFamilies = []) {
+    if (shelterStaffMode === 'off' || shelterStaffHold) return null;
+    const s = m.state;
+    // 调岗比领奖需要更多字段；缺少证据只停止人员管理，仍可收取奖励。
+    if (new Set(s.residents.map(p => p.id)).size !== s.residents.length || s.residents.some(p =>
+      typeof p.name !== 'string' || !p.name.trim() || !Number.isFinite(p.hp) || p.hp < 0 ||
+      !(p.roomId === null || Number.isSafeInteger(p.roomId)) || !Array.isArray(p.parents) ||
+      !p.parents.every(Number.isSafeInteger) || !(p.familyCooldownUntil == null || Number.isFinite(p.familyCooldownUntil)) ||
+      !(p.romance == null || objectState(p.romance) && Number.isSafeInteger(p.romance.partnerId))) ||
+      s.births.some(b => !Number.isSafeInteger(b.roomId) || !s.rooms.some(r => r.id === b.roomId && r.type === 'quarters'))) throw new Error('人员或待产信息不完整');
+    const familyMode = ['family','population'].includes(shelterStaffMode), populationMode = shelterStaffMode === 'population';
+    if (populationMode && shelterPopulationTarget === null) { holdShelterStaff('人口目标无效，本轮只收取奖励，请重新设置目标'); return null; }
+    const families = familyMode ? rememberShelterFamilies(m) : [];
+    const home = p => p.deadAt === null && p.away === null && p.adultAt <= m.now;
+    const healthy = p => p.hp >= .6*Math.round(100+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*(2+.5*p.stats.end));
+    const byRoom = id => s.rooms.find(r => r.id === id);
+    const familyOf = p => families.find(f => f.a === p.id || f.b === p.id);
+    const birthRooms = new Set(s.births.map(b => b.roomId));
+    const romanceResidents = new Set(s.residents.filter(p => p.deadAt === null && p.romance).flatMap(p => [p.id,p.romance.partnerId]));
+    const protectedParent = p => families.some(f => [f.a,f.b].includes(p.id) && birthRooms.has(f.room));
+    const occupancy = id => s.residents.filter(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === id).length;
+    const recovering = shelterRecoveringPopulation(s);
+    const population = s.residents.filter(p => p.deadAt === null).length+s.births.length+recovering;
+    const eligible = p => {
+      if (!home(p) || !healthy(p) || romanceResidents.has(p.id) || birthRooms.has(p.roomId) || protectedParent(p) ||
+          !shelterNameUnique(s,p)) return false;
+      const old = byRoom(p.roomId);
+      if (old?.incident || old?.upgradeAt != null || old && old.builtAt > m.now) return false;
+      if (p.roomId === null || old && staffRoomTypes.includes(old.type)) return true;
+      if (old?.type !== 'quarters') return false;
+      const f = familyOf(p);
+      if (f && f.room === old.id) return p.familyCooldownUntil > m.now || population >= (populationMode ? Math.min(shelterPopulationTarget,m.populationCap) : m.populationCap);
+      // 只接管尚未组建家庭的成年子女；不拆散玩家放进宿舍的其他成人。
+      return p.parents.length === 2 && !s.residents.some(child => child.parents.includes(p.id)) && !p.familyCooldownUntil;
+    };
+    if (populationMode && shelterState.pair) {
+      const next = shelterPopulationPlan(m,families,{eligible,home,healthy});
+      if (next || shelterStaffHold) return next;
+    }
+    const pool = s.residents.filter(p => eligible(p) && !(populationMode && shelterState.pair && [shelterState.pair.a,shelterState.pair.b].includes(p.id)));
+    const budget = populationMode ? populationBudget(m,families) : null;
+    const future = budget ? budget.future+(budget.future === budget.living+budget.recovering && budget.future < budget.limit ? 1 : 0) : 0;
+    const readyFamilies = families.filter(f => {
+      const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id)), room = byRoom(f.room);
+      return room?.type === 'quarters' && room.builtAt <= m.now && room.upgradeAt === null && !room.incident && !room.unpowered &&
+        !birthRooms.has(room.id) && pair.every(p => home(p) && healthy(p) && p.happiness >= 50 && !p.romance && !(p.familyCooldownUntil > m.now) &&
+          (p.roomId === room.id || eligible(p))) &&
+        !s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === room.id && ![f.a,f.b].includes(p.id));
+    });
+    const recoveryDemand = familyMode && recovering ? {...m.demand,food:m.demand.food+recovering,water:m.demand.water+recovering} : m.demand;
+    const familyBirth = familyMode && !populationMode && recovering && population < m.populationCap && readyFamilies.length ? 1 : 0;
+    const baseDemand = populationMode ? {...m.demand,food:future,water:future} :
+      familyBirth ? {...recoveryDemand,food:recoveryDemand.food+1,water:recoveryDemand.water+1} : recoveryDemand;
+    let preparation = null;
+    if (populationMode && !shelterState.pair) {
+      const pending = shelterState.swap?.prepareFamily, familyIds = f => [Math.min(f.a,f.b),Math.max(f.a,f.b),f.room];
+      const candidates = readyFamilies.filter(f => pending ? JSON.stringify(pending) === JSON.stringify(familyIds(f)) :
+        !skippedFamilies.includes(familyKey(f.a,f.b)) && [f.a,f.b].some(id => s.residents.find(p => p.id === id).roomId !== f.room));
+      // 已能返回的家庭先返回；需要接替时只准备一对，避免多对同时抽空基础岗位。
+      if (pending || Object.keys(baseDemand).every(k => m.production[k] >= baseDemand[k]*1.2-1e-9) &&
+          !candidates.some(f => populationCanHouse(m,families,[f.a,f.b].map(id => s.residents.find(p => p.id === id))))) {
+        for (const f of candidates) {
+          const supply = populationHousingSupply(m,families,[f.a,f.b].map(id => s.residents.find(p => p.id === id)));
+          if (supply.allowed) { preparation = {...supply,prepareFamily:familyIds(f)}; break; }
+        }
+      }
+    }
+    if (skippedFamilies.length && !preparation) return null;
+    const staffDemand = preparation?.demand || baseDemand;
+    const staffModel = populationMode || familyMode && recovering ? {...m,demand:staffDemand,currentDemand:m.demand,
+      ...(preparation ? {...preparation,actualProduction:m.production} : {})} : m;
+    const supplyProduction = staffModel.production;
+    const staffPool = preparation ? pool.filter(p => !preparation.reservedResidents.includes(p.id)) : pool;
+    if (preparation) shelterPopulationNote = '原家庭正准备返宿舍：先按两人离岗后的产量安排接替，供应和名额重新核对通过后再返回。';
+    if (shelterState.swap) {
+      const next = shelterSwapStep(staffModel,eligible);
+      if (next || shelterStaffHold) return next;
+    }
+    if (populationMode) for (const f of families) {
+      const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id));
+      if (birthRooms.has(f.room) || pair.some(p => !home(p) || p.romance || p.roomId !== f.room && !eligible(p)) || populationCanHouse(m,families,pair)) continue;
+      const p = pair.find(p => p.roomId === f.room && healthy(p) && shelterNameUnique(s,p));
+      const room = byRoom(f.room);
+      if (p && room && room.builtAt <= m.now && !room.incident && room.upgradeAt === null) return {id:p.id,room:null,from:p.roomId,name:p.name,reason:'人口或供应已到限制，原配对暂缓新增生育'};
+    }
+    const gear = shelterGearPlan(staffModel,staffPool);
+    if (gear) return gear;
+    const rate = (p,r) => r ? shelterWorkerRate(s,m.now,m.view.env,p,r) : 0;
+    const departures=new Map();
+    const departureLoss = p => {
+      const room=byRoom(p.roomId),resource=room&&shelterRooms[room.type][1];
+      if(!resource)return 0;
+      if(!departures.has(p.id))departures.set(p.id,supplyProduction[resource]-shelterProductionWithout(staffModel,[p.id])[resource]);
+      return departures.get(p.id);
+    };
+    const safeDonor = p => {
+      const r = byRoom(p.roomId), resource = r && shelterRooms[r.type][1];
+      const loss=departureLoss(p);
+      return (!Object.hasOwn(staffDemand,resource) || loss<=1e-9 || supplyProduction[resource]-loss >= staffDemand[resource]*1.2-1e-9) &&
+        (!preparation || shelterDepartureSafe(m,[p.id]));
+    };
+    const targets = s.rooms.filter(r => staffRoomTypes.includes(r.type) && r.builtAt <= m.now &&
+      !r.incident && !r.unpowered && r.upgradeAt === null && occupancy(r.id) < r.width*2);
+    const choices = (rooms,reason) => rooms.flatMap(r => staffPool.filter(p => p.roomId !== r.id && safeDonor(p)).map(p => {
+      const old = byRoom(p.roomId), resource = shelterRooms[r.type][1];
+      const gain = rate(p,r)-(old && shelterRooms[old.type][1] === resource ? departureLoss(p) : 0);
+      return {id:p.id,room:r.id,from:p.roomId,reason,gain,name:p.name};
+    })).filter(c => c.gain > 1).sort((a,b) => b.gain-a.gain || a.id-b.id || a.room-b.room);
+    const shortages = Object.keys(staffDemand).filter(k => supplyProduction[k] < staffDemand[k]*1.2-1e-9)
+      .sort((a,b) => m.state.resources[a]/Math.max(1,staffDemand[a])-m.state.resources[b]/Math.max(1,staffDemand[b]));
+    for (const resource of shortages) {
+      const choice = choices(targets.filter(r => shelterRooms[r.type][1] === resource),
+        `${preparation ? '原家庭返宿舍前安排接替，' : ''}补足${shelterResources[resource]}供应`)[0];
+      if (choice) return choice;
+    }
+    if (!shortages.length && familyMode && population < m.populationCap && !(populationMode && shelterState.pair)) {
+      for (const f of readyFamilies) {
+        const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id)), room = byRoom(f.room);
+        // 已回宿舍、尚未开始感情进度的另一对也占用一个预期出生名额。
+        const reserved = families.filter(other => other !== f && !shelterFamilyExpecting(s,other.a,other.b) && [other.a,other.b].every(id =>
+          s.residents.some(p => p.id === id && home(p) && p.roomId === other.room && !(p.familyCooldownUntil > m.now)))).length;
+        if (population+reserved >= m.populationCap) continue;
+        if (populationMode && !populationCanHouse(m,families,pair)) continue;
+        if (!populationMode) {
+          const projected = shelterProductionWithout(m,pair.map(p=>p.id));
+          if (!Object.keys(recoveryDemand).every(k => projected[k] >= (recoveryDemand[k]+(k === 'power' ? 0 : 1))*1.2-1e-9 &&
+              s.resources[k] >= recoveryDemand[k]*2)) continue;
+        }
+        const p = pair.find(p => p.roomId !== room.id && shelterDepartureSafe(m,[p.id]));
+        if (p && occupancy(room.id) < room.width*2) return {id:p.id,room:room.id,from:p.roomId,name:p.name,reason:'冷却结束，原配对返回宿舍'};
+      }
+    }
+    if (populationMode && !preparation) {
+      const next = shelterPopulationPlan(m,families,{eligible,home,healthy},true);
+      if (next || shelterStaffHold) return next;
+    }
+    if (preparation) {
+      if (planShelterSwap(staffModel,pool)) return shelterSwapStep(staffModel,eligible);
+      // 一对暂时无法接替时，继续检查其他原家庭；不让第一对阻塞全部生育轮换。
+      const note = shelterPopulationNote;
+      const next = shelterStaffPlan(m,[...skippedFamilies,familyKey(preparation.prepareFamily[0],preparation.prepareFamily[1])]);
+      if (next || shelterStaffHold) return next;
+      shelterPopulationNote = note;
+    }
+    const scrap = choices(targets.filter(r => r.type === 'scrap'),'增加废料生产')[0];
+    if (scrap) return scrap;
+    if (!preparation && planShelterSwap(staffModel,pool)) return shelterSwapStep(staffModel,eligible);
+    const lowMoodFamilies=families.filter(f=>[f.a,f.b].some(id=>s.residents.find(p=>p.id===id)?.happiness<50)).length;
+    shelterStaffNote = (familyMode ? `已记住 ${families.length} 对原配对。${lowMoodFamilies?`${lowMoodFamilies} 对心情不足50，需恢复后才能继续生育。`:''}` : '')+
+      (shortages.length ? `${preparation ? '原家庭离岗后' : ''}尚缺供应：${shortages.map(k=>`${shelterResources[k]}时产 ${supplyProduction[k].toFixed(1)}/目标 ${(staffDemand[k]*1.2).toFixed(1)}`).join('、')}。当前可用人员和房间无法安全补足。` :
+        '已按供应余量和废料收益安排；培养感情、待产、受伤和特殊岗位保持原安排。');
+    return null;
+  }
+  function shelterExploreStep(m) {
+    const plan=shelterExplorerCandidates(m);
+    shelterExploreNote=plan.notes[0]||(shelterExploreSkipped.size?'部分归来探险未能唯一定位，本轮保留该奖励。':'暂无已归来且可领取的探险。');
+    for(const choice of plan.ready) {
+      if(shelterExploreSkipped.has(choice.id))continue;
+      if(!shelterFits(m,choice.reward,choice.items)) {shelterExploreNote='归来探险的背包或携带治疗针可能溢出，保留奖励，先腾出库存。';continue;}
+      const tab=shelterTab('废土');
+      if(!usable(tab)){shelterExploreNote='尚未识别废土页签，本轮保留归来奖励。';return false;}
+      if(tab.getAttribute('aria-selected')!=='true') {
+        offer('shelter:explore-tab','查看已归来的探险',()=>tab.click());return true;
+      }
+      const root=locator.pick([...document.querySelectorAll('section')].filter(el=>/^单人探险\s*\(\d+\/\d+\)$/.test(textOf(el.querySelector('h2')))));
+      const row=locator.pick([...(root?.querySelectorAll('li')||[])].filter(el=>textOf(el.querySelector('p'))===choice.title&&
+        [...el.querySelectorAll('p')].some(p=>textOf(p)==='到家了')));
+      const button=buttonIn(row,'领取');
+      if(!usable(button)) {
+        shelterExploreSkipped.add(choice.id);shelterExploreNote='未能唯一定位可领取的归来探险，本轮保留该奖励。';continue;
+      }
+      shelterExploreNote='核对并领取已归来的探险奖励。';
+      shelterSubmit(button,'explore',[choice.id,choice.residentId],m,'领取已归来的探险奖励');return true;
+    }
+    return false;
+  }
+  function shelterTab(label) {
+    const tabs = locator.query('[role="tablist"][aria-label="避难所"]');
+    return buttonIn(tabs,new RegExp(`^${label}(?:\\s*\\d+)?$`));
+  }
+  function shelterRewardTabDue(stage,m) {
+    const label = stage === 1 ? '目标' : '图鉴', tab = shelterTab(label);
+    if (!tab) return false;
+    const badge = textOf(tab).match(/(\d+)$/);
+    if (stage === 2) return Boolean(badge && +badge[1] > 0);
+    const season = m.state.season;
+    const tiers = Array.from({length:Math.min(30,Math.floor(season.points/150))},(_,i)=>i+1);
+    if (tiers.some(t => !season.claimedFree.includes(t))) return true;
+    if (m.state.daily.claimed.length >= 3) return false;
+    // 网站目标角标也包含通行证档，不能为不处理的付费奖励反复切页。
+    const paid = season.premium && Array.isArray(season.claimedPremium) ? tiers.filter(t => !season.claimedPremium.includes(t)).length : 0;
+    return Boolean(badge && +badge[1] > paid);
+  }
+  function holdShelterStaff(message) {
+    shelterStaffHold = true; shelterStaffNote = message; cancelQueued();
+    if (shelterState.swap) saveShelter({...shelterState,swap:null});
+    log.add('shelter-staff-held',message);
+  }
+  function shelterWorkTitle(dialog,work = shelterWork) {
+    if (!work) return false;
+    const name = work.name.normalize('NFKC').replace(/\s+/g,' ').trim(), title = textOf(dialog?.querySelector('h2'));
+    return title.startsWith(`${name} · `) && /^\d+ 级$/.test(title.slice(name.length+3));
+  }
+  function closeShelterWork() {
+    const work = shelterWork, dialog = work?.dialog;
+    if (!dialog?.isConnected) { shelterWork = null; return false; }
+    if (work.closing) { say('等待居民窗口关闭，请勿重复操作'); return true; }
+    if (!shelterWorkTitle(dialog,work)) {
+      shelterWork = null; holdShelterStaff('居民窗口已被更改，本轮人员管理等待你处理'); return true;
+    }
+    const close = currentElement([...dialog.querySelectorAll('button')].filter(b => b.getAttribute('aria-label') === '关闭' || textOf(b) === '关闭'));
+    if (!usable(close)) { say('等待关闭脚本打开的居民窗口'); return true; }
+    offer('shelter:staff-close','关闭已核对的居民窗口',() => { close.click(); work.closing = true; });
+    return true;
+  }
+  function shelterWorkStep(m,dialogs) {
+    let choice;
+    try { choice = shelterStaffPlan(m); }
+    catch(error) { if(error?.code==='shelter-state-changed')throw error;holdShelterStaff('人员或配对记录无法核对，本轮只收取奖励'); }
+    if (shelterWork?.submitted || shelterLeave || !shelterEnabled || !choice) return closeShelterWork();
+    if (shelterWork && (shelterWork.id !== choice.id || shelterWork.room !== choice.room || shelterWork.from !== choice.from ||
+        shelterWork.kind !== choice.kind || shelterWork.item !== choice.item || shelterWork.fromItem !== choice.fromItem)) {
+      return closeShelterWork();
+    }
+    if (!shelterWork) shelterWork = {...choice,openedAt:0,dialog:null};
+    const work = shelterWork;
+    if (work.dialog) {
+      if (!work.dialog.isConnected) {
+        if (!work.closing && !work.submitted) {
+          if (shelterStaffMode === 'population' && shelterState.pair) stopPopulationPlan('居民窗口已关闭，本轮停止安排新配对');
+          else holdShelterStaff('居民窗口已关闭，本轮尊重手动操作');
+        }
+        shelterWork = null; return false;
+      }
+      if (work.closing) { say('等待居民窗口关闭'); return true; }
+      const equip = work.kind === 'equip', value = equip ? String(work.item) : work.room === null ? 'rest' : String(work.room);
+      const labels = [...work.dialog.querySelectorAll('label')].filter(el => equip ? /^服装/.test(textOf(el)) : /^调去/.test(textOf(el)));
+      const select = labels.length === 1 ? labels[0].querySelector('select') : null;
+      const option = select && [...select.options].find(o => o.value === value && !o.disabled);
+      if (!usable(select) || !option) { holdShelterStaff('原网页没有可用的岗位或服装选项，本轮保留现有安排'); return closeShelterWork(); }
+      if (!shelterWorkTitle(work.dialog,work)) { shelterWork = null; holdShelterStaff('居民窗口身份发生变化，本轮等待你处理'); return true; }
+      const room = m.state.rooms.find(r => r.id === work.room);
+      shelterStaffNote = equip ? `${work.reason}。` : `${work.reason}：${work.room === null ? '暂时休息' : `安排到${staffRoomNames[room?.type] || '目标房间'}`}。`;
+      shelterSubmit(select,equip ? 'equip' : 'assign',[work.id,equip ? work.item : work.room],m,shelterStaffNote,() => {
+        work.submitted = true;
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,value);
+        select.dispatchEvent(new Event('change',{bubbles:true}));
+      });
+      return true;
+    }
+    if (work.openedAt) {
+      const matches = dialogs.filter(d => shelterWorkTitle(d,work) &&
+        [...d.querySelectorAll('label')].some(el => /^调去/.test(textOf(el))));
+      if (dialogs.length === 1 && matches.length === 1) { work.dialog = matches[0]; schedule(); return true; }
+      if (Date.now()-work.openedAt > 5000) { holdShelterStaff('未能确认居民窗口，本轮保留原岗位'); shelterWork = null; }
+      else say('等待网页打开指定居民详情');
+      return true;
+    }
+    const tab = shelterTab('居民');
+    if (!usable(tab)) { holdShelterStaff('未找到居民页签，本轮只收取奖励'); shelterWork = null; return false; }
+    if (tab.getAttribute('aria-selected') !== 'true') {
+      offer('shelter:staff-tab','打开居民页安排生产',() => tab.click()); return true;
+    }
+    const root = currentElement([...document.querySelectorAll('section')].filter(el => /^居民\s+\d+\/\d+$/.test(textOf(el.querySelector('h2')))));
+    const filter = currentElement([...(root?.querySelectorAll('label') || [])].filter(el => /^筛选/.test(textOf(el))))?.querySelector('select');
+    if (usable(filter) && filter.value !== 'all' && [...filter.options].some(o => o.value === 'all')) {
+      offer('shelter:staff-filter','查看全部居民',() => {
+        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(filter,'all');
+        filter.dispatchEvent(new Event('change',{bubbles:true}));
+      }); return true;
+    }
+    const p = m.state.residents.find(p => p.id === work.id), level = Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)));
+    const name = p.name.normalize('NFKC').replace(/\s+/g,' ').trim();
+    const title = `${name} · ${level} 级`;
+    const row = currentElement([...(root?.querySelectorAll('li > button') || [])].filter(b => textOf(b).startsWith(`${title} · `)));
+    if (!usable(row)) { holdShelterStaff('未能唯一定位居民，本轮保留原岗位'); shelterWork = null; return false; }
+    offer(`shelter:staff-open:${work.id}`,'打开待调岗居民详情',() => { work.title = title; work.openedAt = Date.now(); row.click(); });
+    return true;
+  }
+  // 用户接手脚本打开的窗口后，不再自动改动或关闭该窗口。
+  for (const event of ['pointerdown','keydown','change']) document.addEventListener(event,e => {
+    if (e.isTrusted && shelterWork?.dialog?.contains(e.target)) {
+      shelterWork = null;
+      if (shelterStaffMode === 'population' && shelterState.pair) stopPopulationPlan('你已接手居民窗口，取消剩余新配对安排');
+      else holdShelterStaff('你已接手居民窗口，本轮暂停人员管理');
+      schedule();
+    }
+  },true);
   function shelterAdvice(m) {
     const deficits = Object.keys(m.demand).filter(k => m.production[k] < m.demand[k]);
     const waiting = m.state.residents.filter(p => p.away === null && p.deadAt === null && p.adultAt <= m.now && p.roomId === null).length;
@@ -2419,46 +4433,70 @@
     const cooldown = m.state.residents.filter(p => p.familyCooldownUntil > m.now && p.away === null && p.deadAt === null).length;
     return `${deficits.length ? deficits.map(k => `${shelterResources[k]}净缺 ${(m.demand[k]-m.production[k]).toFixed(1)}/小时，库存约可撑 ${(m.state.resources[k]/(m.demand[k]-m.production[k])).toFixed(1)} 小时`).join('；') : '当前基础供应可覆盖消耗'}。`+
       `废料约 ${m.production.scrap.toFixed(1)}/小时；闲置成人 ${waiting} 人；培养感情 ${pairs} 对，待产 ${m.state.births.length} 个。`+
-      `${cooldown ? `${cooldown} 人处于生育冷却，可在确认待产不受影响后参与生产。` : ''}优先补供应缺口，再安排耐力高的居民回收；第一版由你调岗。`;
+      `${cooldown ? `${cooldown} 人处于生育冷却。` : ''}优先补供应缺口，再安排耐力高的居民回收；自动管理遵循面板所选模式。`;
   }
-  function finishShelter(m, note = '本轮检查完成') {
-    let delay = 15*60000; // 无到期事件时十五分钟兜底；不逐秒访问接口或切页。
+  function finishShelter(m, note = '本轮检查完成', delay = note.includes('上限') ? 60000 : 15*60000,
+    pendingReadOnly) {
+    shelterReload();
+    pendingReadOnly ??= shelterState.pendingReadOnly;
+    let development=shelterState.development;
+    let operations=shelterState.operations,attention={};
     if (m) {
-      const events = m.rooms.filter(r => r.rate > 0 && r.batch > r.stored).map(r => (r.batch-r.stored)/r.rate*3600000);
+      try { development=`${new Date(m.now).toLocaleString('zh-CN')} 检查结果\n${shelterDevelopmentText(shelterDevelopmentPlan(m,shelterPopulationTarget))}`; }
+      catch { development='发展规划资料暂不完整，下一轮重新评估；领取与人员管理照常。'; }
+      const events = m.rooms.filter(r => !r.automatic && r.rate>0 && r.batch>r.stored &&
+        (r.resource!=='parts' || m.state.resources.scrap>=6*(r.batch-r.stored))).map(r =>
+          r.nextTickAt-m.now+Math.max(0,Math.ceil((r.batch-r.stored)/(r.rate/6)-1e-9)-1)*600000);
+      try {
+        const ops=shelterOperations(m);operations=`${new Date(m.now).toLocaleString('zh-CN')} 检查结果\n${ops.messages.join('\n')}`;
+        events.push(...ops.events);attention=ops.counts;
+      }catch{operations='运行提醒资料暂不完整，下一轮重新核对。';}
       for (const b of m.state.births) if (b.dueAt > m.now) events.push(b.dueAt-m.now);
       for (const p of m.state.residents) {
         if (p.adultAt > m.now) events.push(p.adultAt-m.now);
         if (p.familyCooldownUntil > m.now) events.push(p.familyCooldownUntil-m.now);
       }
+      if (shelterStaffMode === 'population' && shelterState.pair && !shelterState.pair.release && shelterState.pair.roomWaitAt == null) {
+        const remaining = (shelterState.pair.waitAt ?? shelterState.pair.at)+30*60000-Date.now();
+        if (remaining > 0) events.push(remaining);
+      }
       const midnight = Date.parse(`${logDay(m.now+86400000)}T00:00:00+08:00`);
       events.push(midnight-m.now);
       if (events.length) delay = Math.max(60000,Math.min(delay,...events)+2000);
     }
-    saveShelter({ ...shelterState, nextAt:Date.now()+delay, note, ...(m ? { advice:shelterAdvice(m) } : {}) });
-    log.add('shelter-check', note, { nextAt:shelterState.nextAt, actions:shelterActions,
-      ...(m ? { resources:m.state.resources, production:m.production, demand:m.demand,
-        population:m.state.residents.filter(p=>p.deadAt===null).length, births:m.state.births.length } : {}) });
+    saveShelter({ ...shelterState, nextAt:Date.now()+delay, note, exploreNote:shelterExploreNote,
+      pendingReadOnly:shelterPending?.id===pendingReadOnly?pendingReadOnly:undefined,
+      ...(m ? { advice:shelterAdvice(m),development,operations } : {}) });
+    log.add('shelter-check', note, { nextAt:shelterState.nextAt, actions:shelterActions,pendingReadOnly:shelterReadOnlyWait(),
+      staffMode:shelterStaffMode,staffHeld:shelterStaffHold,staffNote:shelterStaffNote,
+      gearEnabled:shelterGear,optimizeEnabled:shelterOptimize,pendingSwap:Boolean(shelterState.swap),
+      populationTarget:shelterPopulationTarget,pendingPair:Boolean(shelterState.pair),
+      exploreClaimEnabled:shelterExploreClaim,exploreNote:shelterExploreNote,
+      ...(m ? { resources:m.state.resources, production:m.production, demand:m.demand,attention,
+        population:m.state.residents.filter(p=>p.deadAt===null).length, recovering:shelterRecoveringPopulation(m.state), births:m.state.births.length } : {}) });
     shelterLeave = true; cancelShelterRead();
   }
   function leaveShelter() {
     const link = travelLink('/activities/expedition');
     offer('shelter:return','返回远征，等待下一次避难所预约',() => {
-      if (link) startNavigation('/activities/expedition',link);
-      else location.assign('/activities/expedition');
+      startNavigation('/activities/expedition',link);
     });
   }
   function maybeVisitShelter(running) {
-    if (!shelterEnabled || stateFault('shelter') || shelterState.nextAt > Date.now() || farmPlan) return false;
+    if(shelterReload()){cancelShelterRead();cancelQueued();}
+    if (!shelterEnabled || stateFault('shelter') || shelterState.nextAt > Date.now() || farmEnabled&&farmPlan) return false;
     rememberExpeditionTime(running);
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt-Date.now() < 15000) return false;
     const link = travelLink('/shelter');
     offer('shelter:visit','切换避难所收取产出和奖励',() => {
-      if (link) startNavigation('/shelter',link); else location.assign('/shelter');
+      startNavigation('/shelter',link);
     });
     return true;
   }
   function shelterFits(m, reward, items = 0) {
-    return Object.entries(reward).every(([k,n]) => Number.isFinite(n) && n >= 0 && m.state.resources[k]+n <= m.caps[k]) &&
+    const {automatic}=shelterFutureCollection(m,10000+Math.max(0,Date.now()-(shelterRead?.at || Date.now())));
+    return Object.entries(reward).every(([k,n]) => Number.isFinite(n) && n >= 0 &&
+      m.state.resources[k]+(automatic[k] || 0)+n <= m.caps[k]) &&
       m.state.items.length+items <= m.itemCap;
   }
   function shelterReward(text) {
@@ -2471,9 +4509,27 @@
     }
     return Object.keys(reward).length || items ? { reward, items } : null;
   }
-  function shelterSubmit(button, kind, targets, m, label) {
+  function shelterRequestAction(kind,targets) {
+    const [first,second]=targets;
+    switch(kind){
+      case 'collect':return first==='all'?{type:'collect_all'}:{type:'collect',roomId:first};
+      case 'tutorial':return {type:'claim_tutorial',step:first};
+      case 'daily':return {type:'claim_objective',index:first};
+      case 'season':return {type:'claim_season',tier:first,premium:false};
+      case 'achievement':return {type:'claim_achievement',id:first};
+      case 'assign':return {type:'assign',residentId:first,roomId:second};
+      case 'equip':return {type:'equip',residentId:first,itemId:second,slot:'outfit'};
+      case 'explore':return {type:'explore_claim',explorerId:first};
+      default:return null;
+    }
+  }
+  function shelterSubmit(button, kind, targets, m, label, perform = () => button.click()) {
     if (!usable(button)) return;
+    const readAt=shelterRead.at,periodNote='避难所奖励周期已变化，取消未发送目标；一分钟后重新核对';
     const key = `shelter:${kind}:${targets.join(',')}`;
+    if(!shelterRewardPeriodCurrent(kind,m.now,readAt)) {
+      finishShelter(null,periodNote,60000);return;
+    }
     // 随机等待结束时再读一次，避免沿用等待前的库存和奖励档位。
     if (queued?.key === key && Date.now() >= queued.dueAt && Date.now()-shelterRead.at > 1500) {
       offered = true; readShelter(); return;
@@ -2481,66 +4537,180 @@
     offer(key,label,() => {
       const id = crypto.randomUUID();
       saveShelterPending({ at:Date.now(), id, kind, targets, vaultNo:m.view.vaultNo,
-        before:{ collected:m.state.stats.collected, day:m.state.daily.day, month:m.state.season.month,
+        before:{ collected:m.state.stats.collected, serverTime:m.now, day:m.state.daily.day, month:m.state.season.month,
+          ...(kind === 'assign' ? {room:m.state.residents.find(p => p.id === targets[0]).roomId} : {}),
+          ...(kind === 'equip' ? {outfit:m.state.residents.find(p => p.id === targets[0]).outfitId} : {}),
+          ...(kind === 'explore' ? {explorer:shelterExplorerCandidates(m).ready.find(e=>e.id===targets[0]&&e.residentId===targets[1])?.before} : {}),
           ...(kind === 'collect' ? { rooms:m.rooms.filter(r => r.batch && r.stored >= r.batch &&
             (targets[0] === 'all' || targets.includes(r.id))).map(r => ({id:r.id,stored:r.stored})) } : {}) } });
       shelterRead = null; shelterReadAt = Date.now()+2000; shelterActions++;
-      captureShelterAction = result => {
-        if (shelterPending?.id !== id) return;
-        try { saveShelterPending({ ...shelterPending, result:{status:result.status,outcome:result.outcome} }); }
+      let submitted=0,inFlight=null;
+      const signature=request=>JSON.stringify([request?.idempotencyKey,request?.action]);
+      const capture = (result,request,body) => {
+        if(inFlight===signature(request))inFlight=null;
+        if(kind==='season'&&(submitted===targets.length||result.outcome!=='ok'||body&&(body.code==='retry'||!objectState(body.view))))capture.end();
+        try {
+          shelterReload();if (shelterPending?.id !== id) return;
+          const proof=shelterCollectProof(shelterPending,result.status,request,body)||
+            shelterExplorerProof(shelterPending,result.status,request,body)||shelterPending.result?.proof;
+          const rewardProof=shelterRewardProof(shelterPending,result.status,request,body);
+          const rewardProofs=Array.isArray(shelterPending.result?.rewardProofs)?shelterPending.result.rewardProofs:[];
+          const rewards=rewardProof?[...rewardProofs.filter(p=>p.target!==rewardProof.target),rewardProof]:rewardProofs;
+          saveShelterPending({ ...shelterPending, result:{status:result.status,outcome:result.outcome,
+            ...(proof?{proof}:{}),...(rewards.length?{rewardProofs:rewards}:{})} });
+        }
         catch { pauseShelter('无法保存避难所响应，请核对原结果'); }
         schedule();
       };
+      capture.id=id;
+      capture.current=()=>shelterPending?.id===id&&shelterPending.targets.length===targets.length&&
+        shelterPending.targets.every((target,i)=>target===targets[i])&&shelterPending.sentCount===submitted;
+      capture.end=()=>{if(continueShelterAction===capture)continueShelterAction=null;};
+      capture.validate=body=>{
+        shelterWriteGuard();
+        if(kind==='season'&&submitted&&!capture.current())
+          throw Object.assign(Error('避难所旧批次已被接管，取消后续请求'),{code:'shelter-batch-obsolete'});
+        if(shelterReadOnlyWait())throw Object.assign(Error('避难所原批次等待核对，不继续发送'),{code:'shelter-read-only'});
+        const action=body?.action,expected=shelterRequestAction(kind,kind==='season'?targets.slice(submitted):targets);
+        if(inFlight||submitted>=(kind==='season'?targets.length:1)||!enabled||localStorage.getItem(PREF)==='false'||!active||!shelterEnabled||accountStopReason()||shelterPending?.id!==id||
+          kind==='explore'&&!shelterExploreClaim||kind==='assign'&&shelterStaffMode==='off'||
+          kind==='equip'&&(!shelterGear||shelterStaffMode==='off')||
+          !objectState(body)||Object.keys(body).length!==2||!/^[A-Za-z0-9-]{8,64}$/.test(body?.idempotencyKey||'')||!objectState(action)||!expected||
+          Object.keys(action).length!==Object.keys(expected).length||Object.entries(expected).some(([key,value])=>action[key]!==value))
+          throw Error('避难所请求与原动作或目标不一致');
+        if(!shelterRewardPeriodCurrent(kind,m.now,readAt))
+          throw Object.assign(Error(periodNote),{code:'shelter-period-changed'});
+        // 先持久保存尝试范围，再交给原生 fetch；写入失败不得发送，也不能推断旧记录未曾发送。
+        if(kind==='season')saveShelterPending({...shelterPending,sentCount:submitted+1});
+        submitted++;inFlight=signature(body);
+        if(kind==='season')continueShelterAction=capture;
+      };
+      capture.fail=error=>{
+        capture.end();
+        if(error?.code==='shelter-batch-obsolete'||error?.code==='shelter-state-changed'&&kind==='season'&&submitted&&!capture.current()) {
+          log.add('shelter-batch-obsolete','避难所旧批次已被接管，取消后续请求',{kind,sent:submitted});schedule();return;
+        }
+        const expiredWait=error?.code==='shelter-read-only'&&!shelterRewardPeriodCurrent(kind,m.now,readAt);
+        if(error?.code==='shelter-read-only'&&!expiredWait){schedule();return;}
+        if(error?.code==='shelter-period-changed'||expiredWait) {
+          if(!enabled||!shelterEnabled||localStorage.getItem(PREF)==='false'||!active||accountStopReason()){schedule();return;}
+          try {
+            shelterWriteGuard();
+            if(shelterPending?.id!==id)throw Error('避难所原记录已变化');
+            saveShelterPending(submitted?{...shelterPending,targets:targets.slice(0,submitted)}:null);
+            log.add('shelter-period-change',periodNote,{kind,sent:submitted,cancelled:targets.length-submitted});
+            finishShelter(null,periodNote,60000);schedule();
+          }catch(error){if(!shelterRetryChange(error))pauseShelter('避难所周期变更无法保存，请核对原记录');}
+          return;
+        }
+        pauseShelter('避难所原请求无法绑定，已停止并保留记录');
+      };
+      captureShelterAction=capture;
       log.add('shelter-submitted',label,{kind,targets});
-      try { button.click(); } finally { captureShelterAction = null; }
+      try { perform(); } finally { captureShelterAction = null; }
     });
   }
   function shelterConfirmed(m) {
     const p = shelterPending, s = m.state;
-    if (p.kind === 'collect') return s.stats.collected > p.before.collected && (p.result?.outcome === 'ok' ||
-      p.before.rooms.every(before => m.rooms.some(r => r.id === before.id && r.stored < before.stored)));
-    const claimed = p.kind === 'tutorial' ? (s.tutorial?.claimed || []) : p.kind === 'achievement' ? s.achievements :
-      p.kind === 'daily' && p.before.day === s.daily.day ? s.daily.claimed :
-        p.kind === 'season' && p.before.month === s.season.month ? s.season.claimedFree : [];
+    if(m.now<(p.before.serverTime??0))return false;
+    if (p.kind === 'assign') return s.residents.some(resident => resident.id === p.targets[0] && resident.roomId === p.targets[1]);
+    if (p.kind === 'equip') return s.residents.some(resident => resident.id === p.targets[0] && resident.outfitId === p.targets[1]);
+    if(p.kind==='explore')return shelterExplorerConfirmed(p,m);
+    if (p.kind === 'collect') {
+      const proof=p.result?.proof,proved=proof?.vaultNo===p.vaultNo&&/^[A-Za-z0-9-]{8,64}$/.test(proof?.key||'')&&
+        Number.isFinite(proof.at)&&proof.at>=(p.before.serverTime??0)&&Number.isFinite(proof.collected)&&
+        proof.collected>p.before.collected&&s.stats.collected>=proof.collected;
+      return s.stats.collected > p.before.collected && (proved ||
+        p.before.rooms.every(before => m.rooms.some(r => r.id === before.id && r.stored < before.stored)));
+    }
+    if(p.kind==='daily'||p.kind==='season')return shelterRewardConfirmed(p,m);
+    const claimed = p.kind === 'tutorial' ? (s.tutorial?.claimed || []) : p.kind === 'achievement' ? s.achievements : [];
     return p.targets.length > 0 && p.targets.every(id => claimed.includes(id));
   }
   function shelterStep() {
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')];
-    if (dialogs.length) { say('避难所弹窗需要先处理，自动操作等待'); return; }
+    if(shelterReload()){cancelShelterRead();cancelQueued();}
+    if(shelterExploreClaim&&Date.now()<shelterExploreManualUntil){say('你正在操作避难所页面，自动操作等待一分钟');return;}
+    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    const openingWork = shelterWork?.openedAt && !shelterWork.dialog && dialogs.length === 1 &&
+      shelterWorkTitle(dialogs[0]) && [...dialogs[0].querySelectorAll('label')].some(el => /^调去/.test(textOf(el)));
+    if (openingWork) shelterWork.dialog = dialogs[0];
+    if (dialogs.length && !openingWork && !(dialogs.length === 1 && dialogs[0] === shelterWork?.dialog)) {
+      if(shelterEnabled&&!stateFault('shelter'))handleNotice(dialogs,'避难所弹窗需要先处理，自动操作等待');
+      else say('避难所弹窗需要先处理，自动操作等待');
+      return;
+    }
     if (!shelterEnabled || stateFault('shelter')) {
+      if (closeShelterWork()) return;
       if (shelterEntryAt) leaveShelter(); else say('避难所未开启，可在面板开启'); return;
     }
-    if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0; shelterLeave = false; }
-    if (shelterLeave) { leaveShelter(); return; }
+    // 旧页的原生 await 可能仍未结束；先卸载其回调，不能让新批次覆盖旧捕获器。
+    if(continueShelterAction&&!continueShelterAction.current()) {
+      if(!shelterBatchReloading) {
+        shelterBatchReloading=true;cancelQueued();
+        log.add('shelter-batch-reload','避难所批次已由其他页面处理，刷新以清理旧页面回调');
+        location.reload();
+      }
+      return;
+    }
+    if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0; shelterLeave = false;shelterVisitPeriod=null;
+      shelterExploreSkipped.clear();shelterExploreNote=''; }
+    if (shelterLeave) { if (!closeShelterWork()) leaveShelter(); return; }
+    if (shelterReadOnlyWait() && shelterState.nextAt > Date.now()) { if (!closeShelterWork()) leaveShelter(); return; }
     if (!navigator.onLine) { say('避难所：网络离线，等待恢复'); return; }
-    if (plan || claimWait || farmPlan || nativePending().length) { pauseShelter('其他功能有未决操作，请先回远征核对'); return; }
+    if (plan || claimWait || farmEnabled&&farmPlan || nativePending().length) {
+      finishShelter(null,'其他玩法正在核对原操作，先返回远征，一分钟后再检查避难所',60000);return;
+    }
     if (!shelterPending && (Date.now()-shelterEntryAt > 60000 || shelterActions >= 12)) {
       finishShelter(shelterRead?.model,'本轮处理已到上限，稍后继续避难所'); return;
     }
     if (!shelterRead || Date.now()-shelterRead.at > 10000) { readShelter(); return; }
     const m = shelterRead.model;
+    shelterVisitPeriod ??= {day:m.state.daily.day,month:m.state.season.month};
     if (shelterPending) {
+      if(shelterPending.kind==='season'&&shelterPending.sentCount<shelterPending.targets.length&&
+        continueShelterAction?.id!==shelterPending.id) {
+        const cancelled=shelterPending.targets.length-shelterPending.sentCount;
+        saveShelterPending({...shelterPending,targets:shelterPending.targets.slice(0,shelterPending.sentCount)});
+        log.add('shelter-batch-recovered','恢复赛季批次：先核对已发送档位，撤销未发送预留',{sent:shelterPending.sentCount,cancelled});
+      }
       if (shelterConfirmed(m)) {
-        log.add('shelter-confirmed','避难所领取状态已确认',{kind:shelterPending.kind,targets:shelterPending.targets,resources:m.state.resources});
+        const confirmed=shelterPending;
         saveShelterPending(null);
-      } else if (Date.now()-shelterPending.at >= 30000) pauseShelter('避难所领取仍未确认，保留记录；不重复领取');
-      else { shelterRead = null; shelterReadAt = Date.now()+5000; say('等待避难所原领取结果，不重复点击'); }
+        log.add('shelter-confirmed',confirmed.kind === 'assign' ? '居民岗位变更已确认' : confirmed.kind === 'equip' ? '居民服装变更已确认' :
+          confirmed.kind==='explore'?'探险归来领取与居民释放已确认':'避难所领取状态已确认',
+          {kind:confirmed.kind,targets:confirmed.targets,resources:m.state.resources});
+      } else {
+        const wait=shelterPendingWait(shelterPending,m);
+        if(Date.now()-shelterPending.at>=30000) {
+          log.add('shelter-pending-wait',wait.note,wait.data);
+          finishShelter(null,`${wait.note}，五分钟后只读核对；保留记录，不重复提交`,300000,shelterPending.id);
+        } else { shelterRead=null;shelterReadAt=Date.now()+5000;say(`${wait.note}，稍后只读核对，不重复提交`); }
+      }
       return;
     }
+    if(shelterVisitPeriod.day!==m.state.daily.day||shelterVisitPeriod.month!==m.state.season.month) {
+      finishShelter(null,'避难所奖励周期已变化，取消未发送目标；一分钟后重新核对',60000);return;
+    }
     if (m.view.switches.frozen || m.view.nameRequired) { finishShelter(m,'避难所维护或尚未命名，等待你处理'); return; }
-    const tabs = locator.query('[role="tablist"][aria-label="避难所"]');
+    if(shelterExploreClaim&&!shelterWork&&!dialogs.length&&shelterExploreStep(m))return;
+    if (shelterWork || shelterStaffMode !== 'off' && !shelterStaffHold) {
+      if (shelterWorkStep(m,dialogs)) return;
+    }
+    if (dialogs.length) return;
     const names = ['避难所','目标','图鉴'];
-    const tab = buttonIn(tabs,names[Math.min(shelterStage,2)]);
-    if (!usable(tab)) { finishShelter(m,'未识别避难所页签，稍后再检查'); return; }
+    while (shelterStage > 0 && shelterStage < names.length && !shelterRewardTabDue(shelterStage,m)) shelterStage++;
     if (shelterStage >= names.length) { finishShelter(m); return; }
+    const tab = shelterTab(names[shelterStage]);
+    if (!usable(tab)) { finishShelter(m,'未识别避难所页签，稍后再检查'); return; }
     if (tab.getAttribute('aria-selected') !== 'true') {
-      offer(`shelter:tab:${shelterStage}`,`查看避难所${names[shelterStage]}`,() => tab.click()); return;
+      offer(`shelter:tab:${shelterStage}`,shelterStage ? `领取${names[shelterStage]}待领奖励` : '检查避难所产出',() => tab.click()); return;
     }
     if (shelterStage === 0) {
       const ready = m.rooms.filter(r => r.batch && r.stored >= r.batch);
       const reward = {};
       // 预留在途十秒的下一批；批量还可能收进目前未满、在途才满的房间。
-      const amount = r => Math.floor(Math.min(4*r.batch,r.stored+r.rate*(Date.now()-shelterRead.at+10000)/3600000)/r.batch+1e-9)*r.batch;
+      const projected=shelterFutureCollection(m,Date.now()-shelterRead.at+10000);
+      const amount = r => projected.amounts[r.id] || 0;
       for (const r of m.rooms.filter(r => r.batch)) reward[r.resource] = (reward[r.resource]||0)+amount(r);
       const all = locator.pick([...document.querySelectorAll('button')].filter(b => textOf(b)==='全部收取'));
       // 满仓资源不能拖住其他房间，批量不合适时逐房收取原生图标按钮。
@@ -2710,7 +4880,7 @@
   }
   function setEnabled(value, reason = '') {
     if (value && stateFault('expedition')) { say(stateFault('expedition')); return; }
-    if (!value) { cancelFarmRead(); cancelShelterRead(); }
+    if (!value) { cancelFarmRead(); cancelShelterRead(); cancelStockRead(); }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
     toggle.textContent = value ? '暂停远征与农场' : '开始远征与农场';
@@ -2979,17 +5149,18 @@
   function startNavigation(path, link) {
     navigation = { from: location.pathname.replace(/\/$/, ''), to: path, at: Date.now(), reloaded: false };
     sessionStorage.setItem(NAV_JOURNAL, JSON.stringify(navigation));
-    link.click();
+    if(link)link.click();else location.assign(path);
   }
   function waitForNavigation() {
     if (!navigation) return false;
     const path = location.pathname.replace(/\/$/, '');
-    if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled || navigation.to === '/shelter' && !shelterEnabled) {
+    if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled || navigation.to === '/shelter' && !shelterEnabled || navigation.to === '/stock' && !stockEnabled()) {
       clearNavigation(); return false;
     }
-    const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : '远征';
+    const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : navigation.to === '/stock' ? '股市' : '远征';
     if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
-    if (document.querySelector('[role="dialog"], [role="alertdialog"]') || plan || claimWait || farmPlan || nativePending().length) {
+    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible) ||
+      plan || claimWait || farmEnabled&&farmPlan || nativePending().length) {
       say(`等待切换${target}；先核对当前弹窗或原操作`); return true;
     }
     if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
@@ -3419,8 +5590,13 @@
     syncDialogAnimations();
     farmHint();
     shelterHint();
+    stockHint();
+    if (!inStock() && (stockEntryAt || stockController || stockRead)) {
+      cancelStockRead();stockEntryAt=0;stockLeave=false;stockActions=0;
+    }
     if (!inShelter() && (shelterEntryAt || shelterController || shelterRead)) {
       cancelShelterRead(); shelterEntryAt = 0; shelterStage = 0; shelterActions = 0; shelterLeave = false;
+      shelterWork = null; shelterStaffHold = false;
     }
     if (host.hidden === onPage()) host.hidden = !onPage();
     if (onPage()) log.receipts();
@@ -3432,10 +5608,11 @@
       if (enabled) setEnabled(false, stateFault('expedition')); else say(stateFault('expedition'));
       return;
     }
-    if (!onPage() || !enabled) {
+    if (!onPage() || !enabled || pageFrozen) {
       if (!onPage()) clearNavigation();
       if (farmMarketLoading) cancelFarmRead();
       if (shelterController) cancelShelterRead();
+      if (stockController) cancelStockRead();
       releaseLock?.(); return;
     }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
@@ -3453,11 +5630,19 @@
       say('农场刷新已发起，等待新页面接管'); return;
     }
     if (waitForNavigation()) return;
+    if (inStock()) {
+      expeditionObserved=false;
+      if(farmEntryAt || farmMarketLoading){cancelFarmRead();farmEntryAt=0;}
+      try{stockStep();}catch(error){if(!stockRetryChange(error)){
+        stockFault='股市检查异常，保留原记录并停止股市操作';stockLeave=true;cancelStockRead();log.add('stock-error',stockFault);
+      }}
+      return;
+    }
     if (inShelter()) {
       expeditionObserved = false;
       if (farmEntryAt || farmMarketLoading) { cancelFarmRead(); farmEntryAt = 0; }
       try { shelterStep(); }
-      catch { pauseShelter('避难所检查异常，已暂停并保留原记录'); }
+      catch(error) { if(!shelterRetryChange(error))pauseShelter('避难所检查异常，已暂停并保留原记录'); }
       return;
     }
     if (inFarm()) { expeditionObserved = false; farmStep(); return; }
@@ -3571,6 +5756,7 @@
     if (q.normal === 0 && !burst) {
       if (maybeVisitFarm(running)) return;
       if (maybeVisitShelter(running)) return;
+      if (maybeVisitStock(running)) return;
       // 优先复用正常领取、派遣及返回页面后的状态；无更新一小时才兜底，全天最多两次。
       const quotaCheck = quotaCheckState();
       if (!burstUsed && nowForBurst.canBurst && q.burst < q.burstMax && quotaCheck.count < 2 &&
@@ -3618,6 +5804,7 @@
     if (!preview || preview.total < 1) {
       if (maybeVisitFarm(running)) return;
       if (maybeVisitShelter(running)) return;
+      if (maybeVisitStock(running)) return;
       say('等待符合条件的英雄或可用名额'); return;
     }
     if (burst ? preview.normal !== 0 || preview.burst !== maxTeams : preview.burst !== 0 || preview.normal > q.normal) {
@@ -3638,14 +5825,15 @@
   }
 
   function acquire() {
-    if (acquiring) return;
+    if (acquiring || pageFrozen) return;
     acquiring = true;
     navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
-      if (!lock || !enabled || !onPage()) { if (enabled && onPage()) say('另一远征标签页正在运行'); return; }
-      shelterPending = loadState(localStorage,SHELTER_PENDING,null,'shelter',validShelterPending);
+      if (!lock || !enabled || !onPage() || pageFrozen) { if (enabled && onPage() && !pageFrozen) say('另一远征标签页正在运行'); return; }
+      if(shelterReload()){cancelShelterRead();cancelQueued();}
+      stockReload();
       active = true;
       try { await new Promise(resolve => { releaseLock = resolve; schedule(); }); }
-      finally { active = false; releaseLock = null; cancelShelterRead(); cancelQueued(); }
+      finally { active = false; releaseLock = null; cancelShelterRead(); cancelStockRead(); cancelQueued(); }
     }).catch(() => setEnabled(false, '无法取得远征运行锁，请刷新后重试'))
       .finally(() => { acquiring = false; });
   }
@@ -3673,14 +5861,27 @@
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
     pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot(),
     pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan),
-    shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending), diagnostic } : null);
+    shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending),
+    stockEnabled:stockEnabled(),stockDueAt:stockLedger.nextAt,pendingStock:Boolean(stockLedger.pending),stockHeld:stockLedger.hold,
+    shelterStaffMode,shelterGear,shelterOptimize,populationTarget:shelterPopulationTarget,
+    pendingStaff:Boolean(shelterWork),pendingSwap:Boolean(shelterState.swap),pendingPair:Boolean(shelterState.pair),diagnostic } : null);
   subscribeWakeup(schedule, onPage, () => enabled);
-  window.addEventListener('pagehide', () => { cancelFarmRead(); cancelShelterRead(); cancelQueued(); releaseLock?.(); });
+  document.addEventListener('freeze', () => {
+    pageFrozen = true;
+    cancelFarmRead(); cancelShelterRead(); cancelStockRead(); cancelQueued(); releaseLock?.();
+  });
+  const resumePage = () => {
+    if (pageFrozen) { stockEntryAt = 0; shelterEntryAt = 0; }
+    pageFrozen = false; schedule();
+  };
+  document.addEventListener('resume', resumePage);
+  window.addEventListener('pageshow', resumePage);
+  window.addEventListener('pagehide', () => { cancelFarmRead(); cancelShelterRead(); cancelStockRead(); cancelQueued(); releaseLock?.(); });
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
       toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
-      if (!enabled) { cancelFarmRead(); cancelShelterRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
+      if (!enabled) { cancelFarmRead(); cancelShelterRead(); cancelStockRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
     } else if ([FARM_PREF,FARM_CROP,FARM_STATE].includes(event.key)) {
       try {
         farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
@@ -3689,13 +5890,10 @@
         farmState = JSON.parse(localStorage.getItem(FARM_STATE) || 'null') || farmState;
       } catch { farmEnabled = false; }
       cancelQueued();
-    } else if ([SHELTER_PREF,SHELTER_STATE,SHELTER_PENDING].includes(event.key)) {
-      shelterEnabled = localStorage.getItem(SHELTER_PREF) === 'true';
-      shelterState = loadState(localStorage,SHELTER_STATE,shelterState,'shelter',v => objectState(v) &&
-        Number.isFinite(v.nextAt) && typeof v.note === 'string' &&
-        (v.vaultNo === undefined || Number.isSafeInteger(v.vaultNo) && v.vaultNo > 0));
-      shelterPending = loadState(localStorage,SHELTER_PENDING,null,'shelter',validShelterPending);
-      cancelShelterRead(); cancelQueued();
+    } else if ([STOCK_CONFIG,STOCK_LEDGER].includes(event.key)) {
+      stockReload();if(event.key===STOCK_CONFIG)stockFillSettings();cancelStockRead();cancelQueued();
+    } else if ([SHELTER_PREF,SHELTER_STATE,SHELTER_PENDING,SHELTER_STAFF,SHELTER_GEAR,SHELTER_OPTIMIZE,SHELTER_POPULATION,SHELTER_EXPLORE_CLAIM].includes(event.key)) {
+      if(shelterReload()){cancelShelterRead();cancelQueued();}
     } else return;
     schedule();
   });

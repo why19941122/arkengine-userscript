@@ -13,6 +13,14 @@ import { farmMarkup } from './arkengine-farm.fixture.mjs';
 import { fogMarkup } from './arkengine-fog.fixture.mjs';
 import { shelterMarkup } from './arkengine-shelter.fixture.mjs';
 import { shelterTests } from './arkengine-shelter.tests.mjs';
+import { shelterExplorationTests } from './arkengine-shelter-exploration.tests.mjs';
+import { shelterStaffTests } from './arkengine-shelter-staff.tests.mjs';
+import { shelterProductionTests } from './arkengine-shelter-production.tests.mjs';
+import { shelterPopulationTests } from './arkengine-shelter-population.tests.mjs';
+import { stockMarkup } from './arkengine-stock.fixture.mjs';
+import { stockTests } from './arkengine-stock.tests.mjs';
+import { crossFeatureMarkup } from './arkengine-cross-feature.fixture.mjs';
+import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
 const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
@@ -119,7 +127,8 @@ const loginMarkup = `<!doctype html><meta charset="utf-8"><main>
 <form aria-label="备用账号登录"><input name="login"><input type="password" name="password"></form>
 </main><script>window.loginFixture=true;</script>`;
 
-test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集成检查', { timeout: 900000 }, async t => {
+// 完整浏览器用例顺序执行；四百余项包含跨刷新和随机等待，为整轮预留四十五分钟。
+test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集成检查', { timeout: 2700000 }, async t => {
   // Node 按父测试匹配名称时会包含全部子项；显式筛选用于修改后的定向复测。
   if (process.env.ARKENGINE_TEST_PATTERN) {
     const pattern = new RegExp(process.env.ARKENGINE_TEST_PATTERN);
@@ -131,8 +140,10 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
   let startupResponse;
   let delayFarmReload = false;
   let farmReloadResponse;
+  let delayedFeaturePath=null,featureNavigationResponses=[];
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
+    if(delayedFeaturePath && url.pathname===delayedFeaturePath){featureNavigationResponses.push(res);return;}
     if (delayFarmReload && url.pathname === '/farm') {
       farmReloadResponse = res;
       return; // 刷新请求已发出，但旧文档仍存活，模拟网站响应迟到。
@@ -163,7 +174,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(req.url.includes('shelter-fixture') ? shelterMarkup : req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
+    res.end(req.url.includes('cross-feature-fixture') ? crossFeatureMarkup : req.url.includes('stock-fixture') || url.pathname === '/stock' ? stockMarkup : req.url.includes('shelter-fixture') ? shelterMarkup : req.url.includes('fog-fixture') ? fogMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
@@ -175,8 +186,18 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
   let cdp;
   try {
     const portFile = join(profile, 'DevToolsActivePort');
-    await until(() => existsSync(portFile), 'Chrome debugging port', 15000);
-    const [port, wsPath] = (await readFile(portFile, 'utf8')).trim().split(/\r?\n/);
+    let port, wsPath;
+    // Windows can expose this file before Chrome releases its handle or finishes both lines.
+    await until(async () => {
+      try {
+        [port, wsPath] = (await readFile(portFile, 'utf8')).trim().split(/\r?\n/);
+        return /^\d+$/.test(port) && Number(port)>0 && Number(port)<=65535 &&
+          /^\/devtools\/browser\/[A-Za-z0-9-]+$/.test(wsPath || '');
+      } catch (error) {
+        if (['ENOENT','EBUSY'].includes(error.code)) return false;
+        throw error;
+      }
+    }, 'Chrome debugging port readable and complete', 15000);
     const socket = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
     await new Promise((resolve, reject) => { socket.addEventListener('open', resolve, { once: true }); socket.addEventListener('error', reject, { once: true }); });
     cdp = new CDP(socket);
@@ -186,6 +207,13 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       return { targetId, sessionId };
     };
     const tab = await createTab();
+    const withFrozenOriginal = targetId => async run => {
+      await cdp.send('Target.activateTarget',{targetId});
+      try {
+        await cdp.send('Page.setWebLifecycleState',{state:'frozen'},tab.sessionId);
+        return await run();
+      } finally {await cdp.send('Page.setWebLifecycleState',{state:'active'},tab.sessionId);}
+    };
     const evaluate = expression => cdp.evaluate(tab.sessionId, expression);
     const status = () => evaluate(`document.getElementById('ark-auto-encounter')?.shadowRoot.getElementById('status').textContent`);
     const clickLog = () => evaluate('clicks');
@@ -473,14 +501,102 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         ${code};if(location.pathname==='/shelter')renderShelter();else renderExp();`);
       await evaluate(source);
     };
-    const reloadShelter = async () => {
-      const state = await evaluate('({sm,clock})');
-      await cdp.send('Page.reload', {},tab.sessionId);
+    const restoreReloadedShelter = async state => {
       await until(()=>evaluate(`typeof renderShelter==='function' && !document.getElementById('ark-auto-expedition')`),'reloaded shelter');
       await evaluate(`Object.assign(window,${JSON.stringify(state)});clock+=120000;sm.busy=false;Math.random=()=>0;renderShelter();`);
       await evaluate(source);
     };
-    await shelterTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus });
+    const reloadShelter = async () => {
+      const state = await evaluate('({sm,clock})');
+      await cdp.send('Page.reload', {},tab.sessionId);
+      await restoreReloadedShelter(state);
+    };
+    const secondShelter=async(code='')=>{
+      const state=await evaluate('({sm,clock,model,fm})'),second=await createTab();
+      await cdp.send('Page.navigate',{url:`${origin}/shelter?shelter-fixture=second`},second.sessionId);
+      const read=code=>cdp.evaluate(second.sessionId,code);
+      await until(()=>read(`typeof renderShelter==='function'`),'second shelter fixture');
+      await read(`Object.assign(window,${JSON.stringify(state)});sm.calls=[];sm.busy=false;Math.random=()=>0;${code};renderShelter();`);await read(source);
+      return {evaluate:read,pulse:async(ms=1000)=>{await read(`clock+=${ms};window.dispatchEvent(new Event('focus'));`);await delay(180);},
+        withFrozenOriginal:withFrozenOriginal(second.targetId),close:()=>cdp.send('Target.closeTarget',{targetId:second.targetId})};
+    };
+    await shelterTests({ t, setupShelter, reloadShelter, restoreReloadedShelter, evaluate, pulse, drive, until, expStatus, secondShelter,
+      withDelayedShelterNavigation:run=>withDelayedFeatureNavigation('/shelter',run) });
+    const trustedStaffKey = async () => {
+      for (const type of ['keyDown','keyUp']) await cdp.send('Input.dispatchKeyEvent',
+        {type,key:'Shift',code:'ShiftLeft',windowsVirtualKeyCode:16},tab.sessionId);
+    };
+    await shelterExplorationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
+    await shelterStaffTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
+    await shelterProductionTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive });
+    await shelterPopulationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, trustedStaffKey, secondShelter, until });
+    const setupStock=async(code='',path='/stock')=>{
+      await cdp.send('Page.navigate',{url:`${origin}${path}?stock-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?stock-fixture=${pageSerial}' && typeof renderStock==='function'`),'stock fixture');
+      await resetLogs();
+      await evaluate(`localStorage.clear();sessionStorage.clear();Math.random=()=>0;model.burst=0;addRuns(6);
+        localStorage.setItem('arkengine:auto-farm:enabled:v1','false');${code};if(location.pathname==='/stock')renderStock();else renderExp();`);
+      await evaluate(source);
+    };
+    const reloadStock=async()=>{
+      // Let the SPA route observation finish before simulating a later user reload.
+      await pulse(1000);
+      const state=await evaluate('({km,clock,model,fm})');
+      await cdp.send('Page.navigate',{url:`${origin}/stock?stock-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`typeof renderStock==='function' && !document.getElementById('ark-auto-expedition') && location.search==='?stock-fixture=${pageSerial}'`),'reloaded stock');
+      await evaluate(`Object.assign(window,${JSON.stringify(state)});km.busy=false;Math.random=()=>0;renderStock();`);
+      await evaluate(source);
+    };
+    const secondStock=async(code='')=>{
+      const state=await evaluate('({km,clock,model,fm})'),second=await createTab();
+      await cdp.send('Page.navigate',{url:`${origin}/stock?stock-fixture=second`},second.sessionId);
+      const read=code=>cdp.evaluate(second.sessionId,code);
+      await until(()=>read(`typeof renderStock==='function'`),'second stock fixture');
+      await read(`Object.assign(window,${JSON.stringify(state)});km.calls=[];km.busy=false;Math.random=()=>0;${code};renderStock();`);await read(source);
+      return {evaluate:read,pulse:async(ms=1000)=>{await read(`clock+=${ms};window.dispatchEvent(new Event('focus'));`);await delay(180);},
+        withFrozenOriginal:withFrozenOriginal(second.targetId),
+        close:()=>cdp.send('Target.closeTarget',{targetId:second.targetId})};
+    };
+    async function withDelayedFeatureNavigation(path,run){
+      delayedFeaturePath=path;featureNavigationResponses=[];
+      try{
+        // The Web Lock arrives asynchronously. Do not advance the frozen clock before an action is queued.
+        const label=path==='/stock'?'秒后检查股市':'秒后切换避难所';
+        await until(()=>evaluate(`document.getElementById('ark-auto-expedition')?.shadowRoot.getElementById('status').textContent.includes(${JSON.stringify(label)})`),'feature navigation queued');
+        await run(()=>featureNavigationResponses.length,()=>cdp.send('Page.stopLoading',{},tab.sessionId));
+      }
+      catch(error){
+        await cdp.send('Page.stopLoading',{},tab.sessionId);
+        const state=await evaluate(`({path:location.pathname,clock,enabled:localStorage.getItem('arkengine:auto-expedition:enabled:v1'),
+          status:document.getElementById('ark-auto-expedition')?.shadowRoot.getElementById('status').textContent,
+          navigation:sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')})`);
+        error.message+=` / fixture navigation ${JSON.stringify(state)}`;throw error;
+      }finally{
+        delayedFeaturePath=null;
+        for(const response of featureNavigationResponses){response.writeHead(200,{'Content-Type':'text/html; charset=utf-8'});response.end(path==='/stock'?stockMarkup:shelterMarkup);}
+        featureNavigationResponses=[];
+      }
+    }
+    const withDelayedStockNavigation=run=>withDelayedFeatureNavigation('/stock',run);
+    await stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,until,secondStock,trustedStaffKey,withDelayedStockNavigation});
+    const setupFeatures=async(code='',path='/activities/expedition')=>{
+      await cdp.send('Page.navigate',{url:`${origin}${path}?cross-feature-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?cross-feature-fixture=${pageSerial}'&&typeof renderFeature==='function'`),'cross-feature fixture');
+      await resetLogs();
+      await evaluate(`localStorage.clear();sessionStorage.clear();Math.random=()=>0;model.burst=0;addRuns(6);
+        localStorage.setItem('arkengine:auto-farm:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','true');
+        localStorage.setItem('arkengine:auto-stock:config:v1',JSON.stringify({trade:true,predict:false,tradeLimit:3000,predictionLimit:500,stake:100,reserve:100}));
+        sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;${code};renderFeature();`);
+      await evaluate(source);
+    };
+    const reloadFeatures=async()=>{
+      await pulse(1000);const state=await evaluate('({sm,km,fm,model,clock})');
+      await cdp.send('Page.navigate',{url:`${origin}/activities/expedition?cross-feature-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?cross-feature-fixture=${pageSerial}'&&typeof renderFeature==='function'&&!document.getElementById('ark-auto-expedition')`),'reloaded cross-feature fixture');
+      await evaluate(`Object.assign(window,${JSON.stringify(state)});sm.busy=false;km.busy=false;Math.random=()=>0;renderFeature();`);
+      await evaluate(source);
+    };
+    await crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate,pulse,drive,until,withDelayedStockNavigation});
     await t.test('启动恢复：正文迟到且页面一直加载时仍启动农场，保留人工暂停', async () => {
       // 此项在文档头部注入，不能像普通 setup 那样注入前清库；先卸载上一页并隔离其日志。
       await cdp.send('Page.navigate', { url:`${origin}/?test=${++pageSerial}` },tab.sessionId);
@@ -1561,11 +1677,11 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
       await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};
-        document.getElementById('ark-auto-expedition').shadowRoot.querySelector('details button').click();`);
+        [...document.getElementById('ark-auto-expedition').shadowRoot.querySelectorAll('details button')].find(b=>b.textContent==='导出两页日志（7 天）').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.8.0');
+      assert.equal(exported.version,'1.14.38');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -1621,7 +1737,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('details button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.8.0');
+      assert.equal(exported.version,'1.14.38');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
