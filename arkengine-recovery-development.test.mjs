@@ -111,6 +111,24 @@ test('工坊：当前升级缺零件时预留值班人选，材料备齐或缺�
   assert.ok(api.plan(api.model(v),{workshop:true,partsTarget:15,workshopScrapReserve:100},record).actions.some(a=>a.role==='workshop-release'));
   assert.ok(!api.plan(api.model(v),{workshop:true,partsTarget:15,workshopScrapReserve:100},{}).actions.some(a=>a.role==='workshop-release'),'不撤销人工工坊岗位');
 });
+
+test('工坊整批备料：差1零件不能把未满批库存当到账，保留工人直到整批可收',()=>{
+  const v=campaignView(),s=v.state;s.resources.parts=14;
+  s.rooms.push({...s.rooms[0],id:90,type:'workshop',floor:2,col:4,level:1,stored:1});s.residents[4].roomId=90;
+  const cfg={workshop:true,partsTarget:15,workshopScrapReserve:100},record={roles:[{id:5,room:90,role:'workshop',at:now-1}]};
+  let p=api.plan(api.model(v),cfg,record);
+  assert.ok(!p.actions.some(a=>a.role==='workshop-release'));assert.ok(p.reserved.includes(5));
+  s.rooms.at(-1).stored=3;p=api.plan(api.model(v),cfg,record);
+  assert.ok(p.actions.some(a=>a.role==='workshop-release'),'整批可收时不继续加工');
+});
+
+test('工坊整批备料：完批供料不得动用建设资金和保留线，刚够下一批时才安排',()=>{
+  const v=campaignView(),s=v.state;s.resources.parts=14;s.resources.scrap=711;
+  s.rooms.push({...s.rooms[0],id:90,type:'workshop',floor:2,col:4,level:1,stored:1});
+  const cfg={workshop:true,partsTarget:15,workshopScrapReserve:700};
+  assert.ok(!api.plan(api.model(v),cfg).actions.some(a=>a.role==='workshop'));
+  s.resources.scrap=712;assert.ok(api.plan(api.model(v),cfg).actions.some(a=>a.role==='workshop'));
+});
 test('每日目标：读取网站目标及计数，奖励不提前计入库存，损坏数据不猜测',()=>{
   const v=campaignView();v.state.daily={day:'2026-11-05',claimed:[],counters:{build:1,win:1,collect_scrap:405},
     picks:[['build',2],['win',5],['collect_scrap',600]].map(([key,target])=>({key,target,reward:{scrap:240,parts:2,points:30}}))};
@@ -134,4 +152,24 @@ test('每日收集：保留零点前所需产能，达标后允许原人选外�
   v.state.daily.counters.collect_scrap=600;p=api.plan(api.model(v),cfg);assert.doesNotMatch(p.notes.join('\n'),/保留 1 名现有产出人员/);
   v.state.daily.counters.collect_scrap=0;v.state.rooms[1].incident={kind:'raiders',hp:80,maxHp:80};
   p=api.plan(api.model(v),{...cfg,defense:true});assert.ok(p.actions.some(a=>a.role==='defense'&&a.id===4));
+});
+
+test('每日收集整批：日志场景剩195而每批135，产量够195仍必须提示实际只能收135',()=>{
+  const v=campaignView(Date.parse('2026-11-05T18:51:00+08:00'));
+  v.state.daily={day:'2026-11-05',claimed:[],counters:{collect_scrap:405},picks:['collect_scrap','craft','caravan'].map(key=>({key,target:600,reward:{scrap:240,parts:2,points:30}}))};
+  const m=api.model(v),room=m.rooms.find(r=>r.resource==='scrap');
+  Object.assign(room,{stored:79,batch:135,rate:25});
+  const p=api.plan(m,{dailyGoals:true});
+  assert.match(p.notes.join('\n'),/整批.*135/);
+  assert.match(p.notes.join('\n'),/仍差 60/);
+});
+
+test('每日收集整批：不同房间的零头不能合并，整批已足够才释放人员',()=>{
+  const v=campaignView(Date.parse('2026-11-05T23:59:00+08:00'));
+  v.state.daily={day:'2026-11-05',claimed:[],counters:{collect_scrap:405},picks:['collect_scrap','craft','caravan'].map(key=>({key,target:600,reward:{scrap:240,parts:2,points:30}}))};
+  const m=api.model(v),r=m.rooms.find(r=>r.resource==='scrap');Object.assign(r,{stored:130,batch:135,rate:0});
+  m.rooms.push({...r,id:99,stored:100});
+  let p=api.plan(m,{dailyGoals:true});assert.match(p.notes.join('\n'),/仍差 195/);
+  r.stored=270;p=api.plan(m,{dailyGoals:true});assert.doesNotMatch(p.notes.join('\n'),/仍差/);
+  assert.doesNotMatch(p.notes.join('\n'),/保留 \d+ 名现有产出人员/);
 });

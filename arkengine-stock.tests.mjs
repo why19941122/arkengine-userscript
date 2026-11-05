@@ -12,6 +12,81 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
       entries:[],pending:null,owned:{'1':{shares:10,cost:100,modelName:'模型甲',manual:false}}}));`;
   const done=`location.pathname==='/activities/expedition'`;
   const delayedPage=`const nativeStock=renderStock;window.renderStock=()=>{if(km.pageReady)nativeStock();else {game.innerHTML='<a href="/activities/expedition">远征</a><p>正在加载页面内容</p>';game.querySelector('a').onclick=e=>{e.preventDefault();navFarm('/activities/expedition');};}};`;
+  await t.test('股市慢请求修复：提交前余额17秒返回后继续买入，回执和持仓均确认',async()=>{
+    await setupStock(settings);
+    await drive(`Number(document.querySelector('[aria-label="模型甲 交易数量"]').value)>1`,'quantity filled');
+    await evaluate('km.deferBalance=true;');
+    await drive(`typeof km.resolveBalance==='function'`,'pre-submit balance waiting');
+    await pulse(17000);assert.equal(await evaluate('location.pathname'),'/stock');assert.deepEqual(await evaluate('km.calls'),[]);
+    await evaluate('km.deferBalance=false;km.resolveBalance();');await drive(done,'buy after slow balance');
+    assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`${ledger}.pending`),null);
+    assert.equal(await evaluate(`${ledger}.entries[0].result`),'success');
+    assert.equal(await evaluate(`${ledger}.owned['1'].shares===km.view.positions[0].shares`),true);
+  });
+  await t.test('股市慢请求修复：临时读取失败本轮恢复，持续失败有界退出且不下单',async()=>{
+    for(const failures of [1,10]){
+      await setupStock(settings+`km.readErrorsLeft=${failures};`);await drive(done,'bounded read recovery');
+      assert.equal(await evaluate('km.calls.length'),failures===1?1:0);
+      assert.equal(await evaluate(`${ledger}.pending`),null);
+      if(failures===10){assert.equal(await evaluate('km.reads'),2);assert.match(await evaluate(`${ledger}.note`),/读取/);}
+    }
+  });
+  await t.test('股市快慢快照：余额迟到期间行情涨价，提交前重读旧行情并按新价缩量',async()=>{
+    await setupStock(settings);
+    await drive(`Number(document.querySelector('[aria-label="模型甲 交易数量"]').value)>1`,'quantity before market changes');
+    const quantity=await evaluate(`Number(document.querySelector('[aria-label="模型甲 交易数量"]').value)`);
+    await evaluate('km.deferBalance=true;');await drive(`typeof km.resolveBalance==='function'`,'slow pre-submit balance');
+    // 余额继续保持慢接口；只有补读较快的行情，才能完成这一笔。
+    await pulse(17000);await evaluate(`km.view.stocks[0].priceCents=1320;
+      km.view.ticks.push({stockId:1,priceCents:1320,createdAt:new Date(clock).toISOString()});km.resolveBalance();`);
+    await drive(`Number(document.querySelector('[aria-label="模型甲 交易数量"]')?.value)<${quantity}`,'refresh only the older market and reduce quantity');
+    await evaluate('km.deferBalance=false;km.resolveBalance();');
+    await drive(done,'new market priced before buying');
+    assert.equal(await evaluate('km.calls.length'),1);
+    assert.ok(await evaluate(`km.calls[0].shares<${quantity}`),'不能用17秒前的低价计算数量');
+    assert.equal(await evaluate(`${ledger}.hold`),false);assert.equal(await evaluate(`${ledger}.pending`),null);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.ok(events.find(e=>e.type==='stock-submit').data.reservedDebit>=await evaluate(`${ledger}.entries[0].debit`));
+  });
+  await t.test('股市快慢快照：行情迟到时刷新旧余额，不按已经花掉的资金买入',async()=>{
+    await setupStock(settings+`km.deferRead=true;`);
+    await until(()=>evaluate(`typeof km.resolveRead==='function'`),'initial slow market');
+    await pulse(17000);await evaluate('km.tokens=500;km.deferRead=false;km.resolveRead();');
+    await drive(done,'fresh balance before first buy');
+    assert.equal(await evaluate('km.calls.length'),1);assert.ok(await evaluate('km.tokens>=100'));
+    assert.ok(await evaluate(`${ledger}.entries[0].debit<=400`));assert.equal(await evaluate(`${ledger}.pending`),null);
+  });
+  await t.test('股市快慢快照：补读旧行情时暂停，迟到资料不能恢复买入',async()=>{
+    await setupStock(settings+`km.deferBalance=true;`);
+    await until(()=>evaluate(`typeof km.resolveBalance==='function'`),'balance delayed after market');
+    await pulse(17000);await evaluate('km.deferRead=true;km.deferBalance=false;km.resolveBalance();');
+    await until(()=>evaluate(`typeof km.resolveRead==='function'`),'supplemental market held');
+    await evaluate(`${panel}.getElementById('stock-pause').click();km.deferRead=false;km.resolveRead();`);
+    await drive(done,'pause honors delayed supplemental read');assert.deepEqual(await evaluate('km.calls'),[]);
+  });
+  await t.test('股市慢请求修复：读取超时仅重读，余额变化后重新计量，暂停时不继续买入',async()=>{
+    for(const pause of [false,true]){
+      await setupStock(settings+`km.deferRead=true;`);await until(()=>evaluate(`typeof km.resolveRead==='function'`),'initial read held');
+      await pulse(31000);await pulse(1000);assert.equal(await evaluate('location.pathname'),'/stock');
+      assert.deepEqual(await evaluate('km.calls'),[]);
+      await evaluate(`km.deferRead=false;km.tokens=500;${pause?`${panel}.getElementById('stock-pause').click();`:''}km.resolveRead();`);
+      await drive(done,'recover read or honor pause');
+      assert.equal(await evaluate('km.calls.length'),pause?0:1);
+      if(!pause)assert.ok(await evaluate('km.tokens>=100'),'重读后仍保留余额');
+    }
+  });
+  await t.test('股市慢请求修复：原买入回执丢失后只读失败，不补发新买单或重复扣款',async()=>{
+    await setupStock(settings+`km.mode='lost';`);await drive('km.calls.length===1','executed buy lost response');
+    const key=await evaluate('km.calls[0].idempotencyKey'),tokens=await evaluate('km.tokens');
+    await evaluate('km.readErrorsLeft=1;');await drive(done,'reconcile after transient read failure');
+    assert.ok(await evaluate(`km.calls.every(c=>c.idempotencyKey===${JSON.stringify(key)})`));
+    assert.equal(await evaluate('km.tokens'),tokens);assert.equal(await evaluate(`${ledger}.pending?.key`),key);
+    await pulse(121000); // 原请求第二次核对按既有两分钟退避，不因读取恢复绕过。
+    await evaluate(`km.mode='success';${panel}.getElementById('stock-check').click();`);
+    await drive(`location.pathname==='/stock'`,'original request revisit');await drive(done,'confirm original only');
+    assert.equal(await evaluate(`${ledger}.pending`),null);assert.equal(await evaluate('km.tokens'),tokens);
+    assert.ok(await evaluate(`km.calls.every(c=>c.idempotencyKey===${JSON.stringify(key)})`));
+  });
   await t.test('股市加载修复：行情先返回时等待原生页面，控件出现后只买一次',async()=>{
     await setupStock(settings+delayedPage);await until(()=>evaluate('km.reads>0'),'market read before page');
     await pulse(5000);assert.equal(await evaluate('location.pathname'),'/stock');assert.deepEqual(await evaluate('km.calls'),[]);

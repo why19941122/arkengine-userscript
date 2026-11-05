@@ -152,7 +152,7 @@ window.openConstruction=(kind,target)=>{
    }
  }else if(kind==='upgrade'){
    const base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500}[r.type],parts=r.level===1?0:15*r.width;
-   actionButton(d,'升级 '+(r.level+1)+' 级 · '+(Math.ceil(base*r.width*(r.level===1?2.5:6))+(sm.wrongConstructionPrice||0))+' 废料'+(parts?' '+parts+' 零件':'')+' · 1小时0分',{type:'upgrade',roomId:r.id});
+   actionButton(d,'升到 '+(r.level+1)+' 级 · '+(Math.ceil(base*r.width*(r.level===1?2.5:6))+(sm.wrongConstructionPrice||0))+' 废料'+(parts?' '+parts+' 零件':'')+' · 1小时0分',{type:'upgrade',roomId:r.id});
  }else{
    const cost=Math.ceil(120*(s.depth+1)**1.4),p=document.createElement('p');p.textContent='花 '+cost+' 废料，把电梯井延伸一层。';d.append(p);
    const cancel=d.querySelector('button');cancel.removeAttribute('aria-label');cancel.textContent='取消';

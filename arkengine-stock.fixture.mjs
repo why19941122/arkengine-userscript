@@ -10,11 +10,19 @@ const priorStockFetch=window.fetch;
 window.fetch=async(url,options)=>{
  if(url instanceof Request){const request=url;options={method:request.method,...options,body:options?.body??await request.text()};url=new URL(request.url).pathname;}
  else if(url instanceof URL)url=url.pathname;
- if(url==='/api/me/balance')return new Response(JSON.stringify({tokens:km.tokens,diamonds:10}));
+ if(url==='/api/me/balance'){
+  if(km.deferBalance)return new Promise((resolve,reject)=>{
+   km.resolveBalance=()=>resolve(new Response(JSON.stringify({tokens:km.tokens,diamonds:10})));
+   options?.signal?.addEventListener('abort',()=>reject(new DOMException('Aborted','AbortError')),{once:true});
+  });
+  return new Response(JSON.stringify({tokens:km.tokens,diamonds:10}));
+ }
  if(url!=='/api/stock')return priorStockFetch(url,options);
  if(options?.method!=='POST'){
   km.reads++;
-  if(km.deferRead)return new Promise(resolve=>{km.resolveRead=()=>resolve(new Response(JSON.stringify(km.view)));});
+  if(km.deferRead)return new Promise((resolve,reject)=>{km.resolveRead=()=>resolve(new Response(JSON.stringify(km.view)));
+   options?.signal?.addEventListener('abort',()=>reject(new DOMException('Aborted','AbortError')),{once:true});});
+  if(km.readErrorsLeft>0){km.readErrorsLeft--;throw new TypeError('fixture temporary network');}
   if(km.readError)throw new TypeError('fixture network');
   return new Response(JSON.stringify({...km.view,...(km.hideBets?{myBets:[]}:{}),
     ...(km.hidePositions?{positions:[]}:km.zeroCosts?{positions:km.view.positions.map(p=>({...p,costBasisTokens:0}))}:{})}),{status:km.httpStatus||200});
