@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {campaignView} from './arkengine-shelter-campaign.fixture.mjs';
+import {campaignView,levelGateView} from './arkengine-shelter-campaign.fixture.mjs';
 
 export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey}){
   const key='arkengine:auto-shelter:campaign:v1',state=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`,
@@ -16,6 +16,208 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   const reloadCampaign=async()=>{
     await pulse(1000);await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();
   };
+  const neighbors=Array.from({length:8},(_,i)=>({userId:i+1,vaultNo:100+i,shelterName:'邻居避难所'+i,self:false,helpedToday:false,helpBlocked:null,helpScrap:13}));
+  const dailyScene=`s.daily.picks=[['build',2],['win',5],['collect_scrap',600]].map(([key,target])=>({key,target,reward:{scrap:240,parts:2,points:30}}));
+    s.daily.counters={build:1,win:1,collect_scrap:405};`;
+  await t.test('每日目标浏览器：达标先领奖再养成，跨刷新不重复领取',async()=>{
+    await setupShelter(scene({dailyGoals:true,training:true,trainTarget:10},`${dailyScene}s.resources.scrap=100;
+      s.daily.counters={build:2,win:5,collect_scrap:600};sm.dailyIncomplete=false;
+      s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'agi',floor:2,col:4});`));
+    await settle('daily rewards before training');
+    assert.deepEqual(await evaluate('sm.calls.slice(0,3).map(a=>a.type)'),['claim_objective','claim_objective','claim_objective']);
+    assert.equal(await evaluate('sm.view.state.daily.claimed.length'),3);
+    await reloadCampaign();await settle('daily already claimed');assert.equal(await evaluate(`sm.calls.filter(a=>a.type==='claim_objective').length`),3);
+  });
+  await t.test('每日目标浏览器：差一次建设优先有效升级，零预算不靠未到账奖励开工',async()=>{
+    for(const limit of [0,10000]){
+      await setupShelter(scene({dailyGoals:true},`${dailyScene}${construction}
+        const cfg=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));cfg.scrapLimit=${limit};
+        localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(cfg));
+        s.rooms.find(r=>r.id===4).level=2;s.residents[4].roomId=4;s.residents[5].roomId=5;s.resources.parts=15;`));
+      await settle('daily useful construction '+limit);
+      const count=await evaluate(`sm.calls.filter(a=>a.type==='upgrade').length`);assert.equal(count,limit===0?0:1);
+      assert.ok(!await evaluate(`sm.calls.some(a=>a.type==='dig'||a.type==='claim_objective')`));
+    }
+  });
+  await t.test('每日互助浏览器：跳过受助上限，按成功回执领五次，刷新不重复且没有点赞',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};sm.neighbors[0].helpBlocked='对方今天受助已达上限';sm.neighbors[1].reason='target_limit';`));
+    await drive(`(${state}?.social?.entries.filter(e=>e.rewarded).length||0)===5`,'five rewarded neighbors',180);await settle('social done');
+    assert.equal(await evaluate('sm.calls.filter(a=>a.type===\'help\').length'),6);
+    assert.ok(!await evaluate('sm.calls.some(a=>a.target===1)'));assert.equal(await evaluate('sm.view.state.resources.scrap'),165);
+    await reloadCampaign();await settle('social reload no repeats');assert.equal(await evaluate('sm.calls.length'),6);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.equal(events.filter(e=>e.type==='shelter-help-result'&&e.data.rewarded).length,5);
+    assert.doesNotMatch(JSON.stringify(events),/fixture-fingerprint|fixture-help-key/);
+  });
+  await t.test('每日互助浏览器：自己奖励用尽即停，次日重新核对',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};sm.neighbors[0].reason='self_limit';`));
+    await settle('self quota stops');assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(`${state}.social.stopped`),true);
+    await evaluate(`sm.view.state.daily.day='2026-10-11';sm.neighbors[0].reason=null;sm.neighbors[0].helpedToday=false;`);
+    await reloadCampaign();await drive(`(${state}?.social?.entries.filter(e=>e.day==='2026-10-11'&&e.rewarded).length||0)===5`,'next day social resets',180);
+  });
+  await t.test('每日互助浏览器：未知结果跨刷新保留且不补发，错误目标发送前拦截',async()=>{
+    for(const extra of ['sm.helpUnknown=true;','sm.helpWrongTarget=999;']){
+      await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};${extra}`));
+      await drive(`Boolean(${state}?.social?.pending)`,'social pending saved');await settle('unknown social yields');
+      const before=await evaluate(`${state}.social.pending`),count=await evaluate('sm.calls.length');
+      assert.equal(count,extra.includes('Unknown')?1:0);
+      await reloadCampaign();await settle('unknown help not replayed');assert.equal(await evaluate('sm.calls.length'),count);
+      assert.equal(await evaluate(`${state}.social.pending.id`),before.id);
+    }
+  });
+  await t.test('每日互助浏览器：手动弹窗及关闭开关不接管，满仓不消费奖励',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};`));
+    await drive(`!!document.querySelector('[data-social-dialog]')`,'neighbor before disable');
+    await evaluate(`const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.help=false;localStorage.setItem('${key}',JSON.stringify(cfg));`);
+    await settle('help disabled before post');assert.deepEqual(await evaluate('sm.calls'),[]);
+    await setupShelter(scene({help:true},`s.resources.scrap=6360;sm.neighbors=${JSON.stringify(neighbors)};`));
+    await settle('full storage preserves social reward');assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('每日互助浏览器：原对象已帮助只读解除未知，不假报奖励也不重发原对象',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};sm.helpUnknown=true;`));
+    await drive(`Boolean(${state}?.social?.pending?.key)`,'unknown original help');await settle('original social waits');
+    await evaluate('sm.neighbors[0].helpedToday=true;sm.helpUnknown=false;');
+    await reloadCampaign();await drive(`(${state}?.social?.entries.filter(e=>e.rewarded).length||0)===5`,'confirmed later neighbors',180);
+    assert.equal(await evaluate('sm.calls.filter(a=>a.target===1).length'),1);
+    assert.equal(await evaluate(`${state}.social.entries.find(e=>e.target===1).scrap`),0);
+    assert.match(await evaluate(`${state}.social.entries.find(e=>e.target===1).reason`),/原奖励未知/);
+  });
+  await t.test('每日互助浏览器：回执记账失败后刷新不重发，手动接手原窗口即停止自动点击',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};
+      const original=Storage.prototype.setItem;Storage.prototype.setItem=function(k,v){if(k==='arkengine:auto-shelter:schedule:v1'&&JSON.parse(v)?.social?.entries?.some(e=>e.rewarded))throw Error('fixture ledger failure');return original.call(this,k,v);};`));
+    await drive(`localStorage.getItem('arkengine:auto-shelter:enabled:v1')==='false'`,'social receipt storage failure');
+    assert.equal(await evaluate('sm.calls.length'),1);assert.ok(await evaluate(`${state}.social.pending`));
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};`));
+    await drive(`!!document.querySelector('[data-social-dialog]')`,'social manual takeover');
+    await evaluate(`document.querySelector('[data-social-dialog] button').focus();`);await trustedStaffKey();
+    await pulse(10000);assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.ok(await evaluate(`!!document.querySelector('[data-social-dialog]')`));
+  });
+  await t.test('每日互助浏览器：原生指纹准备迟到，暂停后不得发送；次日不猜测昨日未知奖励',async()=>{
+    await setupShelter(scene({help:true},`s.resources.scrap=100;sm.neighbors=${JSON.stringify(neighbors)};sm.delayHelpSend=true;`));
+    await drive(`typeof sm.releaseHelpSend==='function'`,'native help preparation delayed');
+    await evaluate(`const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.help=false;localStorage.setItem('${key}',JSON.stringify(cfg));`);
+    await pulse(16000);await evaluate('sm.releaseHelpSend();');await pulse(1000);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.ok(await evaluate(`${state}.social.pending`));
+    await evaluate(`sm.view.state.daily.day='2026-10-11';sm.neighbors[0].helpedToday=true;{const updated=JSON.parse(localStorage.getItem('${key}'));updated.help=true;localStorage.setItem('${key}',JSON.stringify(updated));}`);
+    await reloadCampaign();await settle('yesterday unknown remains');assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.ok(await evaluate(`${state}.social.pending`));
+  });
+  await t.test('行程恢复浏览器：成功日志恢复丢失账本，刷新后只召回原探险一次',async()=>{
+    await setupShelter(scene({explore:true}));await settle('original trip confirmed');
+    const original=await evaluate(`${state}.campaign.trips[0]`);
+    await evaluate(`const journal=${state};journal.campaign.trips=[];localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(journal));`);
+    await pulse(6*3600000+1000);await reloadCampaign();await settle('lost trip recovered and recalled');
+    assert.deepEqual(await evaluate('sm.calls.map(a=>a.type)'),['explore_start','explore_recall'],JSON.stringify(await diagnose()));
+    assert.equal(await evaluate(`${state}.campaign.trips[0].id`),original.id);assert.equal(await evaluate(`${state}.campaign.trips[0].hours`),6);
+    await reloadCampaign();await settle('confirmed recall not replayed');assert.equal(await evaluate('sm.calls.length'),2);
+  });
+  await t.test('行程恢复浏览器：其他岗位确认的快照缺少探险，不能清除原行程',async()=>{
+    await setupShelter(scene({explore:true}));await settle('trip before transient snapshot');const original=await evaluate(`${state}.campaign.trips[0]`);
+    await evaluate(`sm.savedExplorers=structuredClone(sm.view.state.explorers);sm.view.state.explorers=[];
+      const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.explore=false;cfg.training=true;cfg.trainTarget=10;localStorage.setItem('${key}',JSON.stringify(cfg));
+      sm.view.state.rooms.push({...sm.view.state.rooms[0],id:90,type:'training',trainStat:'agi',floor:2,col:4,level:1});
+      ${panel}.getElementById('shelter-check').click();`);
+    await drive(`sm.calls.some(a=>a.type==='assign')`,'training despite incomplete explorer list');await settle('training confirmation keeps trip');
+    assert.equal(await evaluate(`${state}.campaign.trips[0].id`),original.id);
+  });
+  const raidScene=scene({defense:true},`s.rooms.push({id:90,type:'door',floor:1,col:0,width:1,level:1,builtAt:0,upgradeAt:null,stored:0,unpowered:false,incident:{kind:'raiders',hp:80,maxHp:80}});`);
+  await t.test('防守浏览器：零库存超员集结，短间隔自动追击，不需手动检查',async()=>{
+    await setupShelter(raidScene+`s.residents=s.residents.filter(p=>p.id>=4);s.resources.power=0;s.resources.food=0;s.resources.water=0;`);
+    await settle('zero stock defenders gathered');
+    assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===90).length`),3);
+    const remaining=await evaluate(`${state}.nextAt-clock`);assert.ok(remaining>0&&remaining<=7000);
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===90).incident=null;sm.view.state.rooms[0].incident={kind:'raiders',hp:60,maxHp:80};`);
+    await pulse(remaining+1000);await drive(`sm.view.state.residents.every(p=>p.roomId===1)`,'automatic incident pursuit');
+    assert.ok(await evaluate(`sm.calls.filter(a=>a.type==='assign'&&a.roomId===1).length===3`));
+    await evaluate(`sm.view.state.rooms[0].incident=null;sm.view.state.rooms.find(r=>r.id===6).incident={kind:'raiders',hp:20,maxHp:80};`);
+    await drive(`sm.view.state.residents.every(p=>p.roomId===6)`,'pursuit into storage despite ordinary zero jobs');
+  });
+  await t.test('防守浏览器：关闭防守取消尚未发送的增援，保持原岗位',async()=>{
+    await setupShelter(raidScene);await drive(`!!document.querySelector('[data-staff-dialog]')`,'defender dialog before pause');
+    await evaluate(`const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.defense=false;localStorage.setItem('${key}',JSON.stringify(cfg));`);
+    await settle('defense disabled');assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('防守浏览器：增援、入室追击、刷新后战后复岗保留最初岗位',async()=>{
+    await setupShelter(raidScene);await settle('defenders dispatched');
+    const original=await evaluate(`${state}.campaign.defense`);assert.ok(original.length>0);
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===90).incident=null;sm.view.state.rooms[0].incident={kind:'raiders',hp:60,maxHp:80};
+      ${panel}.getElementById('shelter-check').click();`);await settle('chase moved raiders');
+    const chase=await evaluate(`${state}.campaign.defense`);assert.ok(chase.some(r=>r.room===1),JSON.stringify(await diagnose()));
+    for(const r of original)assert.equal(chase.find(x=>x.id===r.id)?.from,r.from);
+    await reloadCampaign();await evaluate(`sm.view.state.rooms[0].incident=null;${panel}.getElementById('shelter-check').click();`);
+    await settle('return to original jobs');
+    for(const r of original)assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${r.id}).roomId`),r.from);
+    assert.equal(await evaluate(`${state}.campaign.defense.length`),0);
+  });
+  await t.test('防守浏览器：人工调走临时防守者后不再追击或自动复岗',async()=>{
+    await setupShelter(raidScene);
+    await drive(`(${state}?.campaign?.defense?.length||0)>0&&!${pending}`,'first defender confirmed before owner takeover');
+    const entry=await evaluate(`${state}.campaign.defense[0]`);
+    await evaluate(`(async()=>{await shelterAct({type:'assign',residentId:${entry.id},roomId:5});})()`);
+    assert.ok(!(await evaluate(`${state}.campaign.defense`)).some(r=>r.id===entry.id));
+    await settle('remaining defenders dispatched');
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===90).incident=null;${panel}.getElementById('shelter-check').click();`);await settle('other defenders restored');
+    assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${entry.id}).roomId`),5);
+  });
+  const workshopScene=scene({},`${construction}localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+    s.rooms.find(r=>r.id===4).level=2;s.residents[4].roomId=4;s.residents[5].roomId=5;s.resources.parts=0;`);
+  await t.test('防守浏览器：建造窗口尚未提交时出现掠夺者，关闭窗口优先增援',async()=>{
+    await setupShelter(workshopScene+`const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.defense=true;localStorage.setItem('${key}',JSON.stringify(cfg));
+      s.rooms.push({id:90,type:'door',floor:1,col:0,width:1,level:1,builtAt:0,upgradeAt:null,stored:0,unpowered:false,incident:null});`);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'construction dialog before raid');
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===90).incident={kind:'raiders',hp:80,maxHp:80};`);await pulse(11000);
+    await drive(`sm.calls.some(a=>a.type==='assign'&&a.roomId===90)`,'defense replaces unsubmitted construction');
+    assert.ok(!await evaluate(`sm.calls.some(a=>['build','upgrade','dig'].includes(a.type))`));
+    assert.equal(await evaluate(`!!document.querySelector('[data-construction-dialog]')`),false);
+  });
+  await t.test('工坊闭环浏览器：现有空工坊按需值班，刷新保留，材料备齐后释放自动岗位',async()=>{
+    await setupShelter(workshopScene+`s.rooms.push({...s.rooms[0],id:90,type:'workshop',floor:2,col:4,level:1});`);
+    await settle('workshop staffed');const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop')`);
+    assert.equal(workers.length,1,JSON.stringify(await diagnose()));assert.equal(workers[0].room,90);
+    await reloadCampaign();await settle('workshop role survives reload');
+    assert.equal(await evaluate(`sm.calls.filter(a=>a.type==='assign'&&a.roomId===90).length`),1);
+    await evaluate(`sm.view.state.resources.parts=15;${panel}.getElementById('shelter-check').click();`);
+    await settle('materials ready release workshop');
+    assert.ok(await evaluate(`sm.calls.some(a=>a.type==='assign'&&a.residentId===${workers[0].id}&&a.roomId===null)`));
+    assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').length`),0);
+  });
+  await t.test('工坊闭环浏览器：无工坊先建造，完工后自动到岗，供料不足停工且保留人工岗位',async()=>{
+    await setupShelter(workshopScene);await settle('workshop construction');
+    assert.ok(await evaluate(`sm.calls.some(a=>a.type==='build'&&a.room==='workshop')`),JSON.stringify(await diagnose()));
+    const room=await evaluate(`sm.view.state.rooms.find(r=>r.type==='workshop').id`);
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===${room}).builtAt=clock-1;${panel}.getElementById('shelter-check').click();`);
+    await settle('new workshop staffed');const worker=await evaluate(`${state}.campaign.roles.find(r=>r.role==='workshop')`);
+    assert.ok(worker,JSON.stringify(await diagnose()));
+    await evaluate(`sm.view.state.resources.scrap=0;${panel}.getElementById('shelter-check').click();`);await settle('insufficient feed releases workshop');
+    assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').length`),0);
+    await evaluate(`sm.view.state.residents.find(p=>p.id===${worker.id}).roomId=${room};${panel}.getElementById('shelter-check').click();`);
+    const count=await evaluate('sm.calls.length');await settle('manual worker remains');
+    assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${worker.id}).roomId`),room);
+    assert.equal(await evaluate('sm.calls.length'),count);
+  });
+  await t.test('工坊闭环浏览器：零件保留量计入备料，零建设额度不自动加工',async()=>{
+    for(const limit of [0,100]){
+      await setupShelter(workshopScene+`s.resources.parts=15;
+        s.rooms.push({...s.rooms[0],id:90,type:'workshop',floor:2,col:4,level:1});
+        const cfg=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));cfg.partsReserve=10;cfg.partsLimit=${limit};
+        localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(cfg));`);
+      await settle('parts reserve with budget '+limit);
+      assert.equal(await evaluate(`sm.calls.filter(a=>a.type==='assign'&&a.roomId===90).length`),limit===0?0:1,JSON.stringify(await diagnose()));
+    }
+  });
+  await t.test('等级规划浏览器：工坊锁级时先升级有产出的房间，原预算仍限制开工',async()=>{
+    for(const limit of [100,10000]){
+      await setupShelter(`sm.view=${JSON.stringify(levelGateView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
+        sm.view.state.residents[14].roomId=4;sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;
+        localStorage.setItem('${key}',JSON.stringify(${JSON.stringify(defaults)}));
+        ${construction}const cfg=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));cfg.scrapLimit=${limit};localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(cfg));`);
+      await settle('level gate construction budget '+limit);
+      const calls=await evaluate(`sm.calls.filter(a=>a.type==='upgrade'||a.type==='build'||a.type==='dig')`);
+      if(limit===100)assert.equal(calls.length,0);else {assert.equal(calls.length,1);assert.equal(calls[0].type,'upgrade');}
+    }
+  });
   const sodaReturn=`sm.view.drops.perUserDaily=1;s.residents[4].away={kind:'explore'};
     s.explorers=[{id:101,residentId:5,tier:0,abyss:false,startedAt:clock-9*3600000,recalledAt:clock-3*3600000,returnAt:clock-1,
       stimpaks:0,loot:{scrap:0,parts:0,stimpak:0,items:[]}}];

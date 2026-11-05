@@ -11,3 +11,14 @@ export function campaignView(time=2_000_000_000){
       rooms:[room(1,'power',2),room(2,'diner',3),room(3,'water',4),room(4,'scrap',5),{...room(5,'quarters',2,2),width:2},room(6,'storage',6),
         ...Array.from({length:7},(_,i)=>room(10+i,'elevator',1,i+1,1))]}};
 }
+export function levelGateView(time=2_000_000_000){
+  const v=campaignView(time),s=v.state,base=s.rooms[0];
+  const room=(id,type,floor,col,width,level=1)=>({...base,id,type,floor,col,width,level});
+  s.depth=4;s.rooms=[room(1,'power',1,2,2),room(2,'diner',1,4,2),room(3,'water',1,6,2),
+    room(4,'scrap',2,4,3,2),room(5,'quarters',2,2,2),room(6,'quarters',3,2,3),room(7,'medbay',2,7,1),
+    {...room(8,'training',3,5,1,2),trainStat:'agi'},...Array.from({length:4},(_,i)=>room(20+i,'elevator',i+1,1,1))];
+  const p=s.residents[4];s.residents=Array.from({length:15},(_,i)=>({...structuredClone(p),id:i+1,name:'居民'+(i+1),
+    roomId:[1,1,2,2,2,3,3,3,4,4,8,8,5,5,null][i],stats:{...p.stats}}));
+  s.resources={scrap:722,parts:19,power:500,food:500,water:500,stimpak:7};
+  v.progress={level:4,score:62,next:66};return v;
+}

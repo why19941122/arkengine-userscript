@@ -11,6 +11,20 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify({version:1,userId:77,nextAt:0,note:'fixture',hold:false,
       entries:[],pending:null,owned:{'1':{shares:10,cost:100,modelName:'模型甲',manual:false}}}));`;
   const done=`location.pathname==='/activities/expedition'`;
+  const delayedPage=`const nativeStock=renderStock;window.renderStock=()=>{if(km.pageReady)nativeStock();else {game.innerHTML='<a href="/activities/expedition">远征</a><p>正在加载页面内容</p>';game.querySelector('a').onclick=e=>{e.preventDefault();navFarm('/activities/expedition');};}};`;
+  await t.test('股市加载修复：行情先返回时等待原生页面，控件出现后只买一次',async()=>{
+    await setupStock(settings+delayedPage);await until(()=>evaluate('km.reads>0'),'market read before page');
+    await pulse(5000);assert.equal(await evaluate('location.pathname'),'/stock');assert.deepEqual(await evaluate('km.calls'),[]);
+    await evaluate('km.pageReady=true;renderStock();');await drive(done,'late native page buys');
+    assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`${ledger}.pending`),null);
+  });
+  await t.test('股市加载修复：持续未加载有界退出，诊断保留候选及控件数量',async()=>{
+    await setupStock(settings+delayedPage);await until(()=>evaluate('km.reads>0'),'market available without UI');
+    await pulse(1000);await pulse(31000);await drive(done,'UI deadline yields');assert.deepEqual(await evaluate('km.calls'),[]);
+    assert.match(await evaluate(`${ledger}.note`),/页面.*加载/);
+    const check=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='stock-check').at(-1)`);
+    assert.equal(check.data.ui.model,'模型甲');assert.equal(check.data.ui.matches,0);assert.equal(check.data.ui.tradeInputs,0);
+  });
   await t.test('运行修复浏览器：零成交量不屏蔽有效上涨候选，原单确认后不重复买入',async()=>{
     await setupStock(settings+`km.view.stocks[0].volume24h=0;`);
     await drive(done,'zero volume stock evaluated');assert.equal(await evaluate('km.calls.length'),1);

@@ -15,6 +15,19 @@ window.shelterData=()=>({...structuredClone(sm.view),serverTime:sm.snapshotAt??c
 window.fetch=async (url,options)=>{
  if(url instanceof Request){const request=url;options={method:request.method,...options,body:options?.body??await request.text()};url=new URL(request.url).pathname;}
  else if(url instanceof URL)url=url.pathname;
+ if(String(url).startsWith('/api/shelter/social/leaderboard'))return new Response(JSON.stringify({rows:sm.neighbors||[],me:{userId:777,vaultNo:sm.view.vaultNo}}));
+ if(String(url).startsWith('/api/shelter/social/visit')){
+   const id=Number(new URL(url,'http://fixture').searchParams.get('userId')),v=(sm.neighbors||[]).find(n=>n.userId===id);
+   return new Response(JSON.stringify(v||{}));
+ }
+ if(url==='/api/shelter/social/help'&&options?.method==='POST'){
+   const body=JSON.parse(options.body);sm.calls.push({type:'help',target:body.targetId});
+   if(sm.helpUnknown)return new Promise(()=>{});
+   const v=sm.neighbors.find(n=>n.userId===body.targetId);v.helpedToday=true;
+   const reason=v.reason||null,rewarded=!reason;
+   if(rewarded)sm.view.state.resources.scrap+=v.helpScrap;
+   return new Response(JSON.stringify({rewarded,scrap:rewarded?v.helpScrap:0,targetScrap:25,reason,text:'检修了电站'}));
+ }
  if(url==='/api/shelter'){
    sm.reads++; if(sm.deferRead)return new Promise(resolve=>{sm.resolveRead=()=>resolve(new Response(JSON.stringify(shelterData())));});
    if(sm.readError)throw new TypeError('fixture network');
@@ -64,7 +77,7 @@ window.fetch=async (url,options)=>{
    } else if(a.type==='assign'){
      const p=s.residents.find(p=>p.id===a.residentId),r=s.rooms.find(r=>r.id===a.roomId);
      if(!p||a.roomId!==null&&!r||p.away||p.deadAt!==null||p.adultAt>clock)throw Error('错误调岗');
-     if(r&&s.residents.filter(p=>p.deadAt===null&&p.adultAt<=clock&&p.roomId===r.id).length>=r.width*2)throw Error('房间满员');
+     if(r&&!r.incident&&s.residents.filter(p=>p.deadAt===null&&p.adultAt<=clock&&p.roomId===r.id).length>=r.width*2)throw Error('房间满员');
      p.roomId=a.roomId;
      sm.snapshots.push(s.residents.map(p=>({id:p.id,room:p.roomId})));
      // 仅模拟网站明确确认感情的回执，不模拟或假定遗传公式。
@@ -163,7 +176,7 @@ window.openResident=id=>{
  outfit.onchange=async()=>{outfit.disabled=true;await shelterAct({type:'equip',residentId:p.id,itemId:Number(outfit.value),slot:'outfit'});outfit.disabled=false;};
  const select=d.querySelectorAll('select')[2];
  if(p.roomId!==null){const rest=document.createElement('option');rest.value='rest';rest.textContent='去休息';select.append(rest);}
- for(const r of sm.view.state.rooms.filter(r=>r.id!==p.roomId&&r.type!=='elevator'&&r.type!=='storage'&&r.builtAt<=clock)){
+ for(const r of sm.view.state.rooms.filter(r=>r.id!==p.roomId&&r.type!=='elevator'&&(r.type!=='storage'||r.incident)&&(r.builtAt<=clock||r.incident))){
    const o=document.createElement('option');o.value=r.id;o.textContent=r.type;select.append(o);
  }select.value='';
  select.onchange=async()=>{select.disabled=true;await shelterAct({type:'assign',residentId:p.id,roomId:select.value==='rest'?null:Number(select.value)});select.disabled=false;};
@@ -177,7 +190,7 @@ window.renderShelter=()=>{
  game.innerHTML='<h1>方舟避难所</h1><a href="/activities/expedition">远征</a><div role="tablist" aria-label="避难所"></div><div id="shelter-content"></div>';
  game.querySelector('a').onclick=e=>{e.preventDefault();navFarm('/activities/expedition');};
  const tabs=game.querySelector('[role="tablist"]'),content=game.querySelector('#shelter-content');
- for(const label of ['避难所','目标','图鉴','居民','废土']){
+ for(const label of ['避难所','目标','图鉴','居民','废土',...(sm.neighbors?['排行']:[])]){
    const b=document.createElement('button');b.setAttribute('role','tab');b.setAttribute('aria-selected',String(sm.tab===label));b.textContent=label;
    const count=label==='目标'?(!sm.dailyIncomplete?3-s.daily.claimed.length:0)+Math.max(0,Math.min(30,Math.floor(s.season.points/150))-s.season.claimedFree.length)+(sm.paidBadge||0):label==='图鉴'&&!sm.achievementIncomplete&&!s.achievements.includes('birth-1')?1:0;
    if(count){const badge=document.createElement('span');badge.textContent=count;b.append(badge);}
@@ -256,6 +269,19 @@ window.renderShelter=()=>{
    const free=button(content,'领取免费档（'+tiers.length+'）',{type:'unused'},!tiers.length);
    free.onclick=async()=>{for(const tier of tiers)if(!await shelterAct({type:'claim_season',tier,premium:false}))break;};
    button(content,'解锁通行证',{type:'buy_season_premium'});button(content,'领取通行证档（1）',{type:'claim_season',tier:1,premium:true});
+ } else if(sm.tab==='排行'){
+   const root=document.createElement('section');root.innerHTML='<h2>排行榜</h2><div role="group" aria-label="排行方式"><button aria-pressed="true">等级</button></div><ol></ol>';
+   for(const v of sm.neighbors||[]){
+     const li=document.createElement('li'),b=document.createElement('button');b.textContent=v.shelterName+' 第 '+v.vaultNo+' 号 · 邻居';
+     b.onclick=()=>{const d=document.createElement('div');d.setAttribute('role','dialog');d.dataset.socialDialog='true';
+       const h=document.createElement('h2');h.textContent=v.shelterName;d.append(h);
+       const label=document.createElement('p');label.textContent='第 '+v.vaultNo+' 号避难所';d.append(label);
+       const close=document.createElement('button');close.setAttribute('aria-label','关闭');close.onclick=()=>{d.remove();game.removeAttribute('inert');};d.append(close);
+       const help=document.createElement('button');help.textContent=v.helpedToday?'今天已帮过忙':'帮忙 · 双方各得废料';help.disabled=v.helpedToday||v.helpBlocked!==null;
+       help.onclick=async()=>{help.disabled=true;if(sm.delayHelpSend)await new Promise(resolve=>{sm.releaseHelpSend=resolve;});
+         await fetch('/api/shelter/social/help',{method:'POST',body:JSON.stringify({targetId:sm.helpWrongTarget||v.userId,deviceFp:'fixture-fingerprint',idempotencyKey:'fixture-help-key'})});help.textContent='今天已帮过忙';};d.append(help);
+       game.setAttribute('inert','');document.body.append(d);};li.append(b);root.querySelector('ol').append(li);
+   }content.append(root);
  } else if(sm.tab==='图鉴'){
    const root=document.createElement('section');root.setAttribute('aria-label','铜成就');root.innerHTML='<h3>铜成就</h3><ul><li><div><p>新生命</p><p>出生一个孩子</p><p>1/1 · 奖励 100 废料</p></div></li></ul>';
    const claimed=s.achievements.includes('birth-1');button(root.querySelector('li'),claimed?'已领':'领取',{type:'claim_achievement',id:'birth-1'},claimed||sm.achievementIncomplete);content.append(root);
