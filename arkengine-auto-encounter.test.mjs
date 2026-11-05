@@ -20,11 +20,13 @@ import { shelterProductionTests } from './arkengine-shelter-production.tests.mjs
 import { shelterPopulationTests } from './arkengine-shelter-population.tests.mjs';
 import { stockMarkup } from './arkengine-stock.fixture.mjs';
 import { stockTests } from './arkengine-stock.tests.mjs';
+import { settingsTests } from './arkengine-settings.tests.mjs';
 import { crossFeatureMarkup } from './arkengine-cross-feature.fixture.mjs';
 import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
 const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
+const scriptVersion=rawSource.match(/^\/\/ @version\s+(\S+)/m)[1];
 // 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
 const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;');
 const executable = [process.env.CHROME_PATH,
@@ -527,7 +529,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       const preference=name=>`localStorage.getItem('arkengine:auto-panel:expedition:section:${name}:collapsed:v1')`;
       assert.deepEqual(await evaluate(`[...${panel}.querySelectorAll('.panel-section')].map(d=>[d.dataset.panelSection,d.open])`),
         [['expedition',false],['farm',false],['shelter',false],['stock',false]]);
-      assert.equal(await evaluate(`${panel}.getElementById('script-version').textContent`),'v1.16.0');
+      assert.equal(await evaluate(`${panel}.getElementById('script-version').textContent`),`v${scriptVersion}`);
       for(const name of ['farm','shelter','shelter-staff','stock']) {
         await evaluate(`${section(name)}.querySelector('summary').click();`);
         await until(()=>evaluate(`${preference(name)}==='false'`),'expanded section saved');
@@ -693,6 +695,12 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     }
     const withDelayedStockNavigation=run=>withDelayedFeatureNavigation('/stock',run);
     await stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,until,secondStock,trustedStaffKey,withDelayedStockNavigation});
+    await settingsTests({t,setupShelter,reloadShelter,setupStock,reloadStock,evaluate,pulse,drive,until,
+      viewport:params=>cdp.send('Emulation.setDeviceMetricsOverride',params,tab.sessionId),
+      pressEnter:async()=>{await cdp.send('Page.bringToFront',{},tab.sessionId);
+        await cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key:'Enter',code:'Enter',text:'\r',windowsVirtualKeyCode:13},tab.sessionId);
+        await cdp.send('Input.dispatchKeyEvent',{type:'keyUp',key:'Enter',code:'Enter',windowsVirtualKeyCode:13},tab.sessionId);},
+      screenshot:()=>cdp.send('Page.captureScreenshot',{format:'png'},tab.sessionId)});
     const setupFeatures=async(code='',path='/activities/expedition')=>{
       await cdp.send('Page.navigate',{url:`${origin}${path}?cross-feature-fixture=${++pageSerial}`},tab.sessionId);
       await until(()=>evaluate(`location.search==='?cross-feature-fixture=${pageSerial}'&&typeof renderFeature==='function'`),'cross-feature fixture');
@@ -1961,7 +1969,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.16.0');
+      assert.equal(exported.version,scriptVersion);
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -2017,7 +2025,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('#local-log button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.16.0');
+      assert.equal(exported.version,scriptVersion);
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);

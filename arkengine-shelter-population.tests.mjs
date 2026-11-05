@@ -51,18 +51,19 @@ export async function shelterPopulationTests({t,setupShelter,reloadShelter,evalu
     await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
     await reloadShelter();await drive(done,'shared quarters reservation after reload',200);
     assert.equal(await evaluate(`${intoQuarters}.length`),0);
+    assert.ok(await evaluate(`${moves}.every(c=>![4,5].includes(c.residentId))`),'仍在培养感情的一对不能被调走');
     await evaluate(`for(const p of sm.view.state.residents.filter(p=>[4,5].includes(p.id))){p.romance=null;p.familyCooldownUntil=clock+3600000;}${check}`);
     await drive(`location.pathname==='/shelter'`,'one family reservation released');await drive(done,'new family within fourteen',200);
     assert.deepEqual(await evaluate(`${intoQuarters}.map(c=>c.residentId)`),[6,7]);
     assert.ok(await evaluate(`${state}.families.some(f=>f.a===6&&f.b===7)`));
-    assert.ok(await evaluate(`${moves}.every(c=>![4,5,8,9].includes(c.residentId))`),'不移动原感情或待产家庭');
+    assert.deepEqual(await evaluate('sm.view.state.births[0].parents'),[8,9],'父母调岗后仍保留原待产身份');
   });
   await t.test('同宿舍人口预留匹配：同父母待产与旧感情只算一次，仍可使用剩余一个名额',async()=>{
     await setupShelter(`${sharedQuarters}sm.view.state.births[0].parents=[5,4];`);
     await drive(done,'matching parents do not duplicate reservation',200);
     assert.deepEqual(await evaluate(`${intoQuarters}.map(c=>c.residentId)`),[6,7]);
     assert.match(await evaluate(`${state}.development`),/另预留 1 个出生名额/);
-    assert.ok(await evaluate(`${moves}.every(c=>![4,5,8,9].includes(c.residentId))`));
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[4,5].includes(p.id)).map(p=>p.roomId)'),[1,1],'确认怀孕后原父母可在回收站工作');
   });
   await t.test('同宿舍人口预留缺失：父母资料暂缺不按房间猜测，补齐后自动释放重复预留',async()=>{
     await setupShelter(`${sharedQuarters}delete sm.view.state.births[0].parents;`);

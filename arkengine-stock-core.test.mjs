@@ -12,6 +12,58 @@ function fixture(){const s={id:1,modelName:'模型甲',priceCents:1200,volume24h
     rules:{buyFeePct:2,sellFeePct:2.5,maxTradeTokens:10000,maxDailyBuyTokens:10000,maxPositionTokens:10000,reserveTokens:10000},rounds:[],myBets:[]};
   return {v,m:c.model(v,{tokens:10000}),l:{owned:{},entries:[]}};}
 
+test('股市净信号：含费取整后的净幅度优先，价格涨幅最高者不必排第一；换序结果一致',()=>{
+  const {v,l}=fixture();v.rules.buyFeePct=0;v.rules.sellFeePct=0;
+  v.stocks=[{id:1,modelName:'涨幅更高',priceCents:81,volume24h:1000},{id:2,modelName:'净幅度更高',priceCents:90,volume24h:1000}];
+  v.ticks=v.stocks.flatMap((s,i)=>(i===0?[67,70,73,76,78,81]:[75,78,81,84,87,90]).map((priceCents,n)=>({stockId:s.id,priceCents,createdAt:new Date(now-(5-n)*300000).toISOString()})));
+  const cfg={...config,tradeLimit:300,predict:false},m=c.model(v,{tokens:10000});
+  assert.equal(c.choose(m,cfg,l,now).stockId,1);
+  // Both orders cost 90 tokens; the same-trend scenario settles 99 versus 100 tokens after rounding.
+  const best=c.choose(m,{...cfg,netEfficiency:true},l,now);
+  assert.equal(best.stockId,2);assert.equal(best.estimate,90);assert.equal(best.signalNet,10);
+  v.stocks.reverse();assert.equal(c.choose(c.model(v,{tokens:10000}),{...cfg,netEfficiency:true},l,now).stockId,2);
+  assert.match(best.reason,/非收益预测/);
+});
+test('股市净信号：扣费取整后无净幅度则不买，不把历史涨幅当确定收益',()=>{
+  const {v,l}=fixture();v.rules.buyFeePct=0;v.rules.sellFeePct=0;
+  v.stocks[0].priceCents=120;v.ticks=[100,104,108,112,116,120].map((priceCents,n)=>({stockId:1,priceCents,createdAt:new Date(now-(5-n)*300000).toISOString()}));
+  const cfg={...config,tradeLimit:9,reserve:0,predict:false},m=c.model(v,{tokens:10000});
+  assert.ok(c.choose(m,cfg,l,now));assert.equal(c.choose(m,{...cfg,netEfficiency:true},l,now),null);
+});
+test('股市自动资金：摆脱手填100000，按资产80%和网站限额计算，零设置也可自动投入',()=>{
+  const {m,l}=fixture(),cfg={...config,autoBudget:true,tradeLimit:100000,reserve:99999,predict:false};
+  let f=c.funding(m,cfg);assert.equal(f.reserve,2000);assert.equal(f.tradeLimit,8000);assert.equal(f.positionLimit,8000);
+  m.rules.maxDailyBuyTokens=4000;m.rules.maxPositionTokens=7000;
+  f=c.funding(m,cfg);assert.equal(f.tradeLimit,4000);assert.equal(f.positionLimit,7000);
+  assert.ok(c.choose(m,{...cfg,tradeLimit:0},l,now));
+  m.balance=800;f=c.funding(m,cfg);assert.equal(f.reserve,800);assert.equal(f.tradeLimit,0);assert.equal(c.choose(m,cfg,l,now),null);
+});
+test('股市自动资金：买入转持仓不收缩总预算，卖出不清支出，手动持仓占用总仓位',()=>{
+  const {m,l}=fixture(),cfg={...config,autoBudget:true,predict:false};
+  m.balance=7000;m.view.positions=[{stockId:1,shares:250,costBasisTokens:3000}];
+  assert.equal(c.funding(m,cfg).tradeLimit,8000);assert.equal(c.funding(m,cfg).reserve,2000);
+  l.entries=[{id:'prior',action:'buy',at:now,debit:8000,result:'success'}];
+  m.balance=10000;m.view.positions=[];assert.equal(c.choose(m,cfg,l,now),null,'卖出回款不恢复已花额度');
+  m.balance=2000;m.view.positions=[{stockId:99,shares:100,costBasisTokens:8000}];l.entries=[];
+  assert.equal(c.choose(m,cfg,l,now),null,'手动持仓不再额外获得一份自动仓位');
+  m.view.positions[0].costBasisTokens=null;assert.equal(c.choose(m,cfg,l,now),null);
+  assert.match(c.waitReason(m,cfg,l,now),/成本不完整/);
+});
+test('股市自动资金：未知买单按最新余额和网站上限核对，不重算股数或侵占周转金',()=>{
+  const {m,l}=fixture(),cfg={...config,autoBudget:true,predict:false},p={id:'original',beforeShares:0,
+    choice:{action:'buy',stockId:1,modelName:'模型甲',shares:70,debit:900}};
+  l.entries=[{id:p.id,action:'buy',at:now,debit:900,result:'reserved'}];
+  assert.equal(c.recoveryWait(m,cfg,l,p,now),null);
+  m.balance=1500;assert.match(c.recoveryWait(m,cfg,l,p,now),/额度|保留余额/);
+  m.balance=10000;m.rules.maxDailyBuyTokens=500;assert.match(c.recoveryWait(m,cfg,l,p,now),/额度/);
+  m.rules.maxDailyBuyTokens=10000;m.rules.maxPositionTokens=500;assert.match(c.recoveryWait(m,cfg,l,p,now),/持仓超过/);
+});
+test('股市自动资金：手动模式保持原额度，极大资产与缺失成本不生成不安全金额',()=>{
+  const {m}=fixture();assert.equal(c.funding(m,config).tradeLimit,3000);assert.equal(c.funding(m,config).reserve,100);
+  m.balance=Number.MAX_SAFE_INTEGER;m.view.positions=[{stockId:1,shares:1,costBasisTokens:1}];
+  assert.equal(c.funding(m,{...config,autoBudget:true}).tradeLimit,0);
+});
+
 test('股市下注唯一性：重复编号和数值/字符串别名都不能成为唯一凭据，不改原列表',()=>{
   const first={id:1,roundId:42,settled:true,payoutTokens:180},second={id:1,roundId:42,settled:false};
   const v={myBets:[first,second]},before=JSON.stringify(v);

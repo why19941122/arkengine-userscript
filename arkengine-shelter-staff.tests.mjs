@@ -234,6 +234,16 @@ export async function shelterStaffTests({t,setupShelter,reloadShelter,evaluate,p
     assert.ok(await evaluate(`${moves}.every(c=>c.residentId!==6&&c.residentId!==7)`));
     assert.deepEqual(await evaluate(`${state}.families`),[{a:6,b:7,room:5}]);
   });
+  await t.test('规则纠正浏览器：父母身份明确时怀孕后立即回生产，未知父母仍保留待产房间',async()=>{
+    await setupShelter(`${family}sm.view.state.residents.filter(p=>p.id>=6).forEach(p=>{p.romance=null;p.familyCooldownUntil=clock+6*3600000;});
+      sm.view.state.births=[{id:1,roomId:5,parents:[6,7],dueAt:clock+3*3600000}];`);
+    await drive(done,'parents work during pregnancy',200);
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[6,7].includes(p.id)).map(p=>p.roomId)'),[1,1]);
+    assert.deepEqual(await evaluate(`${state}.families`),[{a:6,b:7,room:5}]);
+    assert.equal(await evaluate('sm.view.state.births.length'),1);assert.equal(await evaluate(pending),null);
+    await setupShelter(`${family}sm.view.state.births=[{id:1,roomId:5,dueAt:clock+3*3600000}];`);
+    await drive(done,'unidentified pregnancy preserved',200);assert.ok(await evaluate(`${moves}.every(c=>![6,7].includes(c.residentId))`));
+  });
   await t.test('人员管理：已有配对从待产到生产，再在冷却结束后成对返回宿舍',async()=>{
     await setupShelter(family);await drive(done,'remember existing family',150);
     await evaluate(`sm.view.state.residents.filter(p=>p.id>=6).forEach(p=>{p.romance=null;p.familyCooldownUntil=clock+3600000;});
