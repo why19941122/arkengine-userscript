@@ -21,6 +21,91 @@ export async function shelterProductionTests({t,setupShelter,reloadShelter,evalu
     sm.view.state.residents[4].stats.end=17;`;
   const swap = `${scene}localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');`;
   const turnOff = id => `${panel}.getElementById('${id}').checked=false;${panel}.getElementById('${id}').dispatchEvent(new Event('change'));`;
+  const cycle = `${swap}
+    Object.assign(sm.view.state.residents[0].stats,{str:5,agi:17,per:0,end:0});
+    Object.assign(sm.view.state.residents[1].stats,{str:0,agi:10,per:17,end:0});
+    Object.assign(sm.view.state.residents[2].stats,{str:10,agi:0,per:10,end:0});
+    for(const p of sm.view.state.residents.slice(3)){p.hp=1;p.stats={str:10,agi:10,per:10,end:17,cha:3,int:3,lck:3};}`;
+
+  await t.test('服装整批分配：为其他岗位保留多属性服，跨刷新继续核对且不重复穿戴',async()=>{
+    await setupShelter(`${gear}sm.view.state.items=[{id:101,slot:'outfit',name:'多用途服',bonus:{end:5,per:4}},
+      {id:102,slot:'outfit',name:'回收专用服',bonus:{end:5}}];`);
+    await drive(`${equips}.length===1&&${pending}===null`,'first batch outfit confirmed');
+    assert.deepEqual(await evaluate(`${equips}.map(c=>[c.residentId,c.itemId])`),[[4,102]]);
+    await reloadShelter();await drive(done,'batch outfit plan after reload',180);
+    assert.deepEqual(await evaluate(`${equips}.map(c=>[c.residentId,c.itemId])`),[[4,102],[3,101]]);
+    const entries=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-gear-plan')`);
+    assert.equal(entries.length,2);assert.equal(entries[0].data.count,2);assert.equal(entries[0].data.complete,true);
+    assert.ok(entries[0].data.after.water>entries[0].data.before.water);
+    await evaluate(`${panel}.getElementById('shelter-check').click()`);await drive(`location.pathname==='/shelter'`,'next batch visit');
+    await drive(done,'batch outfits remain stable');assert.equal(await evaluate(`${equips}.length`),2);
+  });
+
+  await t.test('人员整体分配：三人岗位循环错配时比较整组产出，突破两两互换无收益的局限',async()=>{
+    await setupShelter(cycle);await drive(done,'three-way production allocation',240);
+    assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,3).map(p=>p.roomId)'),[3,4,2]);
+    assert.equal(await evaluate(`${moves}.length`),4,'满员三人轮换只需一次腾位和三次归位');
+    assert.deepEqual(await evaluate('sm.view.state.residents.slice(3).map(p=>p.roomId)'),[1,1,2,3,4],'保护不参与调岗的居民');
+    const count=await evaluate(`${moves}.length`);
+    await evaluate(`${panel}.getElementById('shelter-check').click();`);await drive(`location.pathname==='/shelter'`,'review allocation');await drive(done,'stable allocation',180);
+    assert.equal(await evaluate(`${moves}.length`),count,'达到本轮最优分配后不反复换人');
+  });
+  await t.test('人员整体分配：轮换中刷新接续原计划，已确认步骤不重复',async()=>{
+    for(const completed of [1,2]){
+      await setupShelter(cycle);await drive(`${moves}.length===${completed}`,'allocation before reload');
+      await reloadShelter();await drive(done,'resume allocation',240);
+      assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,3).map(p=>p.roomId)'),[3,4,2]);
+      assert.equal(await evaluate(`${moves}.length`),4);
+      assert.equal(await evaluate(`${state}.swap`),null);assert.equal(await evaluate(pending),null);
+    }
+  });
+  await t.test('人员整体分配：关闭优化或手动改动计划人员后停止剩余轮换',async()=>{
+    for(const change of [turnOff('shelter-optimize'),`sm.view.state.residents[1].roomId=5;`]){
+      await setupShelter(cycle);await drive(`${moves}.length===1&&${pending}===null`,'first allocation step confirmed');
+      await evaluate(change);await drive(done,'allocation cancelled after user change',180);
+      assert.equal(await evaluate(`${moves}.length`),1);assert.equal(await evaluate(`${state}.swap`),null);
+    }
+  });
+  await t.test('人员整体分配：腾位结果未知时只读等待，刷新不执行后续调岗',async()=>{
+    await setupShelter(`${cycle}sm.assignUnknown=true;`);await drive(`${moves}.length===1`,'unknown first allocation step');
+    await reloadShelter();await drive(waiting,'unknown allocation waits',180);
+    assert.equal(await evaluate(`${moves}.length`),1);assert.ok(await evaluate(`${state}.swap`));
+    assert.equal(await evaluate(`${pending}.kind`),'assign');
+  });
+  await t.test('人员整体分配：暂时腾位后属性或服装改变，不执行已失去收益的旧方案',async()=>{
+    for(const [setup,change] of [['',`sm.view.state.residents[5].stats.end=0;`],
+      [`sm.view.state.residents[5].stats.end=0;sm.view.state.residents[5].outfitId=101;sm.view.state.items=[{id:101,slot:'outfit',bonus:{end:10}}];`,
+        `sm.view.state.residents[5].outfitId=null;`]]){
+      await setupShelter(`${swap}${setup}`);await drive(`${moves}.length===1&&${pending}===null`,'first vacancy confirmed before stats change');
+      await evaluate(change);await drive(done,'obsolete allocation stopped',180);
+      assert.equal(await evaluate(`${moves}.length`),1);
+      assert.equal(await evaluate(`${state}.swap`),null);
+      assert.match(await evaluate(`${panel}.getElementById('shelter-staff-status').textContent`),/收益|增益/);
+    }
+  });
+  await t.test('人员整体分配：餐厅无人能安全离岗时仍优化其他房间，不被高属性留守者卡住',async()=>{
+    await setupShelter(`${swap}
+      const specs=[{str:5,per:17,end:0,agi:0},{str:0,per:10,end:17,agi:0},{str:10,per:0,end:10,agi:0},
+        {str:17,per:17,end:17,agi:5},{str:17,per:17,end:17,agi:5},{str:10},{per:10},{end:17}];
+      sm.view.state.residents.forEach((p,i)=>{p.roomId=[2,4,1,3,3,2,4,1][i];Object.assign(p.stats,specs[i]);if(i>=5)p.hp=1;});
+      for(let id=6;id<=8;id++)sm.view.state.rooms.push({...sm.view.state.rooms[1],id});`);
+    await drive(done,'safe allocation around locked diner',240);
+    assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,2).map(p=>p.roomId)'),[4,1]);
+    assert.ok(await evaluate('sm.view.state.rooms.find(r=>r.id===sm.view.state.residents[2].roomId).type===\'power\''));
+    assert.deepEqual(await evaluate('sm.view.state.residents.slice(3).map(p=>p.roomId)'),[3,3,2,4,1]);
+    assert.ok(await evaluate(`${moves}.length>0`));
+    assert.ok(await evaluate(`${moves}.every(c=>[1,2,3].includes(c.residentId))`));
+  });
+  await t.test('人员整体分配：刷新读到重复目标、外来动作或缺失终点时停止调岗并保留奖励领取',async()=>{
+    for(const change of [`saved.swap.targets[1]=saved.swap.targets[0];`,
+      `saved.swap.moves[1].id=999;`,`saved.swap.targets[0].room=1;`]){
+      await setupShelter(cycle);await drive(`${moves}.length===1&&${pending}===null`,'allocation stored before corruption');
+      await evaluate(`const saved=${state};${change}localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(saved));sm.achievementIncomplete=false;`);
+      await reloadShelter();await drive(done,'bad allocation isolated',180);
+      assert.equal(await evaluate(`${moves}.length`),1);
+      assert.ok(await evaluate(`sm.calls.some(c=>c.type==='claim_achievement')`));
+    }
+  });
 
   await t.test('避难所请求绑定：服装、居民或装备槽变化时不发送，不替换原穿戴记录',async()=>{
     for(const change of [`itemId:102`,`residentId:1`,`slot:'weapon'`]){
@@ -103,13 +188,18 @@ export async function shelterProductionTests({t,setupShelter,reloadShelter,evalu
     await evaluate(`${panel}.getElementById('shelter-check').click()`);await drive(`location.pathname==='/shelter'`,'stable swap visit');await drive(done,'stable placement');
     assert.equal(await evaluate(`${moves}.length`),3);
   });
-  await t.test('生产强化：闲置高产居民替换满员回收站人员，空位原岗位用两步完成',async()=>{
+  await t.test('生产强化：闲置高产居民替换满员回收站人员，原岗位有空位时继续比较基础产出',async()=>{
     await setupShelter(`${swap}sm.view.state.residents[5].stats.end=3;
       sm.view.state.residents.push({...structuredClone(adult),id:9,name:'闲置回收员',roomId:null,stats:{str:3,per:3,end:17,cha:3,int:3,agi:3,lck:3}});`);
     await drive(done,'idle replacement',180);assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])`),[[4,null],[9,1]]);
     await setupShelter(`${swap}sm.view.state.residents[0].roomId=5;`);
     await drive(done,'source has spare capacity',180);
-    assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])`),[[4,2],[6,1]]);
+    assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])`),[[4,2],[6,1],[8,2]]);
+    // 净水仍由感知10的居民独立覆盖9.6/小时底线，转去发电额外增加3.2/小时基础产量。
+    assert.equal(await evaluate('sm.view.state.residents.filter(p=>p.roomId===4).reduce((n,p)=>n+8*(.5+p.stats.per/10),0)'),12);
+    const count=await evaluate(`${moves}.length`);
+    await evaluate(`${panel}.getElementById('shelter-check').click()`);await drive(`location.pathname==='/shelter'`,'recheck vacancy allocation');await drive(done,'stable vacancy allocation');
+    assert.equal(await evaluate(`${moves}.length`),count);
   });
   await t.test('生产强化：换位任一步完成后刷新，接续剩余步骤而不重放',async()=>{
     for(const completed of [1,2]){
@@ -166,6 +256,6 @@ export async function shelterProductionTests({t,setupShelter,reloadShelter,evalu
       }`);
     await drive(done,'198 residents balanced');assert.deepEqual(await evaluate('sm.calls'),[]);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:enabled:v1')`),'true');
-    assert.ok(await evaluate(`${panel}.getElementById('shelter-staff-status').textContent.includes('已按供应余量')`));
+    assert.match(await evaluate(`${panel}.getElementById('shelter-staff-status').textContent`),/局部优化.*尚未完成整体最优核验/);
   });
 }

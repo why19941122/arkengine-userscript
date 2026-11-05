@@ -9,6 +9,61 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
   const oldFarm=`sessionStorage.setItem('arkengine:auto-farm:pending:v1',JSON.stringify({action:'harvest',plots:[1],at:clock-60000,reloaded:true}));
     fm.crops=[{plot:1,key:fc[0].key,at:clock-1000}];`;
 
+  await t.test('共享暂停延迟：农场、避难所和股市排队期间保存总暂停后均不继续写入或切页',async()=>{
+    const status=`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent`;
+    for(const path of ['/farm','/shelter','/stock']){
+      await setupFeatures(`localStorage.setItem('arkengine:auto-farm:enabled:v1','true');
+        fm.crops=[{plot:1,key:fc[0].key,name:fc[0].name,at:clock-1000}];`,path);
+      await drive(`${status}.includes('随机等待')`,'feature queued before shared pause');
+      const before=await evaluate(`({farm:${farmPending},shelter:${shelterPending},stock:${stock}})`);
+      await evaluate(`localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');`);
+      await pulse(60000);
+      assert.equal(await evaluate('location.pathname'),path);
+      assert.equal(await evaluate(status),'已暂停');
+      assert.deepEqual(await evaluate('fm.calls.filter(c=>c.type!=="read")'),[]);
+      assert.deepEqual(await evaluate('sm.calls'),[]);
+      assert.deepEqual(await evaluate('km.calls'),[]);
+      assert.deepEqual(await evaluate(`({farm:${farmPending},shelter:${shelterPending},stock:${stock}})`),before);
+    }
+  });
+
+  await t.test('玩法导航地址：损坏链接不阻断农场、避难所与股市，外站及新窗口链接不接管',async()=>{
+    await setupFeatures(`localStorage.setItem('arkengine:auto-farm:enabled:v1','true');window.badNavigationClicks=[];
+      for(const [href,target] of [['http://[',''],['https://example.invalid/farm',''],['/farm','_blank']]){
+        const a=document.createElement('a');a.setAttribute('href',href);a.target=target;a.textContent='无效导航';
+        a.onclick=event=>{event.preventDefault();badNavigationClicks.push(href);};document.body.prepend(a);
+      }`);
+    await drive(`fm.calls.some(c=>c.type==='plant')&&sm.calls.some(c=>c.type==='collect_all')&&${done}`,'all features skip invalid navigation links',240);
+    assert.deepEqual(await evaluate('badNavigationClicks'),[]);
+    assert.equal(await evaluate(`fm.calls.filter(c=>c.type==='plant').length`),1);
+    assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+  });
+
+  await t.test('玩法隔离人员轮换：避难所到时限让股市运行，返回后接续原调岗而不重放',async()=>{
+    const schedule=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`;
+    const moves=`sm.calls.filter(c=>c.type==='assign')`;
+    await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');
+      const original=sm.view.state.rooms[0],adult=sm.view.state.residents[0];
+      sm.view.state.rooms=['scrap','power','diner','water','quarters'].map((type,i)=>({...original,id:i+1,type,width:i===4?3:1,stored:0}));
+      sm.view.state.residents=Array.from({length:8},(_,i)=>({...structuredClone(adult),id:i+1,name:'居民'+(i+1),roomId:[2,3,4,1,1,2,3,4][i],
+        stats:{str:10,per:10,end:17,cha:3,int:3,agi:10,lck:3},hp:i<3?100:1}));
+      Object.assign(sm.view.state.residents[0].stats,{str:5,agi:17,per:0,end:0});
+      Object.assign(sm.view.state.residents[1].stats,{str:0,agi:10,per:17,end:0});
+      Object.assign(sm.view.state.residents[2].stats,{str:10,agi:0,per:10,end:0});`,'/shelter');
+    await drive(`${moves}.length===1&&JSON.parse(${shelterPending})===null`,'allocation first step confirmed').catch(async error=>{
+      error.message+=JSON.stringify(await evaluate(`({calls:sm.calls,schedule:${schedule},pending:${shelterPending},staff:document.getElementById('ark-auto-expedition').shadowRoot.getElementById('shelter-staff-status').textContent})`));throw error;
+    });
+    const id=await evaluate(`${schedule}.swap.id`);
+    await pulse(61000);await drive(done,'stock served between allocation visits');
+    assert.equal(await evaluate(`${moves}.length`),1);assert.equal(await evaluate(`${schedule}.swap.id`),id);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    await pulse(61000);await drive(`${moves}.length===4&&${schedule}.swap===null&&location.pathname==='/activities/expedition'`,'resume allocation after other feature',240);
+    assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,3).map(p=>p.roomId)'),[3,4,2]);
+    assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`JSON.parse(${shelterPending})`),null);
+  });
+
   await t.test('玩法隔离探险快照：成功回执后旧探险仍在时只读等待，股市继续运行且不补领',async()=>{
     await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:explore-claim:v1','true');
       const s=sm.view.state;s.rooms[0].stored=0;s.residents[0].away={kind:'explore'};

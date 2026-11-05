@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.14.38
+// @version      1.14.51
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -29,6 +29,10 @@
   const animationProperty = 'BASE_UI_ANIMATIONS_DISABLED';
   const ACCOUNT_STOP = 'arkengine:auto:account-stop:v1';
   const groupPrefs = ['arkengine:auto-encounter:enabled:v1', 'arkengine:auto-expedition:enabled:v1'];
+  const sharedGroupPaused = key => {
+    try { return localStorage.getItem(key) === 'false'; }
+    catch { return false; } // 站点存储暂时不可读时继续遵守本页已有的开关。
+  };
   const accountListeners = [];
   let memoryAccountStop = '';
   const accountStopReason = () => {
@@ -605,7 +609,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.14.38';
+  const SCRIPT_VERSION = '1.14.51';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -614,7 +618,23 @@
       .panel-heading{min-width:0}.panel-heading strong{display:block;font-size:13px}
       .panel-version{display:block;color:#acbde1;font-size:11px}
       #panel-fold{flex-shrink:0;min-height:28px;padding:2px 8px}
-      #panel-content[hidden]{display:none}`;
+      #panel-content[hidden]{display:none}
+      .panel-section{margin-top:8px;border:1px solid #616e9c;border-radius:4px;overflow-wrap:anywhere}
+      .panel-section>summary{padding:0 10px;font-weight:600;background:#252d45}
+      [data-panel-section]>summary{box-sizing:border-box;min-height:44px;display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none}
+      [data-panel-section]>summary::-webkit-details-marker{display:none}
+      [data-panel-section]>summary::before{content:'›';font-size:18px;line-height:1;flex-shrink:0}
+      [data-panel-section][open]>summary::before{transform:rotate(90deg)}
+      .panel-section>summary::after{content:'展开';margin-left:auto;font-size:12px;font-weight:400;color:#acbde1;flex-shrink:0}
+      .panel-section[open]>summary::after{content:'收起'}
+      [data-panel-section]>summary:focus-visible{outline:2px solid white;outline-offset:-3px}
+      .panel-section>summary:hover{background:#303a56}
+      .panel-section-body{padding:4px 10px 10px}
+      .panel-subsection{border-top:1px solid #414e70;margin-top:8px}
+      .panel-subsection>summary{color:#c9d7f3}
+      .panel-actions{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}
+      #panel-content input[type=number]{box-sizing:border-box;max-width:100%;min-height:32px;color:#e6edf9;background:#1b2033;border:1px solid #616e9c;border-radius:3px;padding:4px}
+      #panel-content input:focus-visible{outline:2px solid white;outline-offset:2px}`;
     shadow.append(style);
     const header=document.createElement('header');header.className='panel-header';
     const heading=document.createElement('div');heading.className='panel-heading';
@@ -641,6 +661,22 @@
       try{localStorage.setItem(key,String(content.hidden));}
       catch{fold.title+='；本次状态仅在当前页面生效';}
     });
+    for(const section of content.querySelectorAll('[data-panel-section]')) {
+      const sectionKey=`arkengine:auto-panel:${group}:section:${section.dataset.panelSection}:collapsed:v1`;
+      const summary=section.querySelector(':scope > summary');
+      summary.title='折叠只隐藏内容，自动任务继续运行';
+      try {
+        const saved=localStorage.getItem(sectionKey);
+        if(saved==='true' || saved==='false')section.open=saved==='false';
+      } catch { /* 无法读取偏好时使用 HTML 默认状态 */ }
+      let lastOpen=section.open;
+      section.addEventListener('toggle',()=>{
+        if(section.open===lastOpen)return;
+        lastOpen=section.open;
+        try{localStorage.setItem(sectionKey,String(!section.open));}
+        catch{summary.title='本次折叠状态仅在当前页面生效；自动任务继续运行';}
+      });
+    }
   }
   const LOG_BUDGET = 20 * 1024 * 1024;
   const LOG_DAYS = 7;
@@ -912,7 +948,7 @@
       render();
       return true;
     }
-    // 小型本地交付队列只保存收益事件；刷新后由随机回执ID去重，不保存游戏请求密钥。
+    // 小型交付队列保存收益和刷新前诊断；随机交付ID跨刷新去重，不保存游戏请求密钥。
     for (const event of outbox) logStore.append(event, event.data.reward, false)
       .then(value => committed(event, value)).catch(failed);
     function failed() { storageFailed = true; failedWrites++; render(); }
@@ -930,7 +966,9 @@
     }
     function add(type, detail = '', data = {}, sum = false, receiptId) {
       const now = Date.now();
-      if (sum) receiptId ||= crypto.randomUUID();
+      const durable = sum || ['page-refresh','navigation-refresh','expedition-idle-refresh',
+        'farm-stamina-refresh','quota-refresh','shelter-batch-reload','operation-refresh'].includes(type);
+      if (durable) receiptId ||= crypto.randomUUID();
       const event = { at: now, beijing: new Date(now + 8 * 3600000).toISOString().replace('Z', '+08:00'),
         group, page: diagnosticPage(), pageId, version: SCRIPT_VERSION, visibility: document.visibilityState,
         type, detail: String(detail).slice(0, 300), data, ...(receiptId ? { receiptId } : {}) };
@@ -945,7 +983,7 @@
       }
       // 结构化诊断限定体积；不让单条异常耗尽日志配额。
       if (logBytes(data) > 32768) event.data = { truncated: true };
-      if (sum && !outbox.some(e => e.receiptId === receiptId)) {
+      if (durable && !outbox.some(e => e.receiptId === receiptId)) {
         if (outbox.length < 50) { outbox.push(event); saveOutbox(); }
         else failed();
       }
@@ -1035,7 +1073,7 @@
     function mount(shadow) {
       const box = shadow.querySelector('.box');
       hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'log-summary'; box.append(hint);
-      const details = document.createElement('details');
+      const details = document.createElement('details'); details.id = 'local-log';
       details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">北京时间今天及前 6 天；两组共用约 20 MiB 事件预算。重复普通状态会合并；关键故障、结果与收益汇总优先保留。导出包含采样、截断和覆盖时间。</p><button type="button">导出两页日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
       details.addEventListener('toggle', async () => {
         if (!details.open) return;
@@ -1369,15 +1407,18 @@
       a { color: #acbde1; }
     </style>
     <div class="box">
-      <strong>自动奇遇、秘境与迷雾</strong>
+      <strong>修仙助手</strong>
       <p id="status" role="status" aria-live="polite"></p>
+      <button type="button" id="toggle"></button>
+      <details class="panel-section" data-panel-section="cultivate" open>
+      <summary>修仙</summary><div class="panel-section-body">
       <p class="hint">最高钻石优先；无钻石时选最高修为。</p>
       <p id="last" class="hint">等待下一次奇遇</p>
-      <button type="button" id="toggle"></button>
       <p id="dungeon-status" class="hint"></p>
       <button type="button" id="dungeon-toggle"></button>
       <p id="fog-status" class="hint"></p>
       <button type="button" id="fog-toggle"></button>
+      </div></details>
       <p class="hint"><a href="/activities/expedition" target="_blank" rel="noopener">打开远征挂机页</a></p>
     </div>`;
   document.body.append(host);
@@ -1592,6 +1633,8 @@
   }
 
   function checkPage() {
+    // storage 通知可能迟到；已保存的人工暂停应先于本轮点击、刷新或切页生效。
+    if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
     syncDialogAnimations();
     observeDungeonEntryReview();
     updateDungeonHint();
@@ -1969,9 +2012,11 @@
   }
   function linkTo(path) {
     return [...document.querySelectorAll('a[href]')].find(link => {
-      const url = new URL(link.href, location.href);
-      return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path &&
-        !link.target && visible(link);
+      try {
+        const url = new URL(link.href, location.href);
+        return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path &&
+          !link.target && usable(link);
+      } catch { return false; }
     });
   }
   function visitDungeon() {
@@ -2333,7 +2378,8 @@
   try {
     farmEnabled = localStorage.getItem(FARM_PREF) !== 'false';
     farmCrop = localStorage.getItem(FARM_CROP) || 'auto';
-    farmState = loadState(localStorage, FARM_STATE, farmState, 'farm', v => objectState(v) && Number.isFinite(v.nextAt));
+    farmState = loadState(localStorage, FARM_STATE, farmState, 'farm', v => objectState(v) && Number.isFinite(v.nextAt) &&
+      (v.readDeferred === undefined || typeof v.readDeferred === 'boolean'));
     farmPlan = loadState(sessionStorage, FARM_JOURNAL, null, 'farm', v => timedState(v) &&
       ['plant', 'harvest'].includes(v.action) && Array.isArray(v.plots) && v.plots.every(p => Number.isInteger(p) && p > 0) &&
       (v.action === 'harvest' ? v.plots.length > 0 : typeof v.crop === 'string' && Number.isInteger(v.empty) && v.empty > 0));
@@ -2507,12 +2553,17 @@
       #shelter-population { width: 64px; margin-left: 6px; }
     </style>
     <div class="box">
-      <strong>自动远征、农场、避难所与股市</strong>
+      <strong>远征综合助手</strong>
       <p id="status" role="status" aria-live="polite"></p>
+      <button type="button" id="toggle"></button>
+      <p class="hint">总开关控制本组四项玩法，各模块按各自设置运行。</p>
+      <details class="panel-section" data-panel-section="expedition">
+      <summary>远征</summary><div class="panel-section-body">
       <p class="hint">常态：边境巡逻，最多 6 队。<br>突发：北京时间 01:00～02:00 优先；错过且额度完整未用时补派深渊。</p>
       <p class="hint">自动领取 · 完整行程 · 点击前随机等 2～5 秒</p>
-      <button type="button" id="toggle"></button>
-      <p class="hint">主开关同时控制远征、农场、避难所和股市。</p>
+      </div></details>
+      <details class="panel-section" data-panel-section="farm">
+      <summary>农场</summary><div class="panel-section-body">
       <p class="hint" id="farm-status"></p>
       <label for="farm-crop">种植作物</label>
       <select id="farm-crop">
@@ -2520,13 +2571,16 @@
         ${CROPS.map(name => `<option value="${name}">${name}</option>`).join('')}
       </select>
       <p class="hint" id="farm-selection">每次种植前读取最新行情，每块扣除留种 1 份。</p>
-      <button type="button" id="farm-toggle"></button>
+      <div class="panel-actions"><button type="button" id="farm-toggle"></button>
       <button type="button" id="farm-check">检查农场</button>
+      </div></div></details>
+      <details class="panel-section" data-panel-section="shelter">
+      <summary>方舟避难所</summary><div class="panel-section-body">
       <p class="hint" id="shelter-status"></p>
-      <button type="button" id="shelter-toggle"></button>
+      <div class="panel-actions"><button type="button" id="shelter-toggle"></button>
       <button type="button" id="shelter-check">检查避难所</button>
-      <label class="staff-option"><input type="checkbox" id="shelter-explore-claim"> 自动领取已归来的探险</label>
-      <p class="hint" id="shelter-explore-status">领取并释放归来的居民；出发、召回、救援和废土小队仍由你安排。</p>
+      </div>
+      <details class="panel-subsection" data-panel-section="shelter-staff"><summary>生产与人口</summary>
       <label for="shelter-staff">避难所人员管理</label>
       <select id="shelter-staff">
         <option value="off">仅收取奖励，人员由我安排</option>
@@ -2537,12 +2591,16 @@
       <label class="staff-option">人口发展目标<input id="shelter-population" type="number" min="2" max="200" step="1" value="14"> 人</label>
       <p class="hint" id="shelter-population-status">人口发展模式才使用此目标；默认 14 人。</p>
       <label class="staff-option"><input type="checkbox" id="shelter-gear"> 自动穿戴闲置生产服装</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-optimize"> 优化满员生产房间</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-optimize"> 优化生产岗位分配</label>
       <p class="hint" id="shelter-staff-status"></p>
-      <details><summary>避难所人员建议</summary><p class="hint" id="shelter-advice">首次检查后显示生产和生育建议。</p></details>
-      <details><summary>避难所发展规划</summary><p class="hint" id="shelter-development" style="white-space:pre-line">检查避难所后比较建造、升级和扩容。建议不会自动花费资源。</p></details>
-      <details><summary>避难所运行提醒</summary><p class="hint" id="shelter-operations" style="white-space:pre-line">检查后显示停产、供应、施工和废土返程情况。</p></details>
-      <details id="stock-settings"><summary>模型股市</summary>
+      <p class="hint" id="shelter-advice">首次检查后显示生产和生育建议。</p></details>
+      <details class="panel-subsection" data-panel-section="shelter-explore"><summary>探险领取</summary>
+      <label class="staff-option"><input type="checkbox" id="shelter-explore-claim"> 自动领取已归来的探险</label>
+      <p class="hint" id="shelter-explore-status">领取并释放归来的居民；出发、召回、救援和废土小队仍由你安排。</p></details>
+      <details class="panel-subsection" data-panel-section="shelter-development"><summary>发展规划</summary><p class="hint" id="shelter-development" style="white-space:pre-line">检查避难所后比较建造、升级和扩容。建议不会自动花费资源。</p></details>
+      <details class="panel-subsection" data-panel-section="shelter-operations"><summary>运行提醒</summary><p class="hint" id="shelter-operations" style="white-space:pre-line">检查后显示停产、供应、施工和废土返程情况。</p></details>
+      </div></details>
+      <details id="stock-settings" class="panel-section" data-panel-section="stock"><summary>模型股市</summary><div class="panel-section-body">
         <p class="hint" id="stock-status"></p>
         <label class="staff-option"><input type="checkbox" id="stock-trade"> 自动择股与管理脚本持仓</label>
         <label class="staff-option"><input type="checkbox" id="stock-predict"> 自动涨跌预测（可能亏损）</label>
@@ -2552,9 +2610,9 @@
         <label class="staff-option">账号保留代币 <input id="stock-reserve" type="number" min="0" step="1" style="width:90px"></label>
         <p class="hint">默认关闭、额度为0。每5分钟检查，最多3只股票；净盈利8%、净亏损6%或趋势转弱时尝试卖出，须满足持有期。预测按近期趋势固定下注，每轮一次，不加倍追损。</p>
         <p class="hint">交易按市价成交，无最高成交价保证；预留10%报价余量仍可能超出预估。上限只统计脚本支出，卖出及预测返还不补回24小时额度。手动持仓和历史仓由你处理。</p>
-        <button type="button" id="stock-save">保存股市设置</button>
+        <div class="panel-actions"><button type="button" id="stock-save">保存股市设置</button>
         <button type="button" id="stock-check">检查股市</button>
-      </details>
+        </div></div></details>
       <p class="hint"><a href="/cultivate" target="_blank" rel="noopener">打开奇遇挂机页</a></p>
     </div>`;
   document.body.append(host);
@@ -3022,6 +3080,7 @@
   function shelterReadOnlyWait() { return Boolean(shelterPending && shelterState.pendingReadOnly === shelterPending.id); }
   let shelterRead = null, shelterController = null, shelterGeneration = 0, shelterReadAt = 0;
   let shelterEntryAt = 0, shelterStage = 0, shelterActions = 0, shelterLeave = false, shelterVisitPeriod = null;
+  let shelterUiWait = null, shelterCollection = null;
   let shelterBatchReloading = false;
   const shelterToggle = shadow.getElementById('shelter-toggle');
   const shelterResources = { power: '电力', food: '食物', water: '净水', scrap: '废料', parts: '零件', stimpak: '治疗针' };
@@ -3143,13 +3202,13 @@
   }
   shelterControl('shelter-toggle','click', () => {
     shelterEnabled = !shelterEnabled; localStorage.setItem(SHELTER_PREF, String(shelterEnabled));
-    cancelShelterRead(); cancelQueued(); shelterLeave = false;
+    cancelShelterRead(); cancelQueued(); shelterLeave = false; shelterUiWait = null; shelterCollection = null;
     saveShelter({ ...shelterState, nextAt: 0, note: shelterEnabled ? '等待检查' : '人工暂停' }); schedule();
   });
   shelterControl('shelter-check','click', () => {
     if (!shelterEnabled) { say('请先开启避难所'); return; }
     saveShelter({ ...shelterState, nextAt: 0, note: '等待检查' });
-    if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false;shelterExploreSkipped.clear();shelterExploreNote=''; }
+    if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false;shelterUiWait=null;shelterCollection=null;shelterExploreSkipped.clear();shelterExploreNote=''; }
     schedule();
   });
   shelterControl('shelter-explore-claim','change',event=>{
@@ -3323,26 +3382,32 @@
     return a!==b&&[a,b].every(id=>Number.isSafeInteger(id)&&id>0)&&s.births.some(birth=>
       Array.isArray(birth.parents)&&birth.parents.length===2&&birth.parents.includes(a)&&birth.parents.includes(b));
   }
-  function shelterDevelopmentPlan(m,target=14) {
-    const s=m.state, now=m.now, candidates=[], notes=[], fmt=n=>Number(n.toFixed(1));
-    const built=s.rooms.filter(r=>r.builtAt<=now), living=s.residents.filter(p=>p.deadAt===null);
+  function shelterGrowthNeeds(m) {
+    const s=m.state,now=m.now,living=s.residents.filter(p=>p.deadAt===null);
     const population=living.length+s.births.length, recovering=shelterRecoveringPopulation(s);
     const construction=s.rooms.filter(r=>r.type!=='elevator'&&(r.builtAt>now||r.upgradeAt!==null));
-    const storagePerk=s.legacy?.perks?.storage??0;
-    const committedRooms=s.rooms.map(r=>r.builtAt<=now&&r.upgradeAt!==null?{...r,level:Math.min(3,r.level+1)}:r);
-    const committed=shelterCapacity(committedRooms,storagePerk),committedCapacity=committed.populationCap;
-    const capacityPending=committed.itemCap>m.itemCap||Object.keys(m.caps).some(k=>committed.caps[k]>m.caps[k]);
     const pairs=new Set(living.filter(p=>p.romance&&Number.isSafeInteger(p.romance.partnerId)&&
       !shelterFamilyExpecting(s,p.id,p.romance.partnerId)).map(p=>[p.id,p.romance.partnerId].sort((a,b)=>a-b).join(':')));
     const futureMouths=population+recovering+pairs.size;
+    // 只预留已有人口/家庭和已开工工程，不提前消耗尚未安排的发展目标所需的人手。
+    const committedPower=construction.reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:
+      (shelterRooms[r.type][1]?1:.5)*r.width*(r.builtAt>now?r.level:r.level<3?1:0)),0);
+    const demand={power:m.demand.power+committedPower,food:Math.max(m.demand.food,futureMouths),water:Math.max(m.demand.water,futureMouths)};
+    return {population,recovering,construction,pairs,futureMouths,committedPower,demand};
+  }
+  function shelterDevelopmentPlan(m,target=14) {
+    const s=m.state, now=m.now, candidates=[], notes=[], buildRequests=[], fmt=n=>Number(n.toFixed(1));
+    const built=s.rooms.filter(r=>r.builtAt<=now), living=s.residents.filter(p=>p.deadAt===null);
+    const {population,recovering,construction,pairs,futureMouths,committedPower,demand}=shelterGrowthNeeds(m);
+    const storagePerk=s.legacy?.perks?.storage??0;
+    const committedRooms=s.rooms.map(r=>r.builtAt<=now&&r.upgradeAt!==null?{...r,level:Math.min(3,r.level+1)}:r);
+    const committed=shelterCapacity(committedRooms,storagePerk),committedCapacity=committed.populationCap;
+    const fitsCommittedCapacity=c=>Object.entries(c.cost).every(([key,cost])=>cost<=committed.caps[key]);
+    const capacityPending=committed.itemCap>m.itemCap||Object.keys(m.caps).some(k=>committed.caps[k]>m.caps[k]);
     const requestedTarget=Number.isInteger(target)&&target>=2&&target<=200?target:null;
     const wanted=Math.max(requestedTarget??0,futureMouths);
     if(pairs.size)notes.push(`已有 ${pairs.size} 对培养感情的家庭，另预留 ${pairs.size} 个出生名额、床位及成年口粮；转为待产后不重复预留。`);
     if(recovering)notes.push(`倒下居民 ${recovering} 人仍在名单中，已预留恢复后的床位与成年口粮；记录移除后才释放预留，当前产出和消耗不包含他们。`);
-    // Current demand already includes built rooms at their current level; reserve only unfinished additions.
-    const committedPower=construction.reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:
-      (shelterRooms[r.type][1]?1:.5)*r.width*(r.builtAt>now?r.level:r.level<3?1:0)),0);
-    const demand={power:m.demand.power+committedPower,food:Math.max(m.demand.food,futureMouths),water:Math.max(m.demand.water,futureMouths)};
     const shortages=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9);
     const netScrap=m.production.scrap-6*m.production.parts;
     const active=r=>r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
@@ -3372,7 +3437,7 @@
     if(awayAssigned)notes.push(`${awayAssigned} 名外出居民仍登记在生产房间，原生调岗按记录占位，这些位置不能直接补员；当前不计他们的产出，归来或岗位释放后再核对空位。`);
     if(built.some(r=>r.incident||r.unpowered))notes.push('有房间因事件或停电停产，先恢复现有产能，再按正常产量重算扩建收益。');
     if(netScrap<=0)notes.push('工坊每生产 1 零件消耗 6 废料；当前废料净增不为正，不能按回收站毛产量推算攒料时间。');
-    const assess=c=>{
+    const assess=(c,record=true)=>{
       c.blocks??=[];c.cost??={scrap:0,parts:0};
       c.shortage=Object.fromEntries(Object.entries(c.cost).map(([k,v])=>[k,Math.max(0,Math.ceil(v-s.resources[k]))]));
       if(c.kind!=='staff'&&c.kind!=='dig'&&construction.length>=2)c.blocks.push('先等一个施工名额空出');
@@ -3382,61 +3447,148 @@
         else if(limits.length)c.blocks.push('先等已开工工程完工，所需库存容量尚未生效');
       }
       c.saveHours=c.shortage.scrap>0&&netScrap>0&&c.cost.scrap<=m.caps.scrap?c.shortage.scrap/netScrap:null;
-      candidates.push(c);
+      if(record)candidates.push(c);
+      return c;
     };
     const powerCheck=extra=>extra>0&&m.production.power<(demand.power+extra)*1.2-1e-9?['扩建后电力余量不足，先补发电']:[];
     const vacancy=type=>built.filter(r=>r.type===type&&active(r)).reduce((n,r)=>n+Math.max(0,r.width*2-
       living.filter(p=>p.adultAt<=now&&p.roomId===r.id).length),0);
     const labels=type=>shelterBuildRules[type][0];
-    const build=(type,priority,benefit)=>{
-      if(!layout||!spots.length)return;
+    const build=(type,priority,benefit,gain=0)=>{
       const [label,base,unlock]=shelterBuildRules[type];
-      const spot=spots.find(p=>p.previous?.type===type&&p.previous.level===1&&p.previous.width<3&&active(p.previous))||spots[0];
       const cells=s.rooms.filter(r=>r.type===type).reduce((n,r)=>n+r.width,0);
       const extra=shelterRooms[type][1]?type==='power'?0:1:.5;
       const blocks=powerCheck(extra);
       if(m.view.progress.level<unlock)blocks.push(`避难所 ${unlock} 级解锁`);
+      const cost={scrap:Math.ceil(base*(1+.2*cells)),parts:0};
+      buildRequests.push({type,label,priority,cost,blocks});
+      if(!layout||!spots.length)return;
+      const spot=spots.find(p=>p.previous?.type===type&&p.previous.level===1&&p.previous.width<3&&active(p.previous))||spots[0];
+      const economics=type==='scrap'&&gain>0?{gain,materialScrap:cost.scrap,lostScrap:0,paybackHours:1/6+cost.scrap/gain}:null;
       assess({kind:'build',type,priority,floor:spot.floor,col:spot.col,hours:1/6,
-        title:`第 ${spot.floor} 层右侧新建一格${label}`,cost:{scrap:Math.ceil(base*(1+.2*cells)),parts:0},benefit:`${benefit}；施工约 10 分钟`,blocks});
+        title:`第 ${spot.floor} 层右侧新建一格${label}`,cost,...(economics?{economics}:{}),
+        benefit:`${benefit}；施工约 10 分钟`+(economics?`；上述闲置人选到岗、产量不变且持续收取时，自开工起回本约 ${economics.paybackHours.toFixed(1)} 小时（不含攒料及调岗等待）`:''),blocks});
+    };
+    const upgradeEstimate=r=>{
+      const next=r.level+1,hours=r.width*(next===2?1:3),rate=m.rooms.find(x=>x.id===r.id)?.rate||0;
+      const cost={scrap:Math.ceil(shelterBuildRules[r.type][1]*r.width*(next===2?2.5:6)),parts:next===3?15*r.width:0};
+      const gain=rate*([0,1,1.5,2.1][next]/[0,1,1.5,2.1][r.level]-1);
+      const materialScrap=cost.scrap+6*cost.parts,lostScrap=rate*hours;
+      return {r,next,hours,rate,cost,gain,economics:r.type==='scrap'&&gain>0?
+        {gain,materialScrap,lostScrap,paybackHours:hours+(materialScrap+lostScrap)/gain}:null};
     };
     const upgrade=(r,priority,benefit)=>{
       if(r.level>=3||!active(r))return;
-      const next=r.level+1,hours=r.width*(next===2?1:3),resource=shelterRooms[r.type][1];
-      const row=m.rooms.find(x=>x.id===r.id),extra=resource?r.type==='power'?0:r.width:.5*r.width;
+      const {next,hours,rate,cost,economics}=upgradeEstimate(r),resource=shelterRooms[r.type][1];
+      const extra=resource?r.type==='power'?0:r.width:.5*r.width;
       const blocks=powerCheck(extra), outages=[];
       for(const k of Object.keys(demand)) {
-        const left=m.production[k]-(resource===k?row.rate:0),need=Math.max(0,demand[k]-left)*hours+2*demand[k];
+        const left=m.production[k]-(resource===k?rate:0),need=Math.max(0,demand[k]-left)*hours+2*demand[k];
         if(s.resources[k]<need)outages.push(`${shelterResources[k]}需至少 ${Math.ceil(need)} 库存（含两小时余量）`);
       }
       if(outages.length)blocks.push(`停产期间${outages.join('、')}`);
-      if(resource==='parts'&&s.resources.scrap<6*row.rate*hours)blocks.push('工坊废料供应不足，实际增产待核对');
-      assess({kind:'upgrade',type:r.type,id:r.id,priority,hours,title:`${Number.isInteger(r.floor)?`第 ${r.floor} 层` : ''}${labels(r.type)}升至 ${next} 级`,
-        cost:{scrap:Math.ceil(shelterBuildRules[r.type][1]*r.width*(next===2?2.5:6)),parts:next===3?15*r.width:0},
-        benefit:`${benefit}；整间施工 ${hours} 小时${resource?'，期间停产':''}`,blocks});
+      if(resource==='parts'&&s.resources.scrap<6*rate*hours)blocks.push('工坊废料供应不足，实际增产待核对');
+      return assess({kind:'upgrade',type:r.type,id:r.id,priority,hours,title:`${Number.isInteger(r.floor)?`第 ${r.floor} 层` : ''}${labels(r.type)}升至 ${next} 级`,
+        cost,...(economics?{economics}:{}),
+        benefit:`${benefit}；整间施工 ${hours} 小时${resource?'，期间停产':''}`+
+          (economics?`；人员与产量不变且持续收取时，自开工起回本约 ${economics.paybackHours.toFixed(1)} 小时`+
+            `（含零件折合废料 ${6*cost.parts}、停产损失约 ${fmt(economics.lostScrap)} 废料，不含攒料等待）`:''),blocks},false);
     };
+    // 各项已开工工程共用人手；先补预计基础供应缺口，再预留回收岗位。
+    const forecasts=new Map(),remaining=[...idle];
+    for(const type of ['power','diner','water','scrap']) {
+      const resource=shelterRooms[type][1],pending=construction.filter(r=>r.type===type&&!r.incident&&!r.unpowered);
+      if(!pending.length)continue;
+      const readyAt=Math.max(now,...pending.map(r=>r.builtAt>now?r.builtAt:r.upgradeAt));
+      const working=built.filter(r=>r.type===type&&active(r));
+      const output=(at,env)=>working.reduce((sum,r)=>sum+living.filter(p=>
+        p.roomId===r.id&&p.away===null&&p.adultAt<=at).slice(0,r.width*2)
+        .reduce((n,p)=>n+shelterWorkerRate(s,at,env,p,r),0),0);
+      const forecast={pending,waitHours:(readyAt-now)/3600000,futureRate:output(readyAt,m.view.env),
+        waitingRate:Math.min(m.production[resource],output(now,{...m.view.env,events:[]})),reserved:[],rooms:[]};
+      for(const r of [...pending].sort((a,b)=>b.level-a.level||a.id-b.id)) {
+        const room={...r,builtAt:now,upgradeAt:null,level:r.builtAt>now?r.level:Math.min(3,r.level+1)};
+        const assigned=living.filter(p=>p.roomId===r.id&&p.adultAt<=readyAt);
+        forecast.futureRate+=assigned.filter(p=>p.away===null).slice(0,r.width*2)
+          .reduce((n,p)=>n+shelterWorkerRate(s,readyAt,m.view.env,p,room),0);
+        forecast.rooms.push({slots:Math.max(0,r.width*2-assigned.length),
+          rates:new Map(idle.map(p=>[p.id,shelterWorkerRate(s,readyAt,m.view.env,p,room)]))});
+      }
+      forecasts.set(type,forecast);
+    }
+    while(remaining.length) {
+      let best=null;
+      for(const [type,f] of forecasts)for(const room of f.rooms) {
+        if(!room.slots)continue;
+        const resource=shelterRooms[type][1],need=demand[resource]*1.2,gap=Math.max(0,need-f.futureRate);
+        for(const p of remaining) {
+          const rate=room.rates.get(p.id),cover=resource==='scrap'?0:Math.min(gap,rate)/Math.max(1,need),scrap=resource==='scrap'?rate:0;
+          if(cover<=1e-9&&scrap<=1e-9)continue;
+          // 同等补缺时先用单项人选，给仍有缺口的其他工程留下兼长居民。
+          let alternative=0;
+          if(cover>0)for(const [otherType,other] of forecasts) {
+            const otherResource=shelterRooms[otherType][1],otherNeed=demand[otherResource]*1.2;
+            if(otherType===type||otherResource==='scrap')continue;
+            for(const otherRoom of other.rooms)if(otherRoom.slots)alternative=Math.max(alternative,
+              Math.min(Math.max(0,otherNeed-other.futureRate),otherRoom.rates.get(p.id))/Math.max(1,otherNeed));
+          }
+          if(!best||cover>best.cover+1e-9||Math.abs(cover-best.cover)<=1e-9&&
+              (scrap>best.scrap+1e-9||Math.abs(scrap-best.scrap)<=1e-9&&alternative<best.alternative-1e-9))
+            best={f,room,p,rate,cover,scrap,alternative};
+        }
+      }
+      if(!best)break;
+      best.room.slots--;best.f.futureRate+=best.rate;best.f.reserved.push(best.p);
+      remaining.splice(remaining.findIndex(p=>p.id===best.p.id),1);
+    }
     for(const type of ['power','diner','water','scrap']) {
       const resource=shelterRooms[type][1],deficit=shortages.includes(resource),priority=deficit?10:resource==='scrap'?50:90;
       if(!deficit&&resource!=='scrap')continue;
       const vacancies=vacancy(type);
       if(vacancies)assess({kind:'staff',type,priority:deficit?5:15,title:`先补现有${labels(type)}岗位`,
         benefit:`已有 ${vacancies} 个空岗；${idle.length?`可先评估 ${idle.length} 名健康闲置成人`:'暂无可直接安排的健康闲置成人，先评估调岗或等待孩子成年'}，不用先造新房`,blocks:[]});
-      if(!vacancies&&idle.length) {
-        const hypothetical={type,width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
-        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
-        build(type,priority,`安排现有闲置成人后约增加 ${fmt(gain)} ${shelterResources[resource]}/小时；空房本身不增产`);
+      const forecast=forecasts.get(type),pending=forecast?.pending||[],reserved=forecast?.reserved||[];
+      const futureRate=forecast?.futureRate??m.production[resource],waitingRate=forecast?.waitingRate??m.production[resource],waitHours=forecast?.waitHours||0;
+      if(pending.length) {
+        notes.push(`已有 ${pending.length} 间${labels(type)}正在施工或升级，为其空岗预留 ${reserved.length} 名现有闲置成人；`+
+          `约 ${Math.ceil(waitHours*60)} 分钟后核对完工结果，不能把这些人重复计入另一间新房的收益。`);
+        if(deficit&&futureRate<demand[resource]*1.2-1e-9)notes.push(`${labels(type)}完工后按已在岗及本项预留人手预计 ${fmt(futureRate)} ${shelterResources[resource]}/小时，`+
+          `仍未达到 ${fmt(demand[resource]*1.2)} 的供应准备线；先评估调岗或等待孩子成年，各项工程不共用同一预留人选。`);
       }
-      if(!vacancies&&!idle.length&&deficit&&!built.some(r=>r.type===type))
+      const reserve=deficit?Math.max(0,demand[resource]-waitingRate)*waitHours+2*demand[resource]:0;
+      const canWait=deficit&&pending.length&&futureRate>=demand[resource]*1.2-1e-9&&s.resources[resource]>=reserve;
+      if(canWait)notes.push(`${labels(type)}完工后按现有人员及预留人选预计可覆盖供应，库存可等待并保留两小时余量；先等现有工程，不重复新建。产量未计入当前收入，完工后重新核对。`);
+      else if(deficit&&pending.length&&s.resources[resource]<reserve)notes.push(`${labels(type)}完工前的库存缓冲不足，仍需评估其他补员或补救建设，不能只等现有工程。`);
+      const urgent=deficit&&pending.length&&waitHours>1/6&&s.resources[resource]<reserve;
+      const available=urgent?[...remaining,...reserved]:remaining;
+      if(urgent&&reserved.length)notes.push(`预留给${labels(type)}的闲置人手可先评估更早完工的补救房间；原工程完工后重新分配，不能同时算两处产量。`);
+      if(!vacancies&&available.length&&!canWait) {
+        const hypothetical={type,width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
+        const gain=available.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        build(type,priority,`安排现有闲置成人后约增加 ${fmt(gain)} ${shelterResources[resource]}/小时；空房本身不增产`,gain);
+      }
+      if(!vacancies&&!idle.length&&deficit&&!built.some(r=>r.type===type)&&!pending.length)
         build(type,priority,'尚无可直接安排的健康闲置成人，先确认调岗人选；建成空房不会增加产量');
-      const upgrades=built.filter(r=>r.type===type&&active(r)&&r.level<3).map(r=>{
-        const rate=m.rooms.find(x=>x.id===r.id).rate,gain=rate*([0,1,1.5,2.1][r.level+1]/[0,1,1.5,2.1][r.level]-1);
-        return {r,gain};}).filter(x=>x.gain>0).sort((a,b)=>b.gain/b.r.width-a.gain/a.r.width);
-      if(upgrades.length){const {r,gain}=upgrades[0];upgrade(r,priority+1,`按当前人员约增加 ${fmt(gain)} ${shelterResources[resource]}/小时`);}
+      const upgrades=built.filter(r=>r.type===type&&active(r)&&r.level<3).map(upgradeEstimate).filter(x=>x.gain>0)
+        .sort((a,b)=>type==='scrap'?a.economics.paybackHours-b.economics.paybackHours||a.cost.scrap-b.cost.scrap||a.r.id-b.r.id:
+          b.gain/b.r.width-a.gain/a.r.width);
+      if(upgrades.length&&!canWait) {
+        const choices=upgrades.map(({r,gain})=>upgrade(r,type==='scrap'?priority:priority+1,
+          `按当前人员约增加 ${fmt(gain)} ${shelterResources[resource]}/小时`));
+        // 先核对每间的供电、停产储备和容量；同等可行条件下保持原收益顺序。
+        const choice=choices.find(c=>!c.blocks.length)||choices.find(fitsCommittedCapacity)||choices[0];
+        if(choice!==choices[0])notes.push(`${choices[0].title}暂未满足条件：${choices[0].blocks.join('；')}；`+
+          `本轮改评估${choice.title}，条件变化后再按增产或回本重新比较。`);
+        candidates.push(choice);
+      }
     }
     if(committedCapacity<wanted) {
       const benefit=`人口容量增加 ${Math.min(200,committedCapacity+4)-committedCapacity}，当前及施工后容量 ${m.populationCap}/${committedCapacity}，规划至少 ${wanted}；不加快培养感情`;
-      build('quarters',shortages.length?65:30,benefit);
+      const housingPriority=committedCapacity-futureMouths>1?70:shortages.length?65:30;
+      if(housingPriority===70)notes.push(`已有及在建床位还可容纳 ${committedCapacity-futureMouths} 人，宿舍暂列后续；先提高废料产出，预期人口距容量只剩 1 人时提前扩容。`);
+      build('quarters',housingPriority,benefit);
       const room=built.filter(r=>r.type==='quarters'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
-      if(room)upgrade(room,shortages.length?66:31,`人口容量增加 ${Math.min(200,committedCapacity+2*room.width)-committedCapacity}；不加快培养感情`);
+      if(room)candidates.push(upgrade(room,housingPriority+1,`人口容量增加 ${Math.min(200,committedCapacity+2*room.width)-committedCapacity}；不加快培养感情`));
     }
     const full=Object.keys(m.caps).filter(k=>s.resources[k]>=.9*m.caps[k]&&m.production[k]>0);
     const equipmentFull=s.items.length>=.9*m.itemCap;
@@ -3455,11 +3607,16 @@
         };
         build('storage',20,storageGain(1));
         const room=built.filter(r=>r.type==='storage'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
-        if(room)upgrade(room,21,storageGain(room.width));
+        if(room)candidates.push(upgrade(room,21,storageGain(room.width)));
       }
     }
-    // 升级方案是备选项：先说明推进其中一项所需的最小零件缺口，不把费用累加。
-    const partsShortages=candidates.filter(c=>c.kind==='upgrade'&&c.shortage.parts>0).map(c=>c.shortage.parts);
+    const compareProjects=(a,b)=>a.priority-b.priority||a.blocks.length-b.blocks.length||
+      (a.economics&&b.economics?a.economics.paybackHours-b.economics.paybackHours:0)||a.cost.scrap-b.cost.scrap;
+    // 材料准备跟随本轮建设取舍；远期扩容和被更优新建替代的升级不提前触发工坊。
+    const partsUpgrades=candidates.filter(c=>c.kind==='upgrade'&&fitsCommittedCapacity(c)&&c.shortage.parts>0);
+    const partsShortages=partsUpgrades.filter(c=>c.priority<70&&!candidates.some(other=>other.type===c.type&&
+      other.kind==='build'&&!other.blocks.length&&compareProjects(other,c)<0)).map(c=>c.shortage.parts);
+    if(partsShortages.length<partsUpgrades.length)notes.push('后续扩容或未优先采用的升级仍列出材料缺口，暂不为这些备选方案提前安排工坊；建设顺序改变后再评估。');
     if(partsShortages.length) {
       const needed=Math.min(...partsShortages),feed=6*needed,workshops=s.rooms.filter(r=>r.type==='workshop');
       notes.push(`备选升级至少还缺 ${needed} 零件；先选定一项，其他方案的零件需求不累加。工坊每生产 1 零件消耗 6 废料，补足这部分至少另外消耗 ${feed} 废料，须与升级、建造费用分别预留。`);
@@ -3474,7 +3631,7 @@
       } else if(workshops.length)notes.push('先恢复现有工坊的事件或停电，再核对产量，不重复建造。');
       else {
         const hypothetical={type:'workshop',width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
-        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        const gain=remaining.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
         build('workshop',25,gain>0?`安排现有闲置成人后约产 ${fmt(gain)} 零件/小时，同时消耗 ${fmt(6*gain)} 废料/小时；人员由你安排`:
           '先确认智力高的值班人选和废料供应；空工坊不会生产零件，人员由你安排');
       }
@@ -3500,7 +3657,7 @@
       else if(medbays.length)notes.push('先恢复现有医务室的事件或停电，再核对产量，不重复建造。');
       else {
         const hypothetical={type:'medbay',width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
-        const gain=idle.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
+        const gain=remaining.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
         build('medbay',18,gain>0?`安排现有闲置成人后约产 ${fmt(gain)} 治疗针/小时；人员由你安排`:
           '先确认智力高的健康值班人选并保住基础供应；空医务室不会生产治疗针，人员由你安排');
       }
@@ -3508,19 +3665,48 @@
     if(Number.isInteger(s.depth)&&s.depth>=1&&s.depth<=1000) {
       const cost=Math.ceil(120*Math.pow(s.depth+1,1.4));
       if(s.digging&&Number.isFinite(s.digging.doneAt))notes.push(`正在下挖，约 ${Math.max(0,Math.ceil((s.digging.doneAt-now)/60000))} 分钟后完成，先等现有工程。`);
-      else if(s.digging===null&&layout&&!spots.length)assess({kind:'dig',type:'elevator',priority:40,
-        title:`向下扩至第 ${s.depth+1} 层`,cost:{scrap:cost,parts:0},benefit:'新增建造空间；下挖本身不增加废料产量，工期以网站确认为准',blocks:[]});
+      else if(s.digging===null&&layout&&!spots.length) {
+        // 普通生产的新建需求已扣除在建岗位/产能；仍有需求时不能再因同类施工一概跳过。
+        const needs=buildRequests.filter(request=>(['power','diner','water','scrap'].includes(request.type)||!construction.some(r=>r.type===request.type))&&
+          !candidates.some(c=>c.type===request.type&&(c.kind==='staff'||c.kind==='upgrade'&&fitsCommittedCapacity(c))))
+          .sort((a,b)=>a.priority-b.priority||a.cost.scrap-b.cost.scrap);
+        if(needs.length) {
+          const request=needs[0];
+          assess({kind:'dig',type:'elevator',priority:request.priority>=70?request.priority:Math.max(0,request.priority-1),
+            title:`向下扩至第 ${s.depth+1} 层，为${request.label}腾出空间`,cost:{scrap:cost,parts:0},
+            benefit:`现有楼层没有空位，也没有可先补员的同类空岗或库存容量足够的同类升级方案；下挖后再建一格${request.label}需 ${request.cost.scrap} 废料，`+
+              `两项合计 ${cost+request.cost.scrap} 废料，可分阶段积攒；下挖本身不增加产量，工期以网站确认为准`,
+            blocks:request.blocks.map(message=>`目标${request.label}：${message}`)});
+        } else notes.push(buildRequests.length?'先利用现有房间补员、升级或等待同类工程完工，暂不下挖；完成后重新检查容量和岗位。':
+          '当前没有必须新增的房间，即使楼层已满也暂不下挖；需要新岗位或容量时再评估。');
+      }
       else if(layout&&spots.length)notes.push(`下挖一层需 ${cost} 废料；目前有空位，暂缓这项开支。`);
     }
-    candidates.sort((a,b)=>a.priority-b.priority||a.cost.scrap-b.cost.scrap);
-    return {at:now,population,recovering,reservedBirths:pairs.size,requestedTarget,capacity:m.populationCap,committedCapacity,target:wanted,netScrap,notes,candidates:candidates.slice(0,8)};
+    candidates.sort(compareProjects);
+    const first=candidates.find(c=>c.priority<70),missing=first?Object.entries(first.shortage).filter(([,v])=>v>0).map(([k,v])=>`${v} ${shelterResources[k]}`):[];
+    const waiting=construction.length>0||s.digging&&Number.isFinite(s.digging.doneAt);
+    let next=first?{kind:first.kind,type:first.type,title:first.title,
+      status:first.blocks.length?'blocked':first.kind==='staff'?'staff':missing.length?'saving':'ready',
+      reason:first.blocks.length?first.blocks.join('；'):first.kind==='staff'?'先评估现有人员与空岗，不必先花资源建造':
+        missing.length?`尚缺 ${missing.join('、')}${first.saveHours!==null?`；按当前净产量且持续收取、不再消费，废料约还需 ${first.saveHours.toFixed(1)} 小时`:''}`:
+          '当前库存和已知施工条件满足；操作前重新核对网页费用与人员安排'}:
+      {status:waiting||candidates.length?'waiting':'none',title:waiting?'等待现有工程完工':candidates.length?'先发展人口，再扩宿舍':'保持生产与收取',
+        reason:waiting?'先核对完工后的容量、岗位和产量，再决定下一笔投入':candidates.length?
+          `已预留感情与待产人口，床位仍余 ${committedCapacity-futureMouths}；预期人口距容量只剩 1 人时再投入扩容`:'暂未发现必须立即投入的建设'};
+    const stopped=built.find(r=>shelterRooms[r.type][1]&&r.upgradeAt===null&&(r.incident||r.unpowered)&&m.rooms.find(row=>row.id===r.id)?.workers>0);
+    if(stopped)next={status:'restore',kind:'restore',type:stopped.type,title:`恢复${labels(stopped.type)}现有产能`,
+      reason:stopped.incident?'现有值班房间因事件停产，先处理事件，再按恢复后的产量决定建设':
+        '现有值班房间停电，先核对发电岗位、电力库存与领取，恢复供电后再决定建设'};
+    return {at:now,population,recovering,reservedBirths:pairs.size,requestedTarget,capacity:m.populationCap,committedCapacity,target:wanted,netScrap,notes,next,candidates:candidates.slice(0,8)};
   }
   function shelterDevelopmentText(plan) {
     const lines=[`人口 ${plan.population}/${plan.capacity}（含外出与待产），${plan.requestedTarget===null?'人口目标未设置':`设置目标 ${plan.requestedTarget}`}，规划容量至少 ${plan.target}；废料扣除工坊消耗后约 ${plan.netScrap.toFixed(1)}/小时。`,...plan.notes];
+    const status={ready:'条件已满足',saving:'先攒资源',blocked:'先满足条件',staff:'先调人员',waiting:'等待时机',none:'继续生产',restore:'先恢复产能'};
+    if(plan.next)lines.unshift(`建设计划：${status[plan.next.status]}。下一步：${plan.next.title}。${plan.next.reason}。`);
     for(const [i,c] of plan.candidates.entries()) {
       const price=c.kind==='staff'?'无需建造费用':`${c.cost.scrap} 废料${c.cost.parts?` + ${c.cost.parts} 零件`:''}`;
       const missing=Object.entries(c.shortage).filter(([,v])=>v>0).map(([k,v])=>`${v} ${shelterResources[k]}`);
-      lines.push(`${i+1}. ${c.title}：${price}。${c.benefit}。${missing.length?`尚缺 ${missing.join('、')}。`:''}${
+      lines.push(`${i+1}. ${c.priority>=70?'后续规划（尚未到开工时机）：':''}${c.title}：${price}。${c.benefit}。${missing.length?`尚缺 ${missing.join('、')}。`:''}${
         c.saveHours!==null?`按当前净产量且持续收取、不再消费，废料约还需 ${c.saveHours.toFixed(1)} 小时。`:''}${
         c.blocks.length?`先决条件：${c.blocks.join('；')}。`:''}`);
     }
@@ -3804,11 +3990,52 @@
         const gain = shelterWorkerRate(s,m.now,m.view.env,{...p,outfitId:item.id},room)-current;
         if (gain <= 1e-6) continue;
         const priority = Object.hasOwn(m.demand,resource) && m.production[resource] < m.demand[resource]*1.2 ? 2 : resource === 'scrap' ? 1 : 0;
-        choices.push({kind:'equip',id:p.id,item:item.id,fromItem:p.outfitId,room:p.roomId,from:p.roomId,name:p.name,
+        choices.push({kind:'equip',id:p.id,item:item.id,fromItem:p.outfitId,room:p.roomId,from:p.roomId,name:p.name,resource,
           reason:`穿戴闲置服装，增加${shelterResources[resource]}产出`,gain,priority});
       }
     }
-    return choices.sort((a,b) => b.priority-a.priority || (Math.abs(b.gain-a.gain) > 1e-6 ? b.gain-a.gain : 0) || a.id-b.id || a.item-b.item)[0] || null;
+    choices.sort((a,b) => b.priority-a.priority || (Math.abs(b.gain-a.gain) > 1e-6 ? b.gain-a.gain : 0) || a.id-b.id || a.item-b.item);
+    const result=shelterFindGear(m,choices),choice=result.choices[0];
+    return choice?{...choice,reason:`${result.complete?'整批比较闲置服装':'有界比较闲置服装'}，增加${shelterResources[choice.resource]}产出`,
+      gearComparison:{complete:result.complete,nodes:result.nodes,count:result.choices.length,
+        before:m.production,after:result.production}}:null;
+  }
+  function shelterFindGear(m,choices,maxNodes=20000) {
+    // 同时比较所有闲置衣服，避免多属性服先被有替代衣服的岗位占用。
+    // 每位居民至多一件、每件至多一人；只返回下一步，确认后按新快照重新比较。
+    const keys=[...Object.keys(m.demand),'scrap'],byPerson=new Map();
+    for(const c of choices){if(!byPerson.has(c.id))byPerson.set(c.id,[]);byPerson.get(c.id).push(c);}
+    const workers=[...byPerson.values()].sort((a,b)=>a.length-b.length||choices.indexOf(a[0])-choices.indexOf(b[0]));
+    const production={...m.production},used=new Set(),people=new Set(),selected=[];
+    for(const c of choices)if(!used.has(c.item)&&!people.has(c.id)){
+      selected.push(c);used.add(c.item);people.add(c.id);production[c.resource]+=c.gain;
+    }
+    const snapshot=()=>({choices:[...selected],production:{...production},score:shelterAllocationScore(production,m.demand),changes:selected.length});
+    let best=snapshot(),nodes=0,limited=false;
+    if(workers.length>16)return {...best,complete:false,nodes};
+    const suffix=Array.from({length:workers.length+1},()=>Object.fromEntries(keys.map(k=>[k,0])));
+    for(let i=workers.length-1;i>=0;i--)for(const k of keys)
+      suffix[i][k]=suffix[i+1][k]+Math.max(0,...workers[i].filter(c=>c.resource===k).map(c=>c.gain));
+    Object.assign(production,m.production);selected.length=0;used.clear();
+    function visit(index){
+      if(nodes>=maxNodes){limited=true;return;}nodes++;
+      const candidate={score:shelterAllocationScore(production,m.demand),changes:selected.length};
+      if(shelterAllocationCompare(candidate,best)>0)best=snapshot();
+      if(index===workers.length)return;
+      const optimistic=Object.fromEntries(keys.map(k=>[k,production[k]+suffix[index][k]]));
+      if(shelterAllocationCompare({score:shelterAllocationScore(optimistic,m.demand),changes:selected.length},best)<=0)return;
+      for(const c of workers[index]){
+        if(used.has(c.item))continue;
+        used.add(c.item);selected.push(c);production[c.resource]+=c.gain;
+        visit(index+1);
+        production[c.resource]-=c.gain;selected.pop();used.delete(c.item);
+        if(limited)return;
+      }
+      visit(index+1);
+    }
+    visit(0);
+    best.choices.sort((a,b)=>choices.indexOf(a)-choices.indexOf(b));
+    return {...best,complete:!limited,nodes};
   }
   function shelterSwapSequences(a,b) {
     const move = (p,room) => ({id:p.id,room});
@@ -3820,33 +4047,178 @@
     ];
   }
   // 模拟每一步的房间容量与供应；不能安全腾位的满员房间保留原安排。
-  function shelterSwapProjection(m,moves,futureSupply = false) {
+  function shelterSwapProjection(m,moves,futureSupply = false,allowShortages = false) {
     const s = m.state, assigned = new Map(s.residents.map(p => [p.id,p.roomId])), projected = {...(m.actualProduction || m.production)};
     const demand = futureSupply && m.currentDemand ? m.currentDemand : m.demand;
+    const output = room => !room || !shelterRooms[room.type][1] ? 0 : s.residents.filter(p =>
+      assigned.get(p.id)===room.id && p.deadAt===null && p.away===null && p.adultAt<=m.now).slice(0,room.width*2)
+      .reduce((sum,p)=>sum+shelterWorkerRate(s,m.now,m.view.env,p,room),0);
     for (const move of moves) {
       const p = s.residents.find(p => p.id === move.id), old = s.rooms.find(r => r.id === assigned.get(move.id));
       const room = move.room === null ? null : s.rooms.find(r => r.id === move.room);
       if (!p || move.room !== null && (!room || !staffRoomTypes.includes(room.type) || room.builtAt > m.now ||
           room.incident || room.unpowered || room.upgradeAt !== null ||
           s.residents.filter(other => other.id !== p.id && other.deadAt === null && other.adultAt <= m.now && assigned.get(other.id) === room.id).length >= room.width*2)) return null;
-      if (old && shelterRooms[old.type][1]) projected[shelterRooms[old.type][1]]-=shelterWorkerRate(s,m.now,m.view.env,p,old);
-      if (room) projected[shelterRooms[room.type][1]]+=shelterWorkerRate(s,m.now,m.view.env,p,room);
+      const floor=Object.fromEntries(Object.keys(demand).map(k=>[k,allowShortages?Math.min(projected[k],demand[k]*1.2):demand[k]*1.2]));
+      const affected=[...new Set([old,room].filter(Boolean))],before=affected.map(output);
       assigned.set(p.id,move.room);
-      if (!Object.keys(demand).every(key => projected[key] >= demand[key]*1.2-1e-9)) return null;
+      affected.forEach((r,i)=>{const resource=shelterRooms[r.type][1];if(resource)projected[resource]+=output(r)-before[i];});
+      if (!Object.keys(demand).every(key => projected[key] >= floor[key]-1e-9)) return null;
     }
     return projected;
+  }
+  function shelterAllocationScore(production,demand) {
+    const keys=Object.keys(demand);
+    return {gap:keys.reduce((sum,k)=>sum+Math.max(0,demand[k]*1.2-production[k])/Math.max(1,demand[k]*1.2),0),
+      scrap:production.scrap,basic:keys.reduce((sum,k)=>sum+production[k],0)};
+  }
+  function shelterAllocationCompare(a,b) {
+    for(const [key,direction] of [['gap',-1],['scrap',1],['basic',1]]) {
+      const delta=(a.score[key]-b.score[key])*direction;
+      if(Math.abs(delta)>1e-6)return delta;
+    }
+    return b.changes-a.changes;
+  }
+  function shelterAllocationFutureSupply(m) {
+    return Boolean(m.currentDemand&&Object.keys(m.demand).some(k=>m.production[k]<m.demand[k]*1.2-1e-9));
+  }
+  function shelterAllocationImproves(before,after) {
+    return before.gap-after.gap>1e-6 || Math.abs(before.gap-after.gap)<=1e-6 &&
+      (after.scrap-before.scrap>1 || Math.abs(after.scrap-before.scrap)<1e-6&&after.basic-before.basic>1);
+  }
+  function shelterAllocationOutput(m,targets) {
+    const assigned=new Map(targets.map(p=>[p.id,p.room])),s=m.state;
+    const production={...m.production,power:0,food:0,water:0,scrap:0};
+    for(const room of s.rooms.filter(r=>staffRoomTypes.includes(r.type))) {
+      const workers=s.residents.filter(p=>(assigned.has(p.id)?assigned.get(p.id):p.roomId)===room.id&&
+        p.deadAt===null&&p.away===null&&p.adultAt<=m.now).slice(0,room.width*2);
+      production[shelterRooms[room.type][1]]+=workers.reduce((sum,p)=>sum+shelterWorkerRate(s,m.now,m.view.env,p,room),0);
+    }
+    return production;
+  }
+  function shelterAllocationMoves(m,targets) {
+    const people=targets.filter(t=>m.state.residents.some(p=>p.id===t.id&&p.roomId!==t.room));
+    const assigned=new Map(m.state.residents.map(p=>[p.id,p.roomId])),visited=new Set();
+    const futureSupply=shelterAllocationFutureSupply(m);
+    let attempts=0;
+    function visit(moves) {
+      if(++attempts>2000)return null;
+      if(people.every(p=>assigned.get(p.id)===p.room))return moves;
+      if(moves.length>=people.length*2)return null;
+      const key=people.map(p=>`${p.id}:${assigned.get(p.id)}`).join(',');
+      if(visited.has(key))return null;visited.add(key);
+      const pending=people.filter(p=>assigned.get(p.id)!==p.room);
+      const options=[...pending,...pending.filter(p=>assigned.get(p.id)!==null&&p.room!==null&&
+        pending.some(other=>other.id!==p.id&&other.room===assigned.get(p.id))).map(p=>({id:p.id,room:null}))];
+      for(const move of options) {
+        const path=[...moves,{id:move.id,room:move.room}];
+        if(!shelterSwapProjection(m,path,futureSupply,true))continue;
+        const old=assigned.get(move.id);assigned.set(move.id,move.room);
+        const result=visit(path);assigned.set(move.id,old);
+        if(result)return result;
+      }
+      return null;
+    }
+    return visit([]);
+  }
+  function shelterFindAllocation(m,pool,maxNodes=50000) {
+    // 全局候选搜索有计算上限；超过规模时交回局部优化，不把未穷举称为全局最优。
+    if(!pool.length || pool.length>16)return {plan:null,complete:false,reason:pool.length?'large-roster':'no-candidates',nodes:0};
+    const s=m.state,keys=Object.keys(m.demand),resources=[...keys,'scrap'];
+    const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&r.builtAt<=m.now&&!r.incident&&!r.unpowered&&r.upgradeAt===null);
+    // 某资源的全部可生产房间已满，且无人能安全离岗时，其他房间无法先补产腾位。
+    // 将这些必留人员固定，避免不可执行的高收益排列挤掉可执行候选；有同类空岗时不能固定。
+    const locked=new Set(),futureSupply=shelterAllocationFutureSupply(m);
+    for(const resource of keys) {
+      const same=rooms.filter(r=>shelterRooms[r.type][1]===resource),roomIds=new Set(same.map(r=>r.id));
+      if(!same.length||same.some(r=>s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length<r.width*2))continue;
+      const residents=pool.filter(p=>roomIds.has(p.roomId));
+      if(residents.length&&!residents.some(p=>shelterSwapProjection(m,[{id:p.id,room:null}],futureSupply,true)))residents.forEach(p=>locked.add(p.id));
+    }
+    const adjustable=pool.filter(p=>!locked.has(p.id)),ids=new Set(adjustable.map(p=>p.id));
+    if(!adjustable.length)return {plan:null,complete:true,reason:'no-safe-sequence',nodes:0};
+    const slots=rooms.map(r=>Math.max(0,r.width*2-s.residents.filter(p=>!ids.has(p.id)&&p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length));
+    const workers=adjustable.map(p=>({p,rates:rooms.map(r=>shelterWorkerRate(s,m.now,m.view.env,p,r))}));
+    workers.sort((a,b)=>Math.max(0,...b.rates)-Math.max(0,...a.rates)||a.p.id-b.p.id);
+    const suffix=Array.from({length:workers.length+1},()=>Object.fromEntries(resources.map(k=>[k,0])));
+    for(let i=workers.length-1;i>=0;i--)for(const k of resources)suffix[i][k]=suffix[i+1][k]+
+      Math.max(0,...rooms.map((r,j)=>slots[j]>0&&shelterRooms[r.type][1]===k?workers[i].rates[j]:0));
+    const before={score:shelterAllocationScore(m.production,m.demand),changes:0};
+    const production=shelterProductionWithout(m,[...ids]),floors=Object.fromEntries(keys.map(k=>[k,Math.min(m.production[k],m.demand[k]*1.2)]));
+    const candidates=[],assignments=[];
+    let nodes=0,limited=false;
+    function visit(index,changes) {
+      if(++nodes>maxNodes){limited=true;return;}
+      if(keys.some(k=>production[k]+suffix[index][k]<floors[k]-1e-9))return;
+      const optimistic=Object.fromEntries(resources.map(k=>[k,production[k]+suffix[index][k]]));
+      const bound=candidates.length===8?candidates.at(-1):before;
+      if(shelterAllocationCompare({score:shelterAllocationScore(optimistic,m.demand),changes:0},bound)<-1e-6)return;
+      if(index===workers.length) {
+        const score=shelterAllocationScore(production,m.demand);
+        if(!shelterAllocationImproves(before.score,score))return;
+        const candidate={score,changes,production:{...production},targets:workers.map((w,i)=>({id:w.p.id,room:assignments[i]}))};
+        candidates.push(candidate);candidates.sort((a,b)=>shelterAllocationCompare(b,a));if(candidates.length>8)candidates.pop();return;
+      }
+      const worker=workers[index];
+      const choices=rooms.map((r,j)=>({room:r,index:j,rate:worker.rates[j]})).filter(c=>slots[c.index]>0);
+      choices.sort((a,b)=>Number(b.room.id===worker.p.roomId)-Number(a.room.id===worker.p.roomId)||b.rate-a.rate||a.room.id-b.room.id);
+      choices.push({room:null,index:-1,rate:0});
+      for(const choice of choices) {
+        const resource=choice.room&&shelterRooms[choice.room.type][1];
+        assignments[index]=choice.room?.id??null;
+        if(choice.room){slots[choice.index]--;production[resource]+=choice.rate;}
+        visit(index+1,changes+Number(assignments[index]!==worker.p.roomId));
+        if(choice.room){slots[choice.index]++;production[resource]-=choice.rate;}
+        if(limited)break;
+      }
+    }
+    visit(0,0);
+    for(const candidate of candidates) {
+      const targets=candidate.targets.filter(t=>pool.some(p=>p.id===t.id&&p.roomId!==t.room)).sort((a,b)=>a.id-b.id);
+      const moves=shelterAllocationMoves(m,targets);
+      if(moves)return {plan:{targets,moves,production:candidate.production},complete:!limited,nodes:Math.min(nodes,maxNodes),before:m.production,reason:'plan'};
+    }
+    return {plan:null,complete:!limited,nodes:Math.min(nodes,maxNodes),reason:candidates.length?'no-safe-sequence':limited?'search-limit':'no-improvement'};
+  }
+  function planShelterAllocation(m,pool) {
+    const result=shelterFindAllocation(m,pool);
+    if(!result.plan)return {plan:null,note:result.reason==='no-safe-sequence'?'找到的增产方案尚无可安全执行的调岗顺序，本轮保留原岗位。':
+      result.reason==='large-roster'?'可调动人数较多，本轮使用局部优化，尚未完成整体最优核验。':
+      result.reason==='search-limit'?'本轮比较达到计算上限，暂未找到可执行的更优分配；不代表已经最优。':
+      result.reason==='no-candidates'?'当前没有符合调岗条件的居民。':'本轮未找到收益更高且可安全执行的人员分配。'};
+    const {targets,moves}=result.plan,futureSupply=shelterAllocationFutureSupply(m),demand=futureSupply?m.currentDemand:m.demand;
+    const supplyFloor=Object.fromEntries(Object.keys(demand).map(k=>[k,Math.min((m.actualProduction||m.production)[k],demand[k]*1.2)]));
+    const swap={id:crypto.randomUUID(),at:Date.now(),kind:'allocation',people:targets.map(t=>({id:t.id,room:m.state.residents.find(p=>p.id===t.id).roomId})),
+      targets,moves,step:0,futureSupply,supplyFloor};
+    saveShelter({...shelterState,swap});
+    log.add('shelter-optimization','按整体产出安排人员分配',
+      {steps:moves.length,people:targets.length,searchComplete:result.complete,compared:result.nodes,before:result.before,after:result.plan.production,
+        assignments:targets.map(t=>({id:t.id,from:swap.people.find(p=>p.id===t.id).room,to:t.room})),futureSupply,
+        scrapGain:result.plan.production.scrap-m.production.scrap,
+        supplyGain:Object.keys(m.demand).reduce((sum,k)=>sum+Math.max(0,m.demand[k]*1.2-m.production[k])-Math.max(0,m.demand[k]*1.2-result.plan.production[k]),0)});
+    return {plan:swap};
   }
   function shelterSwapStep(m,eligible) {
     let swap = shelterState.swap;
     if (!swap) return null;
     const validRoom = room => room === null || Number.isSafeInteger(room) && room > 0;
+    const allocation=swap.kind==='allocation';
+    const validAllocation = () => objectState(swap.supplyFloor)&&Object.keys(m.demand).every(k=>Number.isFinite(swap.supplyFloor[k])&&swap.supplyFloor[k]>=0)&&
+      Array.isArray(swap.targets)&&swap.targets.length===swap.people.length&&
+      new Set(swap.people.map(p=>p.id)).size===swap.people.length&&new Set(swap.targets.map(p=>p?.id)).size===swap.people.length&&
+      swap.targets.every(t=>t&&swap.people.some(p=>p.id===t.id)&&validRoom(t.room))&&
+      swap.moves.length>0&&swap.moves.length<=swap.people.length*2&&swap.moves.every(move=>move&&swap.people.some(p=>p.id===move.id)&&validRoom(move.room))&&
+      swap.targets.every(target=>[...swap.moves].reverse().find(move=>move.id===target.id)?.room===target.room);
     if (!objectState(swap) || typeof swap.id !== 'string' || !Number.isFinite(swap.at) ||
+        !(swap.kind===undefined||allocation) ||
         !(swap.futureSupply === undefined || typeof swap.futureSupply === 'boolean') ||
         !(swap.prepareFamily === undefined || Array.isArray(swap.prepareFamily) && swap.prepareFamily.length === 3 &&
           swap.prepareFamily.every(id => Number.isSafeInteger(id) && id > 0) && swap.prepareFamily[0] < swap.prepareFamily[1]) ||
-        !Array.isArray(swap.people) || swap.people.length !== 2 || swap.people.some(p => !p || !Number.isSafeInteger(p.id) || p.id <= 0 || !validRoom(p.room)) ||
-        swap.people[0].id === swap.people[1].id || swap.people[1].room === null || swap.people[0].room === swap.people[1].room ||
-        !Array.isArray(swap.moves) || !shelterSwapSequences(...swap.people).some(sequence => JSON.stringify(sequence) === JSON.stringify(swap.moves)) ||
+        !Array.isArray(swap.people) || (allocation ? swap.people.length<1||swap.people.length>16 : swap.people.length!==2) ||
+        swap.people.some(p => !p || !Number.isSafeInteger(p.id) || p.id <= 0 || !validRoom(p.room)) ||
+        !Array.isArray(swap.moves) || (allocation ? !validAllocation() :
+          swap.people[0].id===swap.people[1].id || swap.people[1].room===null || swap.people[0].room===swap.people[1].room ||
+          !shelterSwapSequences(...swap.people).some(sequence => JSON.stringify(sequence) === JSON.stringify(swap.moves))) ||
         !Number.isInteger(swap.step) || swap.step < 0 || swap.step > swap.moves.length) throw new Error('换位记录无法核对');
     if (swap.prepareFamily && JSON.stringify(swap.prepareFamily) !== JSON.stringify(m.prepareFamily)) {
       holdShelterStaff('原家庭的返宿舍条件已改变，取消剩余接替换位，保留当前岗位'); return null;
@@ -3863,17 +4235,25 @@
     }
     if (swap.step === swap.moves.length) {
       saveShelter({...shelterState,swap:null});
-      log.add('shelter-optimization','满员房间人员优化已完成',{steps:swap.moves.length}); return null;
+      log.add('shelter-optimization',allocation?'本轮人员分配方案已完成':'满员房间人员优化已完成',{steps:swap.moves.length}); return null;
     }
-    if (!shelterOptimize || swap.people.some(p => {
+    if(allocation) {
+      // 用当前属性重算原岗位与目标岗位；中途暂时休息的低产量不能当作增益基准。
+      const before=shelterAllocationOutput(m,swap.people),after=shelterAllocationOutput(m,swap.targets);
+      if(!Object.keys(m.demand).every(k=>after[k]>=Math.min(before[k],m.demand[k]*1.2)-1e-9)||
+          !shelterAllocationImproves(shelterAllocationScore(before,m.demand),shelterAllocationScore(after,m.demand))) {
+        holdShelterStaff('人员属性或需求已变化，原分配已无明确增益；本轮停止调岗，下一轮重新评估');return null;
+      }
+    }
+    if (!shelterOptimize || allocation&&Object.keys(m.demand).some(k=>(m.actualProduction||m.production)[k]<swap.supplyFloor[k]-1e-9) || swap.people.some(p => {
       const current = m.state.residents.find(current => current.id === p.id);
       return !current || !eligible(current);
-    }) || !shelterSwapProjection(m,swap.moves.slice(swap.step),swap.futureSupply)) {
+    }) || !shelterSwapProjection(m,swap.moves.slice(swap.step),swap.futureSupply,allocation)) {
       holdShelterStaff('换位所需供应、人员或房间条件已变化，本轮停止调整'); return null;
     }
     const move = swap.moves[swap.step], p = m.state.residents.find(p => p.id === move.id);
     return {id:p.id,room:move.room,from:p.roomId,name:p.name,
-      reason:`${swap.prepareFamily ? '为原家庭返宿舍安排接替' : swap.futureSupply ? '补足未来供应，优化满员岗位' : '优化满员岗位'}（${swap.step+1}/${swap.moves.length}）`};
+      reason:`${allocation?'按整体产出调整岗位':swap.prepareFamily ? '为原家庭返宿舍安排接替' : swap.futureSupply ? '补足未来供应，优化满员岗位' : '优化满员岗位'}（${swap.step+1}/${swap.moves.length}）`};
   }
   function planShelterSwap(m,pool) {
     const keys = Object.keys(m.demand), futureSupply = Boolean(m.currentDemand && keys.some(key => m.production[key] < m.demand[key]*1.2-1e-9));
@@ -3968,7 +4348,8 @@
     // 预留所有已安排家庭离岗后的产量，以及儿童、外出/倒下居民恢复和新生儿成年后的口粮。
     const absent = new Set([...budget.reserved.values()].flat().concat(pair.map(p => p.id)));
     const projected = shelterProductionWithout(m,absent);
-    const demand = {...m.demand,food:future,water:future};
+    const growth = shelterGrowthNeeds(m).demand;
+    const demand = {...growth,food:Math.max(growth.food,future),water:Math.max(growth.water,future)};
     return {production:projected,demand,reservedResidents:[...absent],
       allowed:future <= budget.limit && Object.keys(demand).every(k => m.state.resources[k] >= demand[k]*2)};
   }
@@ -4186,9 +4567,9 @@
           (p.roomId === room.id || eligible(p))) &&
         !s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === room.id && ![f.a,f.b].includes(p.id));
     });
-    const recoveryDemand = familyMode && recovering ? {...m.demand,food:m.demand.food+recovering,water:m.demand.water+recovering} : m.demand;
+    const recoveryDemand = shelterGrowthNeeds(m).demand;
     const familyBirth = familyMode && !populationMode && recovering && population < m.populationCap && readyFamilies.length ? 1 : 0;
-    const baseDemand = populationMode ? {...m.demand,food:future,water:future} :
+    const baseDemand = populationMode ? {...recoveryDemand,food:Math.max(recoveryDemand.food,future),water:Math.max(recoveryDemand.water,future)} :
       familyBirth ? {...recoveryDemand,food:recoveryDemand.food+1,water:recoveryDemand.water+1} : recoveryDemand;
     let preparation = null;
     if (populationMode && !shelterState.pair) {
@@ -4206,8 +4587,8 @@
     }
     if (skippedFamilies.length && !preparation) return null;
     const staffDemand = preparation?.demand || baseDemand;
-    const staffModel = populationMode || familyMode && recovering ? {...m,demand:staffDemand,currentDemand:m.demand,
-      ...(preparation ? {...preparation,actualProduction:m.production} : {})} : m;
+    const staffModel = {...m,demand:staffDemand,currentDemand:m.demand,
+      ...(preparation ? {...preparation,actualProduction:m.production} : {})};
     const supplyProduction = staffModel.production;
     const staffPool = preparation ? pool.filter(p => !preparation.reservedResidents.includes(p.id)) : pool;
     if (preparation) shelterPopulationNote = '原家庭正准备返宿舍：先按两人离岗后的产量安排接替，供应和名额重新核对通过后再返回。';
@@ -4281,13 +4662,15 @@
       if (next || shelterStaffHold) return next;
       shelterPopulationNote = note;
     }
+    const allocation=!preparation&&shelterOptimize?planShelterAllocation(staffModel,pool):null;
+    if(allocation?.plan)return shelterSwapStep(staffModel,eligible);
     const scrap = choices(targets.filter(r => r.type === 'scrap'),'增加废料生产')[0];
     if (scrap) return scrap;
     if (!preparation && planShelterSwap(staffModel,pool)) return shelterSwapStep(staffModel,eligible);
     const lowMoodFamilies=families.filter(f=>[f.a,f.b].some(id=>s.residents.find(p=>p.id===id)?.happiness<50)).length;
     shelterStaffNote = (familyMode ? `已记住 ${families.length} 对原配对。${lowMoodFamilies?`${lowMoodFamilies} 对心情不足50，需恢复后才能继续生育。`:''}` : '')+
-      (shortages.length ? `${preparation ? '原家庭离岗后' : ''}尚缺供应：${shortages.map(k=>`${shelterResources[k]}时产 ${supplyProduction[k].toFixed(1)}/目标 ${(staffDemand[k]*1.2).toFixed(1)}`).join('、')}。当前可用人员和房间无法安全补足。` :
-        '已按供应余量和废料收益安排；培养感情、待产、受伤和特殊岗位保持原安排。');
+      (shortages.length ? `${preparation ? '原家庭离岗后' : ''}尚缺供应：${shortages.map(k=>`${shelterResources[k]}时产 ${supplyProduction[k].toFixed(1)}/目标 ${(staffDemand[k]*1.2).toFixed(1)}`).join('、')}。${allocation?.note || '本轮没有找到可安全补足的调岗。'}` :
+        allocation?.note || '当前未找到可执行的增产调岗；培养感情、待产、受伤和特殊岗位保持原安排。');
     return null;
   }
   function shelterExploreStep(m) {
@@ -4296,8 +4679,8 @@
     for(const choice of plan.ready) {
       if(shelterExploreSkipped.has(choice.id))continue;
       if(!shelterFits(m,choice.reward,choice.items)) {shelterExploreNote='归来探险的背包或携带治疗针可能溢出，保留奖励，先腾出库存。';continue;}
-      const tab=shelterTab('废土');
-      if(!usable(tab)){shelterExploreNote='尚未识别废土页签，本轮保留归来奖励。';return false;}
+      const tab=shelterReadyTab(m,'废土');
+      if(!tab)return true;
       if(tab.getAttribute('aria-selected')!=='true') {
         offer('shelter:explore-tab','查看已归来的探险',()=>tab.click());return true;
       }
@@ -4316,6 +4699,26 @@
   function shelterTab(label) {
     const tabs = locator.query('[role="tablist"][aria-label="避难所"]');
     return buttonIn(tabs,new RegExp(`^${label}(?:\\s*\\d+)?$`));
+  }
+  function shelterReadyTab(m,label) {
+    const tab=shelterTab(label);
+    if(usable(tab)) {
+      if(shelterUiWait?.label===label) {
+        log.add('shelter-ui-ready','避难所页签已就绪，继续本轮检查',
+          {tab:label,waitedMs:Math.max(0,Date.now()-shelterUiWait.at)});
+        shelterUiWait=null;
+      }
+      return tab;
+    }
+    cancelQueued();
+    if(shelterUiWait?.label!==label) {
+      shelterUiWait={label,at:Date.now()};
+      log.add('shelter-ui-wait','避难所数据已读取，等待页面页签就绪',
+        {tab:label,found:Boolean(tab),visible:visible(tab),usable:usable(tab)});
+    }
+    if(Date.now()-shelterUiWait.at>=15000)finishShelter(m,`避难所“${label}”页签持续15秒未就绪，保留任务，稍后再检查`);
+    else say(`等待避难所“${label}”页签加载，出现后继续本轮检查`);
+    return null;
   }
   function shelterRewardTabDue(stage,m) {
     const label = stage === 1 ? '目标' : '图鉴', tab = shelterTab(label);
@@ -4382,6 +4785,8 @@
       shelterStaffNote = equip ? `${work.reason}。` : `${work.reason}：${work.room === null ? '暂时休息' : `安排到${staffRoomNames[room?.type] || '目标房间'}`}。`;
       shelterSubmit(select,equip ? 'equip' : 'assign',[work.id,equip ? work.item : work.room],m,shelterStaffNote,() => {
         work.submitted = true;
+        if(equip&&choice.gearComparison)log.add('shelter-gear-plan','闲置服装分配预计收益，穿戴结果另行核对',
+          {...choice.gearComparison,resident:work.id,item:work.item});
         Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,value);
         select.dispatchEvent(new Event('change',{bubbles:true}));
       });
@@ -4395,8 +4800,8 @@
       else say('等待网页打开指定居民详情');
       return true;
     }
-    const tab = shelterTab('居民');
-    if (!usable(tab)) { holdShelterStaff('未找到居民页签，本轮只收取奖励'); shelterWork = null; return false; }
+    const tab = shelterReadyTab(m,'居民');
+    if (!tab) return true;
     if (tab.getAttribute('aria-selected') !== 'true') {
       offer('shelter:staff-tab','打开居民页安排生产',() => tab.click()); return true;
     }
@@ -4435,14 +4840,43 @@
       `废料约 ${m.production.scrap.toFixed(1)}/小时；闲置成人 ${waiting} 人；培养感情 ${pairs} 对，待产 ${m.state.births.length} 个。`+
       `${cooldown ? `${cooldown} 人处于生育冷却。` : ''}优先补供应缺口，再安排耐力高的居民回收；自动管理遵循面板所选模式。`;
   }
+  function shelterCollectionInfo(m,assessment=null) {
+    const projected=assessment?.projected || shelterFutureCollection(m,10000+Math.max(0,Date.now()-(shelterRead?.at || Date.now())));
+    const rooms=m.rooms.filter(r=>r.batch>0);
+    return {checkedAt:Date.now(),serverTime:m.now,assessed:Boolean(assessment),roomCount:rooms.length,truncated:rooms.length>80,
+      rooms:rooms.slice(0,80).map(r=>{
+        const amount=projected.amounts[r.id] || 0;
+        const freeCapacity=Math.max(0,m.caps[r.resource]-m.state.resources[r.resource]-(projected.automatic[r.resource] || 0));
+        const button=assessment && locator.query(`[data-room="${r.id}"]`)?.querySelector(`button[aria-label="收取${shelterResources[r.resource]}"]`);
+        const reason=!assessment?'not-checked':r.stored<r.batch?
+          r.resource==='parts'&&m.state.resources.scrap<6*(r.batch-r.stored)?'materials-short':
+          !r.workers?'no-workers':r.rate<=0?'production-stopped':'not-full':
+          amount>freeCapacity || m.state.items.length>m.itemCap?'capacity-blocked':
+          assessment.bulkReady || usable(button)?'ready':'controls-not-ready';
+        return {id:r.id,resource:r.resource,stored:r.stored,batch:r.batch,rate:r.rate,workers:r.workers,
+          automatic:r.automatic,projectedAmount:amount,freeCapacity,reason};
+      })};
+  }
+  function shelterCollectionText(info) {
+    const reasons={'not-checked':'本轮尚未核对领取控件','not-full':'尚未满批','no-workers':'没有在岗成人',
+      'production-stopped':'当前产量为零','materials-short':'废料不足以凑满一批零件',
+      'capacity-blocked':'库存或装备容量不足','controls-not-ready':'领取按钮未就绪或无法唯一定位','ready':'已满批，可继续核对领取'};
+    return `产出核对（${new Date(info.checkedAt).toLocaleTimeString('zh-CN')}）\n`+
+      (info.rooms.length?info.rooms.slice(0,12).map(r=>`房间${r.id}·${shelterResources[r.resource]}：${r.stored.toFixed(1)}/${r.batch}，`+
+        `${r.rate.toFixed(1)}/小时；${reasons[r.reason]}${r.automatic?'；有楼层机器人':''}。`).join('\n'):'暂无已建成的生产房间。')+
+      (info.roomCount>12?'\n更多房间见本地日志。':'');
+  }
   function finishShelter(m, note = '本轮检查完成', delay = note.includes('上限') ? 60000 : 15*60000,
     pendingReadOnly) {
     shelterReload();
     pendingReadOnly ??= shelterState.pendingReadOnly;
     let development=shelterState.development;
+    let developmentNext=null;
     let operations=shelterState.operations,attention={};
+    const collection=shelterCollection || (m?shelterCollectionInfo(m):null);
     if (m) {
-      try { development=`${new Date(m.now).toLocaleString('zh-CN')} 检查结果\n${shelterDevelopmentText(shelterDevelopmentPlan(m,shelterPopulationTarget))}`; }
+      try { const plan=shelterDevelopmentPlan(m,shelterPopulationTarget);developmentNext=plan.next;
+        development=`${new Date(m.now).toLocaleString('zh-CN')} 检查结果\n${shelterDevelopmentText(plan)}`; }
       catch { development='发展规划资料暂不完整，下一轮重新评估；领取与人员管理照常。'; }
       const events = m.rooms.filter(r => !r.automatic && r.rate>0 && r.batch>r.stored &&
         (r.resource!=='parts' || m.state.resources.scrap>=6*(r.batch-r.stored))).map(r =>
@@ -4464,6 +4898,7 @@
       events.push(midnight-m.now);
       if (events.length) delay = Math.max(60000,Math.min(delay,...events)+2000);
     }
+    if(m && collection)operations+=`\n${shelterCollectionText(collection)}`;
     saveShelter({ ...shelterState, nextAt:Date.now()+delay, note, exploreNote:shelterExploreNote,
       pendingReadOnly:shelterPending?.id===pendingReadOnly?pendingReadOnly:undefined,
       ...(m ? { advice:shelterAdvice(m),development,operations } : {}) });
@@ -4471,8 +4906,9 @@
       staffMode:shelterStaffMode,staffHeld:shelterStaffHold,staffNote:shelterStaffNote,
       gearEnabled:shelterGear,optimizeEnabled:shelterOptimize,pendingSwap:Boolean(shelterState.swap),
       populationTarget:shelterPopulationTarget,pendingPair:Boolean(shelterState.pair),
-      exploreClaimEnabled:shelterExploreClaim,exploreNote:shelterExploreNote,
-      ...(m ? { resources:m.state.resources, production:m.production, demand:m.demand,attention,
+      exploreClaimEnabled:shelterExploreClaim,exploreNote:shelterExploreNote,collection,developmentNext,
+      uiWait:shelterUiWait?{tab:shelterUiWait.label,waitedMs:Math.max(0,Date.now()-shelterUiWait.at)}:null,
+      ...(m ? { resources:m.state.resources, production:m.production, demand:m.demand,plannedDemand:shelterGrowthNeeds(m).demand,attention,
         population:m.state.residents.filter(p=>p.deadAt===null).length, recovering:shelterRecoveringPopulation(m.state), births:m.state.births.length } : {}) });
     shelterLeave = true; cancelShelterRead();
   }
@@ -4653,6 +5089,7 @@
       return;
     }
     if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0; shelterLeave = false;shelterVisitPeriod=null;
+      shelterUiWait=null;shelterCollection=null;
       shelterExploreSkipped.clear();shelterExploreNote=''; }
     if (shelterLeave) { if (!closeShelterWork()) leaveShelter(); return; }
     if (shelterReadOnlyWait() && shelterState.nextAt > Date.now()) { if (!closeShelterWork()) leaveShelter(); return; }
@@ -4698,10 +5135,14 @@
     }
     if (dialogs.length) return;
     const names = ['避难所','目标','图鉴'];
-    while (shelterStage > 0 && shelterStage < names.length && !shelterRewardTabDue(shelterStage,m)) shelterStage++;
+    let tab;
+    while(shelterStage<names.length) {
+      tab=shelterReadyTab(m,names[shelterStage]);
+      if(!tab)return;
+      if(shelterStage===0 || shelterRewardTabDue(shelterStage,m))break;
+      shelterStage++;
+    }
     if (shelterStage >= names.length) { finishShelter(m); return; }
-    const tab = shelterTab(names[shelterStage]);
-    if (!usable(tab)) { finishShelter(m,'未识别避难所页签，稍后再检查'); return; }
     if (tab.getAttribute('aria-selected') !== 'true') {
       offer(`shelter:tab:${shelterStage}`,shelterStage ? `领取${names[shelterStage]}待领奖励` : '检查避难所产出',() => tab.click()); return;
     }
@@ -4713,8 +5154,10 @@
       const amount = r => projected.amounts[r.id] || 0;
       for (const r of m.rooms.filter(r => r.batch)) reward[r.resource] = (reward[r.resource]||0)+amount(r);
       const all = locator.pick([...document.querySelectorAll('button')].filter(b => textOf(b)==='全部收取'));
+      const bulkReady=Boolean(ready.length && usable(all) && shelterFits(m,reward));
+      shelterCollection=shelterCollectionInfo(m,{projected,bulkReady});
       // 满仓资源不能拖住其他房间，批量不合适时逐房收取原生图标按钮。
-      if (ready.length && usable(all) && shelterFits(m,reward)) {
+      if (bulkReady) {
         shelterSubmit(all,'collect',['all'],m,'收取避难所已满批产出'); return;
       }
       for (const r of ready) {
@@ -4883,7 +5326,7 @@
     if (!value) { cancelFarmRead(); cancelShelterRead(); cancelStockRead(); }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
-    toggle.textContent = value ? '暂停远征与农场' : '开始远征与农场';
+    toggle.textContent = value ? '暂停远征组' : '开始远征组';
     if (!value) { if (active) log.stop(reason || '人工暂停'); cancelQueued(); releaseLock?.(); say(reason || '已暂停'); }
     schedule();
   }
@@ -4904,7 +5347,7 @@
       setEnabled(!enabled);
     } catch { setEnabled(false, '无法保存原领取核对状态，已暂停；请检查站点存储'); }
   });
-  toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
+  toggle.textContent = enabled ? '暂停远征组' : '开始远征组';
 
   function savePlan(value) {
     // 出发前保存本脚本的意图；恢复时只确认属于这次自动派遣的原请求。
@@ -5096,6 +5539,8 @@
       if (plan.reloaded) { setEnabled(false, '原派遣结果仍不明确，请手动核对后继续'); return; }
       offer('sync-result', '刷新并核对原派遣结果', () => {
         savePlan({ ...plan, reloaded: true });
+        log.add('operation-refresh','刷新以核对原派遣，不新建派遣请求',
+          {scope:'expedition',operation:'dispatch',waitingMs:Math.max(0,Date.now()-(plan.submittedAt||plan.at))});
         location.reload();
       });
       return;
@@ -5137,8 +5582,10 @@
   }
   function travelLink(path) {
     return [...document.querySelectorAll('a[href]')].find(a => {
-      const url = new URL(a.href, location.href);
-      return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path && !a.target && usable(a);
+      try {
+        const url = new URL(a.href, location.href);
+        return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path && !a.target && usable(a);
+      } catch { return false; } // 一个损坏 href 不能阻断其他有效入口或已知地址的兜底。
     });
   }
   function clearNavigation() {
@@ -5173,7 +5620,6 @@
   }
   function backToExpedition() {
     const link = travelLink('/activities/expedition');
-    if (!link) { say('等待返回远征入口'); return; }
     offer('farm:return', '返回远征，按预约时间再检查农场', () => startNavigation('/activities/expedition', link));
   }
   function planFarmVisit(at, note) {
@@ -5242,10 +5688,6 @@
       earlyStamina = shown;
     }
     const link = travelLink('/farm');
-    if (!link) {
-      waitForIdlePage('农场已到预约时间，但入口不可用');
-      return true;
-    }
     rememberExpeditionTime(running);
     // 距离已知的归来时间只剩十几秒时，先等这一批归来，不立即切走。
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt - Date.now() < 15000) return false;
@@ -5363,11 +5805,13 @@
       .then(async response => {
         if (!current()) return;
         if (!response.ok) throw Object.assign(new Error(`农场状态读取失败（${response.status}）`), {
-          stopGroup: [401, 403, 429].includes(response.status), transient: response.status >= 500
+          stopGroup: [401, 403, 429].includes(response.status), transient: response.status >= 500, status:response.status
         });
-        const data = await response.json();
+        let data;
+        try { data = await response.json(); }
+        catch(error) { throw Object.assign(error,{transient:['SyntaxError','TypeError','AbortError','TimeoutError'].includes(error.name)}); }
         if (!current()) return;
-        if (!Number.isSafeInteger(data.userId) || !Array.isArray(data.seeds) || !Array.isArray(data.prices) ||
+        if (!objectState(data) || !Number.isSafeInteger(data.userId) || !Array.isArray(data.seeds) || !Array.isArray(data.prices) ||
             !Array.isArray(data.plots) || !Array.isArray(data.crops) || !Array.isArray(data.inventory) ||
             !data.stamina || data.staminaCosts?.plant !== 1 || data.staminaCosts?.harvest !== 1) {
           throw new Error('农场数据或体力规则变化');
@@ -5387,6 +5831,14 @@
           farmReadNextAt = Date.now() + (farmReadAttempts === 1 ? 5000 : 15000);
           log.add('farm-read-retry', '只读行情暂时失败，延后核对', { attempt: farmReadAttempts, nextAt: farmReadNextAt });
           say('农场行情暂时不可用，等待有限重试');
+        }
+        else if (error.transient) {
+          const nextAt=Date.now()+5*60000;
+          try {
+            saveFarmState({...farmState,nextAt,readDeferred:true,note:'状态读取暂时失败，五分钟后重新核对'});
+            log.add('farm-read-deferred','三次只读核对暂未成功，保留开启并预约下一轮',
+              {attempts:farmReadAttempts,nextAt,error:error.name||'Error',status:error.status||null});
+          } catch { pauseFarm('无法保存农场读取预约，已暂停；请检查站点存储'); }
         }
         else pauseFarm(`${error.message}；本轮未种植，请核对后开启农场`);
       })
@@ -5462,6 +5914,18 @@
         ownSeedDialog = seedDialog; openingSeedsAt = 0;
       } else { handleNotice(dialogs, '等待你处理农场弹窗'); return; }
     }
+    if (farmState.readDeferred && !farmPlan) {
+      if (farmState.nextAt>Date.now()) {
+        if (ownSeedDialog) {
+          const close=ownSeedDialog.querySelector('button[aria-label="关闭"]');
+          if(usable(close))offer('farm:read-close','关闭种子窗口，稍后重新核对农场',()=>close.click());
+          else say('农场读取暂时失败，请关闭种子窗口，脚本将按预约重查');
+        } else backToExpedition();
+        return;
+      }
+      cancelFarmRead();
+      saveFarmState({...farmState,readDeferred:false});
+    }
     const tabs = locator.query('[role="tablist"][aria-label="农场功能"]');
     const plotsTab = [...(tabs?.querySelectorAll('[role="tab"]') || [])].find(b => textOf(b) === '田地');
     if (!dialogs.length && plotsTab && plotsTab.getAttribute('aria-selected') !== 'true') {
@@ -5493,7 +5957,10 @@
             else say('原种植结果未确认，请手动关闭种子窗口后核对');
           } else if (!dialogs.length) {
             offer('farm:sync-result', '刷新核对上次农场操作结果', () => {
-              saveFarmPlan({ ...farmPlan, reloaded: true }); location.reload();
+              saveFarmPlan({ ...farmPlan, reloaded: true });
+              log.add('operation-refresh','刷新以核对原农场操作，不重复种植或收获',
+                {scope:'farm',operation:farmPlan.action,waitingMs:Math.max(0,Date.now()-farmPlan.at)});
+              location.reload();
             });
           } else say('原农场结果未确认，等待你处理当前弹窗');
         } else if (farmPlan.reloaded && Date.now() - farmEntryAt > 10000 && !confirmed) {
@@ -5559,7 +6026,10 @@
         // 页面自身更新无效时，本批田地最多整页核对一次。跨刷新保留预算。
         if (recoveryBudget.ready('farm-ready', signature, farmEntryAt + 30000, pauseFarm, '农场成熟状态', 1)) {
           offer('farm:refresh-ready', '刷新已到成熟时间的田地', () => {
-            recoveryBudget.attempted('farm-ready'); location.reload();
+            recoveryBudget.attempted('farm-ready');
+            log.add('operation-refresh','刷新以核对已成熟田地的收获按钮',
+              {scope:'farm',operation:'maturity',plots:s.ready.length,nextAt:recoveryBudget.nextAt('farm-ready')});
+            location.reload();
           });
         } else if (farmEnabled) planFarmVisit(recoveryBudget.nextAt('farm-ready'), '等待页面确认成熟状态');
         return;
@@ -5587,6 +6057,7 @@
   }
 
   function step() {
+    if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
     syncDialogAnimations();
     farmHint();
     shelterHint();
@@ -5596,6 +6067,7 @@
     }
     if (!inShelter() && (shelterEntryAt || shelterController || shelterRead)) {
       cancelShelterRead(); shelterEntryAt = 0; shelterStage = 0; shelterActions = 0; shelterLeave = false;
+      shelterUiWait=null;shelterCollection=null;
       shelterWork = null; shelterStaffHold = false;
     }
     if (host.hidden === onPage()) host.hidden = !onPage();
@@ -5716,7 +6188,11 @@
         } else if (!claimWait.reloaded && Date.now() - claimWait.at > 30000) {
           offer('sync-claim', '刷新领取后的状态', () => {
             saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
-              reloaded: true, reloadFrom: claimPageId, at: Date.now() }); location.reload();
+              reloaded: true, reloadFrom: claimPageId, at: Date.now() });
+            log.add('operation-refresh','刷新以核对原远征领取，不重复领取',
+              {scope:'expedition',operation:'claim',teams:claimWait.running,
+                waitingMs:Math.max(0,Date.now()-claimWait.submittedAt)});
+            location.reload();
           });
         }
         else say(`${claimReason()}；${claimWait.reloaded ? '已刷新，等待核对待领队伍' : '等待队伍变化，超时后刷新核对'}`);
@@ -5880,7 +6356,7 @@
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
-      toggle.textContent = enabled ? '暂停远征与农场' : '开始远征与农场';
+      toggle.textContent = enabled ? '暂停远征组' : '开始远征组';
       if (!enabled) { cancelFarmRead(); cancelShelterRead(); cancelStockRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
     } else if ([FARM_PREF,FARM_CROP,FARM_STATE].includes(event.key)) {
       try {

@@ -69,7 +69,7 @@ function developmentScene(){
     room(1,'power',1,2),room(2,'diner',1,3),room(3,'water',1,4),room(4,'scrap',1,5),
     room(5,'quarters',2,2,3),room(6,'storage',3,2)];
   const adult={...s.residents[0],hp:100,romance:null};
-  s.residents=Array.from({length:8},(_,i)=>({...adult,id:i+1,name:`居民${i+1}`,roomId:Math.floor(i/2)+1}));
+  s.residents=Array.from({length:8},(_,i)=>({...structuredClone(adult),id:i+1,name:`居民${i+1}`,roomId:Math.floor(i/2)+1}));
   return x;
 }
 
@@ -114,12 +114,233 @@ test('发展规划：现有空位优先；一格扩建按已有同类格数涨�
   const merge=plan(model(view),14).candidates.find(c=>c.kind==='build'&&c.type==='quarters');
   assert.equal(merge.floor,2);assert.equal(merge.col,4);assert.equal(merge.cost.scrap,168);
 });
-test('发展规划：必须拓展空间时给出真实挖掘成本，已有挖掘不重复建议',()=>{
+test('发展规划：宿舍已满级且必须拓展空间时给出真实挖掘成本，已有挖掘不重复建议',()=>{
   const {state:s,view}=developmentScene();const base=s.rooms[0];
   s.rooms.push({...base,id:20,type:'storage',floor:1,col:6,width:2},{...base,id:21,type:'storage',floor:2,col:5,width:3},
     {...base,id:22,type:'storage',floor:3,col:3,width:3},{...base,id:23,type:'storage',floor:3,col:6,width:2});
-  let p=plan(model(view));assert.equal(p.candidates.find(c=>c.kind==='dig').cost.scrap,836);
-  s.digging={doneAt:now+600000};p=plan(model(view));assert.equal(p.candidates.some(c=>c.kind==='dig'),false);assert.match(render(p),/正在下挖/);
+  s.rooms.find(r=>r.type==='quarters').level=3;
+  let p=plan(model(view),200);assert.equal(p.candidates.find(c=>c.kind==='dig').cost.scrap,836);
+  s.digging={doneAt:now+600000};p=plan(model(view),200);assert.equal(p.candidates.some(c=>c.kind==='dig'),false);assert.match(render(p),/正在下挖/);
+});
+test('建设次序：床位尚宽裕时先提高废料收入，预期人口只剩一个空床位时才提前扩宿舍',()=>{
+  const {state:s,view}=developmentScene();
+  let p=plan(model(view),14);assert.equal(p.candidates[0].type,'scrap');assert.equal(p.next.type,'scrap');
+  assert.equal(p.next.status,'saving');assert.match(p.next.reason,/尚缺.*100.*废料/);
+  s.resources.scrap=300;p=plan(model(view),14);assert.equal(p.next.status,'ready');
+  for(let id=9;id<=11;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:5,adultAt:now+3600000});
+  p=plan(model(view),14);assert.equal(p.candidates[0].type,'quarters');assert.equal(p.next.type,'quarters');
+});
+test('建设时机：施工名额或基础供应未满足时明确等待原因，不显示可以开工',()=>{
+  const {state:s,view}=developmentScene();s.resources.scrap=5000;
+  s.rooms.push({...s.rooms[0],id:30,type:'storage',floor:1,col:6,builtAt:now+3600000},
+    {...s.rooms[0],id:31,type:'storage',floor:2,col:5,builtAt:now+3600000});
+  const p=plan(model(view),8);assert.equal(p.next.status,'blocked');assert.match(p.next.reason,/施工名额/);
+});
+test('建设取舍：新建回收站与升级统一比较回本，新房低产时优先升级已有高产房间',()=>{
+  const {state:s,view}=developmentScene();s.resources.scrap=500;
+  s.residents.filter(p=>p.roomId===4).forEach(p=>p.stats.end=17);
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null,stats:{...s.residents[0].stats,end:0}});
+  const p=plan(model(view),14),build=p.candidates.find(c=>c.kind==='build'&&c.type==='scrap');
+  assert.equal(p.next.kind,'upgrade');assert.equal(p.next.type,'scrap');
+  assert.equal(build.economics.gain,4);assert.equal(build.economics.materialScrap,96);
+  assert.ok(Math.abs(build.economics.paybackHours-(24+1/6))<1e-9);
+});
+test('建设时机：只剩远期宿舍扩容时先等人口接近容量，不把有钱误当成马上应该扩建',()=>{
+  const {state:s,view}=developmentScene();s.resources.scrap=1000;s.rooms.find(r=>r.type==='scrap').level=3;
+  const p=plan(model(view),14);assert.equal(p.next.status,'waiting');assert.match(p.next.title,/先发展人口/);
+  assert.match(render(p),/后续规划（尚未到开工时机）/);
+});
+test('建设时机：有人的现有生产房间停产时先恢复产能，不直接建议花钱补新房',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='scrap').incident={kind:'fire'};
+  const p=plan(model(view),14);assert.equal(p.next.status,'restore');assert.equal(p.next.type,'scrap');
+  assert.match(p.next.reason,/事件/);assert.match(render(p),/先恢复产能/);
+});
+test('在建生产规划：已有回收站为闲置人员提供足够新岗位时不重复新建，完工后先补员',()=>{
+  const {state:s,view}=developmentScene();
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  const room={...s.rooms.find(r=>r.type==='scrap'),id:30,col:6,builtAt:now+600000};s.rooms.push(room);
+  let p=plan(model(view));assert.equal(p.candidates.some(c=>c.kind==='build'&&c.type==='scrap'),false);
+  assert.match(render(p),/回收站.*施工.*预留/);
+  room.builtAt=now;p=plan(model(view));assert.equal(p.candidates[0].kind,'staff');assert.equal(p.candidates[0].type,'scrap');
+  s.rooms=s.rooms.filter(r=>r.id!==30);p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='scrap'));
+});
+test('在建生产规划：只为未被在建岗位预留的额外闲置人手计算新房产量',()=>{
+  const {state:s,view}=developmentScene();
+  s.rooms.push({...s.rooms.find(r=>r.type==='scrap'),id:30,col:6,builtAt:now+600000});
+  for(const [id,end] of [[9,17],[10,10],[11,0]])s.residents.push({...structuredClone(s.residents[0]),id,roomId:null,stats:{...s.residents[0].stats,end}});
+  const p=plan(model(view)),build=p.candidates.find(c=>c.kind==='build'&&c.type==='scrap');
+  assert.ok(build);assert.equal(build.economics.gain,4,'两名高产人选已预留给在建岗位，不能在另一方案里重复使用');
+});
+test('在建生产规划：基础房间升级后能覆盖需求且库存足以等待时不重复建造，库存不足仍保留补救建设',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='diner').upgradeAt=now+3600000;
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  let p=plan(model(view));assert.equal(p.candidates.some(c=>c.kind==='build'&&c.type==='diner'),false);
+  assert.match(render(p),/餐厅.*完工.*覆盖/);
+  s.resources.food=5;p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='diner'));
+});
+test('在建生产规划：活动加成在完工前到期时按届时产量核对，外出占位也不能当成空岗',()=>{
+  const {state:s,view}=developmentScene();s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=0);
+  s.rooms.push({...s.rooms.find(r=>r.type==='diner'),id:30,col:6,builtAt:now+600000});
+  for(const id of [9,10])s.residents.push({...structuredClone(s.residents[0]),id,roomId:null,stats:{...s.residents[0].stats,agi:0}});
+  s.residents.push({...structuredClone(s.residents[0]),id:11,roomId:30,away:{kind:'explore'}});
+  view.env={events:[{kind:'production',startsAt:now-1,endsAt:now+60000,percent:150}]};
+  const p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='diner'));
+  assert.match(render(p),/餐厅.*预留 1 名/);
+});
+test('在建生产规划：库存不足以等长升级时，允许预留人手先去更早完工的补救新房',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='diner').upgradeAt=now+3*3600000;
+  s.residents.filter(p=>p.roomId===2).forEach(p=>p.roomId=5);
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});s.resources.food=5;
+  const p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='diner'));
+  assert.match(render(p),/不能同时算两处产量/);
+});
+test('在建生产规划：等待库存不依赖活动加成连续存在，前后有加成但中途空档仍需预留消耗',()=>{
+  const {state:s,view}=developmentScene();s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=0);
+  s.rooms.push({...s.rooms.find(r=>r.type==='diner'),id:30,col:6,level:2,upgradeAt:now+3*3600000});
+  for(const id of [9,10])s.residents.push({...structuredClone(s.residents[0]),id,roomId:null,stats:{...s.residents[0].stats,agi:0}});
+  s.residents.push({...structuredClone(s.residents[0]),id:11,roomId:30,away:{kind:'explore'}});s.resources.food=25;
+  view.env={events:[{kind:'production',startsAt:now-1,endsAt:now+60000,percent:150},
+    {kind:'production',startsAt:now+2.9*3600000,endsAt:now+4*3600000,percent:150}]};
+  const p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='diner'));
+  assert.match(render(p),/库存缓冲不足/);
+});
+test('在建生产规划：预计已能补足基础供应时也不追加同类升级，取消工程后再恢复评估',()=>{
+  const {state:s,view}=developmentScene();s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=0);
+  s.rooms.push({...s.rooms.find(r=>r.type==='diner'),id:30,col:6,builtAt:now+600000});
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  let p=plan(model(view));assert.equal(p.candidates.some(c=>c.type==='diner'&&['upgrade','build'].includes(c.kind)),false);
+  s.rooms=s.rooms.filter(r=>r.id!==30);p=plan(model(view));assert.ok(p.candidates.some(c=>c.type==='diner'&&['upgrade','build'].includes(c.kind)));
+});
+test('在建生产规划：未来岗位仍容不下额外人手且满层无可升级房间时，保留下挖拓岗建议',()=>{
+  const {state:s,view}=developmentScene(),base=s.rooms[0];s.rooms.find(r=>r.type==='scrap').level=3;
+  s.rooms.push({...base,id:30,type:'scrap',floor:1,col:6,width:2,builtAt:now+600000},
+    {...base,id:21,type:'storage',floor:2,col:5,width:3},{...base,id:22,type:'storage',floor:3,col:3,width:3},
+    {...base,id:23,type:'storage',floor:3,col:6,width:2});
+  for(let id=9;id<=13;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:null});
+  const p=plan(model(view)),dig=p.candidates.find(c=>c.kind==='dig');
+  assert.ok(dig);assert.match(dig.title,/废料回收站/);
+});
+test('宿舍规划：基础供应暂缺不应把远期扩宿舍提前为可开工事项',()=>{
+  const {state:s,view}=developmentScene();s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=0);
+  const p=plan(model(view),14),house=p.candidates.find(c=>c.kind==='build'&&c.type==='quarters');
+  assert.ok(house);assert.ok(house.priority>=70);assert.match(render(p),/后续规划（尚未到开工时机）：.*宿舍/);
+});
+
+test('在建生产规划：不同资源的工程共享闲置人手，不能让同一居民同时保证食物和净水',()=>{
+  const {state:s,view}=developmentScene();
+  for(const type of ['diner','water'])s.rooms.find(r=>r.type===type).upgradeAt=now+3600000;
+  s.residents.filter(p=>[2,3].includes(p.roomId)).forEach(p=>p.roomId=5);
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  const before=JSON.stringify(s),p=plan(model(view)),text=render(p);
+  assert.equal(p.notes.filter(note=>/完工后.*覆盖供应/.test(note)).length,1,
+    '只有一名闲置人选，无法同时在两间房生产；只能为其中一项确认供应覆盖');
+  const reservations=[...text.matchAll(/为其空岗预留 (\d+) 名现有闲置成人/g)].reduce((n,match)=>n+Number(match[1]),0);
+  assert.equal(reservations,1);assert.equal(JSON.stringify(s),before);
+  assert.equal(p.candidates.some(c=>c.type==='scrap'&&c.kind==='build'),false,
+    '已为基础供应工程预留的人不能再当成新增回收站的空闲人手');
+});
+
+test('在建生产规划：人员够用时分别准备两种供应，只留必要人手而保留剩余回收发展人选',()=>{
+  const {state:s,view}=developmentScene();
+  for(const type of ['diner','water'])s.rooms.find(r=>r.type===type).upgradeAt=now+3600000;
+  s.residents.filter(p=>[2,3].includes(p.roomId)).forEach(p=>p.roomId=5);
+  for(const [id,stat] of [[9,'agi'],[10,'per'],[11,'end']])s.residents.push({...structuredClone(s.residents[0]),id,roomId:null,
+    stats:{...s.residents[0].stats,agi:0,per:0,end:0,[stat]:17}});
+  const p=plan(model(view));assert.equal(p.notes.filter(note=>/完工后.*覆盖供应/.test(note)).length,2);
+  assert.match(render(p),/餐厅.*预留 1 名/);assert.match(render(p),/净水.*预留 1 名/);
+  const scrap=p.candidates.find(c=>c.type==='scrap'&&c.kind==='build');assert.ok(scrap);
+  assert.equal(scrap.economics.gain,17.6,'为两项供应各留一人，剩余回收专长居民仍可支持新建');
+});
+
+test('在建生产规划：同等补缺收益先用单项专长，把兼长居民留给另一项供应',()=>{
+  const {state:s,view}=developmentScene();
+  for(const type of ['diner','water'])s.rooms.find(r=>r.type===type).upgradeAt=now+3600000;
+  s.residents.filter(p=>[2,3].includes(p.roomId)).forEach(p=>p.roomId=5);
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null},
+    {...structuredClone(s.residents[0]),id:10,roomId:null,stats:{...s.residents[0].stats,agi:6,per:0}});
+  const p=plan(model(view));
+  assert.equal(p.notes.filter(note=>/完工后.*覆盖供应/.test(note)).length,2,
+    '餐厅单项人选13.2/小时、兼长居民净水12/小时，可以同时满足两项供应准备线');
+});
+
+test('在建生产规划：不同工程争用唯一人手时先补基础供应，取消工程后释放预留',()=>{
+  const {state:s,view}=developmentScene();
+  s.rooms.find(r=>r.type==='diner').upgradeAt=now+3600000;
+  s.residents.filter(p=>p.roomId===2).forEach(p=>p.roomId=5);
+  s.rooms.push({...s.rooms.find(r=>r.type==='scrap'),id:30,col:6,builtAt:now+600000});
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  let p=plan(model(view));assert.match(render(p),/餐厅.*预留 1 名/);assert.match(render(p),/回收站.*预留 0 名/);
+  assert.equal(p.candidates.some(c=>c.type==='scrap'&&c.kind==='build'),false);
+  s.rooms.find(r=>r.type==='diner').upgradeAt=null;
+  s.residents.filter(p=>[3,4].includes(p.id)).forEach(p=>p.roomId=2);
+  p=plan(model(view));assert.match(render(p),/回收站.*预留 1 名/);
+});
+
+test('在建生产规划：库存不足的补救只借用本项预留人选，不挪用另一资源已需的人手',()=>{
+  const {state:s,view}=developmentScene();
+  for(const type of ['diner','water'])s.rooms.find(r=>r.type===type).upgradeAt=now+3*3600000;
+  s.residents.filter(p=>[2,3].includes(p.roomId)).forEach(p=>p.roomId=5);
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null});
+  s.resources.food=5;s.resources.water=5;
+  const p=plan(model(view)),builds=p.candidates.filter(c=>c.kind==='build'&&['diner','water'].includes(c.type));
+  assert.equal(builds.length,1);assert.equal(builds[0].type,'diner');
+  assert.match(render(p),/净水.*仍未达到.*供应准备线/);
+});
+test('下挖规划：楼层虽满但现有升级可以扩容时不挖，没有待建需求也不为了空位下挖',()=>{
+  const {state:s,view}=developmentScene(),base=s.rooms[0];
+  s.rooms.push({...base,id:20,type:'storage',floor:1,col:6,width:2},{...base,id:21,type:'storage',floor:2,col:5,width:3},
+    {...base,id:22,type:'storage',floor:3,col:3,width:3},{...base,id:23,type:'storage',floor:3,col:6,width:2});
+  let p=plan(model(view),14);assert.equal(p.candidates.some(c=>c.kind==='dig'),false);
+  assert.match(render(p),/先利用现有房间.*升级/);
+  s.rooms.forEach(r=>r.level=3);p=plan(model(view),14);
+  assert.equal(p.candidates.some(c=>c.kind==='dig'),false);assert.match(render(p),/没有必须新增/);
+});
+
+test('下挖规划：升级费用超过完工后库存容量时，不以无法攒够资源的升级阻止必要拓展',()=>{
+  const {state:s,view}=developmentScene(),base=s.rooms[0];s.depth=2;
+  s.rooms=s.rooms.filter(r=>r.floor<=2);s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.push({...base,id:20,type:'medbay',floor:1,col:6,width:2},
+    {...base,id:21,type:'medbay',floor:2,col:5,width:3});
+  s.residents.forEach(p=>{p.stats.str=17;p.stats.agi=17;p.stats.per=17;});
+  for(let id=9;id<=17;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:5,adultAt:now+3600000});
+  s.resources.scrap=1000;s.resources.parts=45;
+  const before=JSON.stringify(s),m=model(view),p=plan(m,20);
+  const upgrade=p.candidates.find(c=>c.type==='quarters'&&c.kind==='upgrade');
+  assert.equal(m.caps.scrap,2100);assert.equal(upgrade.cost.scrap,2160);
+  assert.match(upgrade.blocks.join(' '),/超过.*库存容量/);
+  assert.equal(p.next.kind,'dig');assert.equal(p.next.status,'ready');
+  assert.match(p.next.title,/宿舍/);assert.equal(p.candidates.find(c=>c.kind==='dig').cost.scrap,559);
+  assert.equal(JSON.stringify(s),before);
+});
+
+test('下挖规划：未完成工程将补足库存容量时继续等升级，不因当前容量暂缺而另挖一层',()=>{
+  const {state:s,view}=developmentScene(),base=s.rooms[0];s.depth=2;
+  s.rooms=s.rooms.filter(r=>r.floor<=2);s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.push({...base,id:20,type:'storage',floor:1,col:6,width:2,builtAt:now+600000},
+    {...base,id:21,type:'medbay',floor:2,col:5,width:3});
+  s.residents.forEach(p=>{p.stats.str=17;p.stats.agi=17;p.stats.per=17;});
+  for(let id=9;id<=17;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:5,adultAt:now+3600000});
+  s.resources.scrap=1000;s.resources.parts=45;
+  const m=model(view),p=plan(m,20),upgrade=p.candidates.find(c=>c.type==='quarters'&&c.kind==='upgrade');
+  assert.equal(m.caps.scrap,2100);assert.equal(upgrade.cost.scrap,2160);
+  assert.match(upgrade.blocks.join(' '),/已开工工程.*容量尚未生效/);
+  assert.equal(p.candidates.some(c=>c.kind==='dig'),false);
+  assert.equal(p.next.kind,'upgrade');assert.equal(p.next.status,'blocked');
+});
+
+test('升级材料规划：超过可达到库存容量的升级不成为新建工坊的理由',()=>{
+  const {state:s,view}=developmentScene(),base=s.rooms[0];s.depth=2;
+  s.rooms=s.rooms.filter(r=>r.floor<=2);s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.push({...base,id:20,type:'medbay',floor:1,col:6,width:2},
+    {...base,id:21,type:'medbay',floor:2,col:5,width:3});
+  s.residents.forEach(p=>{p.stats.str=17;p.stats.agi=17;p.stats.per=17;});
+  for(let id=9;id<=17;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:5,adultAt:now+3600000});
+  s.resources.scrap=1000;s.resources.parts=0;
+  const p=plan(model(view),20);
+  assert.match(p.next.title,/宿舍/);assert.equal(p.next.kind,'dig');
+  assert.doesNotMatch(render(p),/为工坊腾出空间|备选升级至少还缺/);
+  assert.equal(p.candidates.find(c=>c.type==='quarters'&&c.kind==='upgrade').shortage.parts,45,
+    '不可行的备选升级仍如实列出材料费用，只是不据此提前发展工坊');
 });
 
 test('发展规划：预留外出人员归来后的供应，原生仍登记占位时不能建议直接补员',()=>{
@@ -149,6 +370,105 @@ test('发展规划：三级升级计入零件与整间停产工期，新增收�
   assert.equal(c.cost.scrap,480);assert.equal(c.cost.parts,15);assert.equal(c.hours,3);assert.equal(c.shortage.parts,15);
   assert.match(c.benefit,/9.6 废料\/小时/);assert.match(c.benefit,/期间停产/);
 });
+test('发展规划回本：比较升级投入、零件耗料和停产损失，不只选择表面增产最高的回收站',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.id===4).level=2;
+  s.rooms.push({...s.rooms.find(r=>r.id===4),id:7,level:1,floor:3,col:3});
+  s.residents.push(...[9,10].map(id=>({...structuredClone(s.residents[0]),id,roomId:7,stats:{...s.residents[0].stats,end:0}})));
+  const c=plan(model(view)).candidates.find(c=>c.kind==='upgrade'&&c.type==='scrap');
+  assert.equal(c.id,7,'低一级回收站增产较小，但更快赚回投入');
+  assert.equal(c.economics.gain,4);assert.equal(c.economics.lostScrap,8);
+  assert.equal(c.economics.materialScrap,200);assert.equal(c.economics.paybackHours,53);
+  assert.match(render(plan(model(view))),/回本约 53.0 小时/);
+});
+test('升级可行性：最高增产餐厅停产库存不够时，选择库存足够的另一间，不改原状态',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.push({...s.rooms.find(r=>r.id===2),id:30,floor:3,col:3});
+  s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=1);
+  s.residents.filter(p=>p.roomId===3).forEach(p=>p.stats.per=17);
+  for(const id of [9,10])s.residents.push({...structuredClone(s.residents[0]),id,roomId:30,stats:{...s.residents[0].stats,agi:0}});
+  for(let id=11;id<=16;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:5,adultAt:now+3600000});
+  s.resources.food=39;s.resources.scrap=500;
+  const before=JSON.stringify(s),p=plan(model(view),16),c=p.candidates.find(c=>c.kind==='upgrade'&&c.type==='diner');
+  assert.equal(c.id,30,'主餐厅停产需要40库存，另一间需要38.4，现有39应选择后者');
+  assert.deepEqual(Array.from(c.blocks),[]);assert.equal(c.cost.scrap,250);
+  assert.match(render(p),/第 1 层餐厅升至 2 级暂未满足条件.*食物需至少 40.*本轮改评估第 3 层餐厅/);
+  assert.equal(p.next.type,'diner');assert.equal(p.next.status,'ready');assert.equal(JSON.stringify(s),before);
+  s.resources.food=40;
+  assert.equal(plan(model(view),16).candidates.find(c=>c.kind==='upgrade'&&c.type==='diner').id,2,
+    '库存补足后恢复优先选择增产较高的房间');
+  s.resources.food=37;
+  const blocked=plan(model(view),16),only=blocked.candidates.filter(c=>c.kind==='upgrade'&&c.type==='diner');
+  assert.equal(only.length,1);assert.equal(only[0].id,2);assert.equal(blocked.next.status,'blocked');
+  assert.match(only[0].blocks.join(' '),/停产期间食物需至少 40 库存/,
+    '全部候选都缺储备时保留原因，不以寻找替代方案绕过供应限制');
+});
+
+test('升级可行性：回本最快的宽回收站耗电余量不足时，保留可供电的小房间升级',()=>{
+  const {state:s,view}=developmentScene(),scrap=s.rooms.find(r=>r.id===4);
+  scrap.width=3;s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.push({...scrap,id:30,width:1,floor:3,col:3});
+  s.residents.filter(p=>p.roomId===1).forEach(p=>p.stats.str=1);
+  s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=17);
+  s.residents.filter(p=>p.roomId===3).forEach(p=>p.stats.per=17);
+  s.residents.filter(p=>p.roomId===4).forEach(p=>p.stats.end=17);
+  for(let id=9;id<=12;id++)s.residents.push({...structuredClone(s.residents[0]),id,roomId:4,stats:{...s.residents[0].stats,end:17}});
+  for(const id of [13,14])s.residents.push({...structuredClone(s.residents[0]),id,roomId:30,stats:{...s.residents[0].stats,end:0}});
+  s.resources.scrap=1000;
+  const before=JSON.stringify(s),p=plan(model(view),14),c=p.candidates.find(c=>c.kind==='upgrade'&&c.type==='scrap');
+  assert.equal(c.id,30);assert.deepEqual(Array.from(c.blocks),[]);assert.equal(c.economics.paybackHours,53);
+  assert.equal(p.next.type,'scrap');assert.equal(p.next.status,'ready');assert.equal(JSON.stringify(s),before);
+  s.residents.filter(p=>p.roomId===1).forEach(p=>p.stats.str=5);
+  assert.equal(plan(model(view),14).candidates.find(c=>c.kind==='upgrade'&&c.type==='scrap').id,4,
+    '供电改善后恢复选择更快回本的宽房间');
+  s.rooms.push({...scrap,id:40,type:'storage',floor:2,col:5,width:1,builtAt:now+600000},
+    {...scrap,id:41,type:'storage',floor:2,col:6,width:1,builtAt:now+600000});
+  const blocked=plan(model(view),14),candidates=blocked.candidates.filter(c=>c.kind==='upgrade'&&c.type==='scrap');
+  assert.equal(candidates.length,1);assert.equal(candidates[0].id,4);
+  assert.ok(candidates[0].blocks.includes('先等一个施工名额空出'));assert.equal(blocked.next.status,'blocked');
+});
+
+test('发展规划回本：三级所需零件按6废料计入投入，工期内原产量作为机会损失',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.id===4).level=2;
+  const c=plan(model(view)).candidates.find(c=>c.kind==='upgrade'&&c.type==='scrap');
+  assert.equal(c.economics.materialScrap,570);assert.equal(c.economics.lostScrap,72);
+  assert.ok(Math.abs(c.economics.paybackHours-69.875)<1e-9);
+  assert.match(c.benefit,/不含攒料/);assert.match(c.benefit,/停产损失/);
+});
+test('零件准备时机：远期宿舍升级的材料缺口不提前触发工坊建设',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='quarters').level=2;
+  s.rooms.find(r=>r.type==='scrap').level=3;s.resources.scrap=1000;
+  const before=JSON.stringify(s),p=plan(model(view),20);
+  const housing=p.candidates.find(c=>c.type==='quarters'&&c.kind==='upgrade');
+  assert.ok(housing.priority>=70);assert.equal(housing.shortage.parts,45);
+  assert.equal(p.next.status,'waiting');assert.match(p.next.title,/先发展人口/);
+  assert.equal(p.candidates.some(c=>c.type==='workshop'),false);
+  assert.doesNotMatch(render(p),/备选升级至少还缺|另外消耗 270/);
+  assert.equal(JSON.stringify(s),before);
+  s.rooms.find(r=>r.type==='scrap').level=2;
+  const current=plan(model(view),20);
+  assert.ok(current.candidates.some(c=>c.type==='workshop'));
+  assert.match(render(current),/备选升级至少还缺 15 零件/);
+  assert.doesNotMatch(render(current),/备选升级至少还缺 45 零件/,
+    '出现当前回收升级需求时只准备它的15零件，不把远期宿舍的45零件提前算入');
+});
+
+test('零件准备时机：新建回收站更优时不为备选升级提前造工坊，方案改变后恢复材料规划',()=>{
+  const {state:s,view}=developmentScene();s.rooms.find(r=>r.type==='scrap').level=2;
+  s.residents.push({...structuredClone(s.residents[0]),id:9,roomId:null,stats:{...s.residents[0].stats,end:17}});
+  const before=JSON.stringify(s),p=plan(model(view)),build=p.candidates.find(c=>c.type==='scrap'&&c.kind==='build'),
+    upgrade=p.candidates.find(c=>c.type==='scrap'&&c.kind==='upgrade');
+  assert.ok(build.economics.paybackHours<upgrade.economics.paybackHours);
+  assert.equal(upgrade.shortage.parts,15);assert.equal(build.cost.scrap,96);
+  assert.equal(p.next.type,'scrap');assert.equal(p.next.kind,'build');assert.equal(p.next.status,'ready');
+  assert.equal(p.candidates.some(c=>c.type==='workshop'),false);assert.equal(JSON.stringify(s),before);
+  s.resources.scrap=50;
+  const saving=plan(model(view));assert.equal(saving.next.type,'scrap');assert.equal(saving.next.status,'saving');
+  assert.equal(saving.candidates.some(c=>c.type==='workshop'),false,'为优先新房攒料，不改为攒更多废料先造工坊');
+  s.residents.pop();
+  const changed=plan(model(view));assert.equal(changed.next.type,'workshop');
+  assert.match(render(changed),/备选升级至少还缺 15 零件/);
+});
+
 test('发展规划零件：缺工坊时给出真实建造前提和转化成本，备选升级不累加需求',()=>{
   const {state:s,view}=developmentScene();s.rooms.find(r=>r.id===4).level=2;view.progress.level=4;
   const p=plan(model(view)),workshop=p.candidates.find(c=>c.kind==='build'&&c.type==='workshop');
@@ -421,7 +741,8 @@ test('发展规划扩仓：工程所需容量将在现有施工完工后满足�
     let col=Math.max(2,...s.rooms.filter(r=>r.floor===floor).map(r=>r.col+r.width));
     while(col<8){const width=Math.min(3,8-col);s.rooms.push({...base,id:id++,type:'training',floor,col,width});col+=width;}
   }
-  const dig=plan(model(view)).candidates.find(c=>c.kind==='dig');assert.ok(dig);
+  s.rooms.find(r=>r.type==='quarters').level=3;
+  const dig=plan(model(view),200).candidates.find(c=>c.kind==='dig');assert.ok(dig);
   assert.ok(dig.cost.scrap>3300&&dig.cost.scrap<4500);
   assert.ok(dig.blocks.some(x=>/先等.*完工.*容量/.test(x)));assert.equal(dig.blocks.some(x=>/先扩仓/.test(x)),false);
 });

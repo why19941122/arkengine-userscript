@@ -20,6 +20,42 @@ export async function shelterStaffTests({t,setupShelter,reloadShelter,evaluate,p
   const family = `${scene}localStorage.setItem('arkengine:auto-shelter:staff:v1','family');
     sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'家人'+id,roomId:5,
       romance:{partnerId:id===6?7:6,progress:.4}})));`;
+  await t.test('发展供应准备：生产模式先备好儿童成年、外出归来、恢复及待产口粮，再增加废料',async()=>{
+    for(const extra of [
+      `sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000})));`,
+      `sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'外出'+id,roomId:null,away:{kind:'explore'}})));`,
+      `sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'待恢复'+id,roomId:null,deadAt:clock-1000,hp:0})));`,
+      `sm.view.state.births=[{id:1,roomId:5,dueAt:clock+3600000},{id:2,roomId:5,dueAt:clock+7200000}];`
+    ]){
+      await setupShelter(`${scene}sm.view.state.residents[1].stats.agi=5;sm.view.state.residents[4].stats.agi=10;${extra}`);
+      const fixtureSearch=await evaluate('location.search');
+      await drive(done,'prepare future food before scrap',200);
+      assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])[0]`),[5,3]);
+      const diagnostic=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data`);
+      assert.equal(diagnostic.plannedDemand.food,7);assert.ok(diagnostic.demand.food<7,'当前消耗与未来预留分别记录');
+      assert.ok(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===3&&p.deadAt===null&&p.away===null&&p.adultAt<=clock)
+        .slice(0,2).reduce((sum,p)=>sum+8*(.5+p.stats.agi/10),0)>=7*1.2`));
+      const count=await evaluate(`${moves}.length`);await evaluate(check);await drive(`location.pathname==='/shelter'`,'revisit with future food reserved');
+      await evaluate(`history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+      await reloadShelter();await drive(done,'future food remains reserved',160);
+      assert.equal(await evaluate(`${moves}.length`),count);
+    }
+  });
+  await t.test('发展供应准备：预留已在建房间的完工耗电，不能把未来供电人手先派去回收',async()=>{
+    await setupShelter(`${scene}sm.view.state.residents[4].stats.str=17;
+      sm.view.state.rooms.push({...original,id:6,type:'workshop',width:3,level:3,builtAt:clock+3600000});`);
+    await drive(done,'prepare committed construction power',200);
+    assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])[0]`),[5,2]);
+  });
+  await t.test('避难所页签等待：居民页签晚到后继续调岗，不提前停止本轮人员管理',async()=>{
+    await setupShelter(`${scene}sm.delayedStaff=true;const originalRender=renderShelter;window.renderShelter=()=>{originalRender();
+      if(sm.delayedStaff)[...game.querySelectorAll('[role="tablist"] button')].find(b=>b.textContent==='居民')?.remove();};`);
+    await until(async()=>/等待避难所.*居民.*页签/.test(await expStatus()),'resident tab pending');
+    await pulse(5000);assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate('sm.delayedStaff=false;renderShelter();');await drive(done,'staff continues when tab appears');
+    assert.ok(await evaluate(`${moves}.length>0`));
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-staff-held').length`),0);
+  });
   const recoveringFamily = `${family}sm.confirmFamily=true;
     sm.view.state.residents.filter(p=>p.id<6).forEach(p=>p.familyCooldownUntil=clock+86400000);
     sm.view.state.residents.filter(p=>p.id>=6).forEach(p=>{p.romance=null;p.roomId=1;});

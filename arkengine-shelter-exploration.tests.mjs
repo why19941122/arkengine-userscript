@@ -20,6 +20,15 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     s.rooms[0].stored=0;s.residents[0].away={kind:'explore'};
     s.explorers=[{id:11,residentId:1,startedAt:clock-3600000,recalledAt:clock-1200000,returnAt:clock-1,
       tier:0,abyss:false,stimpaks:2,loot:{scrap:50,parts:1,stimpak:1,items:[]}}];`;
+  await t.test('避难所页签等待：废土页签晚到后同轮领取归来探险并释放居民',async()=>{
+    await setupShelter(`${scene}${flag}sm.delayedExplore=true;const originalRender=renderShelter;window.renderShelter=()=>{originalRender();
+      if(sm.delayedExplore)[...game.querySelectorAll('[role="tablist"] button')].find(b=>b.textContent==='废土')?.remove();};`);
+    await until(async()=>/等待避难所.*废土.*页签/.test(await expStatus()),'exploration tab pending');
+    await pulse(5000);assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate('sm.delayedExplore=false;renderShelter();');await drive(done,'claim after exploration tab appears');
+    assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['explore_claim']);
+    assert.equal(await evaluate('sm.view.state.residents[0].away'),null);
+  });
   await t.test('探险迟到快照：已收到成功回执但页面仍显示原探险时保留原记录，不再次领取',async()=>{
     await setupShelter(`${scene}${flag}sm.beforeClaimView=structuredClone(sm.view);`);
     await drive('sm.calls.length===1','explorer claim executed');

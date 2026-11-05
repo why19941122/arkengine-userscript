@@ -8,6 +8,257 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   const done = `location.pathname==='/activities/expedition' && ${state}?.nextAt>clock`;
   const waiting = `${done}&&${enabled}==='true'&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`;
   const quiet = `sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;sm.view.state.rooms[0].stored=0;`;
+  const lateTab = label => `sm.delayedTab=true;const originalRender=renderShelter;
+    window.renderShelter=()=>{originalRender();if(sm.delayedTab)
+      [...document.querySelectorAll('[role="tablist"] button')].find(b=>b.textContent.startsWith('${label}'))?.remove();};`;
+  const lastCollection = `(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.collection`;
+  const developmentScene = `${quiet}const s=sm.view.state,base=s.rooms[0],adult=s.residents[0];s.depth=3;s.digging=null;sm.view.progress.level=8;
+    s.rooms=[...[1,2,3].map(floor=>({...base,id:100+floor,type:'elevator',floor,col:1})),
+      ...['power','diner','water','scrap'].map((type,i)=>({...base,id:i+1,type,floor:1,col:i+2})),
+      {...base,id:5,type:'quarters',floor:2,col:2,width:3},{...base,id:6,type:'storage',floor:3,col:2}];
+    s.residents=Array.from({length:8},(_,i)=>({...structuredClone(adult),id:i+1,name:'居民'+(i+1),roomId:Math.floor(i/2)+1,
+      xp:0,happiness:100,stats:{str:5,per:5,end:5,cha:5,int:5,agi:5,lck:5}}));s.resources.scrap=100;`;
+  await t.test('避难所在建生产：预留施工岗位而不重复造房，工程完成后改为先补员且不自动消费',async()=>{
+    await setupShelter(`${developmentScene}s.residents.push({...structuredClone(s.residents[0]),id:9,name:'闲置成人',roomId:null});
+      s.rooms.push({...s.rooms.find(r=>r.id===4),id:30,col:6,builtAt:clock+600000});`);
+    await drive(done,'pending scrap staffing reservation');
+    let advice=await evaluate(`${state}.development`);assert.match(advice,/回收站.*施工.*预留 1 名/);
+    assert.doesNotMatch(advice,/新建一格废料回收站/);
+    await evaluate(`sm.view.state.rooms.find(r=>r.id===30).builtAt=clock;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'construction completed');await drive(done,'staff completed room first');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先调人员。下一步：先补现有废料回收站岗位/);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所在建供应：库存够时等升级，缓冲下降后允许预留人手用于更早的补救建设，刷新仍按当前库存评估',async()=>{
+    await setupShelter(`${developmentScene}s.rooms.find(r=>r.id===2).upgradeAt=clock+3*3600000;
+      s.residents.filter(p=>p.roomId===2).forEach(p=>p.roomId=5);
+      s.residents.push({...structuredClone(s.residents[0]),id:9,name:'闲置成人',roomId:null});`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'wait for existing diner upgrade');
+    let advice=await evaluate(`${state}.development`);assert.match(advice,/餐厅.*完工.*覆盖供应/);assert.doesNotMatch(advice,/新建一格餐厅/);
+    await evaluate(`sm.view.state.resources.food=5;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review low food reserve');await drive(done,'allow earlier remedy');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/库存缓冲不足/);assert.match(advice,/新建一格餐厅/);assert.match(advice,/不能同时算两处产量/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'remedy remains after reload');
+    assert.match(await evaluate(`${state}.development`),/新建一格餐厅/);assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所建设计划：明确先攒料或可开工，床位宽裕时先回收，接近容量后转向宿舍',async()=>{
+    await setupShelter(developmentScene);await drive(done,'save for scrap development');
+    let advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：先攒资源。下一步：.*废料回收站/);
+    assert.match(advice,/尚缺 100 废料/);assert.match(advice,/回本约/);
+    await evaluate(`sm.view.state.resources.scrap=300;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review construction funds');await drive(done,'construction ready');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：条件已满足。下一步：.*废料回收站/);
+    await evaluate(`sm.view.state.residents.push(...[9,10,11].map(id=>({...structuredClone(sm.view.state.residents[0]),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000})));
+      ${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review approaching population capacity');await drive(done,'housing now takes priority');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：条件已满足。下一步：.*新建一格宿舍/);
+    const next=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.developmentNext`);
+    assert.equal(next.type,'quarters');assert.equal(next.status,'ready');assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所在建人手：两种工程不能重复预留一人，增加专长人选后覆盖供应，刷新与完工重新评估',async()=>{
+    await setupShelter(`${developmentScene}
+      for(const type of ['diner','water'])s.rooms.find(r=>r.type===type).upgradeAt=clock+3600000;
+      s.residents.filter(p=>[2,3].includes(p.roomId)).forEach(p=>p.roomId=5);
+      s.residents.push({...structuredClone(s.residents[0]),id:9,name:'兼长居民',roomId:null});`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'share one worker across committed rooms');
+    let advice=await evaluate(`${state}.development`);
+    assert.equal((advice.match(/完工后.*覆盖供应/g)||[]).length,1);
+    assert.equal([...advice.matchAll(/为其空岗预留 (\d+) 名现有闲置成人/g)].reduce((n,m)=>n+Number(m[1]),0),1);
+    assert.match(advice,/净水.*仍未达到.*供应准备线/);assert.doesNotMatch(advice,/新建一格废料回收站/);
+    await evaluate(`{const s=sm.view.state;s.residents.push({...structuredClone(s.residents[0]),id:10,name:'餐厅专长',roomId:null,
+      stats:{...s.residents[0].stats,agi:6,per:0}});${panel}.getElementById('shelter-check').click();}`);
+    await drive(`location.pathname==='/shelter'`,'review additional worker');await drive(done,'two distinct workers cover both supplies');
+    advice=await evaluate(`${state}.development`);assert.equal((advice.match(/完工后.*覆盖供应/g)||[]).length,2);
+    assert.equal([...advice.matchAll(/为其空岗预留 (\d+) 名现有闲置成人/g)].reduce((n,m)=>n+Number(m[1]),0),2);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'shared reservations remain after reload');
+    advice=await evaluate(`${state}.development`);assert.equal((advice.match(/完工后.*覆盖供应/g)||[]).length,2);
+    await evaluate(`{const s=sm.view.state;for(const type of ['diner','water']){const room=s.rooms.find(r=>r.type===type);room.upgradeAt=null;room.level=2;}
+      ${panel}.getElementById('shelter-check').click();}`);
+    await drive(`location.pathname==='/shelter'`,'review completed rooms');await drive(done,'staff real vacancies after completion');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先调人员。下一步：先补现有餐厅岗位/);
+    assert.doesNotMatch(advice,/为其空岗预留/);assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所下挖计划：楼层满先用现有升级，确需新宿舍才列下挖与后续建房费用',async()=>{
+    await setupShelter(`${developmentScene}
+      s.rooms.push({...base,id:20,type:'storage',floor:1,col:6,width:2},{...base,id:21,type:'storage',floor:2,col:5,width:3},
+        {...base,id:22,type:'storage',floor:3,col:3,width:3},{...base,id:23,type:'storage',floor:3,col:6,width:2});`);
+    await drive(done,'full floors do not force excavation');
+    let advice=await evaluate(`${state}.development`);assert.match(advice,/先利用现有房间.*暂不下挖/);assert.doesNotMatch(advice,/向下扩至第/);
+    await evaluate(`{const s=sm.view.state;s.rooms.find(r=>r.id===5).level=3;s.residents.forEach(p=>{p.stats.str=17;p.stats.agi=17;p.stats.per=17;});
+      for(let id=9;id<=23;id++)s.residents.push({...structuredClone(s.residents[0]),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000});
+      const target=${panel}.getElementById('shelter-population');target.value='25';target.dispatchEvent(new Event('change'));
+      ${panel}.getElementById('shelter-check').click();}`);
+    await drive(`location.pathname==='/shelter'`,'review exhausted housing upgrades');await drive(done,'excavation has a concrete purpose');
+    advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：先攒资源。下一步：向下扩至第 4 层，为宿舍腾出空间/);
+    assert.match(advice,/836 废料/);assert.match(advice,/再建一格宿舍需 192 废料/);assert.match(advice,/两项合计 1028 废料/);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所建设容量：无法攒够的升级不阻止必要下挖，也不先造工坊，已有扩仓后恢复等待升级',async()=>{
+    await setupShelter(`${developmentScene}s.depth=2;s.rooms=s.rooms.filter(r=>r.floor<=2);
+      s.rooms.find(r=>r.type==='quarters').level=2;
+      s.rooms.push({...base,id:20,type:'medbay',floor:1,col:6,width:2},{...base,id:21,type:'medbay',floor:2,col:5,width:3});
+      s.residents.forEach(p=>{p.stats.str=17;p.stats.agi=17;p.stats.per=17;});
+      for(let id=9;id<=17;id++)s.residents.push({...structuredClone(s.residents[0]),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000});
+      s.resources.scrap=1000;s.resources.parts=0;localStorage.setItem('arkengine:auto-shelter:population:v1','20');`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'housing expansion despite impossible upgrade');
+    let advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：条件已满足。下一步：向下扩至第 3 层，为宿舍/);
+    assert.match(advice,/2160 废料.*超过.*库存容量/);assert.match(advice,/两项合计 751 废料/);
+    assert.doesNotMatch(advice,/为工坊腾出空间|备选升级至少还缺/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'housing expansion remains after refresh');
+    assert.match(await evaluate(`${state}.development`),/下一步：向下扩至第 3 层，为宿舍/);
+    await evaluate(`{const s=sm.view.state;Object.assign(s.rooms.find(r=>r.id===20),{type:'storage',builtAt:clock+600000});
+      s.resources.parts=45;${panel}.getElementById('shelter-check').click();}`);
+    await drive(`location.pathname==='/shelter'`,'review committed storage capacity');await drive(done,'wait for capacity before housing upgrade');
+    advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：先满足条件。下一步：.*宿舍升至 3 级/);
+    assert.match(advice,/已开工工程.*容量尚未生效/);assert.doesNotMatch(advice,/向下扩至第/);
+    const next=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.developmentNext`);
+    assert.equal(next.kind,'upgrade');assert.equal(next.type,'quarters');assert.equal(next.status,'blocked');
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所升级取舍：主餐厅停产储备不足时选择另一间，刷新保持且库存补足后重算',async()=>{
+    await setupShelter(`${developmentScene}s.rooms.find(r=>r.type==='quarters').level=2;
+      s.rooms.push({...s.rooms.find(r=>r.id===2),id:30,floor:3,col:3});
+      s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=1);
+      s.residents.filter(p=>p.roomId===3).forEach(p=>p.stats.per=17);
+      for(const id of [9,10])s.residents.push({...structuredClone(s.residents[0]),id,name:'餐厅'+id,roomId:30,stats:{...s.residents[0].stats,agi:0}});
+      for(let id=11;id<=16;id++)s.residents.push({...structuredClone(s.residents[0]),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000});
+      s.resources.food=39;s.resources.scrap=500;localStorage.setItem('arkengine:auto-shelter:population:v1','16');`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'choose safe diner upgrade');
+    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 3 层餐厅升至 2 级/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'safe alternative persists after reload');
+    assert.match(await evaluate(`${state}.development`),/下一步：第 3 层餐厅升至 2 级/);
+    await evaluate(`sm.view.state.resources.food=40;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review larger food reserve');await drive(done,'higher gain diner becomes safe');
+    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 1 层餐厅升至 2 级/);
+    await evaluate(`sm.view.state.resources.food=37;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review insufficient reserve for either room');await drive(done,'retain safety block');
+    const advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先满足条件/);assert.match(advice,/停产期间食物需至少 40 库存/);
+    const next=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.developmentNext`);
+    assert.equal(next.type,'diner');assert.equal(next.status,'blocked');assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所升级取舍：宽回收站供电不足时保留小房间增产，供电改善后重新比较回本',async()=>{
+    await setupShelter(`${developmentScene}const scrap=s.rooms.find(r=>r.id===4);scrap.width=3;
+      s.rooms.find(r=>r.type==='quarters').level=2;s.rooms.push({...scrap,id:30,width:1,floor:3,col:3});
+      s.residents.filter(p=>p.roomId===1).forEach(p=>p.stats.str=1);
+      s.residents.filter(p=>p.roomId===2).forEach(p=>p.stats.agi=17);
+      s.residents.filter(p=>p.roomId===3).forEach(p=>p.stats.per=17);
+      s.residents.filter(p=>p.roomId===4).forEach(p=>p.stats.end=17);
+      for(let id=9;id<=12;id++)s.residents.push({...structuredClone(s.residents[0]),id,name:'回收'+id,roomId:4,stats:{...s.residents[0].stats,end:17}});
+      for(const id of [13,14])s.residents.push({...structuredClone(s.residents[0]),id,name:'回收'+id,roomId:30,stats:{...s.residents[0].stats,end:0}});
+      s.resources.scrap=1000;`);
+    await drive(done,'choose smaller upgrade within power margin');
+    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 3 层废料回收站升至 2 级/);
+    await evaluate(`sm.view.state.residents.filter(p=>p.roomId===1).forEach(p=>p.stats.str=5);${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review stronger power workers');await drive(done,'select shorter payback upgrade');
+    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 1 层废料回收站升至 2 级/);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所零件时机：远期宿舍缺料不提前造工坊，刷新保持，当前生产升级需要时再准备',async()=>{
+    await setupShelter(`${developmentScene}s.rooms.find(r=>r.type==='quarters').level=2;
+      s.rooms.find(r=>r.type==='scrap').level=3;s.resources.scrap=1000;
+      localStorage.setItem('arkengine:auto-shelter:population:v1','20');`);
+    const fixtureSearch=await evaluate('location.search');await drive(done,'defer distant housing materials');
+    let advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：等待时机。下一步：先发展人口/);
+    assert.match(advice,/后续规划.*宿舍升至 3 级.*45 零件/);
+    assert.doesNotMatch(advice,/新建一格工坊|备选升级至少还缺/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'distant housing remains deferred after reload');
+    assert.doesNotMatch(await evaluate(`${state}.development`),/新建一格工坊|备选升级至少还缺/);
+    await evaluate(`sm.view.state.rooms.find(r=>r.type==='scrap').level=2;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review current production upgrade');await drive(done,'prepare only current upgrade materials');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/新建一格工坊/);
+    assert.match(advice,/备选升级至少还缺 15 零件/);assert.doesNotMatch(advice,/备选升级至少还缺 45 零件/);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所零件时机：优先新建回收站不被备选升级的工坊抢先，人选变化后重新安排',async()=>{
+    await setupShelter(`${developmentScene}s.rooms.find(r=>r.type==='scrap').level=2;
+      s.residents.push({...structuredClone(s.residents[0]),id:9,name:'闲置回收专长',roomId:null,stats:{...s.residents[0].stats,end:17}});`);
+    const fixtureSearch=await evaluate('location.search');await drive(done,'build scrap before optional workshop');
+    let advice=await evaluate(`${state}.development`);
+    assert.match(advice,/建设计划：条件已满足。下一步：.*新建一格废料回收站/);
+    assert.match(advice,/暂不为这些备选方案提前安排工坊/);assert.doesNotMatch(advice,/新建一格工坊|备选升级至少还缺/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'preferred build survives reload');
+    assert.match(await evaluate(`${state}.development`),/下一步：.*新建一格废料回收站/);
+    await evaluate(`sm.view.state.residents.find(p=>p.id===9).roomId=5;${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'review unavailable idle worker');await drive(done,'upgrade materials become relevant');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/备选升级至少还缺 15 零件/);assert.match(advice,/新建一格工坊/);
+    const next=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.developmentNext`);
+    assert.equal(next.type,'workshop');assert.equal(next.status,'saving');assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('避难所页签等待：产出、目标或图鉴页签晚到时同轮继续，不把缺页签当作没有奖励',async()=>{
+    for(const [label,seed,action] of [['避难所','sm.view.state.rooms[0].stored=30;','collect_all'],
+      ['目标','sm.dailyIncomplete=false;','claim_objective'],['图鉴','sm.achievementIncomplete=false;','claim_achievement']]) {
+      await setupShelter(`${quiet}${seed}${lateTab(label)}`);
+      await until(async()=>/等待避难所.*页签/.test(await expStatus()),'wait for missing tab');
+      await pulse(5000);
+      assert.equal(await evaluate('location.pathname'),'/shelter');
+      assert.deepEqual(await evaluate('sm.calls'),[]);
+      await evaluate('sm.delayedTab=false;renderShelter();');
+      await drive(done,'resume the same visit after tabs render');
+      assert.ok(await evaluate(`sm.calls.some(c=>c.type==='${action}')`));
+      assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-ui-ready').length`),1);
+    }
+  });
+  await t.test('避难所页签等待：持续缺失只等十五秒，记录未检查产出并返回远征，不连续请求',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;${lateTab('避难所')}`);
+    await until(async()=>/等待避难所.*页签/.test(await expStatus()),'initial missing tab');
+    await pulse(16000);await drive(done,'bounded tab wait');
+    assert.equal(await evaluate(enabled),'true');assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.match(await evaluate(`${state}.note`),/页签.*未就绪/);
+    assert.equal(await evaluate(`${lastCollection}.rooms[0].reason`),'not-checked');
+    assert.equal(await evaluate(`${lastCollection}.rooms[0].stored`),30);
+    const reads=await evaluate('sm.reads');assert.ok(reads<=3);
+    await pulse(60000);assert.equal(await evaluate('sm.reads'),reads);
+  });
+  await t.test('避难所页签等待：等待期间独立暂停或总暂停，页面恢复也不能继续领取',async()=>{
+    for(const control of ['shelter-toggle','toggle']) {
+      await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;${lateTab('避难所')}`);
+      await until(async()=>/等待避难所.*页签/.test(await expStatus()),'waiting before manual pause');
+      await evaluate(`${panel}.getElementById('${control}').click();sm.delayedTab=false;renderShelter();`);
+      await pulse(20000);await pulse(5000);
+      assert.deepEqual(await evaluate('sm.calls'),[]);
+      assert.equal(await evaluate(`localStorage.getItem('${control==='toggle'?'arkengine:auto-expedition:enabled:v1':'arkengine:auto-shelter:enabled:v1'}')`),'false');
+    }
+  });
+  await t.test('避难所产出诊断：区分未满批、无人生产、缺材料、容量不足和按钮未就绪',async()=>{
+    for(const [seed,reason] of [
+      [`sm.view.state.rooms[0].stored=12;`,'not-full'],
+      [`sm.view.state.residents[0].roomId=null;`,'no-workers'],
+      [`sm.view.state.rooms[0].incident={kind:'fire'};`,'production-stopped'],
+      [`sm.view.state.rooms[0].type='workshop';sm.view.state.resources.scrap=0;`,'materials-short'],
+      [`sm.view.state.rooms[0].stored=30;sm.view.state.resources.scrap=2100;`,'capacity-blocked'],
+      [`sm.view.state.rooms[0].stored=30;const originalRender=renderShelter;window.renderShelter=()=>{originalRender();
+        [...game.querySelectorAll('button')].filter(b=>b.textContent==='全部收取'||b.getAttribute('aria-label')==='收取废料').forEach(b=>b.remove());};`,'controls-not-ready']]) {
+      await setupShelter(`${quiet}${seed}`);await drive(done,'production reason logged');
+      const collection=await evaluate(lastCollection),room=collection.rooms[0];
+      assert.equal(room.reason,reason);assert.equal(room.id,1);
+      assert.ok(Number.isFinite(room.stored)&&room.batch>0&&Number.isFinite(room.rate));
+      assert.equal(collection.assessed,true);assert.ok(collection.checkedAt>=collection.serverTime);
+      assert.deepEqual(await evaluate('sm.calls'),[]);
+      assert.match(await evaluate(`${state}.operations`),/产出核对/);
+      assert.doesNotMatch(JSON.stringify(collection),/居民甲|idempotencyKey|vaultNo/);
+    }
+  });
+  await t.test('避难所产出诊断：领取确认后记录新库存，不把已收取产出继续显示为待领',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;`);await drive(done,'collect and refresh production diagnostics');
+    assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
+    assert.equal(await evaluate(`${lastCollection}.rooms[0].stored`),0);
+    assert.equal(await evaluate(`${lastCollection}.rooms[0].reason`),'not-full');
+  });
   const pausedSeason=`${quiet}sm.view.state.season.points=300;
     window.shelterTransport=async(u,o)=>{const response=await fetch(u,o);
       if(JSON.parse(o.body).action.tier===1)await new Promise(resolve=>{window.continueOldBatch=resolve;});return response;};`;
@@ -20,6 +271,13 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       targets:${JSON.stringify({assign:[1,1],equip:[1,8],collect:[1],tutorial:[1],achievement:['collect-10k'],daily:[0],season:[1]}[kind])},
       at:clock-60000,vaultNo:77,before:{collected:0,serverTime:clock-60000,day:'2026-10-10',month:'2026-10',
         room:null,outfit:null,rooms:[{id:1,stored:30}]}}));`;
+  await t.test('避难所页签等待：页签缺失不阻断原领取的只读确认，也不能重新领取',async()=>{
+    await setupShelter(`${oldSnapshot('collect')}sm.snapshotAt=clock;${lateTab('避难所')}`);
+    await drive(`${pending}===null`,'reconcile original collect without rendered tabs');
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    await until(async()=>/等待避难所.*页签/.test(await expStatus()),'only new actions wait for tabs');
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-confirmed').length`),1);
+  });
   for(const [label,kinds] of [['人员',['assign','equip']],['产出',['collect']],['奖励',['tutorial','achievement','daily','season']]]){
     await t.test(`避难所过期快照${label}：状态看似达到目标但时间早于原操作时保留记录，更新后才确认`,async()=>{
       for(const kind of kinds){
