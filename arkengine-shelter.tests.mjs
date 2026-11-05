@@ -971,7 +971,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     await drive(done,'development advice without building');
     const advice=await evaluate(`${panel}.getElementById('shelter-development').textContent`);
     assert.match(advice,/192 废料/);assert.match(advice,/836 废料/);assert.match(advice,/停产/);
-    assert.match(advice,/不自动建造、升级或下挖/);assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.match(advice,/自动建设默认关闭/);assert.deepEqual(await evaluate('sm.calls'),[]);
     assert.equal(await evaluate(`${state}.development`),advice);
   });
   await t.test('避难所发展规划零件：缺料时提示工坊，刷新保留建议，材料备齐后撤销且不自动消费',async()=>{

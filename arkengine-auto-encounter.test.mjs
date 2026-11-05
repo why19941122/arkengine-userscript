@@ -12,6 +12,8 @@ import { farmMarkup } from './arkengine-farm.fixture.mjs';
 import { fogMarkup } from './arkengine-fog.fixture.mjs';
 import { shelterMarkup } from './arkengine-shelter.fixture.mjs';
 import { shelterTests } from './arkengine-shelter.tests.mjs';
+import { shelterConstructionTests } from './arkengine-shelter-construction.tests.mjs';
+import { shelterCampaignTests } from './arkengine-shelter-campaign.tests.mjs';
 import { shelterExplorationTests } from './arkengine-shelter-exploration.tests.mjs';
 import { shelterStaffTests } from './arkengine-shelter-staff.tests.mjs';
 import { shelterProductionTests } from './arkengine-shelter-production.tests.mjs';
@@ -525,7 +527,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       const preference=name=>`localStorage.getItem('arkengine:auto-panel:expedition:section:${name}:collapsed:v1')`;
       assert.deepEqual(await evaluate(`[...${panel}.querySelectorAll('.panel-section')].map(d=>[d.dataset.panelSection,d.open])`),
         [['expedition',false],['farm',false],['shelter',false],['stock',false]]);
-      assert.equal(await evaluate(`${panel}.getElementById('script-version').textContent`),'v1.14.51');
+      assert.equal(await evaluate(`${panel}.getElementById('script-version').textContent`),'v1.16.0');
       for(const name of ['farm','shelter','shelter-staff','stock']) {
         await evaluate(`${section(name)}.querySelector('summary').click();`);
         await until(()=>evaluate(`${preference(name)}==='false'`),'expanded section saved');
@@ -637,6 +639,8 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         {type,key:'Shift',code:'ShiftLeft',windowsVirtualKeyCode:16},tab.sessionId);
     };
     await shelterExplorationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
+    await shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,trustedStaffKey});
+    await shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey});
     await shelterStaffTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
     await shelterProductionTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive });
     await shelterPopulationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, trustedStaffKey, secondShelter, until });
@@ -1957,7 +1961,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
-      assert.equal(exported.version,'1.14.51');
+      assert.equal(exported.version,'1.16.0');
     });
     await t.test('代币统计：只有农场种收和估值不会增加代币收入', async () => {
       await setupFarm('addRuns(6);');
@@ -2013,7 +2017,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         document.getElementById('ark-auto-encounter').shadowRoot.querySelector('#local-log button').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
-      assert.equal(exported.version,'1.14.51');
+      assert.equal(exported.version,'1.16.0');
       assert.equal(exported.days.length,3);
       assert.ok(!JSON.stringify(exported).includes('idempotencyKey'));
       await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);

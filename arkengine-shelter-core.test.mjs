@@ -7,9 +7,55 @@ const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.me
 const table=source.match(/const shelterRooms = [\s\S]*?;/)[0];
 const buildTable=source.match(/const shelterBuildRules = [\s\S]*?;/)[0];
 const functions=source.slice(source.indexOf('  function shelterWorkerRate('),source.indexOf('  function readShelter('));
+const actions=source.slice(source.indexOf('  function shelterRequestAction('),source.indexOf('  function shelterSubmit('));
+const construction=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n${actions}\n({spent:shelterConstructionSpent,allow:shelterConstructionAllowance,proof:shelterConstructionProof,confirmed:shelterConstructionConfirmed});`,{
+  shelterResources:{scrap:'废料',parts:'零件'}});
 const {project,model,future,plan,render,proof,rewardProof,rewardConfirmed,periodCurrent,operations,explorers,exploreProof,exploreConfirmed,pendingWait,released,without,safe}=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n({project:shelterStoredProjection,model:shelterModel,future:shelterFutureCollection,plan:shelterDevelopmentPlan,render:shelterDevelopmentText,proof:shelterCollectProof,rewardProof:shelterRewardProof,rewardConfirmed:shelterRewardConfirmed,periodCurrent:shelterRewardPeriodCurrent,operations:shelterOperations,explorers:shelterExplorerCandidates,exploreProof:shelterExplorerProof,exploreConfirmed:shelterExplorerConfirmed,pendingWait:shelterPendingWait,released:shelterExplorerReleased,without:shelterProductionWithout,safe:shelterDepartureSafe});`,{
   shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const now=2000000000;
+
+test('自动建设预算：滚动额度含未决预留，未知消费不会过期释放，确认与待清理记录不重复记账',()=>{
+  const cost={scrap:200,parts:15},pending={id:'old',before:{construction:{project:{cost}}}};
+  const state={constructionLedger:[{id:'spent',at:now-86400001,scrap:100,parts:0}]};
+  assert.equal(construction.spent(state,pending,now).scrap,200);
+  assert.equal(construction.spent(state,pending,now+10*86400000).parts,15);
+  state.constructionLedger.push({id:'old',at:now,scrap:200,parts:15});
+  assert.equal(construction.spent(state,pending,now).scrap,200);
+  assert.equal(construction.spent(state,null,now+86400000).scrap,0);
+});
+test('自动建设预算：当前项目不能绕过开关、额度、保留量和前置条件',()=>{
+  const c={kind:'upgrade',cost:{scrap:200,parts:15},priority:50,blocks:[]},m={state:{resources:{scrap:250,parts:20}}};
+  const cfg={upgrade:true,scrapLimit:250,partsLimit:20,scrapReserve:50,partsReserve:5};
+  assert.equal(construction.allow(c,m,cfg,{},null,now),'');
+  assert.match(construction.allow(c,m,{...cfg,upgrade:false},{},null,now),/未开启/);
+  assert.match(construction.allow(c,m,{...cfg,scrapLimit:199},{},null,now),/额度/);
+  assert.match(construction.allow(c,m,{...cfg,partsReserve:6},{},null,now),/保留量/);
+  assert.match(construction.allow({...c,blocks:['电力不足']},m,cfg,{},null,now),/条件/);
+  assert.match(construction.allow(c,m,cfg,{}, {id:'pending'},now),/原操作/);
+});
+test('自动建设凭据：三种操作均绑定原请求、目标、账号和实际开工状态，余额变化不能替代',()=>{
+  for(const kind of ['build','upgrade','dig']){
+    const {state:s,view}=developmentScene();s.resources.scrap=1000;
+    const project=kind==='build'?{kind,type:'scrap',floor:1,col:6,cost:{scrap:96,parts:0}}:
+      kind==='upgrade'?{kind,type:'scrap',id:4,level:2,cost:{scrap:200,parts:0}}:{kind,type:'elevator',floor:4,cost:{scrap:836,parts:0}};
+    const targets=kind==='build'?['scrap',1,6]:kind==='upgrade'?[4]:[4];
+    const action=kind==='build'?{type:'build',room:'scrap',floor:1,col:6,trainStat:null}:kind==='upgrade'?{type:'upgrade',roomId:4}:{type:'dig'};
+    const p={id:'operation',kind,targets,vaultNo:77,constructionKey:'native-key',before:{serverTime:now,construction:{project,cells:1}}},request={action,idempotencyKey:'native-key'};
+    s.resources.scrap-=project.cost.scrap;assert.equal(construction.proof(p,200,request,{view}),null);
+    if(kind==='build')s.rooms.push({...s.rooms.find(r=>r.id===4),id:99,col:6,builtAt:now+600000});
+    else if(kind==='upgrade')s.rooms.find(r=>r.id===4).upgradeAt=now+3600000;
+    else s.digging={floor:4,doneAt:now+3600000};
+    const proof=construction.proof(p,200,request,{view});assert.ok(proof,kind);
+    assert.equal(construction.proof(p,503,request,{view}),null);
+    assert.equal(construction.proof(p,200,request,{view,code:'retry'}),null);
+    assert.equal(construction.proof(p,200,{...request,idempotencyKey:'wrong-key'},{view}),null);
+    assert.equal(construction.proof(p,200,{...request,action:{...action,roomId:999}},{view}),null);
+    assert.equal(construction.confirmed(p,model(view)),false,'没有绑定回执不凭状态自动解除未知结果');
+    p.result={constructionProof:proof};assert.equal(construction.confirmed(p,model(view)),true);
+    view.vaultNo=78;assert.equal(construction.confirmed(p,model(view)),false);view.vaultNo=77;
+    view.serverTime=now-1;assert.equal(construction.confirmed(p,model(view)),false);
+  }
+});
 test('避难所等待诊断：各类原操作遇到更早快照时说明同步等待，同时间与旧缺省记录保持原提示',()=>{
   for(const kind of ['assign','equip','collect','tutorial','achievement','daily','season']){
     const p={kind,before:{serverTime:now}},before=JSON.stringify(p),m={now:now-1};
@@ -354,8 +400,20 @@ test('发展规划：预留外出人员归来后的供应，原生仍登记占�
   assert.equal(occupied.candidates.some(c=>c.kind==='staff'&&c.type==='diner'),false);
   assert.match(occupied.notes.join(' '),/外出居民.*占位.*不能直接补员/);
   s.residents.filter(r=>r.roomId===2).forEach(r=>r.roomId=null);
-  const vacant=plan(model(view),14).candidates.find(c=>c.kind==='staff'&&c.type==='diner');
-  assert.match(vacant.benefit,/已有 2 个空岗/);
+  const vacant=plan(model(view),14);
+  assert.equal(vacant.candidates.some(c=>c.kind==='staff'&&c.type==='diner'),false,'外出人选不能立即补空岗');
+  assert.match(vacant.notes.join(' '),/餐厅有 2 个空岗.*空岗不作为/);
+  s.residents.push({...s.residents[0],id:99,name:'闲置成人',roomId:null,away:null});
+  assert.match(plan(model(view),14).candidates.find(c=>c.kind==='staff'&&c.type==='diner').benefit,/已有 2 个空岗/);
+});
+test('快速发展：无人可补的回收空岗不能阻止有收益的升级，基础岗位不要求填满',()=>{
+  const {state:s,view}=developmentScene();
+  s.residents=s.residents.filter(p=>![2,4,6,8].includes(p.id));
+  s.resources.scrap=300;
+  const p=plan(model(view),4);
+  assert.equal(p.candidates.some(c=>c.kind==='staff'),false);
+  assert.equal(p.next.kind,'upgrade');assert.equal(p.next.type,'scrap');assert.equal(p.next.status,'ready');
+  assert.match(p.notes.join(' '),/空岗.*不作为.*前置/);
 });
 test('发展规划：优先现有空岗；额外空房不凭空增产，不抢培养感情的闲置人选',()=>{
   const {state:s,view}=developmentScene();s.residents[7].roomId=null;
