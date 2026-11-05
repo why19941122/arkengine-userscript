@@ -11,6 +11,23 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify({version:1,userId:77,nextAt:0,note:'fixture',hold:false,
       entries:[],pending:null,owned:{'1':{shares:10,cost:100,modelName:'模型甲',manual:false}}}));`;
   const done=`location.pathname==='/activities/expedition'`;
+  await t.test('运行修复浏览器：零成交量不屏蔽有效上涨候选，原单确认后不重复买入',async()=>{
+    await setupStock(settings+`km.view.stocks[0].volume24h=0;`);
+    await drive(done,'zero volume stock evaluated');assert.equal(await evaluate('km.calls.length'),1);
+    assert.equal(await evaluate('km.calls[0].action'),'buy');assert.equal(await evaluate(`${ledger}.pending`),null);
+    await evaluate(`${panel}.getElementById('stock-check').click();`);await drive(`location.pathname==='/stock'`,'stock refresh visit');
+    await drive(done,'owned zero volume stock not bought again');assert.equal(await evaluate('km.calls.length'),1);
+    const check=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='stock-check').at(-1)`);
+    assert.equal(check.data.market.zeroVolume,1);assert.equal(check.data.market.up,1);
+  });
+  await t.test('运行修复浏览器：没有达到含费门槛时显示行情筛选统计并保持不交易',async()=>{
+    await setupStock(settings+`km.view.stocks[0].volume24h=0;km.view.stocks[0].priceCents=1040;
+      km.view.ticks.forEach((t,i)=>{t.priceCents=1000+8*i;});`);
+    await drive(done,'market explains why no buy');assert.deepEqual(await evaluate('km.calls'),[]);
+    assert.match(await evaluate(`${ledger}.note`),/上涨1只.*含费门槛0只/);
+    const check=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='stock-check').at(-1)`);
+    assert.equal(check.data.market.buySignals,0);assert.equal(check.data.market.total,1);
+  });
   await t.test('股市结算重复记录：同一下注编号返回已结算与未结算两条时，不能取第一条宣布完成',async()=>{
     await setupStock(prediction);await drive(done,'prediction before conflicting settlement rows');
     await evaluate(`km.originalBet=structuredClone(km.view.myBets[0]);

@@ -14,6 +14,34 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     const p=s.residents[0];s.residents=Array.from({length:8},(_,i)=>({...structuredClone(p),id:i+1,name:'居民'+(i+1),roomId:Math.floor(i/2)+1}));`;
   const config=(changes={})=>`localStorage.setItem('arkengine:auto-shelter:construction:v1',${JSON.stringify(JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:3000,partsLimit:100,scrapReserve:0,partsReserve:0,...changes}))});`;
 
+  await t.test('运行修复浏览器：建设窗口已打开时跨过访问时限，先确认当前项目再返回',async()=>{
+    await setupShelter(scene+config()+`sm.visitStart=clock;
+      const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=48000;}return originalData();};`);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'late construction dialog');
+    await pulse(await evaluate('sm.visitStart+62000-clock'));await drive(done,'finish late construction before returning');
+    const list=await evaluate(calls);assert.equal(list.length,1);assert.equal(list[0].type,'upgrade');
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+    assert.match(await evaluate(`${state}.constructionNote`),/已确认开工/);
+    const check=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1)`);
+    assert.ok(check.data.visit.elapsedMs>60000);assert.ok(check.data.visit.elapsedMs<90000);
+    assert.equal(check.data.visit.constructionConfirmed,true);
+  });
+  await t.test('运行修复浏览器：建设收尾延时有上限，不可用按钮不能持续占用页面',async()=>{
+    await setupShelter(scene+config()+`sm.visitStart=clock;
+      const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=48000;}return originalData();};`);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'late construction hard deadline');
+    await pulse(40000);await drive(done,'hard deadline yields');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('运行修复浏览器：窗口收尾仍重核最新预算，不能借延时绕过额度下降',async()=>{
+    await setupShelter(scene+config()+`sm.visitStart=clock;
+      const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=48000;}return originalData();};`);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'late construction before new budget');
+    await evaluate(config({scrapLimit:199}));await pulse(await evaluate('sm.visitStart+62000-clock'));
+    await drive(done,'updated budget cancels finishing work');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(pending),null);
+  });
+
   await t.test('自动建设：默认关闭，足额资源也只显示规划',async()=>{
     await setupShelter(scene);await drive(done,'default advisory');assert.deepEqual(await evaluate(calls),[]);
     assert.match(await evaluate(`${panel}.getElementById('shelter-construction-status').textContent`),/未开启/);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.16.7
+// @version      1.16.8
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -369,23 +369,40 @@
       const matches=v.myBets.filter(b=>id(b?.id)&&String(b.id)===String(betId));
       return matches.length===1&&matches[0].id===betId?matches[0]:null;
     }
-    function trend(v,s,now) {
-      if(s.stale || s.suspended || !Number.isFinite(s.volume24h) || s.volume24h<=0) return null;
+    function trendInfo(v,s,now) {
+      const unavailable=reason=>({reason,signal:null});
+      if(s.suspended)return unavailable('suspended');
+      if(s.stale)return unavailable('stale');
+      // 原生页面不以零成交量禁用交易；行情有效性由时点、价格与停牌状态核对，不能用零量替代。
+      if(!Number.isFinite(s.volume24h)||s.volume24h<0)return unavailable('invalid');
       const ticks=v.ticks.filter(t=>t.stockId===s.id).map(t=>({at:time(t.createdAt),price:t.priceCents}))
         .sort((a,b)=>a.at-b.at).slice(-12);
-      if(ticks.length<6 || !ticks.every(t=>Number.isFinite(t.at) && positive(t.price)) ||
-          now-ticks.at(-1).at>10*60000 || ticks.at(-1).at>now+5000 || now-ticks[0].at>2*3600000 ||
-          ticks.at(-1).at-ticks[0].at<20*60000 || Math.abs(s.priceCents/ticks.at(-1).price-1)>.05) return null;
+      if(ticks.length<6)return unavailable('history');
+      if(!ticks.every(t=>Number.isFinite(t.at)&&positive(t.price)))return unavailable('invalid');
+      if(now-ticks.at(-1).at>10*60000)return unavailable('stale');
+      if(ticks.at(-1).at>now+5000||now-ticks[0].at>2*3600000||
+          ticks.at(-1).at-ticks[0].at<20*60000||Math.abs(s.priceCents/ticks.at(-1).price-1)>.05)return unavailable('history');
       let up=0,down=0;
       for(let i=1;i<ticks.length;i++) {
         const delta=ticks[i].price/ticks[i-1].price-1, gap=ticks[i].at-ticks[i-1].at;
-        if(gap<=0 || gap>15*60000 || Math.abs(delta)>.2) return null;
+        if(gap<=0 || gap>15*60000 || Math.abs(delta)>.2)return unavailable('history');
         if(delta>0)up++; if(delta<0)down++;
       }
       const avg=xs=>xs.reduce((sum,t)=>sum+t.price,0)/xs.length;
       const change=avg(ticks.slice(-3))/avg(ticks.slice(0,3))-1;
       const direction=change>=.02 && up/(ticks.length-1)>=.6 ? 'up' : change<=-.02 && down/(ticks.length-1)>=.6 ? 'down' : null;
-      return direction ? {direction,change,samples:ticks.length,at:ticks.at(-1).at} : null;
+      return direction?{reason:direction,signal:{direction,change,samples:ticks.length,at:ticks.at(-1).at}}:unavailable('flat');
+    }
+    function trend(v,s,now) { return trendInfo(v,s,now).signal; }
+    function marketSummary(m,now) {
+      const result={total:m.view.stocks.length,suspended:0,stale:0,invalid:0,history:0,flat:0,up:0,down:0,
+        zeroVolume:0,buySignals:0,minBuyChangePct:m.rules.buyFeePct+m.rules.sellFeePct+1};
+      for(const stock of m.view.stocks){
+        const info=trendInfo(m.view,stock,now);result[info.reason]++;
+        if(stock.volume24h===0)result.zeroVolume++;
+        if(info.signal?.direction==='up'&&info.signal.change*100>=result.minBuyChangePct)result.buySignals++;
+      }
+      return result;
     }
     // Server receipts do not expose an execution time. First successful confirmation is a conservative bound.
     const entryTime = e => Math.max(e.at,e.confirmedAt??0);
@@ -552,7 +569,12 @@
         else if(spent>=r.maxDailyBuyTokens)reason='网站买入额度暂无余量，按已记录支出保守等待';
         else if(free<=0)reason='可用余额已到保留线';
         else if(!r.maxTradeTokens)reason='网站单笔交易额度为0';
-        else reason='暂无同时满足行情、持仓和资金条件的股票';
+        else {
+          const market=marketSummary(m,now);
+          reason=`行情${market.total}只，停牌或停滞${market.suspended+market.stale}只，资料不足${market.invalid+market.history}只；`+
+            `上涨${market.up}只，达到含费门槛${market.buySignals}只（${market.minBuyChangePct}%）；`+
+            (market.buySignals?'仍需满足持仓、冷却、可买股数和扣费条件':'等待符合条件的行情');
+        }
         messages.push('买入：'+reason);
       }
       if(config.predict) {
@@ -576,7 +598,7 @@
       if(status===400 && r.executed===false && r.code!=='idempotency_conflict')return 'rejected';
       return null;
     }
-    return {whole,positive,id,time,quote,sharesFor,model,uniqueBet,trend,entryTime,spend,funding,sellPlan,choose,recoveryWait,waitReason,input,same,receipt};
+    return {whole,positive,id,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,sellPlan,choose,recoveryWait,waitReason,input,same,receipt};
   })();
   // STOCK_CORE_END
 
@@ -632,7 +654,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.16.7';
+  const SCRIPT_VERSION = '1.16.8';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -2902,7 +2924,8 @@
     stockPersist({...stockLedger,nextAt:Date.now()+300000,note,hold:hold || stockLedger.hold,
       holdReason:hold?note:stockHoldReason()});
     log.add(hold?'stock-held':'stock-check',note,{pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),
-      buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now())});
+      buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now()),
+      ...(stockRead?{market:stockCore.marketSummary(stockRead.model,Date.now())}:{})});
     stockLeave=true;cancelStockRead();
     if(stockCheckRequested){stockCheckRequested=false;stockCheckMessage=`检查结果：${note}`;}
   }
@@ -5766,7 +5789,7 @@
     const title = `${name} · ${level} 级`;
     const row = currentElement([...(root?.querySelectorAll('li > button') || [])].filter(b => textOf(b).startsWith(`${title} · `)));
     if (!usable(row)) { holdShelterStaff('未能唯一定位居民，本轮保留原岗位'); shelterWork = null; return false; }
-    offer(`shelter:staff-open:${work.id}`,'打开待调岗居民详情',() => { work.title = title; work.openedAt = Date.now(); row.click(); });
+    offer(`shelter:staff-open:${work.id}`,`打开${name}的居民详情：${work.reason}`,() => { work.title = title; work.openedAt = Date.now(); row.click(); });
     return true;
   }
   // 用户接手脚本打开的窗口后，不再自动改动或关闭该窗口。
@@ -5853,6 +5876,10 @@
       pendingReadOnly:shelterPending?.id===pendingReadOnly?pendingReadOnly:undefined,
       ...(m ? { advice:shelterAdvice(m),development,operations } : {}) });
     log.add('shelter-check', note, { nextAt:shelterState.nextAt, actions:shelterActions,pendingReadOnly:shelterReadOnlyWait(),
+      visit:{elapsedMs:Math.max(0,Date.now()-shelterEntryAt),limitMs:60000,finishLimitMs:90000,
+        openKind:shelterBuildWork?.openedAt?shelterBuildWork.project.kind:shelterWork?.openedAt?shelterWork.kind:
+          shelterRecallWork?'explore-recall':null,submitted:Boolean(shelterPending||shelterWork?.submitted),constructionConfirmed:shelterConstructionDone,
+        allocationStep:shelterState.swap?.step??null,allocationSteps:shelterState.swap?.moves?.length??null},
       staffMode:shelterStaffMode,staffHeld:shelterStaffHold,staffNote:shelterStaffNote,
       gearEnabled:shelterGear,optimizeEnabled:shelterOptimize,pendingSwap:Boolean(shelterState.swap),
       populationTarget:shelterPopulationTarget,pendingPair:Boolean(shelterState.pair),
@@ -6189,7 +6216,10 @@
     if (plan || claimWait || farmEnabled&&farmPlan || nativePending().length) {
       finishShelter(null,'其他玩法正在核对原操作，先返回远征，一分钟后再检查避难所',60000);return;
     }
-    if (!shelterPending && (Date.now()-shelterEntryAt > 60000 || shelterActions >= 12)) {
+    // 到访问时限后只允许已打开的本轮窗口收尾；最多追加30秒，不再开新任务或长期占住其他玩法。
+    const finishing=Boolean(shelterBuildWork?.openedAt&&!shelterBuildWork.cancelled&&!shelterConstructionDone||
+      shelterWork?.openedAt&&!shelterWork.submitted&&!shelterWork.closing||shelterRecallWork?.at&&!shelterRecallWork.cancelled);
+    if (!shelterPending && (Date.now()-shelterEntryAt > (finishing?90000:60000) || shelterActions >= 12)) {
       finishShelter(shelterRead?.model,'本轮处理已到上限，稍后继续避难所'); return;
     }
     if (!shelterRead || Date.now()-shelterRead.at > 10000) { readShelter(); return; }

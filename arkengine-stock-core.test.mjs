@@ -12,6 +12,25 @@ function fixture(){const s={id:1,modelName:'模型甲',priceCents:1200,volume24h
     rules:{buyFeePct:2,sellFeePct:2.5,maxTradeTokens:10000,maxDailyBuyTokens:10000,maxPositionTokens:10000,reserveTokens:10000},rounds:[],myBets:[]};
   return {v,m:c.model(v,{tokens:10000}),l:{owned:{},entries:[]}};}
 
+test('运行修复：零成交量但行情有效可选股，停牌停滞和无效成交量仍不可选',()=>{
+  const {v,m,l}=fixture(),s=v.stocks[0],cfg={...config,predict:false,netEfficiency:true};s.volume24h=0;
+  assert.equal(c.trend(v,s,now)?.direction,'up');assert.equal(c.choose(m,cfg,l,now)?.action,'buy');
+  for(const volume of [-1,NaN,undefined,Infinity]){s.volume24h=volume;assert.equal(c.choose(m,cfg,l,now),null);}
+  s.volume24h=0;s.stale=true;assert.equal(c.choose(m,cfg,l,now),null);
+  s.stale=false;s.suspended=true;assert.equal(c.choose(m,cfg,l,now),null);
+  s.suspended=false;assert.equal(c.choose(m,cfg,l,now+11*60000),null);
+});
+test('运行修复：股市等待说明区分历史不足、停滞和上涨不足以覆盖费用',()=>{
+  const {v,m,l}=fixture(),cfg={...config,predict:false};v.stocks[0].volume24h=0;
+  v.stocks[0].priceCents=1040;v.ticks=v.ticks.map((t,i)=>({...t,priceCents:1000+i*8}));
+  v.stocks.push({...v.stocks[0],id:2,modelName:'停滞模型',stale:true},{...v.stocks[0],id:3,modelName:'无历史模型'});
+  const summary=c.marketSummary(m,now);
+  assert.equal(summary.total,3);assert.equal(summary.stale,1);assert.equal(summary.history,1);
+  assert.equal(summary.up,1);assert.equal(summary.buySignals,0);assert.equal(summary.minBuyChangePct,5.5);
+  assert.equal(c.choose(m,cfg,l,now),null);assert.match(c.waitReason(m,cfg,l,now),/上涨1只.*含费门槛0只/);
+  assert.match(c.waitReason(m,cfg,l,now),/停牌或停滞1只/);
+});
+
 test('股市净信号：含费取整后的净幅度优先，价格涨幅最高者不必排第一；换序结果一致',()=>{
   const {v,l}=fixture();v.rules.buyFeePct=0;v.rules.sellFeePct=0;
   v.stocks=[{id:1,modelName:'涨幅更高',priceCents:81,volume24h:1000},{id:2,modelName:'净幅度更高',priceCents:90,volume24h:1000}];

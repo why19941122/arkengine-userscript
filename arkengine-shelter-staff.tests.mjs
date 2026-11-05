@@ -20,6 +20,18 @@ export async function shelterStaffTests({t,setupShelter,reloadShelter,evaluate,p
   const family = `${scene}localStorage.setItem('arkengine:auto-shelter:staff:v1','family');
     sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'家人'+id,roomId:5,
       romance:{partnerId:id===6?7:6,progress:.4}})));`;
+  await t.test('运行修复浏览器：居民窗口跨过访问时限时完成当前调岗，刷新不重复同一目标',async()=>{
+    await setupShelter(scene+`sm.visitStart=clock;sm.fixtureSearch=location.search;
+      const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=45000;}return originalData();};`);
+    await drive(`!!document.querySelector('[data-staff-dialog]')`,'late resident dialog');
+    await pulse(await evaluate('sm.visitStart+62000-clock'));await drive(done,'finish current resident move');
+    assert.equal(await evaluate(`${moves}.length`),1);assert.equal(await evaluate(pending),null);
+    const original=await evaluate(`${moves}[0]`);
+    await pulse(1000);
+    await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();
+    await drive(done,'no replay after staff refresh');
+    assert.equal(await evaluate(`${moves}.filter(c=>c.residentId===${original.residentId}&&c.roomId===${original.roomId}).length`),1);
+  });
   await t.test('发展供应准备：生产模式先备好儿童成年、外出归来、恢复及待产口粮，再增加废料',async()=>{
     for(const extra of [
       `sm.view.state.residents.push(...[6,7].map(id=>({...structuredClone(adult),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000})));`,
