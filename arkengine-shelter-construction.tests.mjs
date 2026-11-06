@@ -19,6 +19,25 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     s.residents.filter(p=>p.adultAt===0).forEach(p=>{p.stats.agi=20;p.stats.per=20;p.stats.str=20;});`;
   const digLogs=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`;
 
+  await t.test('建设规划耗时：重复决策不能耗尽提交新鲜度并撤销已可开工工程',async()=>{
+    await setupShelter(scene+config()+`s.residents=s.residents.filter(p=>![2,4,6,8].includes(p.id));
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');sm.planCostMs=250;`);
+    await drive(done,'construction with bounded per-plan computation cost');
+    const report=await evaluate(`({calls:${calls},reads:sm.reads,planCalls:sm.planCalls,note:${state}.constructionNote})`);
+    t.diagnostic(JSON.stringify(report));
+    assert.equal(report.calls.length,1,JSON.stringify(report));
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+  });
+  await t.test('建设撤销接续：窗口超时后一分钟重新核对，不误归为正常完成后闲等十五分钟',async()=>{
+    await setupShelter(scene+config());
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'construction dialog before timeout');
+    await pulse(31000);await drive(done,'cancel expired construction without spending');
+    assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
+    const check=await evaluate(`(${digLogs}).filter(e=>e.type==='shelter-check').at(-1)`);
+    assert.ok(check.data.nextAt-check.at<=62000,JSON.stringify({wait:check.data.nextAt-check.at,note:check.detail}));
+    assert.match(check.detail,/建设.*撤销|超时/);
+  });
+
   await t.test('运行修复浏览器：建设窗口已打开时跨过访问时限，先确认当前项目再返回',async()=>{
     await setupShelter(scene+config()+`sm.visitStart=clock;
       const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=48000;}return originalData();};`);

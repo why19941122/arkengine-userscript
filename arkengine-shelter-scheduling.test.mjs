@@ -21,11 +21,37 @@ function setup(v=workshopChurnView(),explore=true){
   context.saveShelter=x=>context.shelterState=x;
   const api=vm.runInNewContext(`${implementation}\nshelterCampaign={...campaignDefaults,explore:${explore},sodaEfficiency:true};
     ({model:shelterModel,campaign:shelterCampaignSchedule,staff:shelterStaffPlan,record:recordShelterCampaign,development:shelterDevelopmentPlan,
-      powerReserve:shelterConstructionPowerReserve,
+      powerReserve:shelterConstructionPowerReserve,populationDiagnostics:shelterPopulationDiagnostics,
+      startCache:()=>shelterCampaignSchedule.cache={},endCache:()=>delete shelterCampaignSchedule.cache,
       raw:(m,cfg)=>shelterCampaignPlan(m,{...campaignDefaults,...cfg},shelterState.campaign,30)})`,context);
   const plan=()=>{const m=api.model(v),c=api.campaign(m);return {m,c,p:api.development(m,context.shelterPopulationTarget,c,context.shelterLevelTarget)};};
   return {v,context,api,plan};
 }
+test('人口阻塞诊断：按家庭分别记录外出、心情、冷却及离岗后供给，不修改人员或配对',()=>{
+  const {v,context,api}=setup(workshopChurnView(),false),s=v.state;
+  context.shelterPopulationTarget=30;context.shelterState.families=[{a:1,b:3,room:6},{a:13,b:14,room:5}];
+  s.residents.find(p=>p.id===1).away={kind:'explore'};
+  s.residents.find(p=>p.id===3).happiness=49;
+  s.residents.find(p=>p.id===13).familyCooldownUntil=v.serverTime+3600000;
+  const before=JSON.stringify({v,state:context.shelterState}),d=api.populationDiagnostics(api.model(v),{reserved:[],dailyReserved:[]});
+  assert.match(d.families[0].reasons.join('；'),/外出/);assert.match(d.families[0].reasons.join('；'),/心情/);
+  assert.match(d.families[1].reasons.join('；'),/冷却/);assert.equal(d.target,30);
+  assert.ok(d.families.every(f=>f.supply&&Object.hasOwn(f.supply,'food')));
+  assert.equal(JSON.stringify({v,state:context.shelterState}),before);
+});
+test('同步规划复用：同一快照重复核对只算一次，目标、记录、设置、快照变化及下一轮均重新计算',()=>{
+  const {v,context,api}=setup(workshopChurnView(),false),m=api.model(v);
+  api.startCache();let previous=api.campaign(m);assert.equal(api.campaign(m),previous);
+  const changes=[()=>context.shelterPopulationTarget=30,
+    ()=>context.shelterState=JSON.parse(JSON.stringify(context.shelterState)),
+    ()=>context.shelterConstruction={...context.shelterConstruction,partsLimit:0},
+    ()=>context.shelterCampaign={...context.shelterCampaign,medical:true},
+    ()=>context.shelterStaffHold='manual'];
+  for(const change of changes){change();const current=api.campaign(m);assert.notEqual(current,previous);assert.equal(api.campaign(m),current);previous=current;}
+  assert.notEqual(api.campaign(api.model(v)),previous);api.endCache();
+  assert.notEqual(api.campaign(m),api.campaign(m),'同步回合以外不保留规划');
+});
+
 test('工坊调度稳定：5级已有自动岗位不能因上下岗改变需求而无限往返',()=>{
   for(const target of [null,10]){
     const {v,context,api,plan}=setup(),actions=[];context.shelterLevelTarget=target;

@@ -28,7 +28,9 @@ import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
 const scriptVersion=rawSource.match(/^\/\/ @version\s+(\S+)/m)[1];
 // 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
-const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;');
+const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;')
+  .replace('function shelterCampaignPlan(m,cfg={},record={},target=14) {',
+    'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(window.sm?.planCostMs){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}');
 const executable = [process.env.CHROME_PATH,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'].find(p => p && existsSync(p));

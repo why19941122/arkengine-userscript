@@ -186,6 +186,18 @@ export async function shelterPopulationTests({t,setupShelter,reloadShelter,evalu
     assert.deepEqual(await evaluate(`${intoQuarters}.map(c=>c.residentId)`),[6,7]);
     assert.equal(await evaluate(`${state}.pair`),null);
   });
+  await t.test('生育诊断：未配对原因写入检查日志，离页刷新后仍显示且目标变更后不沿用',async()=>{
+    await setupShelter(`${scene}${onlyIdle}sm.confirmFamily=true;sm.view.state.residents[5].happiness=49;`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'persist actual population blocking reason',200);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.match(events.filter(e=>e.type==='shelter-check').at(-1).data.populationNote,/心情/);
+    const saved=await evaluate(`${state}.populationEvaluation`);assert.equal(saved.target,14);assert.match(saved.note,/心情/);
+    await evaluate(`history.replaceState({},'','/activities/expedition'+${JSON.stringify(fixtureSearch)});`);await reloadShelter();
+    assert.match(await evaluate(`${panel}.getElementById('shelter-population-status').textContent`),/上次检查.*心情/);
+    await evaluate(`${target(30)}`);
+    assert.doesNotMatch(await evaluate(`${panel}.getElementById('shelter-population-status').textContent`),/上次检查/);
+  });
   await t.test('生育心情：新配对排队或第一人到宿舍后心情下降，撤销剩余安排且刷新不丢失',async()=>{
     for(const phase of ['queued','first','reload','late-reload']){
       await setupShelter(`${scene}${onlyIdle}`);
