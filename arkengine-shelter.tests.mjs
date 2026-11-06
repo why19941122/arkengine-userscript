@@ -8,6 +8,143 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   const done = `location.pathname==='/activities/expedition' && ${state}?.nextAt>clock`;
   const waiting = `${done}&&${enabled}==='true'&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`;
   const quiet = `sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;sm.view.state.rooms[0].stored=0;`;
+  const incomeTotals=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).totals`;
+  const manualIncomeScene=`${quiet}sm.view.state.rooms[0].stored=30;sm.resultMessages={collect:'收到 30 废料',collect_all:'收到 30 废料'};
+    localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','false');`;
+  const auxScene=`${manualIncomeScene}sm.neighbors=[{userId:1,vaultNo:22,helpScrap:13}];
+    sm.caravan={offers:[{slot:0,scrap:10,parts:0,reward:80,delivered:false}]};sm.view.state.daily.counters={caravan:0};`;
+  const auxPost=(kind,key,requestBody=false)=>{
+    const url=kind==='help'?'/api/shelter/social/help':'/api/shelter/caravan',body=kind==='help'?
+      {targetId:1,deviceFp:'private-manual-fingerprint',idempotencyKey:key}:{slot:0,idempotencyKey:key};
+    const options=JSON.stringify({method:'POST',body:JSON.stringify(body)});
+    return `fetch(${requestBody?`new Request(new URL('${url}',location.href),${options})`:`'${url}',${options}`}).then(r=>r.json())`;
+  };
+  const auxRead=async()=>{await evaluate(`fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);};
+  await t.test('手动互助商队收入：原响应和后续账号读取齐备才记账，Request不被消费，同编号刷新去重',async()=>{
+    for(const kind of ['help','caravan']){
+      await setupShelter(auxScene);await auxRead();
+      const key='manual-aux-'+kind,response=await evaluate(auxPost(kind,key,true));
+      assert.equal(kind==='help'?response.scrap:response.tokens,kind==='help'?13:80);await pulse(1000);
+      const field=kind==='help'?'避难所废料':'避难所商队代币';
+      assert.equal(await evaluate(`${incomeTotals}['${field}']||0`),0);
+      await auxRead();await until(()=>evaluate(`${incomeTotals}['${field}']===${kind==='help'?13:80}`),'aux actual income');
+      await reloadShelter();await auxRead();await evaluate(auxPost(kind,key));await auxRead();
+      assert.equal(await evaluate(`${incomeTotals}['${field}']`),kind==='help'?13:80);
+      assert.equal(await evaluate('sm.calls.length'),2);assert.equal(await evaluate(enabled),'false');
+      const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+      assert.ok(!JSON.stringify(events).includes(key));assert.doesNotMatch(JSON.stringify(events),/private-manual-fingerprint/);
+    }
+  });
+  await t.test('手动互助商队收入：缺账号前状态、切换账号或未知回执不猜金额，不补发操作',async()=>{
+    for(const mode of ['missing-before','other-account','unknown']){
+      await setupShelter(auxScene+(mode==='unknown'?`sm.caravanUnknown=true;`:''));
+      if(mode!=='missing-before')await auxRead();
+      await evaluate(auxPost('caravan','manual-aux-boundary'));
+      if(mode==='other-account')await evaluate('sm.view.vaultNo=88;');
+      await auxRead();assert.equal(await evaluate(`${incomeTotals}['代币']||0`),0);
+      assert.equal(await evaluate('sm.calls.length'),1);
+    }
+  });
+  await t.test('手动互助商队收入：无奖励互助不虚增，商队补给单列汽水和装备，不折算代币',async()=>{
+    await setupShelter(auxScene+`sm.neighbors[0].reason='self_limit';sm.caravan.offers[0].reward=0;
+      sm.caravanFallback={item:'猎枪',boundSoda:2};`);await auxRead();
+    await evaluate(auxPost('help','manual-help-no-reward'));await auxRead();
+    await evaluate(auxPost('caravan','manual-caravan-fallback'));await auxRead();
+    const totals=await evaluate(incomeTotals);assert.equal(totals['避难所废料'],0);assert.equal(totals['代币'],0);
+    assert.equal(totals['避难所汽水'],2);assert.equal(totals['避难所商队装备'],1);
+    assert.equal(totals['避难所金额待核对']||0,0);assert.equal(await evaluate('sm.calls.length'),2);
+  });
+  await t.test('手动收入避难所：关闭自动功能后仍记真实领取，不接管操作，不记录原请求密钥',async()=>{
+    await setupShelter(manualIncomeScene);
+    await evaluate(`fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);
+    await evaluate(`shelterAct({type:'collect',roomId:1})`);
+    await until(()=>evaluate(`${incomeTotals}['避难所废料']===30`),'manual collection income');
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-income')`);
+    assert.equal(events.length,1);assert.equal(events[0].data.source,'manual');
+    assert.match(events[0].receiptId,/^shelter-income:[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(events).includes(await evaluate('sm.calls[0].idempotencyKey')));
+    assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(enabled),'false');
+    await reloadShelter();await pulse(1000);
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),30);
+    assert.equal(await evaluate('sm.calls.length'),1);
+  });
+  await t.test('手动收入避难所：Request正文只复制观察，成功后网站仍可读取原响应',async()=>{
+    await setupShelter(manualIncomeScene);
+    await evaluate(`fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);
+    const response=await evaluate(`fetch(new Request(new URL('/api/shelter/action',location.href),{method:'POST',body:JSON.stringify({action:{type:'collect',roomId:1},idempotencyKey:'manual-request-key'})})).then(r=>r.json())`);
+    assert.equal(response.result.message,'收到 30 废料');
+    await until(()=>evaluate(`${incomeTotals}['避难所废料']===30`),'manual Request income');
+    assert.equal(await evaluate('sm.calls.length'),1);
+  });
+  await t.test('手动收入避难所：没有领取前快照或服务器结果未知时不估收入，也不补发请求',async()=>{
+    for(const mode of ['missing-before','unknown']){
+      await setupShelter(manualIncomeScene);
+      if(mode==='unknown'){await evaluate(`sm.mode='unknown';fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);}
+      await evaluate(`void shelterAct({type:'collect',roomId:1})`);await pulse(1000);
+      assert.equal(await evaluate(`${incomeTotals}['避难所废料']||0`),0);
+      assert.equal(await evaluate('sm.calls.length'),1);
+    }
+  });
+  await t.test('手动收入避难所：同一原编号的并发重复响应只记一次，正文属性顺序不影响去重',async()=>{
+    await setupShelter(manualIncomeScene);
+    await evaluate(`fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);
+    await evaluate(`Promise.all([{type:'collect',roomId:1},{roomId:1,type:'collect'}].map(action=>fetch('/api/shelter/action',
+      {method:'POST',body:JSON.stringify({action,idempotencyKey:'manual-duplicate-key'})}).then(r=>r.json())))`);
+    await until(()=>evaluate(`${incomeTotals}['避难所废料']===30`),'one duplicate receipt');await pulse(1000);
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),30);
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).counts['shelter-income']`),1);
+    assert.equal(await evaluate('sm.view.state.stats.collected'),30);assert.equal(await evaluate('sm.calls.length'),2);
+  });
+  await t.test('手动收入避难所：自动领取与人工重放共用回执身份，不能从两个入口重复入账',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;sm.resultMessages={collect_all:'收到 30 废料'};
+      window.shelterTransport=(u,o)=>{const response=fetch(u,o);queueMicrotask(()=>{void fetch(u,o);});return response;};`);
+    await drive(done,'automatic and manual receipt reconciled');await pulse(1000);
+    assert.equal(await evaluate('sm.calls.length'),2);
+    assert.equal(await evaluate('sm.view.state.stats.collected'),30);
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),30);
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).counts['shelter-income']`),1);
+  });
+  await t.test('手动收入避难所：页面闲置仍可核对本次回执，跨账号和倒序状态不能混入',async()=>{
+    for(const mode of ['idle','other-account','old-read']){
+      await setupShelter(manualIncomeScene+(mode==='old-read'?`sm.view.state.rooms[0].stored=0;`:''));
+      await evaluate(`fetch('/api/shelter').then(r=>r.json())`);await pulse(1000);
+      if(mode==='idle')await pulse(61000);
+      if(mode==='other-account')await evaluate(`sm.view.vaultNo=88;`);
+      if(mode==='old-read'){
+        await evaluate(`sm.view.state.rooms[0].stored=30;sm.snapshotAt=clock-60000;fetch('/api/shelter').then(r=>r.json())`);
+        await pulse(1000);await evaluate(`delete sm.snapshotAt;`);
+      }
+      await evaluate(`shelterAct({type:'collect',roomId:1})`);await pulse(1000);
+      assert.equal(await evaluate(`${incomeTotals}['避难所废料']||0`),mode==='idle'?30:0,mode);assert.equal(await evaluate('sm.calls.length'),1);
+    }
+  });
+  await t.test('收入统计避难所：原生产领取金额入账，刷新与重复检查不重记',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;sm.resultMessages={collect:'收到30 废料',collect_all:'收到30 废料'};`);
+    const fixtureSearch=await evaluate('location.search');
+    await drive(done,'collection income confirmed');
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),30);
+    assert.equal(await evaluate(`${incomeTotals}['代币']||0`),0);
+    assert.match(await evaluate(`${panel}.getElementById('log-summary').textContent`),/废料 30/);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'income retained after reload');
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),30);
+  });
+  await t.test('收入统计避难所：成功缺金额列待核对，未知响应不凭库存估收入',async()=>{
+    for(const mode of ['success','unknown']){
+      await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;sm.mode='${mode}';`);
+      await drive(done,'collection amount boundary');
+      assert.equal(await evaluate(`${incomeTotals}['避难所废料']||0`),0);
+      assert.equal(await evaluate(`${incomeTotals}['避难所金额待核对']||0`),mode==='success'?1:0);
+    }
+  });
+  await t.test('收入统计避难所：赛季各档独立累计，部分成功只记已确认档位',async()=>{
+    for(const mode of ['success','partial']){
+      await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='${mode}';sm.resultMessages={claim_season:'奖励：30 废料 · 零件 +2'};`);
+      await drive(done,'season income confirmed');
+      assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),mode==='success'?60:30);
+      assert.equal(await evaluate(`${incomeTotals}['避难所零件']`),mode==='success'?4:2);
+    }
+  });
   const lateTab = label => `sm.delayedTab=true;const originalRender=renderShelter;
     window.renderShelter=()=>{originalRender();if(sm.delayedTab)
       [...document.querySelectorAll('[role="tablist"] button')].find(b=>b.textContent.startsWith('${label}'))?.remove();};`;
@@ -372,7 +509,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   for(const release of [true,false])await t.test(`避难所批次接力：新页完成剩余档位，旧页${release?'恢复回调不再续发':'清理悬挂回调后继续'}`,async()=>{
     await setupShelter(`${pausedSeason}
-      document.addEventListener('freeze',()=>localStorage.setItem('fixture:shelter-frozen','true'));
+      window.fixtureFreezeInstalled=true;document.addEventListener('freeze',()=>{window.fixtureFrozenEvent=true;localStorage.setItem('fixture:shelter-frozen','true');});
       document.addEventListener('resume',()=>{
         const server=JSON.parse(localStorage.getItem('fixture:shelter-server')||'null');
         if(server){Object.assign(sm,server.sm);clock=server.clock+2*3600000;${release?'window.continueOldBatch();':''}}

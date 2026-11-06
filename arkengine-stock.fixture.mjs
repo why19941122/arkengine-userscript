@@ -28,6 +28,7 @@ window.fetch=async(url,options)=>{
     ...(km.hidePositions?{positions:[]}:km.zeroCosts?{positions:km.view.positions.map(p=>({...p,costBasisTokens:0}))}:{})}),{status:km.httpStatus||200});
  }
  const a=JSON.parse(options.body);km.calls.push(a);
+ if(km.deferPost)return new Promise(resolve=>{km.resolvePost=()=>resolve(new Response('{}',{status:503}));});
  const existing=km.receipts[a.idempotencyKey];
  if(km.mode==='deferred'&&!existing)return new Response('{}',{status:503});
  let body=existing||{userId:km.view.userId,action:a.action,idempotencyKey:a.idempotencyKey,ok:true};

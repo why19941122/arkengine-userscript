@@ -19,7 +19,7 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
   await t.test('推荐预设：首次股市无需填写，暂停总开关不交易，刷新保留全部额度',async()=>{
     await setupStock(paused);assert.equal(await evaluate(stock),null);assert.equal(await evaluate('km.reads'),0);
     await click('stock-preset');
-    assert.deepEqual(await evaluate(stock),{trade:true,predict:false,netEfficiency:true,autoBudget:true,tradeLimit:3000,predictionLimit:500,stake:100,reserve:1000});
+    assert.deepEqual(await evaluate(stock),{trade:true,predict:false,netEfficiency:true,autoBudget:true,tradeLimit:3000,predictionLimit:500,stake:100,reserve:1000,riskLimit:10000});
     await pulse(10000);assert.equal(await evaluate('km.reads'),0);assert.deepEqual(await evaluate('km.calls'),[]);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
     await reloadStock();assert.equal(await evaluate(`${stock}.reserve`),1000);assert.equal(await evaluate('km.reads'),0);
@@ -42,13 +42,13 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     await setupStock(`${paused}localStorage.setItem('${stockKey}',JSON.stringify(${JSON.stringify(cfg)}));
       localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify(${JSON.stringify(saved)}));`);
     for(let i=0;i<2;i++){
-      await click('stock-preset');assert.deepEqual(await evaluate(stock),{...cfg,predict:false,netEfficiency:true,autoBudget:true});
+      await click('stock-preset');assert.deepEqual(await evaluate(stock),{...cfg,predict:false,netEfficiency:true,autoBudget:true,riskLimit:10000});
       const actual=await evaluate(ledger);assert.deepEqual(actual.entries,saved.entries);assert.deepEqual(actual.owned,saved.owned);
       assert.equal(actual.hold,true);assert.equal(actual.holdReason,saved.holdReason);
     }
     await reloadStock();assert.equal(await evaluate(`${stock}.tradeLimit`),100000);
     assert.equal(await evaluate(`${stock}.autoBudget`),true);
-    assert.match(await evaluate(`${panel}.getElementById('stock-preset-summary').textContent`),/不再使用手填上限/);
+    assert.match(await evaluate(`${panel}.getElementById('stock-preset-summary').textContent`),/自动计算股票额度.*总风险本金上限 10000.*保留已设独立限制/);
   });
   await t.test('推荐预设：股票零备用额度不妨碍显式启用自动资金，建设零额度仍保留',async()=>{
     await setupStock(`${paused}localStorage.setItem('${stockKey}',JSON.stringify({...${JSON.stringify(cfg)},tradeLimit:0,predictionLimit:0,stake:0}));`);
@@ -61,10 +61,11 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     assert.match(await evaluate(`${panel}.getElementById('shelter-config-summary').textContent`),/零建设额度/);
   });
   await t.test('推荐预设：首次避难所配齐生产人口养成与建设，刷新保留且不越过总暂停',async()=>{
-    await setupShelter(`${paused}localStorage.removeItem('arkengine:auto-shelter:enabled:v1');`);
+    await setupShelter(`${paused}localStorage.removeItem('arkengine:auto-shelter:enabled:v1');localStorage.removeItem('arkengine:auto-shelter:population:v1');`);
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-population').value`),'30');
     await click('shelter-preset');await pulse(10000);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:staff:v1')`),'population');
-    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'14');
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
     for(const key of ['enabled','gear','optimize','explore-claim'])assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:${key}:v1')`),'true');
     const c=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'))`);
     for(const key of ['explore','quests','training','medical','radio','combatGear'])assert.equal(c[key],true);
@@ -74,19 +75,30 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     await reloadShelter();assert.equal(await evaluate(`${construction}.scrapLimit`),10000);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
   });
-  await t.test('推荐预设：保留自定义人口、探险数字与建设账本，应用后统一开启项目',async()=>{
+  await t.test('推荐预设：保留更高的自定义人口、探险数字与建设账本，应用后统一开启项目',async()=>{
     const budgets={build:false,upgrade:false,dig:false,scrapLimit:5000,partsLimit:45,scrapReserve:240,partsReserve:10};
     const entries=[{id:'original-construction',at:1,scrap:300,parts:15}];
-    await setupShelter(`${paused}localStorage.setItem('arkengine:auto-shelter:population:v1','28');
+    await setupShelter(`${paused}localStorage.setItem('arkengine:auto-shelter:population:v1','44');
       localStorage.setItem('${shelterKey}',JSON.stringify(${JSON.stringify(budgets)}));
       localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(${JSON.stringify(campaign)}));
       localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'fixture',constructionLedger:${JSON.stringify(entries)}}));`);
     await click('shelter-preset');await click('shelter-preset');
-    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'28');
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'44');
     assert.deepEqual(await evaluate(construction),{...budgets,build:true,upgrade:true,dig:true});
     assert.deepEqual(await evaluate(`${state}.constructionLedger`),entries);
     const c=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'))`);
     for(const key of ['tier','hours','stimpaks','reserve','chance','attempts','trainTarget'])assert.equal(c[key],campaign[key]);
+  });
+  await t.test('人口阶段推荐：保存的14或28不会自行变化，明确应用后改为30并跨刷新保留',async()=>{
+    for(const previous of [14,28]){
+      await setupShelter(`${paused}localStorage.setItem('arkengine:auto-shelter:population:v1','${previous}');`);
+      assert.equal(await evaluate(`${panel}.getElementById('shelter-population').value`),String(previous));
+      assert.match(await evaluate(`${panel}.getElementById('shelter-preset-summary').textContent`),/人口阶段目标 30.*下一批人口/);
+      await click('shelter-preset');await pulse(10000);
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
+      assert.deepEqual(await evaluate('sm.calls'),[],'the preset must still respect the paused main switch');
+      await reloadShelter();assert.equal(await evaluate(`${panel}.getElementById('shelter-population').value`),'30');
+    }
   });
   await t.test('推荐预设：避难所开启后实际执行综合发展，未填写数字也能派出探险',async()=>{
     await setupShelter(`sm.view=${JSON.stringify(campaignView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;

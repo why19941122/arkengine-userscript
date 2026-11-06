@@ -11,12 +11,112 @@ const actions=source.slice(source.indexOf('  function shelterRequestAction('),so
 const api=vm.runInNewContext(`${declarations}\n${code}\n${actions}\n({model:shelterModel,plan:shelterCampaignPlan,development:shelterDevelopmentPlan,combat:shelterCombat,
   growth:shelterQuestGrowth,value:shelterQuestValue,better:shelterQuestBetter,
   efficiency:shelterExploreEfficiency,chance:shelterQuestChance,loadout:shelterCombatLoadout,defaults:campaignDefaults,proof:shelterCampaignProof,confirmed:shelterCampaignConfirmed,valid:validCampaignPending,record:validCampaignRecord,action:shelterRequestAction,matches:shelterActionMatches,
-  sodaProof:shelterSodaProof,sodaReceipt:shelterSodaReceipt,sodaQuota:shelterSodaQuota,sodaLedger:shelterSodaLedger,sodaValid:validShelterSodaReceipts})`,{
+  income:shelterIncomeReward,manualIncome:shelterManualIncomePending,sodaProof:shelterSodaProof,sodaReceipt:shelterSodaReceipt,sodaQuota:shelterSodaQuota,sodaLedger:shelterSodaLedger,sodaValid:validShelterSodaReceipts})`,{
   objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const now=2_000_000_000;
 
 const cfg=extra=>({...api.defaults,...extra});
+test('手动收入前证据：缺少原状态、原房无整批、已领取奖励或付费档都不能生成领取凭据',()=>{
+  const view=campaignView(),request={idempotencyKey:'manual-income-key',action:{type:'collect',roomId:1}};
+  assert.equal(api.manualIncome(null,request),null);
+  view.state.rooms[0].stored=0;assert.equal(api.manualIncome(api.model(view),request),null);
+  view.state.rooms[0].stored=63;assert.equal(api.manualIncome(api.model(view),request).targets[0],1);
+  request.action={type:'claim_objective',index:0};assert.ok(api.manualIncome(api.model(view),request));
+  view.state.daily.claimed=[0];assert.equal(api.manualIncome(api.model(view),request),null);
+  request.action={type:'claim_season',tier:1,premium:true};assert.equal(api.manualIncome(api.model(view),request),null);
+  request.action={type:'upgrade',roomId:1};assert.equal(api.manualIncome(api.model(view),request),null);
+});
+test('收入统计核心：只解析原领取回执，支持数字顺序与千分位，不拿错误或预估金额入账',()=>{
+  const view=campaignView();view.state.tutorial={claimed:[1]};
+  const p={id:'income-one',kind:'tutorial',targets:[1],vaultNo:77,before:{serverTime:now-1000}};
+  const request={idempotencyKey:'income-native-key',action:{type:'claim_tutorial',step:1}};
+  const read=(message,extra={})=>JSON.parse(JSON.stringify(api.income(p,200,request,{view,result:{message},...extra})));
+  assert.deepEqual(read('收到30 废料 · 2 零件'),{'避难所废料':30,'避难所零件':2});
+  assert.deepEqual(read('奖励：废料 +1,234 · 零件 2 · 3瓶汽水'),{'避难所废料':1234,'避难所零件':2,'避难所汽水':3});
+  for(const message of ['', '成功', '预计收到 30 废料', '收到 1,23 废料', '收到 -30 废料', '收到 30 废料，消耗 2 零件'])
+    assert.deepEqual(read(message),{'避难所金额待核对':1},message);
+  const body={view,result:{message:'收到 30 废料'}};
+  for(const status of [0,503])assert.equal(api.income(p,status,request,body),null);
+  assert.equal(read('收到 30 废料',{code:'retry'}),null);
+  assert.equal(api.income(p,200,{...request,action:{type:'claim_tutorial',step:2}},body),null);
+  assert.equal(api.income(p,200,request,{...body,view:{...view,vaultNo:88}}),null);
+  view.state.tutorial.claimed=[];assert.equal(api.income(p,200,request,body),null);
+});
 const run=(v,c={},record={})=>api.plan(api.model(v),cfg(c),record,14);
+test('收入统计核心：每日与成就必须对应已领取目标，日切后旧每日回执不归入新日奖励',()=>{
+  const view=campaignView();view.state.daily.claimed=[0];view.state.achievements=['first'];
+  const p={id:'income-daily',kind:'daily',targets:[0],vaultNo:77,before:{serverTime:now-1000,day:'2026-10-10'}};
+  const request={idempotencyKey:'income-native-key',action:{type:'claim_objective',index:0}},body={view,result:{message:'收到 160 废料 · 1 零件'}};
+  assert.equal(api.income(p,200,request,body)['避难所废料'],160);
+  view.state.daily.day='2026-10-11';assert.equal(api.income(p,200,request,body),null);
+  p.kind='achievement';p.targets=['first'];request.action={type:'claim_achievement',id:'first'};
+  assert.equal(api.income(p,200,request,body)['避难所零件'],1);
+  request.action.id='other';assert.equal(api.income(p,200,request,body),null);
+});
+test('收入统计核心：探险汽水字段与明文不重复相加，部分已知不掩盖其余金额未知',()=>{
+  const view=campaignView(),p={id:'income-explore',kind:'explore',targets:[11,5],vaultNo:77,exploreKey:'income-native-key',before:{serverTime:now-1000}};
+  const request={idempotencyKey:'income-native-key',action:{type:'explore_claim',explorerId:11}},body={view,result:{message:'探险归来：50 废料 · 1 汽水',sodaDropped:1}};
+  let reward=api.income(p,200,request,body);assert.equal(reward['避难所废料'],50);assert.equal(reward['避难所汽水'],1);
+  body.result.message='探险归来';reward=api.income(p,200,request,body);
+  assert.equal(reward['避难所汽水'],1);assert.equal(reward['避难所金额待核对'],1);
+  view.state.residents.find(r=>r.id===5).away={kind:'explore'};assert.equal(api.income(p,200,request,body),null);
+});
+test('收入统计核心：周任务须原请求和队员释放证据，队伍消失本身不能产生收入',()=>{
+  const view=campaignView(),p={id:'income-quest',kind:'quest-claim',targets:[99],vaultNo:77,campaignKey:'income-native-key',
+    before:{serverTime:now-1000,campaign:{choice:{team:[5,6]}}}};
+  const request={idempotencyKey:'income-native-key',action:{type:'quest_claim',runId:99}},body={view,result:{message:'小队归来：200 废料 · 3 零件'}};
+  assert.equal(api.income(p,200,request,body)['避难所废料'],200);
+  assert.equal(api.income(p,200,{...request,idempotencyKey:'different-key'},body),null);
+  view.state.residents.find(r=>r.id===5).away={kind:'quest'};assert.equal(api.income(p,200,request,body),null);
+});
+function guardedView() {
+  const v=campaignView(),s=v.state;
+  for(let i=7;i<=15;i++)s.residents.push({...structuredClone(s.residents[0]),id:i,name:`儿童${i}`,roomId:null,adultAt:now+86400000});
+  s.items=[{id:71,slot:'weapon',tier:1,name:'留守武器',damage:[20,20]}];s.residents[4].weaponId=71;
+  return v;
+}
+test('出发前留守：主力不能带走过半力量武器指标，但可改派其他居民且不占生产岗位',()=>{
+  const v=guardedView(),p=run(v,{explore:true,defense:true});
+  const trip=p.actions.find(a=>a.kind==='explore-start');assert.ok(trip);
+  assert.notEqual(trip.id,5);assert.ok(!p.actions.some(a=>a.role==='defense'));
+  assert.match(p.notes.join(' '),/留守/);assert.equal(v.state.residents[4].roomId,null);
+});
+test('出发前留守：未满15不套掠夺者门槛，待产计入门槛且人工关闭防守尊重设置',()=>{
+  const v=guardedView();v.state.residents.pop();
+  assert.equal(run(v,{explore:true,defense:true}).actions.find(a=>a.kind==='explore-start').id,5);
+  v.state.births=[{roomId:5,dueAt:now+100000}];
+  assert.notEqual(run(v,{explore:true,defense:true}).actions.find(a=>a.kind==='explore-start')?.id,5);
+  assert.equal(run(v,{explore:true,defense:false}).actions.find(a=>a.kind==='explore-start').id,5);
+});
+test('出发前留守：返程人员不算到家，多队共用留守额度而非各自通过',()=>{
+  const v=guardedView(),s=v.state;s.residents[4].away={kind:'explore'};
+  s.explorers=[{id:11,residentId:5,tier:0,abyss:false,startedAt:now-10000,recalledAt:now-1000,returnAt:now+5000}];
+  assert.ok(!run(v,{explore:true,quests:true,defense:true}).actions.some(a=>['explore-start','quest-start'].includes(a.kind)));
+  s.residents[4].away=null;s.explorers=[];s.items=[];s.residents[4].weaponId=null;s.depth=24;
+  const p=run(v,{explore:true,quests:true,defense:true,stimpaks:0,guardResidents:4,guardPowerPercent:50});
+  const departed=p.actions.flatMap(a=>a.kind==='explore-start'?[a.id]:a.kind==='quest-start'?a.team:[]);
+  assert.ok(departed.length>0);assert.ok(departed.length<=2);assert.equal(new Set(departed).size,departed.length);
+});
+test('出发前留守：伤员和其他事故中人员不计可增援人数，低于门槛不阻断治疗',()=>{
+  const v=guardedView(),s=v.state;s.residents[4].hp=20;
+  const p=run(v,{explore:true,medical:true,defense:true,guardResidents:6});
+  assert.ok(!p.actions.some(a=>a.kind==='explore-start'));assert.ok(p.actions.some(a=>a.kind==='stimpak'));
+  assert.match(p.notes.join(' '),/留守/);
+});
+test('施工期间养成：发电站升级且库存足够等到首批电力时，不释放正常训练人选',()=>{
+  const v=campaignView(),s=v.state;
+  Object.assign(s.rooms[0],{level:1,upgradeAt:now+2*3600000});
+  s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'agi',level:1,floor:2,col:4,upgradeAt:null});
+  Object.assign(s.residents[4],{roomId:90});s.residents[4].stats.agi=3;
+  const record={roles:[{id:5,room:90,role:'training',stat:'agi',base:3,at:now-1000}]};
+  let p=run(v,{training:true,trainTarget:6},record);
+  assert.ok(!p.actions.some(a=>a.role==='training-release'&&a.id===5));assert.ok(p.reserved.includes(5));
+  assert.match(p.notes.join(' '),/施工.*首批/);
+  s.resources.power=1;p=run(v,{training:true,trainTarget:6},record);
+  assert.ok(p.actions.some(a=>a.role==='training-release'&&a.id===5));
+  s.resources.power=400;s.residents[0].away={kind:'explore'};
+  assert.ok(run(v,{training:true,trainTarget:6},record).actions.some(a=>a.role==='training-release'&&a.id===5),'外出工人不能算完工产能');
+});
 test('汽水额度回执：仅原领取成功响应可计数，错误请求、旧凭据、错误账号和未知数量不计',()=>{
   const v=campaignView(),p={id:'claim-one',kind:'explore',targets:[11,5],vaultNo:77,exploreKey:'native-key',before:{serverTime:now-1000}};
   const request={idempotencyKey:'native-key',action:{type:'explore_claim',explorerId:11}},body={view:v,result:{sodaDropped:1}};

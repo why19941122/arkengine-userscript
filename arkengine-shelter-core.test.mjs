@@ -8,7 +8,7 @@ const table=source.match(/const shelterRooms = [\s\S]*?;/)[0];
 const buildTable=source.match(/const shelterBuildRules = [\s\S]*?;/)[0];
 const functions=source.slice(source.indexOf('  function shelterWorkerRate('),source.indexOf('  function readShelter('));
 const actions=source.slice(source.indexOf('  function shelterRequestAction('),source.indexOf('  function shelterSubmit('));
-const construction=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n${actions}\n({spent:shelterConstructionSpent,allow:shelterConstructionAllowance,proof:shelterConstructionProof,confirmed:shelterConstructionConfirmed});`,{
+const construction=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n${actions}\n({spent:shelterConstructionSpent,allow:shelterConstructionAllowance,proof:shelterConstructionProof,confirmed:shelterConstructionConfirmed,observation:typeof shelterDigObservation==='function'?shelterDigObservation:null,timing:typeof shelterDigTiming==='function'?shelterDigTiming:null});`,{
   shelterResources:{scrap:'废料',parts:'零件'}});
 const {project,model,future,plan,render,proof,rewardProof,rewardConfirmed,periodCurrent,operations,explorers,exploreProof,exploreConfirmed,pendingWait,released,without,safe}=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n({project:shelterStoredProjection,model:shelterModel,future:shelterFutureCollection,plan:shelterDevelopmentPlan,render:shelterDevelopmentText,proof:shelterCollectProof,rewardProof:shelterRewardProof,rewardConfirmed:shelterRewardConfirmed,periodCurrent:shelterRewardPeriodCurrent,operations:shelterOperations,explorers:shelterExplorerCandidates,exploreProof:shelterExplorerProof,exploreConfirmed:shelterExplorerConfirmed,pendingWait:shelterPendingWait,released:shelterExplorerReleased,without:shelterProductionWithout,safe:shelterDepartureSafe});`,{
   shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
@@ -55,6 +55,51 @@ test('自动建设凭据：三种操作均绑定原请求、目标、账号和�
     view.vaultNo=78;assert.equal(construction.confirmed(p,model(view)),false);view.vaultNo=77;
     view.serverTime=now-1;assert.equal(construction.confirmed(p,model(view)),false);
   }
+});
+test('下挖时点：原回执和确认快照各留期限，客户端偏差不参与工期计算',()=>{
+  const {state:s,view}=developmentScene();s.depth=3;s.digging={floor:4,doneAt:now+3600000};
+  const p={id:'operation',at:now+9000000,submittedClientAt:now+9000100,kind:'dig',targets:[4],vaultNo:77,constructionKey:'native-key',
+    before:{serverTime:now,construction:{project:{kind:'dig',floor:4}}}};
+  const request={action:{type:'dig'},idempotencyKey:'native-key'};
+  const proof=construction.proof(p,200,request,{view});
+  assert.equal(proof.digObservation?.digging.doneAt,now+3600000);
+  p.result={constructionProof:JSON.parse(JSON.stringify(proof))};
+  view.serverTime=now+600000;s.digging.doneAt=now+1800000;
+  const timing=construction.timing(p,model(view),now+9600000);
+  assert.equal(timing.submittedClientAt,now+9000100);
+  assert.equal(timing.beforeSnapshotServerAt,now);assert.equal(timing.confirmedClientAt,now+9600000);
+  assert.equal(timing.receiptObservation.serverAt,now);
+  assert.equal(timing.receiptObservation.digging.remainingMs,3600000);
+  assert.equal(timing.confirmationObservation.serverAt,now+600000);
+  assert.equal(timing.confirmationObservation.digging.doneAt,now+1800000);
+  assert.equal(timing.confirmationObservation.digging.remainingMs,1200000);
+  assert.deepEqual(Object.keys(timing).sort(),['beforeSnapshotServerAt','confirmationObservation','confirmedClientAt','receiptObservation','submittedClientAt','targetFloor'].sort());
+  assert.doesNotMatch(JSON.stringify(timing),/native-key|operation|duration|startedAt/);
+});
+test('下挖时点：旧回执重放和确认时已完工不重写原期限，旧版记录仍可确认',()=>{
+  const {state:s,view}=developmentScene();s.depth=3;s.digging={floor:4,doneAt:now+3600000};
+  const p={id:'operation',kind:'dig',targets:[4],vaultNo:77,constructionKey:'native-key',before:{serverTime:now,construction:{project:{kind:'dig',floor:4}}}};
+  const original=JSON.parse(JSON.stringify(view)),request={action:{type:'dig'},idempotencyKey:'native-key'};
+  view.serverTime=now+7200000;s.depth=4;s.digging=null;
+  p.result={constructionProof:construction.proof(p,200,request,{view:original})};
+  let timing=construction.timing(p,model(view),now+7300000);
+  assert.equal(timing.receiptObservation.digging.doneAt,now+3600000);
+  assert.equal(timing.confirmationObservation.status,'idle');assert.equal(timing.confirmationObservation.digging,null);
+  assert.equal(timing.submittedClientAt,null);
+  delete p.result.constructionProof.digObservation;
+  assert.equal(construction.confirmed(p,model(view)),true);
+  timing=construction.timing(p,model(view),now+7300000);assert.equal(timing.receiptObservation,null);
+  p.result.constructionProof.key='wrong-key';assert.equal(construction.timing(p,model(view)),null);
+});
+test('下挖时点：缺失或畸形工程信息保持未知，过期倒计时归零但不宣称完工',()=>{
+  for(const digging of [undefined,{floor:4,doneAt:'unknown'},{floor:0,doneAt:now+1}]){
+    const observation=construction.observation({now,state:{depth:3,digging}});
+    assert.equal(observation.status,'unavailable');assert.equal(observation.digging,null);
+  }
+  const observation=construction.observation({now,state:{depth:3,digging:{floor:4,doneAt:now-1,key:'do-not-log'}}});
+  assert.equal(observation.status,'digging');assert.equal(observation.digging.remainingMs,0);
+  assert.doesNotMatch(JSON.stringify(observation),/do-not-log/);
+  assert.equal(construction.observation({now,state:{depth:3,digging:null}}).status,'idle');
 });
 test('避难所等待诊断：各类原操作遇到更早快照时说明同步等待，同时间与旧缺省记录保持原提示',()=>{
   for(const kind of ['assign','equip','collect','tutorial','achievement','daily','season']){
@@ -543,13 +588,15 @@ test('发展规划零件：缺工坊时给出真实建造前提和转化成本�
   assert.match(render(alternatives),/另外消耗 60 废料/);
   assert.doesNotMatch(render(alternatives),/至少还缺 50 零件/);
 });
-test('发展规划零件：已有工坊施工先等，建成空岗先补员，有产出时按实际速度等待',()=>{
+test('发展规划零件：已有工坊施工先等，空岗按选定工程补员，有产出时按实际速度等待',()=>{
   const {state:s,view}=developmentScene();s.rooms.find(r=>r.id===4).level=2;
   const workshop={...s.rooms[0],id:30,type:'workshop',floor:1,col:6,builtAt:now+600000};s.rooms.push(workshop);
   let p=plan(model(view));assert.equal(p.candidates.some(c=>c.type==='workshop'),false);
   assert.match(render(p),/工坊.*施工.*先等/);
   workshop.builtAt=0;p=plan(model(view));
-  assert.ok(p.candidates.some(c=>c.type==='workshop'&&c.kind==='staff'));
+  assert.equal(p.candidates.some(c=>c.type==='workshop'&&c.kind==='staff'),false,'空岗不能成为抢占实际工程的独立候选');
+  assert.match(render(p),/现有工坊有 2 个空岗；仅当本轮选定工程需要零件时安排值班/);
+  assert.equal(p.partsProject.id,4,'备选回收站升级的材料需求仍须保留');
   assert.equal(p.candidates.some(c=>c.type==='workshop'&&c.kind==='build'),false);
   s.residents.push({...s.residents[0],id:20,name:'工坊值班',roomId:30});
   p=plan(model(view));assert.match(render(p),/当前工坊约 0.6 零件\/小时/);assert.match(render(p),/约需 25.0 小时/);

@@ -2,7 +2,7 @@ import { farmMarkup } from './arkengine-farm.fixture.mjs';
 
 // 2026-11-03 公开前端的原生按钮/页签结构；只在本机模拟，不使用真实账户。
 export const shelterMarkup = farmMarkup + `<script>
-window.sm = { tab:'避难所', tabs:[], reads:0, calls:[], snapshots:[], busy:false, mode:'success', tutorial:true, filter:'all',
+window.sm = { tab:'避难所', tabs:[], reads:0, calls:[], receipts:{}, snapshots:[], busy:false, mode:'success', tutorial:true, filter:'all',
   view:{ vaultNo:77, serverTime:clock, progress:{level:2}, switches:{frozen:false}, nameRequired:false,
     env:{events:[]}, state:{lastSettledAt:clock, resources:{power:100,food:100,water:100,scrap:269,parts:0,stimpak:0},
       stats:{collected:0}, legacy:{perks:{}}, items:[], births:[], achievements:[], explorers:[], quests:[],
@@ -21,14 +21,27 @@ window.fetch=async (url,options)=>{
    return new Response(JSON.stringify(v||{}));
  }
  if(url==='/api/shelter/social/help'&&options?.method==='POST'){
-   const body=JSON.parse(options.body);sm.calls.push({type:'help',target:body.targetId});
+   const body=JSON.parse(options.body);sm.calls.push({type:'help',target:body.targetId,idempotencyKey:body.idempotencyKey});
+   const receiptKey='help:'+body.idempotencyKey;if(sm.receipts[receiptKey])return new Response(JSON.stringify(sm.receipts[receiptKey]));
    if(sm.helpUnknown)return new Promise(()=>{});
    const v=sm.neighbors.find(n=>n.userId===body.targetId);v.helpedToday=true;
    const reason=v.reason||null,rewarded=!reason;
    if(rewarded)sm.view.state.resources.scrap+=v.helpScrap;
-   return new Response(JSON.stringify({rewarded,scrap:rewarded?v.helpScrap:0,targetScrap:25,reason,text:'检修了电站'}));
+   sm.receipts[receiptKey]={rewarded,scrap:rewarded?v.helpScrap:0,targetScrap:25,reason,text:'检修了电站'};
+   return new Response(JSON.stringify(sm.receipts[receiptKey]));
  }
- if(url==='/api/shelter'){
+  if(url==='/api/shelter/caravan'){
+   if(options?.method!=='POST')return new Response(JSON.stringify(sm.caravan));
+   const body=JSON.parse(options.body);sm.calls.push({type:'caravan',...body});
+   const receiptKey='caravan:'+body.idempotencyKey;if(sm.receipts[receiptKey])return new Response(JSON.stringify(sm.receipts[receiptKey]));
+   if(sm.caravanUnknown)return new Response('{}',{status:503});
+   const offer=sm.caravan.offers.find(o=>o.slot===body.slot);
+   if(!offer||offer.delivered)throw Error('重复交付');
+   offer.delivered=true;sm.view.state.resources.scrap-=offer.scrap;sm.view.state.resources.parts-=offer.parts;
+   sm.view.state.daily.counters.caravan++;sm.receipts[receiptKey]={tokens:offer.reward,...(sm.caravanFallback?{fallback:sm.caravanFallback}:{})};
+   return new Response(JSON.stringify(sm.receipts[receiptKey]));
+  }
+  if(url==='/api/shelter'){
    sm.reads++; if(sm.deferRead)return new Promise(resolve=>{sm.resolveRead=()=>resolve(new Response(JSON.stringify(shelterData())));});
    if(sm.readError)throw new TypeError('fixture network');
    if(sm.malformedRead)return new Response('{"state":',{status:200});
@@ -36,6 +49,7 @@ window.fetch=async (url,options)=>{
  }
  if(url==='/api/shelter/action'&&options?.method==='POST'){
    const envelope=JSON.parse(options.body),a={...envelope.action,idempotencyKey:envelope.idempotencyKey};sm.calls.push(a);
+   if(sm.receipts[envelope.idempotencyKey])return new Response(JSON.stringify(sm.receipts[envelope.idempotencyKey]));
    if(sm.mode==='unknown'||sm.assignUnknown&&a.type==='assign'||sm.equipUnknown&&a.type==='equip')return new Promise(()=>{});
    if(sm.mode==='error'||sm.mode==='partial'&&a.type==='claim_season'&&a.tier>1)return new Response('{}',{status:503});
    const s=sm.view.state;
@@ -103,6 +117,10 @@ window.fetch=async (url,options)=>{
      const scrap=Math.ceil(base*r.width*(r.level===1?2.5:6)),parts=r.level===1?0:15*r.width;
      if(s.resources.scrap<scrap||s.resources.parts<parts)throw Error('升级资金不足');
      s.resources.scrap-=scrap;s.resources.parts-=parts;r.upgradeAt=clock+r.width*(r.level===1?1:3)*3600000;
+   } else if(a.type==='craft'){
+     const r=s.rooms.find(r=>r.id===a.roomId);
+     if(!r||!['armory','tailor'].includes(r.type)||r.craft||a.tier!==0||s.resources.scrap<80)throw Error('错误制作');
+     s.resources.scrap-=80;r.craft={tier:0,doneAt:clock+3600000};
    } else if(a.type==='dig'){
      const cost=Math.ceil(120*(s.depth+1)**1.4);if(s.digging||s.resources.scrap<cost)throw Error('错误下挖');
      s.resources.scrap-=cost;s.digging={floor:s.depth+1,doneAt:clock+3600000};
@@ -116,18 +134,19 @@ window.fetch=async (url,options)=>{
    } else if(a.type==='claim_achievement'){s.achievements.push(a.id);s.resources.scrap+=100;}
    else throw Error('意外写操作 '+a.type);
    s.lastSettledAt=clock;
-   return new Response(JSON.stringify({view:shelterData(),result:{}}));
+   const receipt={view:shelterData(),result:sm.resultMessages?.[a.type]?{message:sm.resultMessages[a.type]}:{}};
+   sm.receipts[envelope.idempotencyKey]=receipt;return new Response(JSON.stringify(receipt));
  }
  return farmFetch(url,options);
 };
 window.shelterTransport=(url,options)=>fetch(url,options);
 window.shelterAct=async a=>{
  if(sm.busy)throw Error('重复避难所请求');sm.busy=true;renderShelter();
- try{const r=await shelterTransport('/api/shelter/action',{method:'POST',body:JSON.stringify({action:a,idempotencyKey:'fixture-key'})});return r.ok;}
+ try{const r=await shelterTransport('/api/shelter/action',{method:'POST',body:JSON.stringify({action:a,idempotencyKey:crypto.randomUUID()})});return r.ok;}
  catch{return false;}finally{sm.busy=false;if(location.pathname==='/shelter')renderShelter();}
 };
 window.closeResident=()=>{document.querySelector('[data-staff-dialog]')?.remove();game.removeAttribute('inert');game.removeAttribute('aria-hidden');};
-const shelterLabels={power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍',storage:'仓库',medbay:'医务室',workshop:'工坊',training:'训练室',radio:'电台'};
+const shelterLabels={power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍',storage:'仓库',medbay:'医务室',workshop:'工坊',training:'训练室',radio:'电台',armory:'武器工坊',tailor:'服装工坊'};
 window.openConstruction=(kind,target)=>{
  const s=sm.view.state,r=kind==='upgrade'?s.rooms.find(r=>r.id===target):null;
  const d=document.createElement('div');d.setAttribute('role',kind==='dig'?'alertdialog':'dialog');d.dataset.constructionDialog=kind;
@@ -151,6 +170,7 @@ window.openConstruction=(kind,target)=>{
      actionButton(row,(cost+(sm.wrongConstructionPrice||0))+' 废料',action);
    }
  }else if(kind==='upgrade'){
+   if(['armory','tailor'].includes(r.type)&&!r.craft)actionButton(d,'0 档 · 80 废料',{type:'craft',roomId:r.id,tier:0});
    const base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500}[r.type],parts=r.level===1?0:15*r.width;
    actionButton(d,'升到 '+(r.level+1)+' 级 · '+(Math.ceil(base*r.width*(r.level===1?2.5:6))+(sm.wrongConstructionPrice||0))+' 废料'+(parts?' '+parts+' 零件':'')+' · 1小时0分',{type:'upgrade',roomId:r.id});
  }else{
@@ -190,7 +210,7 @@ window.renderShelter=()=>{
  game.innerHTML='<h1>方舟避难所</h1><a href="/activities/expedition">远征</a><div role="tablist" aria-label="避难所"></div><div id="shelter-content"></div>';
  game.querySelector('a').onclick=e=>{e.preventDefault();navFarm('/activities/expedition');};
  const tabs=game.querySelector('[role="tablist"]'),content=game.querySelector('#shelter-content');
- for(const label of ['避难所','目标','图鉴','居民','废土',...(sm.neighbors?['排行']:[])]){
+ for(const label of ['避难所','目标','图鉴','居民','废土',...(sm.neighbors?['排行']:[]),...(sm.caravan?['商队']:[])]){
    const b=document.createElement('button');b.setAttribute('role','tab');b.setAttribute('aria-selected',String(sm.tab===label));b.textContent=label;
    const count=label==='目标'?(!sm.dailyIncomplete?3-s.daily.claimed.length:0)+Math.max(0,Math.min(30,Math.floor(s.season.points/150))-s.season.claimedFree.length)+(sm.paidBadge||0):label==='图鉴'&&!sm.achievementIncomplete&&!s.achievements.includes('birth-1')?1:0;
    if(count){const badge=document.createElement('span');badge.textContent=count;b.append(badge);}
@@ -269,6 +289,16 @@ window.renderShelter=()=>{
    const free=button(content,'领取免费档（'+tiers.length+'）',{type:'unused'},!tiers.length);
    free.onclick=async()=>{for(const tier of tiers)if(!await shelterAct({type:'claim_season',tier,premium:false}))break;};
    button(content,'解锁通行证',{type:'buy_season_premium'});button(content,'领取通行证档（1）',{type:'claim_season',tier:1,premium:true});
+ } else if(sm.tab==='商队'){
+   const root=document.createElement('section');root.innerHTML='<h2>今日商队</h2><ul></ul>';
+   for(const offer of sm.caravan.offers){
+     const li=document.createElement('li');li.textContent='★ 交付 '+offer.scrap+' 废料'+(offer.parts?' + '+offer.parts+' 零件':'')+' 报酬最多 '+offer.reward+' 代币';
+     const b=document.createElement('button');b.textContent=offer.delivered?'已交付':'交付';b.disabled=offer.delivered;li.append(b);root.lastChild.append(li);
+     b.onclick=async()=>{sm.beforeCaravan?.();
+       const send=()=>fetch('/api/shelter/caravan',{method:'POST',body:JSON.stringify({slot:offer.slot,idempotencyKey:crypto.randomUUID()})});
+       const requests=[send()];if(sm.caravanDuplicate)requests.push(send());
+       await Promise.allSettled(requests);renderShelter();};
+   }content.append(root);
  } else if(sm.tab==='排行'){
    const root=document.createElement('section');root.innerHTML='<h2>排行榜</h2><div role="group" aria-label="排行方式"><button aria-pressed="true">等级</button></div><ol></ol>';
    for(const v of sm.neighbors||[]){
@@ -279,7 +309,7 @@ window.renderShelter=()=>{
        const close=document.createElement('button');close.setAttribute('aria-label','关闭');close.onclick=()=>{d.remove();game.removeAttribute('inert');};d.append(close);
        const help=document.createElement('button');help.textContent=v.helpedToday?'今天已帮过忙':'帮忙 · 双方各得废料';help.disabled=v.helpedToday||v.helpBlocked!==null;
        help.onclick=async()=>{help.disabled=true;if(sm.delayHelpSend)await new Promise(resolve=>{sm.releaseHelpSend=resolve;});
-         await fetch('/api/shelter/social/help',{method:'POST',body:JSON.stringify({targetId:sm.helpWrongTarget||v.userId,deviceFp:'fixture-fingerprint',idempotencyKey:'fixture-help-key'})});help.textContent='今天已帮过忙';};d.append(help);
+         await fetch('/api/shelter/social/help',{method:'POST',body:JSON.stringify({targetId:sm.helpWrongTarget||v.userId,deviceFp:'fixture-fingerprint',idempotencyKey:crypto.randomUUID()})});help.textContent='今天已帮过忙';};d.append(help);
        game.setAttribute('inert','');document.body.append(d);};li.append(b);root.querySelector('ol').append(li);
    }content.append(root);
  } else if(sm.tab==='图鉴'){

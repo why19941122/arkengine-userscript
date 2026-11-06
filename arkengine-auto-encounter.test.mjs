@@ -213,10 +213,17 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     const tab = await createTab();
     const withFrozenOriginal = targetId => async run => {
       await cdp.send('Target.activateTarget',{targetId});
+      let failure;
       try {
         await cdp.send('Page.setWebLifecycleState',{state:'frozen'},tab.sessionId);
         return await run();
-      } finally {await cdp.send('Page.setWebLifecycleState',{state:'active'},tab.sessionId);}
+      }catch(error){failure=error;throw error;}
+      finally {
+        await cdp.send('Page.setWebLifecycleState',{state:'active'},tab.sessionId);
+        if(failure)try{failure.message+=' '+JSON.stringify(await cdp.evaluate(tab.sessionId,`({url:location.href,visibility:document.visibilityState,
+          hook:window.fixtureFreezeInstalled,event:window.fixtureFrozenEvent,shared:localStorage.getItem('fixture:shelter-frozen'),
+          script:!!window.__arkTestLogs,calls:window.sm?.calls?.length})`));}catch{}
+      }
     };
     const evaluate = expression => cdp.evaluate(tab.sessionId, expression);
     const status = () => evaluate(`document.getElementById('ark-auto-encounter')?.shadowRoot.getElementById('status').textContent`);
@@ -612,6 +619,8 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       await resetLogs();
       await evaluate(`localStorage.clear();sessionStorage.clear();Math.random=()=>0;model.burst=0;addRuns(6);
         localStorage.setItem('arkengine:auto-farm:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','true');
+        // Existing scenarios model the previously saved target. New-default tests explicitly remove this key.
+        localStorage.setItem('arkengine:auto-shelter:population:v1','14');
         ${code};if(location.pathname==='/shelter')renderShelter();else renderExp();`);
       await evaluate(source);
     };
@@ -654,13 +663,13 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         localStorage.setItem('arkengine:auto-farm:enabled:v1','false');${code};if(location.pathname==='/stock')renderStock();else renderExp();`);
       await evaluate(source);
     };
-    const reloadStock=async()=>{
+    const reloadStock=async(code='')=>{
       // Let the SPA route observation finish before simulating a later user reload.
       await pulse(1000);
       const state=await evaluate('({km,clock,model,fm})');
       await cdp.send('Page.navigate',{url:`${origin}/stock?stock-fixture=${++pageSerial}`},tab.sessionId);
       await until(()=>evaluate(`typeof renderStock==='function' && !document.getElementById('ark-auto-expedition') && location.search==='?stock-fixture=${pageSerial}'`),'reloaded stock');
-      await evaluate(`Object.assign(window,${JSON.stringify(state)});km.busy=false;Math.random=()=>0;renderStock();`);
+      await evaluate(`Object.assign(window,${JSON.stringify(state)});km.busy=false;Math.random=()=>0;${code};renderStock();`);
       await evaluate(source);
     };
     const secondStock=async(code='')=>{

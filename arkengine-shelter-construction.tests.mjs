@@ -13,6 +13,11 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
       room(2,'diner',1,3),room(3,'water',1,4),room(4,'scrap',1,5),room(5,'quarters',2,2,3),room(6,'storage',3,2)];
     const p=s.residents[0];s.residents=Array.from({length:8},(_,i)=>({...structuredClone(p),id:i+1,name:'居民'+(i+1),roomId:Math.floor(i/2)+1}));`;
   const config=(changes={})=>`localStorage.setItem('arkengine:auto-shelter:construction:v1',${JSON.stringify(JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:3000,partsLimit:100,scrapReserve:0,partsReserve:0,...changes}))});`;
+  const digScene=scene+config()+`s.depth=1;s.rooms=s.rooms.filter(r=>r.floor===1);s.rooms.push(room(5,'quarters',1,6,2,3));
+    s.resources.scrap=1000;localStorage.setItem('arkengine:auto-shelter:population:v1','20');
+    for(let i=9;i<=16;i++)s.residents.push({...structuredClone(s.residents[0]),id:i,name:'儿童'+i,roomId:5,adultAt:clock+3600000});
+    s.residents.filter(p=>p.adultAt===0).forEach(p=>{p.stats.agi=20;p.stats.per=20;p.stats.str=20;});`;
+  const digLogs=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`;
 
   await t.test('运行修复浏览器：建设窗口已打开时跨过访问时限，先确认当前项目再返回',async()=>{
     await setupShelter(scene+config()+`sm.visitStart=clock;
@@ -72,16 +77,60 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     await setupShelter(scene+config()+`localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
       s.residents.push({...structuredClone(s.residents[0]),id:20,name:'待命居民',roomId:null});`);
     await drive(done,'new scrap room');const list=await evaluate(calls);assert.equal(list.length,1);
-    assert.deepEqual(list[0],{type:'build',room:'scrap',floor:1,col:6,trainStat:null,idempotencyKey:'fixture-key'});
+    assert.match(list[0].idempotencyKey,/^[A-Za-z0-9-]{8,64}$/);
+    assert.deepEqual(list[0],{type:'build',room:'scrap',floor:1,col:6,trainStat:null,idempotencyKey:list[0].idempotencyKey});
     assert.equal(await evaluate(`${state}.constructionLedger[0].scrap`),96);
   });
   await t.test('自动建设：无可用空间且人口扩容确有需要才下挖，确认Promise绑定一次消费',async()=>{
-    await setupShelter(scene+config()+`s.depth=1;s.rooms=s.rooms.filter(r=>r.floor===1);s.rooms.push(room(5,'quarters',1,6,2,3));
-      s.resources.scrap=1000;localStorage.setItem('arkengine:auto-shelter:population:v1','20');
-      for(let i=9;i<=16;i++)s.residents.push({...structuredClone(s.residents[0]),id:i,name:'儿童'+i,roomId:5,adultAt:clock+3600000});
-      s.residents.filter(p=>p.adultAt===0).forEach(p=>{p.stats.agi=20;p.stats.per=20;p.stats.str=20;});`);
+    await setupShelter(digScene);
     await drive(done,'dig capacity expansion');const list=await evaluate(calls);assert.equal(list.length,1,JSON.stringify(await evaluate(`({state:${state},pending:${pending}})`)));assert.equal(list[0].type,'dig');
     assert.equal(await evaluate(`${pending}`),null);assert.equal(await evaluate(`${state}.constructionLedger[0].scrap`),Math.ceil(120*2**1.4));
+    const events=await evaluate(digLogs),request=events.find(e=>e.type==='shelter-dig-request');
+    const timing=events.find(e=>e.type==='shelter-confirmed'&&e.data.kind==='dig').data.digTiming;
+    assert.equal(timing.targetFloor,2);assert.equal(timing.submittedClientAt,request.data.submittedClientAt);
+    assert.equal(timing.beforeSnapshotServerAt,request.data.beforeSnapshotServerAt);
+    assert.ok(timing.confirmedClientAt>=timing.submittedClientAt);
+    // 这里只核对夹具期限传递，不把夹具的一小时占位当网站规则。
+    const original=await evaluate('sm.receipts[sm.calls.find(c=>c.type==="dig").idempotencyKey].view');
+    assert.equal(timing.receiptObservation.serverAt,original.serverTime);
+    assert.equal(timing.receiptObservation.digging.doneAt,original.state.digging.doneAt);
+    assert.equal(timing.receiptObservation.digging.remainingMs,original.state.digging.doneAt-original.serverTime);
+    assert.equal(events.filter(e=>e.type==='shelter-check').at(-1).data.digObservation.digging.doneAt,original.state.digging.doneAt);
+    assert.ok(!JSON.stringify({timing,request}).includes(list[0].idempotencyKey));
+  });
+  await t.test('下挖时点浏览器：原回执跨刷新保留，后续期限和完工读取独立记录且不重复消费',async()=>{
+    await setupShelter(digScene+`const originalData=shelterData;window.shelterData=()=>{
+      const data=originalData();if(sm.calls.at(-1)?.type==='dig'&&!sm.digOriginal){
+        sm.digOriginal={serverAt:data.serverTime,doneAt:data.state.digging.doneAt};
+        sm.snapshotAt=data.serverTime+600000;s.digging.doneAt-=900000;sm.deferRead=true;
+      }return data;};`);
+    const search=await evaluate('location.search');
+    await drive(`!!${pending}?.result?.constructionProof?.digObservation`,'dig receipt persisted');
+    const saved=await evaluate(pending),original=await evaluate('sm.digOriginal');
+    assert.equal(saved.result.constructionProof.digObservation.digging.doneAt,original.doneAt);
+    await evaluate('sm.deferRead=false;');await reloadShelter();await drive(done,'confirm dig after reload');
+    let events=await evaluate(digLogs);
+    const confirmations=events.filter(e=>e.type==='shelter-confirmed'&&e.data.kind==='dig');
+    assert.equal(confirmations.length,1);
+    const timing=confirmations[0].data.digTiming;
+    assert.equal(timing.submittedClientAt,saved.submittedClientAt);
+    assert.equal(timing.receiptObservation.serverAt,original.serverAt);
+    assert.equal(timing.receiptObservation.digging.doneAt,original.doneAt);
+    assert.equal(timing.confirmationObservation.serverAt,original.serverAt+600000);
+    assert.equal(timing.confirmationObservation.digging.doneAt,original.doneAt-900000);
+    assert.equal(timing.confirmationObservation.digging.remainingMs,original.doneAt-900000-original.serverAt-600000);
+    assert.equal((await evaluate(calls)).length,1);assert.equal(await evaluate(pending),null);
+    // 用明确的完工状态验证后续观察，不靠占位工期推进真实规则。
+    await pulse(1000);
+    await evaluate(`sm.view.state.depth=2;sm.view.state.digging=null;sm.snapshotAt+=3600000;sm.view.state.lastSettledAt=sm.snapshotAt;
+      ${config({build:false,upgrade:false,dig:false})}
+      history.replaceState({},'','/shelter'+${JSON.stringify(search)});renderShelter();`);
+    await reloadShelter();await drive(done,'observe completed dig');events=await evaluate(digLogs);
+    const latest=events.filter(e=>e.type==='shelter-check').at(-1).data.digObservation;
+    assert.ok(latest,JSON.stringify(events.filter(e=>e.type==='shelter-check').slice(-3)));
+    assert.equal(latest.status,'idle');assert.equal(latest.depth,2);assert.equal(latest.digging,null);
+    assert.equal(events.filter(e=>e.type==='shelter-confirmed'&&e.data.kind==='dig').length,1);
+    assert.equal((await evaluate(calls)).length,1);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
   });
   for(const [label,options] of [['废料保留量',{scrapReserve:101}],['废料额度',{scrapLimit:199}],['升级开关',{upgrade:false}]]){
     await t.test('自动建设：'+label+'不满足时不跳去消费其他备选方案',async()=>{
@@ -95,7 +144,7 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
   });
   await t.test('自动建设：未知结果跨刷新保留原记录和额度，不能重新提交',async()=>{
     await setupShelter(scene+config()+`sm.mode='unknown';`);await drive(`${calls}.length===1`,'unknown construction');
-    const saved=await evaluate(pending);assert.equal(saved.kind,'upgrade');assert.equal(saved.constructionKey,'fixture-key');
+    const saved=await evaluate(pending);assert.equal(saved.kind,'upgrade');assert.equal(saved.constructionKey,await evaluate('sm.calls[0].idempotencyKey'));
     await reloadShelter();await drive(done,'unknown construction yields');assert.equal((await evaluate(calls)).length,1);
     assert.equal(await evaluate(`${pending}.id`),saved.id);
     assert.match(await evaluate(`${panel}.getElementById('shelter-construction-status').textContent`),/200\/3000/);

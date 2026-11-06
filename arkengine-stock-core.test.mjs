@@ -7,10 +7,226 @@ const code=source.split('// STOCK_CORE_BEGIN')[1].split('// STOCK_CORE_END')[0];
 const c=vm.runInNewContext(code.slice(code.indexOf('\n'))+'\nstockCore;');
 const now=Date.parse('2026-11-03T03:00:00Z');
 const config={trade:true,predict:true,tradeLimit:3000,predictionLimit:500,stake:100,reserve:100};
+test('卖出回执诊断：只记录已绑定成功回执的字段结构，不泄露原始值或把候选金额入账',()=>{
+  const p={key:'original-sale-key',input:{action:'sell',expectedUserId:7}},
+    body={ok:true,userId:7,action:'sell',idempotencyKey:p.key,result:{payoutTokens:987654321,note:'private receipt text'},
+      accessToken:'private-access',password:'private-password',account:{apiKey:'private-key',balance:123456789},rows:[{secret:'private-row'}]};
+  const before=JSON.stringify(body),shape=c.saleReceiptShape(p,200,body),json=JSON.stringify(shape);
+  assert.deepEqual(JSON.parse(json),{version:1,type:'object',fields:[
+    {name:'ok',type:'boolean'},{name:'userId',type:'number'},{name:'action',type:'string'},
+    {name:'result',type:'object',fields:[{name:'payoutTokens',type:'number'},{name:'note',type:'string'}]},
+    {name:'account',type:'object',fields:[{name:'balance',type:'number'}],omitted:1},{name:'rows',type:'array'}],omitted:3});
+  assert.doesNotMatch(json,/private|original-sale-key|987654321|123456789|idempotencyKey|accessToken|password|apiKey/);
+  assert.equal(JSON.stringify(body),before);
+});
+test('卖出回执诊断：错账号、错原请求、未成功和其他动作都不生成成交结构证据',()=>{
+  const p={key:'original-sale-key',input:{action:'sell',expectedUserId:7}},body={ok:true,userId:7,action:'sell',idempotencyKey:p.key};
+  for(const changed of [{userId:8},{action:'buy'},{idempotencyKey:'other-sale-key'},{ok:false}])
+    assert.equal(c.saleReceiptShape(p,200,{...body,...changed}),null);
+  assert.equal(c.saleReceiptShape(p,503,body),null);assert.equal(c.saleReceiptShape(p,null,null),null);
+  assert.equal(c.saleReceiptShape({...p,input:{...p.input,action:'buy'}},200,{...body,action:'buy'}),null);
+});
+test('卖出回执诊断：字段总数和嵌套深度有界，异常对象不影响交易确认',()=>{
+  const p={key:'original-sale-key',input:{action:'sell',expectedUserId:7}},body={ok:true,userId:7,action:'sell',idempotencyKey:p.key};
+  const nested={...body,result:{trade:{detail:{amount:123456789}}}};
+  assert.match(JSON.stringify(c.saleReceiptShape(p,200,nested)),/truncated/);
+  const many={...body,...Object.fromEntries(Array.from({length:100},(_,i)=>['field'+i,{amount:i}]))};
+  const json=JSON.stringify(c.saleReceiptShape(p,200,many));assert.ok(json.length<4500);assert.match(json,/truncated/);
+  Object.defineProperty(body,'result',{enumerable:true,get(){throw Error('unreadable diagnostic');}});
+  assert.equal(c.saleReceiptShape(p,200,body),null);assert.equal(c.receipt(p,200,body),'success');
+});
+test('手动股市核心：原生输入严格区分编号、整数股数和下注金额，未知字段不接管',()=>{
+  const body={idempotencyKey:'manual-stock-key',action:'buy',expectedUserId:7,modelName:'模型甲',shares:2};
+  assert.ok(c.incomeInput(body));
+  for(const shares of [0,-1,1.2,'2',NaN])assert.equal(c.incomeInput({...body,shares}),null);
+  assert.equal(c.incomeInput({...body,extra:true}),null);assert.equal(c.incomeInput({...body,idempotencyKey:'bad'}),null);
+  assert.ok(c.incomeInput({idempotencyKey:'manual-predict-key',action:'predict',expectedUserId:7,roundId:42,direction:'up',betTokens:100}));
+});
+test('手动股市核心：买入只核对对应持仓成本增量，不把累计成本、报价或混合交易当本次支出',()=>{
+  const {v}=fixture(),input={action:'buy',expectedUserId:7,modelName:'模型甲',shares:2};
+  v.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:null}];
+  const e={input,before:c.incomeBefore(v,input),ambiguous:false};
+  v.positions[0]={...v.positions[0],shares:12,costBasisTokens:131};assert.equal(c.incomeProof(e,v).debit,31);
+  assert.equal(c.incomeProof({...e,ambiguous:true},v),null);
+  assert.equal(c.incomeProof(e,{...v,userId:8}),null);
+  v.positions[0].shares=13;assert.equal(c.incomeProof(e,v),null);
+  v.positions[0].shares=12;v.positions[0].costBasisTokens=99;assert.equal(c.incomeProof(e,v),null);
+});
+test('手动股市核心：预测排除旧下注，绑定唯一新记录后才用该笔返还核算',()=>{
+  const {v}=fixture(),input={action:'predict',expectedUserId:7,roundId:42,direction:'up',betTokens:100};
+  const bet={id:1,roundId:42,direction:'up',betTokens:100,settled:true,payoutTokens:180};v.myBets=[bet];
+  const e={input,before:c.incomeBefore(v,input)};
+  assert.equal(c.incomeProof(e,v),null);v.myBets.push({...bet,id:2,settled:false});
+  assert.equal(c.incomeProof(e,v).betId,2);assert.equal(c.incomeProof(e,v).payout,undefined);
+  v.myBets.push({...bet,id:3});assert.equal(c.incomeProof(e,v),null);
+  e.betId=2;v.myBets[1].settled=true;v.myBets[1].payoutTokens=0;assert.equal(c.incomeProof(e,v).payout,0);
+  v.myBets[1].direction='down';assert.equal(c.incomeProof(e,v),null);
+});
 function fixture(){const s={id:1,modelName:'模型甲',priceCents:1200,volume24h:1000};
   const v={userId:7,enabled:true,stocks:[s],positions:[],ticks:[1000,1040,1080,1120,1160,1200].map((priceCents,i)=>({stockId:1,priceCents,createdAt:new Date(now-(5-i)*300000).toISOString()})),
     rules:{buyFeePct:2,sellFeePct:2.5,maxTradeTokens:10000,maxDailyBuyTokens:10000,maxPositionTokens:10000,reserveTokens:10000},rounds:[],myBets:[]};
   return {v,m:c.model(v,{tokens:10000}),l:{owned:{},entries:[]}};}
+
+test('股票编号类型：同一股票已有人工持仓时，字符串与数字别名不能触发新的自动买入',()=>{
+  const {v,m,l}=fixture();v.positions=[{stockId:'1',shares:10,costBasisTokens:100,holdUntil:null}];
+  assert.ok(c.model(v,{tokens:10000}));
+  assert.equal(c.choose(m,{...config,predict:false},l,now),null);
+});
+
+test('股票编号类型：脚本持仓卖出、逐仓说明与原交易核对接受唯一别名，不丢失既有成本',()=>{
+  const {v,m,l}=fixture();v.positions=[{stockId:'1',shares:10,costBasisTokens:100,holdUntil:null}];
+  l.owned['1']={shares:10,cost:100,modelName:'模型甲',manual:false};
+  const a=c.choose(m,{...config,predict:false},l,now);assert.equal(a?.action,'sell');assert.equal(a.shares,10);
+  assert.equal(c.positionReport(m,l,now)[0].status,'sell');
+  assert.equal(c.recoveryWait(m,config,l,{id:'original',beforeShares:10,choice:a},now),null);
+  v.stocks[0].id='1';a.stockId=1;
+  assert.equal(c.recoveryWait(m,config,l,{id:'original',beforeShares:10,choice:a},now),null);
+});
+
+test('股票编号类型：旧卖出冷却和字符串行情继续匹配，但不同拼写编号不强行合并',()=>{
+  const {v,m,l}=fixture();l.entries=[{id:'sale',stockId:'1',action:'sell',at:now,result:'success',debit:0}];
+  assert.equal(c.choose(m,{...config,predict:false},l,now),null);
+  l.entries=[];v.ticks.forEach(t=>t.stockId='1');
+  assert.equal(c.choose(m,{...config,predict:false},l,now)?.action,'buy');
+  assert.equal(c.observationParts(m)[0].ticks.length,6);
+  v.positions=[{stockId:'01',shares:10,costBasisTokens:100}];
+  assert.equal(c.choose(m,{...config,predict:false},l,now)?.action,'buy','01 is a distinct opaque identifier');
+});
+
+test('股票编号类型：手动买入按唯一别名持仓算成本增量，重复别名或改名不能当成新持仓',()=>{
+  const {v}=fixture(),input={action:'buy',expectedUserId:7,modelName:'模型甲',shares:2};
+  v.positions=[{stockId:'1',shares:10,costBasisTokens:100}];
+  const before=c.incomeBefore(v,input);assert.equal(before.shares,10);assert.equal(before.cost,100);
+  v.positions[0]={stockId:1,shares:12,costBasisTokens:125};v.stocks[0].id='1';
+  assert.equal(c.incomeProof({input,before},v).debit,25);
+  v.positions.push({...v.positions[0],stockId:'1'});
+  assert.equal(c.incomeBefore(v,input),null);assert.equal(c.incomeProof({input,before},v),null);
+  v.positions.pop();v.stocks.push({...v.stocks[0],id:1,modelName:'编号冲突'});
+  assert.equal(c.incomeBefore(v,input),null);assert.equal(c.incomeProof({input,before},v),null);
+  v.stocks.pop();v.stocks[0].modelName='已改名';
+  assert.equal(c.incomeBefore(v,input),null);assert.equal(c.incomeProof({input,before},v),null);
+});
+
+test('股票编号类型：原买入已出现别名持仓时，恢复核对不重复累加同一笔成本',()=>{
+  const {v,m,l}=fixture(),a=c.choose(m,{...config,predict:false},l,now);
+  v.positions=[{stockId:'1',shares:a.shares,costBasisTokens:a.estimate}];
+  const cfg={...config,riskLimit:a.debit,positionLimit:a.debit,perStockLimit:a.debit};
+  assert.equal(c.recoveryWait(m,cfg,l,{id:'original',beforeShares:0,choice:a},now),null);
+  v.positions[0].shares++;assert.match(c.recoveryWait(m,cfg,l,{id:'original',beforeShares:0,choice:a},now),/持仓数量/);
+});
+
+test('股票编号类型：预测按股票别名找到轮次，但轮次和账号仍精确绑定',()=>{
+  const {v,m,l}=fixture();v.rounds=[{id:42,stockId:'1',ruleVersion:2,oddsBp:180,
+    lockAt:new Date(now+240000).toISOString(),closeAt:new Date(now+900000).toISOString()}];
+  const cfg={...config,trade:false},a=c.choose(m,cfg,l,now);
+  assert.equal(a.action,'predict');assert.equal(a.roundId,42);
+  const input=c.input(a,7);assert.equal(c.same(input,{...input,roundId:'42'}),false);
+  assert.equal(c.incomeBefore({...v,userId:'7'},input),null);
+  v.myBets=[{id:1,roundId:42}];assert.equal(c.choose(m,cfg,l,now),null);
+});
+
+test('股市独立额度：周转、总仓位、单股、现金保留和总风险分别生效',()=>{
+  const {m,l}=fixture(),cfg={...config,predict:false,tradeLimit:6000,positionLimit:2000,perStockLimit:400,riskLimit:1500,cashReserve:9500};
+  const f=c.funding(m,cfg);assert.equal(f.tradeLimit,6000);assert.equal(f.positionLimit,1500);assert.equal(f.perStockLimit,400);assert.equal(f.reserve,9500);
+  const a=c.choose(m,cfg,l,now);assert.ok(a&&a.debit<=400);
+  assert.equal(c.choose(m,{...cfg,perStockLimit:0},l,now),null);
+  assert.equal(c.choose(m,{...cfg,cashReserve:10000},l,now),null);
+  m.balance=100000;m.rules.maxDailyBuyTokens=100000;m.rules.maxPositionTokens=100000;
+  const auto=c.funding(m,{...cfg,autoBudget:true,riskLimit:1200,positionLimit:2000,cashReserve:0});
+  assert.equal(auto.positionLimit,1200);assert.ok(auto.perStockLimit<=400);
+});
+
+test('股市独立预算：未设置总风险时人工仓成本未知不阻断固定预算预测，原请求核对口径一致',()=>{
+  const {v,m,l}=fixture(),cfg={...config,trade:false,predict:true};
+  v.rounds=[{id:42,stockId:1,ruleVersion:2,oddsBp:180,lockAt:new Date(now+240000).toISOString(),closeAt:new Date(now+900000).toISOString()}];
+  const a=c.choose(m,cfg,l,now);assert.equal(a.action,'predict');
+  const p={id:'original',choice:a,reserveFloor:100};
+  v.positions=[{stockId:2,shares:10,costBasisTokens:null}];
+  assert.equal(c.recoveryWait(m,cfg,l,p,now),null);
+  for(const riskLimit of [undefined,null]){
+    const next=c.choose(m,{...cfg,riskLimit},l,now);assert.equal(next?.action,'predict');assert.equal(next.betTokens,100);
+  }
+  assert.equal(c.choose(m,{...cfg,trade:true,predict:false},l,now),null,'buying still requires known portfolio cost');
+  assert.equal(c.choose(m,{...cfg,autoBudget:true},l,now),null,'automatic allocation cannot be inferred from unknown assets');
+  assert.equal(c.choose(m,{...cfg,riskLimit:500},l,now),null,'an explicit total-risk cap still needs complete cost evidence');
+  assert.match(c.waitReason(m,{...cfg,riskLimit:500},l,now),/总风险.*无法核对/);
+  assert.match(c.recoveryWait(m,{...cfg,riskLimit:500},l,p,now),/总风险/);
+  m.balance=199;assert.equal(c.choose(m,cfg,l,now),null,'cash reserve and stake remain binding');
+});
+
+test('股市风险等待：总风险尚未到顶但不足一注时解释本金缺口，额度恰好一注才可下注',()=>{
+  const {v,m,l}=fixture(),cfg={...config,trade:false,predict:true,riskLimit:500};
+  v.rounds=[{id:42,stockId:1,ruleVersion:2,oddsBp:180,lockAt:new Date(now+240000).toISOString(),closeAt:new Date(now+900000).toISOString()}];
+  v.positions=[{stockId:2,shares:10,costBasisTokens:401}];
+  assert.equal(c.choose(m,cfg,l,now),null);
+  assert.match(c.waitReason(m,cfg,l,now),/总风险.*99.*固定单注.*100/);
+  v.positions[0].costBasisTokens=400;assert.equal(c.choose(m,cfg,l,now)?.action,'predict');
+  l.entries=[{id:'unsettled',action:'predict',result:'success',at:now-2*86400000,debit:100}];
+  assert.equal(c.choose(m,cfg,l,now),null,'unsettled prediction still occupies risk after the daily budget window');
+  assert.match(c.waitReason(m,cfg,l,now),/总风险本金已到上限/);
+  l.entries[0].settlement={payout:0,at:now};assert.equal(c.choose(m,cfg,l,now)?.action,'predict');
+});
+
+test('股市盈亏：实际成本与卖出未知到账分开，不能把报价当已实现收入',()=>{
+  const {m,l}=fixture();m.view.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:null}];
+  l.owned={'1':{shares:10,cost:100,modelName:'模型甲',manual:false}};
+  l.entries=[{id:'buy',at:now,action:'buy',result:'success',debit:100},
+    {id:'sell',at:now,action:'sell',result:'success',debit:0,releasedCost:50,proceeds:null}];
+  const p=c.performance(m,l,now);assert.equal(p.buyCost,100);assert.equal(p.unknownSales,1);assert.equal(p.realized,0);
+  assert.equal(p.unrealized,17);assert.equal(p.heldCost,100);
+  assert.match(c.riskReason(m,{lossLimit:100},l,now),/卖出到账.*未知/);
+});
+
+test('股市亏损保护：达到净亏损上限停止新增风险，仍允许管理原持仓',()=>{
+  const {m,l}=fixture();m.view.positions=[{stockId:1,shares:10,costBasisTokens:200,holdUntil:null}];
+  l.owned={'1':{shares:10,cost:200,modelName:'模型甲',manual:false}};
+  const cfg={...config,predict:false,lossLimit:50};assert.match(c.riskReason(m,cfg,l,now),/亏损/);
+  assert.equal(c.choose(m,cfg,l,now)?.action,'sell');
+  m.view.positions[0].holdUntil=new Date(now+3600000).toISOString();assert.equal(c.choose(m,cfg,l,now),null);
+});
+
+test('逐仓说明：明确持有期、未触发退出、系统储备限制及可卖数量，金额只是报价估算',()=>{
+  const {v,m,l}=fixture();v.stocks[0].priceCents=1000;v.ticks=[];
+  v.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:new Date(now+3600000).toISOString()}];
+  l.owned={'1':{shares:10,cost:100,modelName:'模型甲',manual:false}};
+  let row=c.positionReport(m,l,now)[0];assert.equal(row.status,'locked');assert.equal(row.estimatedNet,97);
+  assert.equal(row.unrealized,-3);assert.match(row.reason,/持有期/);
+  v.positions[0].holdUntil=null;row=c.positionReport(m,l,now)[0];assert.equal(row.status,'holding');
+  v.stocks[0].priceCents=1200;v.rules.reserveTokens=0;
+  row=c.positionReport(m,l,now)[0];assert.equal(row.status,'liquidity');assert.match(row.reason,/储备/);
+  v.rules.reserveTokens=60;row=c.positionReport(m,l,now)[0];assert.equal(row.status,'sell');assert.equal(row.sellShares,5);
+  assert.equal(row.estimatedNet,117);assert.equal(row.estimatedSaleNet,58);
+  assert.equal(c.choose(m,{...config,predict:false},l,now).shares,row.sellShares);
+});
+
+test('逐仓说明：手动持仓排除、账本不一致和停牌不冒充可卖或已实现收入',()=>{
+  const {v,m,l}=fixture();v.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:null}];
+  l.owned={'1':{shares:10,cost:100,modelName:'模型甲',manual:true}};
+  assert.equal(c.positionReport(m,l,now).length,0);l.owned['1'].manual=false;
+  v.positions[0].shares=11;let row=c.positionReport(m,l,now)[0];assert.equal(row.status,'unconfirmed');assert.equal(row.estimatedNet,null);
+  v.positions[0].shares=10;v.stocks[0].suspended=true;row=c.positionReport(m,l,now)[0];
+  assert.equal(row.status,'unavailable');assert.equal(row.unrealized,null);
+  v.stocks[0].suspended=false;row=c.positionReport(m,l,now)[0];assert.equal(row.status,'sell');assert.equal(row.unrealized,17);
+});
+
+test('观察行情分片：67只模型保留每只最近12点和决策字段，不超过单条日志预算',()=>{
+  const {v}=fixture();v.stocks=Array.from({length:67},(_,i)=>({id:i+1,modelName:'模型'.repeat(80)+i,priceCents:1200,volume24h:1000}));
+  v.ticks=v.stocks.flatMap(s=>Array.from({length:24},(_,i)=>({stockId:s.id,priceCents:900+i*13,
+    createdAt:new Date(now-(23-i)*300000).toISOString(),unneeded:'secret-must-not-be-copied'})));
+  const m=c.model(v,{tokens:10000}),parts=c.observationParts(m);
+  assert.ok(parts.length>1);assert.equal(parts.flatMap(p=>p.stocks).length,67);assert.equal(parts.flatMap(p=>p.ticks).length,67*12);
+  for(const part of parts){assert.ok(Buffer.byteLength(JSON.stringify(part))<24000);assert.ok(!JSON.stringify(part).includes('secret-must-not-be-copied'));}
+  const restored={...v,stocks:parts.flatMap(p=>p.stocks),ticks:parts.flatMap(p=>p.ticks)};
+  for(const s of v.stocks)assert.deepEqual(c.trend(restored,s,now),c.trend(v,s,now));
+});
+test('股市总风险核对：原买入已反映在持仓时不重复计本金，单股限制仍约束原请求',()=>{
+  const {m,l}=fixture(),p={id:'pending',beforeShares:0,choice:{action:'buy',stockId:1,modelName:'模型甲',shares:70,debit:900}};
+  l.entries=[{id:p.id,action:'buy',at:now,debit:900,result:'reserved'}];
+  m.view.positions=[{stockId:1,shares:70,costBasisTokens:900}];
+  assert.equal(c.recoveryWait(m,{...config,riskLimit:900,perStockLimit:900},l,p,now),null);
+  assert.match(c.recoveryWait(m,{...config,riskLimit:900,perStockLimit:800},l,p,now),/单股/);
+  assert.equal(c.choose(m,{...config,predict:true,riskLimit:900},l,now),null);
+});
 
 test('运行修复：零成交量但行情有效可选股，停牌停滞和无效成交量仍不可选',()=>{
   const {v,m,l}=fixture(),s=v.stocks[0],cfg={...config,predict:false,netEfficiency:true};s.volume24h=0;
