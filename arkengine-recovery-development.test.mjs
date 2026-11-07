@@ -9,6 +9,93 @@ const code=source.slice(source.indexOf('  function shelterWorkerRate('),source.i
 const api=vm.runInNewContext(`${declarations}\n${code}\n({model:shelterModel,plan:shelterCampaignPlan,defense:shelterDefensePlan,level:shelterLevelProgress,routes:shelterLevelRoutes,development:shelterDevelopmentPlan,render:shelterDevelopmentText,forecast:shelterMaterialForecast,trace:shelterDevelopmentTrace,traceValid:validShelterDevelopmentTrace,traceText:shelterDevelopmentTraceText,daily:shelterDailyGoals,evidence:shelterTripEvidence,valid:validCampaignRecord,caravan:shelterCaravanPlan})`,{
   objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const now=2_000_000_000;
+function levelInvestmentView(){
+  const v=levelGateView(),s=v.state;
+  for(const r of s.rooms)if(!['quarters','elevator'].includes(r.type))r.level=3;
+  s.residents.at(-1).roomId=7;
+  s.rooms.push({...s.rooms[0],id:90,type:'storage',floor:4,col:2,width:1,level:1});
+  s.resources={scrap:2000,parts:40,power:500,food:500,water:500,stimpak:7};
+  return v;
+}
+function investmentPlan(v,target,campaign,goal=10,model=null){
+  const s=v.state,score=2*s.residents.filter(p=>p.deadAt===null).length+3*s.depth+
+    s.rooms.filter(r=>r.builtAt<=v.serverTime&&!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
+  v.progress={level:1+Math.floor(Math.sqrt(Math.max(0,score-30))/1.5),score,next:0};
+  return api.development(model||api.model(v),target,campaign,goal);
+}
+test('等级投资：人口阶段完成后，未满仓也可升级已有空宿舍和仓库，不新建凑分',()=>{
+  for(const type of ['quarters','storage']){
+    const v=levelInvestmentView(),s=v.state;
+    for(const r of s.rooms)if(r.type!==type&&r.type!=='elevator')r.level=3;
+    investmentPlan(v,15,{enabled:true,reserved:[],projects:[]});
+    const before=JSON.stringify(v),p=investmentPlan(v,15,{enabled:true,reserved:[],projects:[]});
+    const c=p.next.project;
+    assert.equal(c?.kind,'upgrade',JSON.stringify(p.next));assert.equal(c.type,type);
+    assert.equal(c.levelInvestment,true);assert.ok(c.levelTarget);assert.equal(p.next.status,'ready');
+    assert.match(c.benefit,/等级分/);assert.doesNotMatch(c.benefit,/提高已有在岗人员产能/);
+    assert.ok(!p.candidates.some(c=>c.kind==='build'&&c.levelInvestment));
+    assert.equal(JSON.stringify(v),before);
+  }
+});
+test('等级投资：人口未完成、待产、幼儿、恢复与成年子女就业未完成时保留人口优先',()=>{
+  const variants=[(v,c)=>31,(v,c)=>{v.state.births=[{roomId:5,dueAt:now+3600000}];},
+    (v,c)=>{v.state.residents[0].adultAt=now+3600000;},
+    (v,c)=>{v.state.residents[0].deadAt=now-1000;},
+    (v,c)=>{c.unemployedResidents=[15];},(v,c)=>{c.levelInvestmentHeld=true;}];
+  for(const change of variants){
+    const v=levelInvestmentView(),c={enabled:true,reserved:[],projects:[]},target=change(v,c)||14;
+    const p=investmentPlan(v,target,c);
+    assert.ok(!p.candidates.some(c=>c.levelInvestment),JSON.stringify(p.next));
+  }
+});
+test('等级投资：入住、停电、施工或来袭房间不作为纯等级投资，关闭等级目标立即取消',()=>{
+  for(const change of [r=>{r.unpowered=true;},r=>{r.upgradeAt=now+3600000;},
+    r=>{r.incident={kind:'raiders',hp:70,maxHp:80};},(r,s)=>{s.residents[0].roomId=r.id;}]){
+    const v=levelInvestmentView(),s=v.state;
+    for(const r of s.rooms)if(r.type==='quarters')r.level=3;
+    change(s.rooms.find(r=>r.id===90),s);
+    const p=investmentPlan(v,14,{enabled:true,reserved:[],projects:[]});
+    assert.ok(!p.candidates.some(c=>c.levelInvestment&&c.id===90));
+  }
+  const v=levelInvestmentView(),c={enabled:true,reserved:[],projects:[]};
+  assert.ok(!investmentPlan(v,14,c,0).candidates.some(c=>c.levelInvestment));
+});
+test('等级投资：缺零件仍保留明确备料工程，供电不足显示前提而非无项目囤货',()=>{
+  const v=levelInvestmentView(),s=v.state;
+  for(const r of s.rooms)if(r.type==='quarters')r.level=3;
+  s.rooms.find(r=>r.id===90).level=2;s.resources.parts=0;
+  const campaign={enabled:true,reserved:[],projects:[]};
+  let p=investmentPlan(v,14,campaign);
+  assert.equal(p.next.project?.id,90);assert.equal(p.partsProject?.id,90);assert.equal(p.partsTarget,15);
+  const m=api.model(v);m.production.power=m.demand.power*1.2;
+  p=investmentPlan(v,14,campaign,10,m);
+  assert.equal(p.next.project?.id,90);assert.match(p.next.reason,/电力/);
+});
+test('等级投资后续：已有安全房间满级后，未满仓也可按等级目标新建仓库，不再空等囤货',()=>{
+  const v=levelInvestmentView();for(const r of v.state.rooms)if(r.type!=='elevator')r.level=3;
+  const campaign={enabled:true,reserved:[],projects:[]},p=investmentPlan(v,15,campaign);
+  assert.equal(p.next.project?.kind,'build',JSON.stringify(p.next));assert.equal(p.next.project.type,'storage');
+  assert.equal(p.next.project.levelInvestment,true);assert.equal(p.next.status,'ready');
+  assert.match(p.next.project.benefit,/等级/);assert.ok(!p.next.project.storageDemand,'不能伪称未满仓库存有扩容压力');
+  const incomplete=investmentPlan(v,30,campaign);
+  assert.ok(!incomplete.candidates.some(c=>c.levelInvestment));
+});
+test('等级投资空间：已有房满级且楼层用尽才列下挖，已有下挖或待产够分时不重复投入',()=>{
+  const v=levelInvestmentView(),s=v.state;
+  for(const r of s.rooms)if(r.type!=='elevator')r.level=3;
+  let id=300;for(let floor=1;floor<=s.depth;floor++)for(let col=2;col<8;col++){
+    if(s.rooms.some(r=>r.floor===floor&&r.col<=col&&r.col+r.width>col))continue;
+    s.rooms.push({...s.rooms.find(r=>r.id===90),id:id++,floor,col,width:1});
+  }
+  const campaign={enabled:true,reserved:[],projects:[]};let p=investmentPlan(v,15,campaign);
+  assert.equal(p.next.project?.kind,'dig',JSON.stringify(p.next));assert.equal(p.next.project.purpose.type,'storage');
+  assert.equal(p.next.project.levelInvestment,true);assert.equal(p.next.project.floor,s.depth+1);
+  s.digging={floor:s.depth+1,doneAt:now+3600000};p=investmentPlan(v,15,campaign);
+  assert.ok(!p.candidates.some(c=>c.levelInvestment));
+  s.digging=null;s.births=Array.from({length:Math.ceil(p.levelProgress.remaining/2)},()=>({roomId:5,dueAt:now+3600000}));
+  p=investmentPlan(v,15,campaign);
+  assert.ok(p.routes.some(r=>r.kind==='wait'));assert.ok(!p.candidates.some(c=>c.levelInvestment));
+});
 function stageTrace(view,previous,goal=10){
   const m=api.model(view),plan=api.development(m,14,{enabled:true,reserved:[],projects:[]},goal);
   return api.trace(previous,m,plan);
@@ -99,7 +186,7 @@ test('连续备料：原发电升级归属跨产速变化保留，不因工坊�
   m=api.model(v);p=api.development(m,14,api.plan(m,{},record),10);
   assert.equal(p.next.project.type,'power');assert.equal(p.partsTarget,30);
   assert.ok(p.routes.every(r=>!r.steps.length||r.steps[0].project.id===1));
-  assert.match(p.notes.join('\n'),/继续.*备料/);
+  assert.match(p.notes.join('\n'),/接续已确认原工程.*按材料缺口安排工坊/);
   s.resources.parts=30;p=api.development(api.model(v),14,api.plan(api.model(v),{},record),10);
   assert.equal(p.next.project.id,1);assert.equal(p.next.status,'ready');
 });
@@ -360,7 +447,8 @@ test('等级阶段记录：预计时间已到不等于升级，缺完整路线�
   assert.match(api.traceText(record),/尚未确认升级/);
   for(const r of v.state.rooms)if(r.type!=='elevator'){r.level=3;r.upgradeAt=null;}
   v.state.residents.at(-1).roomId=7;v.state.resources={scrap:100,parts:0,power:100,food:100,water:100,stimpak:1};v.progress.level=6;
-  record=stageTrace(v);assert.equal(record.active.target,7);assert.equal(record.active.latest.route,null);
+  record=stageTrace(v);assert.equal(record.active.target,7);
+  assert.ok(!record.active.latest.route?.complete);assert.equal(record.active.latest.route?.expectedAt??null,null);
   assert.match(api.traceText(record),/没有.*完整时间估算/);
 });
 test('等级阶段记录：坏记录、错账号、倒序状态和不一致等级保留原证据，不影响独立规划',()=>{
@@ -564,14 +652,38 @@ test('持续等级目标：没有锁定建筑仍推进4到5，达到5级后继�
   assert.equal(p.levelProgress.targetScore,87);
   assert.equal(p.levelProgress.finalTarget,10);
 });
-test('持续等级目标：生产房满级且人口硬上限已达时，明确等级阻碍而非声称保持生产即可推进',()=>{
+
+test('持续升级模式：逐级滚动目标并保留人口限制，固定终点与停止设置仍生效',()=>{
+  const v=levelGateView(),campaign={enabled:true,reserved:[],projects:[]};
+  let p=api.development(api.model(v),14,campaign,'auto');
+  assert.equal(p.levelProgress.finalTarget,5);assert.equal(p.levelProgress.targetLevel,5);
+  assert.equal(p.levelProgress.continuous,true);assert.equal(p.requestedTarget,14);
+  assert.match(api.render(p),/持续升级：4 → 5 级/);
+  v.state.rooms.find(r=>r.id===1).level=2;v.state.rooms.find(r=>r.id===2).level=2;
+  v.progress={level:5,score:66,next:87};
+  p=api.development(api.model(v),14,campaign,'auto');
+  assert.equal(p.levelProgress.finalTarget,6);assert.equal(p.levelProgress.targetLevel,6);
+  const fixed=api.development(api.model(v),14,campaign,5),off=api.development(api.model(v),14,campaign,1);
+  assert.equal(fixed.levelProgress.finalTarget,5);assert.ok(!fixed.candidates.some(c=>c.levelTarget));
+  assert.ok(!off.candidates.some(c=>c.levelTarget));
+});
+
+test('持续升级模式：20级以后仍从已核对的等级分规划下一级，不沿用旧数字上限',()=>{
+  const v=levelGateView();v.state.depth=310;
+  const score=2*v.state.residents.length+3*v.state.depth+v.state.rooms.filter(r=>!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
+  const level=1+Math.floor(Math.sqrt(Math.max(0,score-30))/1.5);v.progress={level,score,next:30+Math.ceil(2.25*level*level)};
+  assert.ok(level>=20);
+  const p=api.development(api.model(v),14,{enabled:true,reserved:[],projects:[]},'auto');
+  assert.equal(p.levelProgress.finalTarget,level+1);assert.equal(p.levelProgress.targetLevel,level+1);
+});
+test('持续等级目标：人口目标不变，已有房满级后以明确仓库投资接续等级',()=>{
   const v=levelGateView();for(const r of v.state.rooms)if(r.type!=='elevator')r.level=3;
   v.state.residents.at(-1).roomId=7;
   v.state.resources={scrap:100,parts:0,power:100,food:100,water:100,stimpak:1};
   v.progress.level=6;
   const p=api.development(api.model(v),14,{enabled:true,reserved:[],projects:[]},10);
-  assert.equal(p.next.status,'blocked');assert.equal(p.next.kind,'level');
-  assert.match(p.next.reason,/人口目标|设置目标/);assert.match(p.next.reason,/14/);
+  assert.equal(p.next.status,'ready');assert.equal(p.next.kind,'build');
+  assert.equal(p.next.project.type,'storage');assert.equal(p.next.project.levelInvestment,true);
   assert.equal(p.requestedTarget,14);assert.equal(p.levelProgress.finalTarget,10);
 });
 test('持续等级目标：在途足够时展示等待路线，人口建议不越过用户设置',()=>{
@@ -631,7 +743,8 @@ test('路线需求：扩容已解除满仓压力时不重复扩仓凑分，完�
 
 test('路线需求：装备扩容后仍接近满仓时保留第二项扩仓，充足后不再沿用旧需求',()=>{
   const v=storageChoiceView();v.state.resources.scrap=1000;
-  const campaign={enabled:true,reserved:[],projects:[]};
+  // 此例单测容量需求；等级投资另有独立正例，暂停投资不改变原满仓需求。
+  const campaign={enabled:true,reserved:[],projects:[],levelInvestmentHeld:true};
   let p=api.development(api.model(v),14,campaign,10);
   assert.ok(p.routes.every(r=>r.steps.filter(x=>x.project.type==='storage').length<=1));
   v.state.items.push(...Array.from({length:14},(_,i)=>({id:2000+i,slot:'weapon',damage:[0,0]})));

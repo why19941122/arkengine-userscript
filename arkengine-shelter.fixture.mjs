@@ -112,7 +112,7 @@ window.fetch=async (url,options)=>{
      if(s.resources.scrap<cost)throw Error('建造资金不足');s.resources.scrap-=cost;
      s.rooms.push({id:Math.max(...s.rooms.map(r=>r.id))+1,type:a.room,trainStat:a.trainStat,floor:a.floor,col:a.col,width:1,level:1,stored:0,builtAt:clock+600000,upgradeAt:null,incident:null,unpowered:false});
    } else if(a.type==='upgrade'){
-     const r=s.rooms.find(r=>r.id===a.roomId),base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500}[r?.type];
+     const r=s.rooms.find(r=>r.id===a.roomId),base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500,training:400}[r?.type];
      if(!r||!base||r.level>=3||r.upgradeAt!==null)throw Error('错误升级');
      const scrap=Math.ceil(base*r.width*(r.level===1?2.5:6)),parts=r.level===1?0:15*r.width;
      if(s.resources.scrap<scrap||s.resources.parts<parts)throw Error('升级资金不足');
@@ -150,7 +150,8 @@ const shelterLabels={power:'发电站',diner:'餐厅',water:'净水站',scrap:'�
 window.openConstruction=(kind,target)=>{
  const s=sm.view.state,r=kind==='upgrade'?s.rooms.find(r=>r.id===target):null;
  const d=document.createElement('div');d.setAttribute('role',kind==='dig'?'alertdialog':'dialog');d.dataset.constructionDialog=kind;
- const title=kind==='build'?'在第 '+target.floor+' 层建造':kind==='dig'?'向下挖到第 '+(s.depth+1)+' 层？':shelterLabels[r.type]+(r.width>1?' ×'+r.width:'')+' · '+r.level+' 级';
+ const training=r?.type==='training'?'·'+({str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[r.trainStat]):'';
+ const title=kind==='build'?'在第 '+target.floor+' 层建造':kind==='dig'?'向下挖到第 '+(s.depth+1)+' 层？':shelterLabels[r.type]+training+(r.width>1?' ×'+r.width:'')+' · '+r.level+' 级';
  d.innerHTML='<h2>'+title+'</h2><button aria-label="关闭">关闭</button>';
  const close=()=>{d.remove();game.removeAttribute('inert');game.removeAttribute('aria-hidden');};d.querySelector('button').onclick=close;
  const actionButton=(root,text,action)=>{const b=document.createElement('button');b.textContent=text;b.onclick=async()=>{if(await shelterAct(sm.constructionWrong?{...action,roomId:999}:action))close();};root.append(b);};
@@ -171,7 +172,7 @@ window.openConstruction=(kind,target)=>{
    }
  }else if(kind==='upgrade'){
    if(['armory','tailor'].includes(r.type)&&!r.craft)actionButton(d,'0 档 · 80 废料',{type:'craft',roomId:r.id,tier:0});
-   const base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500}[r.type],parts=r.level===1?0:15*r.width;
+   const base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500,training:400}[r.type],parts=r.level===1?0:15*r.width;
    actionButton(d,'升到 '+(r.level+1)+' 级 · '+(Math.ceil(base*r.width*(r.level===1?2.5:6))+(sm.wrongConstructionPrice||0))+' 废料'+(parts?' '+parts+' 零件':'')+' · 1小时0分',{type:'upgrade',roomId:r.id});
  }else{
    const cost=Math.ceil(120*(s.depth+1)**1.4),p=document.createElement('p');p.textContent='花 '+cost+' 废料，把电梯井延伸一层。';d.append(p);

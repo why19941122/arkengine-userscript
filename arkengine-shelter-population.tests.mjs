@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 
 export async function shelterPopulationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey,secondShelter,until}) {
   const panel = `document.getElementById('ark-auto-expedition').shadowRoot`;
@@ -29,6 +30,58 @@ export async function shelterPopulationTests({t,setupShelter,reloadShelter,evalu
     sm.view.state.residents[3].stats.agi=10;sm.view.state.residents[3].stats.per=0;
     sm.view.state.residents[4].stats.per=10;sm.view.state.residents[4].stats.agi=0;
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'原配对正在生产',vaultNo:77,families:[{a:2,b:3,room:5}]}));`;
+
+  const stageFixture=JSON.parse(readFileSync(new URL('./arkengine-shelter-population-stage.fixture.json',import.meta.url),'utf8'));
+  const stageScene=`sm.view=${JSON.stringify(stageFixture.view)};clock=sm.view.serverTime;sm.fixtureSearch=location.search;
+    sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;sm.confirmFamily=true;
+    localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+    localStorage.setItem('arkengine:auto-shelter:population:v1','30');
+    localStorage.setItem('arkengine:auto-shelter:population-continuous:v1','true');
+    localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${JSON.stringify(stageFixture.state)},nextAt:0,note:'30人阶段已就业',vaultNo:sm.view.vaultNo}));
+    localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:false,upgrade:false,dig:false,scrapLimit:0,partsLimit:0,scrapReserve:100,partsReserve:0}));`;
+  await t.test('持续人口浏览器：30阶段自动进入40并实际安排新家庭，刷新不重复抬高',async()=>{
+    await setupShelter(stageScene);
+    await drive(`localStorage.getItem('arkengine:auto-shelter:population:v1')==='40'`,'advance population stage');
+    await drive(`sm.view.state.residents.some(p=>p.romance)`,'new family beyond thirty',400);
+    assert.ok(await evaluate(`sm.calls.some(c=>c.type==='assign'&&sm.view.state.rooms.some(r=>r.id===c.roomId&&r.type==='quarters'))`));
+    assert.equal(await evaluate(`sm.calls.filter(c=>['build','upgrade','dig'].includes(c.type)).length`),0,'阶段提高不放宽零预算');
+    await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(done,'population stage survives reload',400);
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'40');
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population-continuous:v1')`),'true');
+  });
+  await t.test('持续人口浏览器：关闭后保持30，重新开启才进入40，旧固定设置不会静默改义',async()=>{
+    await setupShelter(`${stageScene}localStorage.removeItem('arkengine:auto-shelter:population-continuous:v1');`);
+    await drive(done,'saved fixed population stays fixed',300);
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-population-continuous').checked`),false);
+    assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.romance).length`),0);
+    await evaluate(`{const mode=${panel}.getElementById('shelter-population-continuous');mode.checked=true;mode.dispatchEvent(new Event('change'));}${check}`);
+    await drive(`localStorage.getItem('arkengine:auto-shelter:population:v1')==='40'`,'enable continuous population',400);
+    await evaluate(`{const mode=${panel}.getElementById('shelter-population-continuous');mode.checked=false;mode.dispatchEvent(new Event('change'));}`);
+    await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(done,'disabled growth survives reload',400);
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-population-continuous').checked`),false);
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'40');
+  });
+  await t.test('持续人口浏览器：仍有儿童时保持30并输出阶段阻塞原因',async()=>{
+    await setupShelter(`${stageScene}sm.view.state.residents.find(p=>p.id===49).adultAt=clock+86400000;`);
+    await drive(done,'children prevent next population stage',300);
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
+    assert.match(await evaluate(`${panel}.getElementById('shelter-population-status').textContent`),/30 → 40 人等待.*儿童尚未成年/);
+  });
+  await t.test('深层预算诊断浏览器：单笔下挖超过全天总额度时明确阻塞，不显示可开工或自动提额',async()=>{
+    const high=JSON.parse(readFileSync(new URL('./arkengine-shelter-population-level.fixture.json',import.meta.url),'utf8'));
+    await setupShelter(`${stageScene}sm.view=${JSON.stringify(high.view)};clock=sm.view.serverTime;
+      localStorage.setItem('arkengine:auto-shelter:population-continuous:v1','false');
+      localStorage.setItem('arkengine:auto-shelter:level-target:v1','auto');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${JSON.stringify(high.state)},nextAt:0,note:'固定30人深层预算边界',vaultNo:sm.view.vaultNo}));
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0}));`);
+    await drive(done,'single project exceeds total daily budget',400);
+    assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/单笔需 10268.*总额度 10000.*等待额度恢复也不足/);
+    assert.equal(await evaluate(`sm.calls.filter(c=>['build','upgrade','dig'].includes(c.type)).length`),0);
+    assert.equal(await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1')).scrapLimit`),10000);
+  });
 
   const sharedQuarters = `${scene}${adequate}sm.confirmFamily=true;
     sm.view.state.rooms.push({...original,id:6,type:'quarters',width:2,stored:0});
@@ -197,6 +250,62 @@ export async function shelterPopulationTests({t,setupShelter,reloadShelter,evalu
     assert.match(await evaluate(`${panel}.getElementById('shelter-population-status').textContent`),/上次检查.*心情/);
     await evaluate(`${target(30)}`);
     assert.doesNotMatch(await evaluate(`${panel}.getElementById('shelter-population-status').textContent`),/上次检查/);
+  });
+  await t.test('避难所详细诊断浏览器：关联人员房间与工程阻塞，低心情不伪报配对或开工',async()=>{
+    await setupShelter(`${scene}${onlyIdle}sm.confirmFamily=true;sm.view.state.residents[5].happiness=49;`);
+    await drive(done,'detailed shelter evidence',200);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.equal(events.filter(e=>e.type==='shelter-diagnostic-error').length,0);
+    const summary=events.filter(e=>e.type==='shelter-decision').at(-1);assert.ok(summary);
+    const detail=events.filter(e=>e.type==='shelter-decision-detail'&&e.data.diagnosticId===summary.data.diagnosticId);
+    assert.equal(detail.length,summary.data.totalParts);assert.ok(detail.every(e=>!e.data.truncated));
+    const rows=detail.flatMap(e=>e.data.rows),residents=rows.filter(r=>r.kind==='resident'),rooms=rows.filter(r=>r.kind==='room');
+    assert.equal(residents.length,await evaluate('sm.view.state.residents.length'));
+    assert.equal(rooms.length,await evaluate('sm.view.state.rooms.length'));
+    assert.ok(residents.find(p=>p.id===6).screeningReasons.includes('心情不足50'));
+    assert.ok(summary.data.planAvailable);assert.equal(summary.data.population.target,14);
+    const projects=rows.filter(r=>r.kind==='construction');assert.ok(projects.length);
+    assert.equal(projects.length,summary.data.candidatesRecorded);assert.ok(summary.data.candidateTotal>=projects.length);
+    assert.ok(projects.every(p=>p.funds.scrap.stock>=0&&typeof p.allowanceReason==='string'));
+    assert.equal(events.filter(e=>e.type==='shelter-check').at(-1).data.diagnosticId,summary.data.diagnosticId);
+    assert.equal(await evaluate(`${intoQuarters}.length`),0);
+  });
+  await t.test('避难所详细诊断浏览器：多人快照分片完整，关闭调岗时只记录而不调动居民',async()=>{
+    await setupShelter(`${scene}localStorage.setItem('arkengine:auto-shelter:staff:v1','off');
+      sm.view.state.residents=Array.from({length:80},(_,i)=>({...structuredClone(adult),id:i+1,name:'居民'.repeat(80)+i,
+        roomId:5,adultAt:clock+86400000,parents:[]}));`);
+    await drive(done,'large shelter diagnostic',200);
+    assert.equal(await evaluate(`${moves}.length`),0);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.equal(events.filter(e=>e.type==='shelter-diagnostic-error').length,0);
+    const summary=events.filter(e=>e.type==='shelter-decision').at(-1);assert.ok(summary&&!summary.data.truncated);
+    const parts=events.filter(e=>e.type==='shelter-decision-detail'&&e.data.diagnosticId===summary.data.diagnosticId);
+    assert.ok(parts.length>1);assert.equal(parts.length,summary.data.totalParts);assert.ok(parts.every(e=>!e.data.truncated));
+    assert.equal(new Set(parts.flatMap(e=>e.data.rows).filter(r=>r.kind==='resident').map(r=>r.id)).size,80);
+  });
+  await t.test('避难所家庭诊断容量：多家庭原因超过单条上限时保留检查结论及完整可关联分片',async()=>{
+    await setupShelter(`${scene}
+      sm.view.state.residents=Array.from({length:100},(_,i)=>({...structuredClone(adult),id:i+1,name:'长名字居民'.repeat(20)+i,
+        roomId:null,hp:10,happiness:40,parents:[],familyCooldownUntil:clock+3600000}));
+      const families=Array.from({length:50},(_,i)=>({a:i*2+1,b:i*2+2,room:1000+i}));
+      for(const f of families)sm.view.state.rooms.push({...original,id:f.room,type:'quarters',width:1,stored:0});
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,vaultNo:77,note:'多家庭等待',families}));`);
+    await drive(done,'large family diagnostics',200);
+    assert.equal(await evaluate(`${moves}.length`),0);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    const check=events.filter(e=>e.type==='shelter-check').at(-1);assert.ok(check&&!check.data.truncated,'检查结论不能整体变成truncated');
+    assert.ok(check.data.diagnosticId);assert.equal(check.data.population,100);
+    const summary=events.find(e=>e.type==='shelter-decision'&&e.data.diagnosticId===check.data.diagnosticId);
+    assert.ok(summary&&!summary.data.truncated);
+    const parts=events.filter(e=>e.type==='shelter-decision-detail'&&e.data.diagnosticId===check.data.diagnosticId);
+    assert.equal(parts.length,summary.data.totalParts);assert.ok(parts.every(e=>!e.data.truncated));
+    const families=parts.flatMap(e=>e.data.rows).filter(r=>r.kind==='family');
+    assert.equal(families.length,50);assert.ok(families.every(f=>f.reasons.some(r=>r.includes('心情'))));
+    const full=events.filter(e=>e.type==='shelter-check-detail'&&e.data.diagnosticId===check.data.diagnosticId);
+    assert.equal(full.length,check.data.detailParts);assert.ok(full.every(e=>!e.data.truncated));
+    const restored=JSON.parse(full.sort((a,b)=>a.data.part-b.data.part).map(e=>e.data.json).join(''));
+    assert.equal(restored.population,100);assert.equal(restored.populationDiagnostics.families.length,50);
+    assert.equal(restored.nextAt,check.data.nextAt);assert.ok(restored.populationNote.length>6000);
   });
   await t.test('生育心情：新配对排队或第一人到宿舍后心情下降，撤销剩余安排且刷新不丢失',async()=>{
     for(const phase of ['queued','first','reload','late-reload']){

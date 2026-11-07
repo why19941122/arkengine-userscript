@@ -67,10 +67,77 @@ function fixture(){const s={id:1,modelName:'模型甲',priceCents:1200,volume24h
     rules:{buyFeePct:2,sellFeePct:2.5,maxTradeTokens:10000,maxDailyBuyTokens:10000,maxPositionTokens:10000,reserveTokens:10000},rounds:[],myBets:[]};
   return {v,m:c.model(v,{tokens:10000}),l:{owned:{},entries:[]}};}
 
+test('股市详细诊断：逐股给出真实涨幅、含费门槛差额、样本时效和资金瓶颈，保持交易决策不变',()=>{
+  const {v,m,l}=fixture(),cfg={...config,predict:false,netEfficiency:true};
+  v.ticks=[1000,1010,1020,1030,1040,1050].map((priceCents,i)=>({stockId:1,priceCents,createdAt:new Date(now-(5-i)*300000).toISOString()}));v.stocks[0].priceCents=1050;
+  const before=JSON.stringify({v,l,cfg}),choice=c.choose(m,cfg,l,now),d=c.decisionDiagnostics(m,cfg,l,now);
+  assert.equal(choice,null);assert.equal(d.selected,null);assert.equal(d.stocks[0].modelName,'模型甲');
+  assert.ok(d.stocks[0].trend.changePct>2&&d.stocks[0].trend.changePct<5.5);
+  assert.equal(d.stocks[0].trend.buyThresholdPct,5.5);assert.ok(d.stocks[0].trend.gapPct>0);
+  assert.equal(d.stocks[0].trend.samples,6);assert.equal(d.stocks[0].trend.quoteAgeMs,0);
+  assert.ok(d.stocks[0].buy.blockers.includes('below-fee-threshold'));
+  assert.ok(d.budget.constraints.some(c=>c.key==='per-stock-limit'&&c.remaining===1000));
+  assert.equal(JSON.stringify({v,l,cfg}),before);
+});
+test('股市详细诊断：停滞标志与报价过期分别说明；已有持仓、卖后冷却、零预算和未知成本不伪称可买',()=>{
+  for(const kind of ['stale-flag','expired','position','cooldown','budget','unknown']){
+    const {v,m,l}=fixture(),cfg={...config,predict:false};
+    if(kind==='stale-flag')v.stocks[0].stale=true;
+    if(kind==='expired')for(const t of v.ticks)t.createdAt=new Date(Date.parse(t.createdAt)-11*60000).toISOString();
+    if(['position','unknown'].includes(kind))v.positions=[{stockId:'1',shares:1,costBasisTokens:kind==='unknown'?null:12}];
+    if(kind==='cooldown')l.entries=[{id:'sale',at:now-1000,action:'sell',stockId:'1',debit:0,result:'success'}];
+    if(kind==='budget')cfg.tradeLimit=0;
+    const d=c.decisionDiagnostics(m,cfg,l,now),row=d.stocks[0];
+    assert.equal(row.buy.eligible,false,kind);assert.equal(c.choose(m,cfg,l,now),null,kind);
+    if(kind==='stale-flag')assert.ok(row.trend.reasons.includes('website-stale'));
+    if(kind==='expired')assert.ok(row.trend.reasons.includes('quote-older-than-10m'));
+    if(kind==='cooldown')assert.equal(row.buy.cooldownUntil,now-1000+3600000);
+    if(kind==='unknown')assert.equal(d.budget.heldCost,null);
+  }
+});
+
 test('股票编号类型：同一股票已有人工持仓时，字符串与数字别名不能触发新的自动买入',()=>{
   const {v,m,l}=fixture();v.positions=[{stockId:'1',shares:10,costBasisTokens:100,holdUntil:null}];
   assert.ok(c.model(v,{tokens:10000}));
   assert.equal(c.choose(m,{...config,predict:false},l,now),null);
+});
+
+test('股市详细诊断：有效买入与预测选择保持一致，逐项记录预测轮次拒绝条件',()=>{
+  const {v,m,l}=fixture(),cfg={...config,netEfficiency:true};
+  const round={id:42,stockId:1,ruleVersion:2,oddsBp:180,lockAt:new Date(now+120000).toISOString(),closeAt:new Date(now+900000).toISOString()};
+  for(const variant of ['valid','lock','version','duplicate','disabled','risk']){
+    v.rounds=[{...round}];l.entries=[];const settings={...cfg};
+    if(variant==='lock')v.rounds[0].lockAt=new Date(now+30000).toISOString();
+    if(variant==='version')v.rounds[0].ruleVersion=1;
+    if(variant==='duplicate')l.entries=[{action:'predict',roundId:42,at:now,debit:100,result:'success'}];
+    if(variant==='disabled')settings.predict=false;
+    if(variant==='risk')settings.riskLimit=0;
+    const before=JSON.stringify({v,l,settings}),d=c.decisionDiagnostics(m,settings,l,now);
+    assert.equal(JSON.stringify(d.selected),JSON.stringify(c.choose(m,settings,l,now)));
+    assert.equal(d.rounds[0].eligible,variant==='valid');
+    if(variant==='valid')assert.equal(d.selected.action,'predict');
+    if(variant==='lock')assert.ok(d.rounds[0].blockers.includes('lock-within-60s'));
+    if(variant==='duplicate')assert.ok(d.rounds[0].blockers.includes('already-recorded-round'));
+    if(d.selected?.action==='buy')assert.equal(d.stocks[0].buy.eligible,true);
+    assert.equal(JSON.stringify({v,l,settings}),before);
+  }
+});
+
+test('股市详细诊断：67只长名称及12笔行情完整分片，单条含封套低于截断限制',()=>{
+  const {v,m,l}=fixture();v.stocks=Array.from({length:67},(_,i)=>({...v.stocks[0],id:i+1,modelName:'模型'.repeat(80)+i}));
+  v.ticks=v.stocks.flatMap(s=>Array.from({length:12},(_,i)=>({stockId:s.id,priceCents:980+i*20,createdAt:new Date(now-(11-i)*300000).toISOString()})));
+  const d=c.decisionDiagnostics(m,config,l,now),parts=c.diagnosticParts(d.stocks);
+  assert.ok(parts.length>1);assert.equal(parts.flat().length,67);
+  for(const rows of parts)assert.ok(Buffer.byteLength(JSON.stringify({diagnosticId:'x'.repeat(36),snapshotAt:now,part:1,totalParts:parts.length,rows}))<32768);
+});
+
+test('股市详细诊断：组合条件下可买标记与原单股选择一致，拒绝原因不能替代交易规则',()=>{
+  for(const priceStep of [0,1,10,40,80])for(const reserve of [0,9500,10000])for(const limit of [0,10,3000])for(const netEfficiency of [false,true]){
+    const {v,m,l}=fixture(),cfg={...config,predict:false,reserve,tradeLimit:limit,netEfficiency};
+    v.ticks.forEach((t,i)=>t.priceCents=1000+priceStep*i);v.stocks[0].priceCents=v.ticks.at(-1).priceCents;
+    const d=c.decisionDiagnostics(m,cfg,l,now);
+    assert.equal(d.stocks[0].buy.eligible,c.choose(m,cfg,l,now)?.action==='buy',JSON.stringify({priceStep,reserve,limit,netEfficiency,d}));
+  }
 });
 
 test('股票编号类型：脚本持仓卖出、逐仓说明与原交易核对接受唯一别名，不丢失既有成本',()=>{

@@ -1,0 +1,3617 @@
+{
+  "sourceSHA256": "8bc2d97eaa3daecc86277ebc1548ee415fdf15dea0bd8def674be2a435506853",
+  "view": {
+    "vaultNo": 77,
+    "serverTime": 1796419800000,
+    "progress": {
+      "level": 13,
+      "score": 373,
+      "next": 411
+    },
+    "switches": {
+      "frozen": false
+    },
+    "nameRequired": false,
+    "drops": {
+      "enabled": true,
+      "minMinutes": 360,
+      "tierPermille": [
+        50,
+        70
+      ],
+      "perUserDaily": 2
+    },
+    "env": {
+      "week": "2026-W45",
+      "events": [],
+      "quests": [
+        {
+          "id": "w1",
+          "title": "旧地铁站",
+          "difficulty": 1,
+          "stages": 3,
+          "stageMinutes": 60,
+          "recommendedLevel": 1,
+          "rewards": {
+            "scrap": 30,
+            "parts": 1,
+            "itemTier": null,
+            "seasonPoints": 20
+          }
+        }
+      ]
+    },
+    "state": {
+      "lastSettledAt": 1796419800000,
+      "depth": 16,
+      "digging": null,
+      "resources": {
+        "scrap": 639.6926999998077,
+        "parts": 2.5,
+        "power": 17085.583366666902,
+        "food": 8754.583333333336,
+        "water": 8601.583333333334,
+        "stimpak": 9
+      },
+      "stats": {
+        "collected": 0
+      },
+      "legacy": {
+        "perks": {}
+      },
+      "items": [],
+      "births": [],
+      "achievements": [],
+      "explorers": [],
+      "quests": [],
+      "weekly": {
+        "completed": []
+      },
+      "daily": {
+        "day": "2026-10-10",
+        "claimed": []
+      },
+      "season": {
+        "month": "2026-10",
+        "points": 0,
+        "claimedFree": []
+      },
+      "residents": [
+        {
+          "id": 1,
+          "name": "居民1",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794017400000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 2,
+          "name": "居民2",
+          "roomId": 1027,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794018000000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 3,
+          "name": "居民3",
+          "roomId": 1027,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794017400000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 4,
+          "name": "居民4",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 5,
+          "name": "居民5",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 6,
+          "name": "居民6",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 7,
+          "name": "居民7",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 8,
+          "name": "居民8",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 9,
+          "name": "居民9",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 10,
+          "name": "居民10",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794018000000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 11,
+          "name": "居民11",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 12,
+          "name": "居民12",
+          "roomId": 1058,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 13,
+          "name": "居民13",
+          "roomId": 1058,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794043200000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 14,
+          "name": "居民14",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794043200000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 21,
+          "name": "杨初一",
+          "roomId": 50,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 35,
+          "name": "居民16",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 36,
+          "name": "居民17",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 37,
+          "name": "子女38",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793952000000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 38,
+          "name": "子女39",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793959800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 39,
+          "name": "子女40",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793960400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 40,
+          "name": "子女41",
+          "roomId": 1001,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793982000000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 41,
+          "name": "子女42",
+          "roomId": 1001,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793988600000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 42,
+          "name": "子女43",
+          "roomId": 1002,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793989200000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 43,
+          "name": "子女44",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793999400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            12,
+            21
+          ],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 44,
+          "name": "子女45",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794014400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 45,
+          "name": "子女46",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794017400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 46,
+          "name": "子女47",
+          "roomId": 1002,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794018000000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 47,
+          "name": "子女48",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794028800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            12,
+            21
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 48,
+          "name": "子女49",
+          "roomId": 1009,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794028800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            35,
+            43
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 49,
+          "name": "子女50",
+          "roomId": 1009,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794043200000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        }
+      ],
+      "rooms": [
+        {
+          "id": 1,
+          "type": "power",
+          "col": 2,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 105.8400000000033,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 2,
+          "type": "diner",
+          "col": 4,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 10.68000000000374,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 3,
+          "type": "water",
+          "col": 6,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 80.88000000000372,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 4,
+          "type": "scrap",
+          "col": 4,
+          "floor": 2,
+          "width": 3,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 128.25300000000445,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 5,
+          "type": "quarters",
+          "col": 2,
+          "floor": 2,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 6,
+          "type": "quarters",
+          "col": 2,
+          "floor": 3,
+          "width": 3,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 8,
+          "type": "training",
+          "col": 7,
+          "floor": 2,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false,
+          "trainStat": "agi"
+        },
+        {
+          "id": 20,
+          "type": "elevator",
+          "col": 1,
+          "floor": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 21,
+          "type": "elevator",
+          "col": 1,
+          "floor": 2,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 22,
+          "type": "elevator",
+          "col": 1,
+          "floor": 3,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 23,
+          "type": "elevator",
+          "col": 1,
+          "floor": 4,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 50,
+          "type": "workshop",
+          "col": 5,
+          "floor": 3,
+          "width": 1,
+          "level": 2,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 3.811199999999929,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1000,
+          "type": "quarters",
+          "floor": 3,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793931600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1001,
+          "type": "scrap",
+          "floor": 3,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793952600000,
+          "upgradeAt": null,
+          "stored": 35.87999999999954,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1002,
+          "type": "scrap",
+          "floor": 4,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793953200000,
+          "upgradeAt": null,
+          "stored": 2.2800000000000864,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1003,
+          "type": "quarters",
+          "floor": 4,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793970600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1004,
+          "type": "scrap",
+          "floor": 4,
+          "col": 4,
+          "width": 2,
+          "level": 3,
+          "builtAt": 1793982600000,
+          "upgradeAt": null,
+          "stored": 12.599999999999783,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1006,
+          "type": "quarters",
+          "floor": 4,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793994000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1007,
+          "type": "scrap",
+          "floor": 4,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794026400000,
+          "upgradeAt": null,
+          "stored": 13.91999999999985,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1008,
+          "type": "elevator",
+          "floor": 5,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794069600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1009,
+          "type": "scrap",
+          "floor": 5,
+          "col": 2,
+          "width": 2,
+          "level": 3,
+          "builtAt": 1794070200000,
+          "upgradeAt": null,
+          "stored": 55.4400000000074,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1011,
+          "type": "workshop",
+          "floor": 5,
+          "col": 4,
+          "width": 3,
+          "level": 1,
+          "builtAt": 1794180600000,
+          "upgradeAt": null,
+          "stored": 4.259999999999898,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1014,
+          "type": "workshop",
+          "floor": 5,
+          "col": 7,
+          "width": 1,
+          "level": 2,
+          "builtAt": 1794384600000,
+          "upgradeAt": null,
+          "stored": 0.4799999999999706,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1015,
+          "type": "elevator",
+          "floor": 6,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794633600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1016,
+          "type": "storage",
+          "floor": 6,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794675000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1017,
+          "type": "storage",
+          "floor": 6,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794694200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1018,
+          "type": "storage",
+          "floor": 6,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794718800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1019,
+          "type": "storage",
+          "floor": 6,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794743400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1020,
+          "type": "storage",
+          "floor": 6,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794765000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1021,
+          "type": "storage",
+          "floor": 6,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794789600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1022,
+          "type": "elevator",
+          "floor": 7,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794832800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1023,
+          "type": "storage",
+          "floor": 7,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794833400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1024,
+          "type": "storage",
+          "floor": 7,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794858000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1025,
+          "type": "storage",
+          "floor": 7,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794882000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1026,
+          "type": "storage",
+          "floor": 7,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794906600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1027,
+          "type": "power",
+          "floor": 7,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794931200000,
+          "upgradeAt": null,
+          "stored": 13.68000000000124,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1028,
+          "type": "storage",
+          "floor": 7,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794954000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1029,
+          "type": "elevator",
+          "floor": 8,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794999600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1030,
+          "type": "storage",
+          "floor": 8,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795000200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1031,
+          "type": "storage",
+          "floor": 8,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795020600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1032,
+          "type": "storage",
+          "floor": 8,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795040400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1033,
+          "type": "storage",
+          "floor": 8,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795064400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1034,
+          "type": "storage",
+          "floor": 8,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795089000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1035,
+          "type": "storage",
+          "floor": 8,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795112400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1036,
+          "type": "elevator",
+          "floor": 9,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795157400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1037,
+          "type": "storage",
+          "floor": 9,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795158000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1038,
+          "type": "storage",
+          "floor": 9,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795178400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1039,
+          "type": "storage",
+          "floor": 9,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795198200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1040,
+          "type": "storage",
+          "floor": 9,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795222800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1041,
+          "type": "storage",
+          "floor": 9,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795246800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1042,
+          "type": "storage",
+          "floor": 9,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795270200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1043,
+          "type": "elevator",
+          "floor": 10,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795315800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1044,
+          "type": "storage",
+          "floor": 10,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795316400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1045,
+          "type": "storage",
+          "floor": 10,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795336200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1046,
+          "type": "storage",
+          "floor": 10,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795356000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1047,
+          "type": "storage",
+          "floor": 10,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795380600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1048,
+          "type": "storage",
+          "floor": 10,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795405200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1049,
+          "type": "storage",
+          "floor": 10,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795428000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1050,
+          "type": "elevator",
+          "floor": 11,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795473600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1051,
+          "type": "storage",
+          "floor": 11,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795474200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1052,
+          "type": "storage",
+          "floor": 11,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795494600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1053,
+          "type": "storage",
+          "floor": 11,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795514400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1054,
+          "type": "storage",
+          "floor": 11,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795538400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1055,
+          "type": "storage",
+          "floor": 11,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795563000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1056,
+          "type": "storage",
+          "floor": 11,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795586400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1057,
+          "type": "elevator",
+          "floor": 12,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795608000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1058,
+          "type": "power",
+          "floor": 12,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795608600000,
+          "upgradeAt": null,
+          "stored": 5.220000000000752,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1059,
+          "type": "storage",
+          "floor": 12,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795638600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1060,
+          "type": "storage",
+          "floor": 12,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795658400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1061,
+          "type": "storage",
+          "floor": 12,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795683000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1062,
+          "type": "storage",
+          "floor": 12,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795707000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1063,
+          "type": "storage",
+          "floor": 12,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795730400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1064,
+          "type": "elevator",
+          "floor": 13,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795776000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1065,
+          "type": "storage",
+          "floor": 13,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795776600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1066,
+          "type": "storage",
+          "floor": 13,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795796400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1067,
+          "type": "storage",
+          "floor": 13,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795816200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1068,
+          "type": "storage",
+          "floor": 13,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795840800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1069,
+          "type": "storage",
+          "floor": 13,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795865400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1070,
+          "type": "storage",
+          "floor": 13,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795888200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1071,
+          "type": "elevator",
+          "floor": 14,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1795933800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1072,
+          "type": "storage",
+          "floor": 14,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795934400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1073,
+          "type": "storage",
+          "floor": 14,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795954800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1074,
+          "type": "storage",
+          "floor": 14,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795974600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1075,
+          "type": "storage",
+          "floor": 14,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1795999200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1076,
+          "type": "storage",
+          "floor": 14,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796023800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1077,
+          "type": "storage",
+          "floor": 14,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796047200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1078,
+          "type": "elevator",
+          "floor": 15,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1796116200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1079,
+          "type": "storage",
+          "floor": 15,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796116800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1080,
+          "type": "storage",
+          "floor": 15,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796137200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1081,
+          "type": "storage",
+          "floor": 15,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796166000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1082,
+          "type": "storage",
+          "floor": 15,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796199000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1083,
+          "type": "storage",
+          "floor": 15,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796227200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1084,
+          "type": "storage",
+          "floor": 15,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796263800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1085,
+          "type": "elevator",
+          "floor": 16,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1796387400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1086,
+          "type": "storage",
+          "floor": 16,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1796388000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1087,
+          "type": "storage",
+          "floor": 16,
+          "col": 3,
+          "width": 1,
+          "level": 2,
+          "builtAt": 1796412600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        }
+      ]
+    }
+  },
+  "state": {
+    "campaign": {
+      "roles": [
+        {
+          "id": 21,
+          "room": 50,
+          "role": "workshop",
+          "at": 1796419800000
+        }
+      ],
+      "defense": [],
+      "defenseManual": [],
+      "trips": [],
+      "attempts": [],
+      "heals": [],
+      "trainingRest": [],
+      "materials": {
+        "vaultNo": 77,
+        "id": 1087,
+        "type": "storage",
+        "level": 3,
+        "targetLevel": 14,
+        "finalTarget": 16
+      }
+    },
+    "families": [
+      {
+        "a": 1,
+        "b": 3,
+        "room": 6
+      },
+      {
+        "a": 2,
+        "b": 10,
+        "room": 1000
+      },
+      {
+        "a": 12,
+        "b": 21,
+        "room": 1003
+      },
+      {
+        "a": 13,
+        "b": 14,
+        "room": 5
+      },
+      {
+        "a": 35,
+        "b": 43,
+        "room": 1006
+      }
+    ],
+    "swap": null,
+    "constructionLedger": [
+      {
+        "id": "1793923200000",
+        "at": 1793923200000,
+        "scrap": 500,
+        "parts": 0
+      },
+      {
+        "id": "1793923800000",
+        "at": 1793923800000,
+        "scrap": 500,
+        "parts": 0
+      },
+      {
+        "id": "1793931000000",
+        "at": 1793931000000,
+        "scrap": 240,
+        "parts": 0
+      },
+      {
+        "id": "1793952000000",
+        "at": 1793952000000,
+        "scrap": 128,
+        "parts": 0
+      },
+      {
+        "id": "1793952600000",
+        "at": 1793952600000,
+        "scrap": 144,
+        "parts": 0
+      },
+      {
+        "id": "1793953200000",
+        "at": 1793953200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1793953800000",
+        "at": 1793953800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1793960400000",
+        "at": 1793960400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1793970000000",
+        "at": 1793970000000,
+        "scrap": 264,
+        "parts": 0
+      },
+      {
+        "id": "1793982000000",
+        "at": 1793982000000,
+        "scrap": 160,
+        "parts": 0
+      },
+      {
+        "id": "1793985000000",
+        "at": 1793985000000,
+        "scrap": 176,
+        "parts": 0
+      },
+      {
+        "id": "1793993400000",
+        "at": 1793993400000,
+        "scrap": 289,
+        "parts": 0
+      },
+      {
+        "id": "1794014400000",
+        "at": 1794014400000,
+        "scrap": 400,
+        "parts": 0
+      },
+      {
+        "id": "1794025200000",
+        "at": 1794025200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794025800000",
+        "at": 1794025800000,
+        "scrap": 193,
+        "parts": 0
+      },
+      {
+        "id": "1794048000000",
+        "at": 1794048000000,
+        "scrap": 1143,
+        "parts": 0
+      },
+      {
+        "id": "1794069600000",
+        "at": 1794069600000,
+        "scrap": 208,
+        "parts": 0
+      },
+      {
+        "id": "1794070200000",
+        "at": 1794070200000,
+        "scrap": 224,
+        "parts": 0
+      },
+      {
+        "id": "1794070800000",
+        "at": 1794070800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794071400000",
+        "at": 1794071400000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794075000000",
+        "at": 1794075000000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794077400000",
+        "at": 1794077400000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794084600000",
+        "at": 1794084600000,
+        "scrap": 400,
+        "parts": 0
+      },
+      {
+        "id": "1794098400000",
+        "at": 1794098400000,
+        "scrap": 600,
+        "parts": 0
+      },
+      {
+        "id": "1794112200000",
+        "at": 1794112200000,
+        "scrap": 900,
+        "parts": 0
+      },
+      {
+        "id": "1794142800000",
+        "at": 1794142800000,
+        "scrap": 1250,
+        "parts": 0
+      },
+      {
+        "id": "1794165600000",
+        "at": 1794165600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794180000000",
+        "at": 1794180000000,
+        "scrap": 600,
+        "parts": 0
+      },
+      {
+        "id": "1794190800000",
+        "at": 1794190800000,
+        "scrap": 700,
+        "parts": 0
+      },
+      {
+        "id": "1794211200000",
+        "at": 1794211200000,
+        "scrap": 960,
+        "parts": 30
+      },
+      {
+        "id": "1794225600000",
+        "at": 1794225600000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794246600000",
+        "at": 1794246600000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794256800000",
+        "at": 1794256800000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794297600000",
+        "at": 1794297600000,
+        "scrap": 960,
+        "parts": 30
+      },
+      {
+        "id": "1794333000000",
+        "at": 1794333000000,
+        "scrap": 800,
+        "parts": 0
+      },
+      {
+        "id": "1794339600000",
+        "at": 1794339600000,
+        "scrap": 1440,
+        "parts": 45
+      },
+      {
+        "id": "1794384000000",
+        "at": 1794384000000,
+        "scrap": 900,
+        "parts": 0
+      },
+      {
+        "id": "1794394800000",
+        "at": 1794394800000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794426000000",
+        "at": 1794426000000,
+        "scrap": 1440,
+        "parts": 30
+      },
+      {
+        "id": "1794481200000",
+        "at": 1794481200000,
+        "scrap": 2160,
+        "parts": 45
+      },
+      {
+        "id": "1794612000000",
+        "at": 1794612000000,
+        "scrap": 1475,
+        "parts": 0
+      },
+      {
+        "id": "1794632400000",
+        "at": 1794632400000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794652800000",
+        "at": 1794652800000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794674400000",
+        "at": 1794674400000,
+        "scrap": 80,
+        "parts": 0
+      },
+      {
+        "id": "1794675000000",
+        "at": 1794675000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794682800000",
+        "at": 1794682800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794693600000",
+        "at": 1794693600000,
+        "scrap": 96,
+        "parts": 0
+      },
+      {
+        "id": "1794694200000",
+        "at": 1794694200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794707400000",
+        "at": 1794707400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794718200000",
+        "at": 1794718200000,
+        "scrap": 112,
+        "parts": 0
+      },
+      {
+        "id": "1794718800000",
+        "at": 1794718800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794732000000",
+        "at": 1794732000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794742800000",
+        "at": 1794742800000,
+        "scrap": 128,
+        "parts": 0
+      },
+      {
+        "id": "1794743400000",
+        "at": 1794743400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794753600000",
+        "at": 1794753600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794764400000",
+        "at": 1794764400000,
+        "scrap": 144,
+        "parts": 0
+      },
+      {
+        "id": "1794765000000",
+        "at": 1794765000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794778200000",
+        "at": 1794778200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794789000000",
+        "at": 1794789000000,
+        "scrap": 160,
+        "parts": 0
+      },
+      {
+        "id": "1794789600000",
+        "at": 1794789600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794800400000",
+        "at": 1794800400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794811200000",
+        "at": 1794811200000,
+        "scrap": 1830,
+        "parts": 0
+      },
+      {
+        "id": "1794832800000",
+        "at": 1794832800000,
+        "scrap": 176,
+        "parts": 0
+      },
+      {
+        "id": "1794833400000",
+        "at": 1794833400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794846600000",
+        "at": 1794846600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794857400000",
+        "at": 1794857400000,
+        "scrap": 193,
+        "parts": 0
+      },
+      {
+        "id": "1794858000000",
+        "at": 1794858000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794870600000",
+        "at": 1794870600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794881400000",
+        "at": 1794881400000,
+        "scrap": 208,
+        "parts": 0
+      },
+      {
+        "id": "1794882000000",
+        "at": 1794882000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794895200000",
+        "at": 1794895200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794906000000",
+        "at": 1794906000000,
+        "scrap": 224,
+        "parts": 0
+      },
+      {
+        "id": "1794906600000",
+        "at": 1794906600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794919800000",
+        "at": 1794919800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794930600000",
+        "at": 1794930600000,
+        "scrap": 140,
+        "parts": 0
+      },
+      {
+        "id": "1794931200000",
+        "at": 1794931200000,
+        "scrap": 250,
+        "parts": 0
+      },
+      {
+        "id": "1794934800000",
+        "at": 1794934800000,
+        "scrap": 1250,
+        "parts": 0
+      },
+      {
+        "id": "1794942600000",
+        "at": 1794942600000,
+        "scrap": 600,
+        "parts": 15
+      },
+      {
+        "id": "1794953400000",
+        "at": 1794953400000,
+        "scrap": 240,
+        "parts": 0
+      },
+      {
+        "id": "1794954000000",
+        "at": 1794954000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794967200000",
+        "at": 1794967200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794978000000",
+        "at": 1794978000000,
+        "scrap": 2206,
+        "parts": 0
+      },
+      {
+        "id": "1794999600000",
+        "at": 1794999600000,
+        "scrap": 256,
+        "parts": 0
+      },
+      {
+        "id": "1795000200000",
+        "at": 1795000200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795009200000",
+        "at": 1795009200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795020000000",
+        "at": 1795020000000,
+        "scrap": 272,
+        "parts": 0
+      },
+      {
+        "id": "1795020600000",
+        "at": 1795020600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795029000000",
+        "at": 1795029000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795039800000",
+        "at": 1795039800000,
+        "scrap": 288,
+        "parts": 0
+      },
+      {
+        "id": "1795040400000",
+        "at": 1795040400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795053000000",
+        "at": 1795053000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795063800000",
+        "at": 1795063800000,
+        "scrap": 304,
+        "parts": 0
+      },
+      {
+        "id": "1795064400000",
+        "at": 1795064400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795077600000",
+        "at": 1795077600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795088400000",
+        "at": 1795088400000,
+        "scrap": 320,
+        "parts": 0
+      },
+      {
+        "id": "1795089000000",
+        "at": 1795089000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795101000000",
+        "at": 1795101000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795111800000",
+        "at": 1795111800000,
+        "scrap": 336,
+        "parts": 0
+      },
+      {
+        "id": "1795112400000",
+        "at": 1795112400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795125000000",
+        "at": 1795125000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795135800000",
+        "at": 1795135800000,
+        "scrap": 2601,
+        "parts": 0
+      },
+      {
+        "id": "1795157400000",
+        "at": 1795157400000,
+        "scrap": 352,
+        "parts": 0
+      },
+      {
+        "id": "1795158000000",
+        "at": 1795158000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795167000000",
+        "at": 1795167000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795177800000",
+        "at": 1795177800000,
+        "scrap": 368,
+        "parts": 0
+      },
+      {
+        "id": "1795178400000",
+        "at": 1795178400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795186800000",
+        "at": 1795186800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795197600000",
+        "at": 1795197600000,
+        "scrap": 385,
+        "parts": 0
+      },
+      {
+        "id": "1795198200000",
+        "at": 1795198200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795211400000",
+        "at": 1795211400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795222200000",
+        "at": 1795222200000,
+        "scrap": 400,
+        "parts": 0
+      },
+      {
+        "id": "1795222800000",
+        "at": 1795222800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795235400000",
+        "at": 1795235400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795246200000",
+        "at": 1795246200000,
+        "scrap": 416,
+        "parts": 0
+      },
+      {
+        "id": "1795246800000",
+        "at": 1795246800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795258800000",
+        "at": 1795258800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795269600000",
+        "at": 1795269600000,
+        "scrap": 432,
+        "parts": 0
+      },
+      {
+        "id": "1795270200000",
+        "at": 1795270200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795283400000",
+        "at": 1795283400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795294200000",
+        "at": 1795294200000,
+        "scrap": 3015,
+        "parts": 0
+      },
+      {
+        "id": "1795315800000",
+        "at": 1795315800000,
+        "scrap": 449,
+        "parts": 0
+      },
+      {
+        "id": "1795316400000",
+        "at": 1795316400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795324800000",
+        "at": 1795324800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795335600000",
+        "at": 1795335600000,
+        "scrap": 465,
+        "parts": 0
+      },
+      {
+        "id": "1795336200000",
+        "at": 1795336200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795344600000",
+        "at": 1795344600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795355400000",
+        "at": 1795355400000,
+        "scrap": 480,
+        "parts": 0
+      },
+      {
+        "id": "1795356000000",
+        "at": 1795356000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795369200000",
+        "at": 1795369200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795380000000",
+        "at": 1795380000000,
+        "scrap": 496,
+        "parts": 0
+      },
+      {
+        "id": "1795380600000",
+        "at": 1795380600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795393800000",
+        "at": 1795393800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795404600000",
+        "at": 1795404600000,
+        "scrap": 512,
+        "parts": 0
+      },
+      {
+        "id": "1795405200000",
+        "at": 1795405200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795416600000",
+        "at": 1795416600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795427400000",
+        "at": 1795427400000,
+        "scrap": 528,
+        "parts": 0
+      },
+      {
+        "id": "1795428000000",
+        "at": 1795428000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795441200000",
+        "at": 1795441200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795452000000",
+        "at": 1795452000000,
+        "scrap": 3445,
+        "parts": 0
+      },
+      {
+        "id": "1795473600000",
+        "at": 1795473600000,
+        "scrap": 544,
+        "parts": 0
+      },
+      {
+        "id": "1795474200000",
+        "at": 1795474200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795483200000",
+        "at": 1795483200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795494000000",
+        "at": 1795494000000,
+        "scrap": 560,
+        "parts": 0
+      },
+      {
+        "id": "1795494600000",
+        "at": 1795494600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795503000000",
+        "at": 1795503000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795513800000",
+        "at": 1795513800000,
+        "scrap": 576,
+        "parts": 0
+      },
+      {
+        "id": "1795514400000",
+        "at": 1795514400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795527000000",
+        "at": 1795527000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795537800000",
+        "at": 1795537800000,
+        "scrap": 592,
+        "parts": 0
+      },
+      {
+        "id": "1795538400000",
+        "at": 1795538400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795551600000",
+        "at": 1795551600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795562400000",
+        "at": 1795562400000,
+        "scrap": 608,
+        "parts": 0
+      },
+      {
+        "id": "1795563000000",
+        "at": 1795563000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795575000000",
+        "at": 1795575000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795585800000",
+        "at": 1795585800000,
+        "scrap": 624,
+        "parts": 0
+      },
+      {
+        "id": "1795586400000",
+        "at": 1795586400000,
+        "scrap": 3891,
+        "parts": 0
+      },
+      {
+        "id": "1795608000000",
+        "at": 1795608000000,
+        "scrap": 160,
+        "parts": 0
+      },
+      {
+        "id": "1795608600000",
+        "at": 1795608600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795609200000",
+        "at": 1795609200000,
+        "scrap": 250,
+        "parts": 0
+      },
+      {
+        "id": "1795621200000",
+        "at": 1795621200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795627200000",
+        "at": 1795627200000,
+        "scrap": 600,
+        "parts": 15
+      },
+      {
+        "id": "1795638000000",
+        "at": 1795638000000,
+        "scrap": 640,
+        "parts": 0
+      },
+      {
+        "id": "1795638600000",
+        "at": 1795638600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795647000000",
+        "at": 1795647000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795657800000",
+        "at": 1795657800000,
+        "scrap": 656,
+        "parts": 0
+      },
+      {
+        "id": "1795658400000",
+        "at": 1795658400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795671600000",
+        "at": 1795671600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795682400000",
+        "at": 1795682400000,
+        "scrap": 672,
+        "parts": 0
+      },
+      {
+        "id": "1795683000000",
+        "at": 1795683000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795695600000",
+        "at": 1795695600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795706400000",
+        "at": 1795706400000,
+        "scrap": 689,
+        "parts": 0
+      },
+      {
+        "id": "1795707000000",
+        "at": 1795707000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795719000000",
+        "at": 1795719000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795729800000",
+        "at": 1795729800000,
+        "scrap": 704,
+        "parts": 0
+      },
+      {
+        "id": "1795730400000",
+        "at": 1795730400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795743600000",
+        "at": 1795743600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795754400000",
+        "at": 1795754400000,
+        "scrap": 4353,
+        "parts": 0
+      },
+      {
+        "id": "1795776000000",
+        "at": 1795776000000,
+        "scrap": 720,
+        "parts": 0
+      },
+      {
+        "id": "1795776600000",
+        "at": 1795776600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795785000000",
+        "at": 1795785000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795795800000",
+        "at": 1795795800000,
+        "scrap": 737,
+        "parts": 0
+      },
+      {
+        "id": "1795796400000",
+        "at": 1795796400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795804800000",
+        "at": 1795804800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795815600000",
+        "at": 1795815600000,
+        "scrap": 752,
+        "parts": 0
+      },
+      {
+        "id": "1795816200000",
+        "at": 1795816200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795829400000",
+        "at": 1795829400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795840200000",
+        "at": 1795840200000,
+        "scrap": 768,
+        "parts": 0
+      },
+      {
+        "id": "1795840800000",
+        "at": 1795840800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795854000000",
+        "at": 1795854000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795864800000",
+        "at": 1795864800000,
+        "scrap": 784,
+        "parts": 0
+      },
+      {
+        "id": "1795865400000",
+        "at": 1795865400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795876800000",
+        "at": 1795876800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795887600000",
+        "at": 1795887600000,
+        "scrap": 800,
+        "parts": 0
+      },
+      {
+        "id": "1795888200000",
+        "at": 1795888200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795901400000",
+        "at": 1795901400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795912200000",
+        "at": 1795912200000,
+        "scrap": 4828,
+        "parts": 0
+      },
+      {
+        "id": "1795933800000",
+        "at": 1795933800000,
+        "scrap": 817,
+        "parts": 0
+      },
+      {
+        "id": "1795934400000",
+        "at": 1795934400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795943400000",
+        "at": 1795943400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795954200000",
+        "at": 1795954200000,
+        "scrap": 832,
+        "parts": 0
+      },
+      {
+        "id": "1795954800000",
+        "at": 1795954800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795963200000",
+        "at": 1795963200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795974000000",
+        "at": 1795974000000,
+        "scrap": 849,
+        "parts": 0
+      },
+      {
+        "id": "1795974600000",
+        "at": 1795974600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1795987200000",
+        "at": 1795987200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1795998600000",
+        "at": 1795998600000,
+        "scrap": 864,
+        "parts": 0
+      },
+      {
+        "id": "1795999200000",
+        "at": 1795999200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796012400000",
+        "at": 1796012400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796023200000",
+        "at": 1796023200000,
+        "scrap": 880,
+        "parts": 0
+      },
+      {
+        "id": "1796023800000",
+        "at": 1796023800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796035800000",
+        "at": 1796035800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796046600000",
+        "at": 1796046600000,
+        "scrap": 897,
+        "parts": 0
+      },
+      {
+        "id": "1796047200000",
+        "at": 1796047200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796059800000",
+        "at": 1796059800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796094600000",
+        "at": 1796094600000,
+        "scrap": 5318,
+        "parts": 0
+      },
+      {
+        "id": "1796116200000",
+        "at": 1796116200000,
+        "scrap": 912,
+        "parts": 0
+      },
+      {
+        "id": "1796116800000",
+        "at": 1796116800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796125800000",
+        "at": 1796125800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796136600000",
+        "at": 1796136600000,
+        "scrap": 929,
+        "parts": 0
+      },
+      {
+        "id": "1796137800000",
+        "at": 1796137800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796154000000",
+        "at": 1796154000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796165400000",
+        "at": 1796165400000,
+        "scrap": 944,
+        "parts": 0
+      },
+      {
+        "id": "1796169600000",
+        "at": 1796169600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796186400000",
+        "at": 1796186400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796198400000",
+        "at": 1796198400000,
+        "scrap": 960,
+        "parts": 0
+      },
+      {
+        "id": "1796202000000",
+        "at": 1796202000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796215200000",
+        "at": 1796215200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796226600000",
+        "at": 1796226600000,
+        "scrap": 977,
+        "parts": 0
+      },
+      {
+        "id": "1796230800000",
+        "at": 1796230800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796250600000",
+        "at": 1796250600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796263200000",
+        "at": 1796263200000,
+        "scrap": 992,
+        "parts": 0
+      },
+      {
+        "id": "1796264400000",
+        "at": 1796264400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796283000000",
+        "at": 1796283000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796365800000",
+        "at": 1796365800000,
+        "scrap": 5821,
+        "parts": 0
+      },
+      {
+        "id": "1796387400000",
+        "at": 1796387400000,
+        "scrap": 1009,
+        "parts": 0
+      },
+      {
+        "id": "1796388000000",
+        "at": 1796388000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1796398800000",
+        "at": 1796398800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1796412000000",
+        "at": 1796412000000,
+        "scrap": 1024,
+        "parts": 0
+      },
+      {
+        "id": "1796413200000",
+        "at": 1796413200000,
+        "scrap": 200,
+        "parts": 0
+      }
+    ],
+    "pair": null
+  }
+}

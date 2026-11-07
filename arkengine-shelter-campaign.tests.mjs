@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {workshopBudgetCycleView} from './arkengine-shelter-campaign.fixture.mjs';
 import {campaignView,levelGateView,upperStageView,materialCycleView,storageChoiceView,handyMaterialView,capacityRouteView,powerPrerequisiteView,digPowerPrerequisiteView,fullPowerPrerequisiteView,workshopUpgradeView,multiWorkshopView,workshopBuildView,workshopPowerCycleView,materialProducerCycleView,populationGrowthView,familyGrowthView,workshopChurnView,dormWorkshopCycleView,familyWorkshopCycleView,workshopFamilyReturnView} from './arkengine-shelter-campaign.fixture.mjs';
 
@@ -17,6 +18,178 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   const reloadCampaign=async()=>{
     await pulse(1000);await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();
   };
+  const scrapInvestmentScene=()=>scene({},`${construction}
+    Object.assign(s.rooms.find(r=>r.id===4),{width:3,level:2});
+    Object.assign(s.rooms.find(r=>r.id===6),{floor:2,col:4,width:3});
+    for(let id=7;id<=11;id++)s.residents.push({...structuredClone(s.residents[3]),id,name:'回收居民'+id});
+    s.resources.scrap=1000;s.resources.parts=60;sm.view.progress={level:5,score:82,next:87};
+    localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+    localStorage.setItem('arkengine:auto-shelter:level-target:v1','10');`);
+  await t.test('废料布局浏览器：实际建第二回收站并按两名工人使用现有小空位，完工后到岗且刷新不重建',async()=>{
+    await setupShelter(scrapInvestmentScene());await settle('second recycler investment');
+    const builds=await evaluate('sm.calls.filter(c=>c.type==="build")');
+    assert.equal(builds.length,1,JSON.stringify(await diagnose()));
+    assert.equal(builds[0].room,'scrap');assert.equal(builds[0].floor,2);assert.equal(builds[0].col,7);
+    assert.ok(await evaluate(`${state}.constructionLedger.some(c=>c.scrap===128&&c.parts===0)`));
+    const room=await evaluate('sm.view.state.rooms.find(r=>r.type==="scrap"&&r.floor===2)');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${room.id}).length`),0);
+    await reloadCampaign();await settle('scrap construction kept after reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build").length'),1);
+    await evaluate(`clock=${room.builtAt}+1;sm.view.state.lastSettledAt=clock;${panel}.getElementById('shelter-check').click();`);
+    await settle('second recycler actually staffed');
+    assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===${room.id}).length`),2,JSON.stringify(await diagnose()));
+  });
+  await t.test('废料布局浏览器：打开建站窗口后降低预算，不发送原建造请求也不记消费',async()=>{
+    await setupShelter(scrapInvestmentScene());await drive('!!document.querySelector("[data-construction-dialog]")','recycler build confirmation');
+    await evaluate(`const c=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));c.scrapLimit=127;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(c));`);
+    await drive('!document.querySelector("[data-construction-dialog]")','cancel over-budget recycler');
+    assert.equal(await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type)).length'),0);
+    assert.equal(await evaluate(`${state}.constructionLedger?.length||0`),0);
+  });
+  await t.test('父母优化浏览器：基础属性与生育速度参与实际新配对，不单凭闲置优先',async()=>{
+    await setupShelter(scene({},`sm.confirmFamily=true;s.rooms.find(r=>r.id===4).width=3;
+      for(const p of s.residents.slice(3))Object.assign(p,{xp:0,hp:100,stats:{str:3,per:3,end:3,cha:3,int:3,agi:3,lck:3}});
+      for(const id of [7,8])s.residents.push({...structuredClone(s.residents[3]),id,name:'优质居民'+id,roomId:4,
+        stats:{str:8,per:8,end:8,cha:8,int:8,agi:8,lck:8}});
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','14');`));
+    await settle('quality parents actually placed');
+    assert.deepEqual(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===5).slice(0,2).map(c=>c.residentId).sort((a,b)=>a-b)'),[7,8]);
+    await reloadCampaign();await settle('quality family survives reload');
+    assert.ok(await evaluate(`${state}.families.some(f=>f.a===7&&f.b===8)`));
+  });
+  await t.test('父母优化浏览器：魅力训练回执刷新保留，冷却结束退出并成对返回宿舍',async()=>{
+    await setupShelter(scene({training:true},`sm.confirmFamily=true;
+      for(const p of s.residents.slice(4))Object.assign(p,{roomId:5,xp:0,hp:100,familyCooldownUntil:clock+21600000,
+        stats:{str:5,per:5,end:5,cha:2,int:5,agi:5,lck:5}});
+      s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'cha',level:2,floor:2,col:4});
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','14');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'父母冷却',vaultNo:77,
+        families:[{a:5,b:6,room:5}],campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]}}));`));
+    await settle('parent charisma training');
+    const role=await evaluate(`${state}.campaign.roles.find(r=>r.purpose==='parent')`);
+    assert.ok(role,JSON.stringify(await diagnose()));assert.equal(role.stat,'cha');assert.equal(role.room,90);
+    await reloadCampaign();await settle('parent training restored');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===90).length'),1);
+    await evaluate(`clock=${role.until}+1000;sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;`);
+    await reloadCampaign();await settle('parent training deadline and family return');
+    assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.purpose==='parent').length`),0);
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).map(p=>p.roomId)'),[5,5]);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===90).length'),1);
+  });
+  await t.test('父母优化浏览器：已有魅力训练室太慢时按预算升级，完工后入室且刷新不重复施工',async()=>{
+    await setupShelter(scene({training:true},`${construction}
+      for(const p of s.residents.slice(4))Object.assign(p,{roomId:5,xp:0,hp:100,familyCooldownUntil:clock+21600000,
+        stats:{str:5,per:5,end:5,cha:5,int:5,agi:5,lck:5}});
+      s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'cha',level:1,floor:2,col:4});
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','14');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'父母训练房升级',vaultNo:77,
+        families:[{a:5,b:6,room:5}],campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]}}));`));
+    await settle('parent training room upgrade');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===90).length'),1,JSON.stringify(await diagnose()));
+    assert.ok(await evaluate(`${state}.constructionLedger.some(c=>c.scrap===1000&&c.parts===0)`));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===90).length'),0);
+    await reloadCampaign();await settle('training construction restored');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===90).length'),1);
+    await evaluate(`const r=sm.view.state.rooms.find(r=>r.id===90);clock=r.upgradeAt+1;r.upgradeAt=null;r.level=2;
+      sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;${panel}.getElementById('shelter-check').click();`);
+    await settle('parent uses completed training room');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===90).length'),1,JSON.stringify(await diagnose()));
+  });
+  const levelInvestmentScene=()=>scene({},`sm.view=${JSON.stringify(upperStageView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
+    const ls=sm.view.state;for(const r of ls.rooms){if(r.type!=='elevator')r.level=3;r.stored=0;}
+    ls.rooms.find(r=>r.id===6).level=1;ls.resources={scrap:2000,parts:40,power:500,food:500,water:500,stimpak:7};
+    const score=2*ls.residents.length+3*ls.depth+ls.rooms.filter(r=>!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
+    sm.view.progress={level:1+Math.floor(Math.sqrt((score-30))/1.5),score,next:111};
+    ${construction}localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+    localStorage.setItem('arkengine:auto-shelter:population:v1','15');localStorage.setItem('arkengine:auto-shelter:level-target:v1','10');`);
+  await t.test('等级投资浏览器：未满仓且人口阶段完成，实际升级空宿舍并只记一次费用，刷新保留施工',async()=>{
+    await setupShelter(levelInvestmentScene());
+    await settle('existing empty quarters upgrade');
+    const calls=await evaluate('sm.calls');assert.equal(calls.filter(c=>c.type==='upgrade'&&c.roomId===6).length,1,JSON.stringify(await diagnose()));
+    assert.equal(calls.filter(c=>c.type==='build'||c.type==='dig').length,0);
+    assert.equal(await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.scrap,0)`),900);
+    assert.equal(await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.parts,0)`),0);
+    assert.ok(await evaluate('sm.view.state.rooms.find(r=>r.id===6).upgradeAt>clock'));
+    await reloadCampaign();await settle('investment construction after refresh');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='upgrade'&&c.roomId===6).length`),1);
+  });
+  await t.test('等级投资浏览器：确认前有人入住空宿舍则撤销该升级，保留居民与费用',async()=>{
+    await setupShelter(levelInvestmentScene());
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'empty quarters investment dialog');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
+    await evaluate('sm.view.state.residents.find(p=>p.id===13).roomId=6;');
+    await settle('occupied quarters cancels investment');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===6).length'),0,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===13).roomId'),6);
+    assert.equal(await evaluate(`${state}.constructionLedger?.reduce((n,r)=>n+r.scrap,0)||0`),0);
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('等级投资接续浏览器：已有房满级后按原预算新建仓库，未满仓可开工且刷新不重复',async()=>{
+    for(const limit of [127,128]){
+      await setupShelter(levelInvestmentScene()+`ls.rooms.find(r=>r.id===6).level=3;
+        sm.view.progress.score+=6;sm.view.progress.level=1+Math.floor(Math.sqrt((sm.view.progress.score-30))/1.5);
+        const lc=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));lc.scrapLimit=${limit};
+        localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(lc));`);
+      await settle('level investment warehouse within original budget '+limit);
+      const calls=await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type))');
+      if(limit===127){assert.deepEqual(calls,[]);continue;}
+      assert.equal(calls.length,1,JSON.stringify(await diagnose()));assert.equal(calls[0].type,'build');assert.equal(calls[0].room,'storage');
+      assert.equal(await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.scrap,0)`),128);
+      assert.equal(await evaluate('sm.view.state.residents.length'),15);
+      await reloadCampaign();await settle('new investment warehouse retained');
+      assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build").length'),1);
+    }
+  });
+  const handoffScene=()=>levelInvestmentScene()+`ls.rooms.find(r=>r.id===6).level=2;
+    ls.rooms.push({...ls.rooms[0],id:400,type:'workshop',level:3,floor:5,col:2,width:1});
+    for(const id of [9,10])ls.residents.find(p=>p.id===id).roomId=400;
+    for(const p of ls.residents)if(ls.rooms.some(r=>r.id===p.roomId&&r.type==='power'))p.stats.str=10;
+    ls.resources.scrap=5000;ls.resources.parts=45;
+    sm.view.progress.score=2*ls.residents.length+3*ls.depth+ls.rooms.filter(r=>!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
+    sm.view.progress.level=1+Math.floor(Math.sqrt((sm.view.progress.score-30))/1.5);
+    localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'已备齐宿舍升级',campaign:{
+      roles:[9,10].map(id=>({id,room:400,role:'workshop',at:clock})),trips:[],attempts:[],heals:[],trainingRest:[]}}));`;
+  await t.test('工坊工程交接浏览器：先升级再释放，实际扣料与刷新后重评，不把工人永久留在工坊',async()=>{
+    await setupShelter(handoffScene());await settle('funded investment before workshop releases');
+    const calls=await evaluate('sm.calls'),buildIndex=calls.findIndex(c=>c.type==='upgrade'&&c.roomId===6);
+    assert.ok(buildIndex>=0,JSON.stringify(await diagnose()));
+    assert.ok(calls.slice(0,buildIndex).every(c=>c.type!=='assign'||![9,10].includes(c.residentId)),'开工前不释放现有工坊');
+    assert.equal(await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.parts,0)`),45);
+    assert.equal(await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.scrap,0)`),2160);
+    await reloadCampaign();await evaluate(`${panel}.getElementById('shelter-check').click();`);await settle('handoff after refresh');
+    assert.ok(await evaluate('sm.view.state.residents.filter(p=>[9,10].includes(p.id)).every(p=>p.roomId!==400)'),
+      '下一轮无后续备料需求时实际释放 '+JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===6).length'),1);
+    assert.ok(await evaluate(`${state}.campaign.roles.every(r=>r.role!=='workshop')`));
+  });
+  await t.test('工坊工程交接浏览器：建设窗口后预算被调低，撤销升级并解除本次交接保留',async()=>{
+    await setupShelter(handoffScene());await drive('!!document.querySelector("[data-construction-dialog]")','handoff upgrade window');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"||c.type==="assign"&&[9,10].includes(c.residentId)).length'),0);
+    // 保持自动备料启用，只把额度降到本工程所需45件以下；0同时关闭自动工坊管理，是另一项设置语义。
+    await evaluate(`const hc=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));hc.partsLimit=44;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(hc));`);
+    await settle('budget change cancels construction handoff');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
+    await reloadCampaign();await evaluate(`${panel}.getElementById('shelter-check').click();`);await settle('release workers after cancelled handoff');
+    assert.ok(await evaluate('sm.view.state.residents.filter(p=>[9,10].includes(p.id)).every(p=>p.roomId!==400)'),JSON.stringify(await diagnose()));
+    assert.equal(await evaluate(`${state}.constructionLedger?.length||0`),0);
+  });
+  await t.test('工坊工程交接浏览器：开工结果未知时跨刷新保留原请求，不再次升级或调动保留工人',async()=>{
+    await setupShelter(handoffScene());await drive('!!document.querySelector("[data-construction-dialog]")','handoff before unknown upgrade');
+    await evaluate("sm.mode='unknown';");await drive('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===6)','unknown handoff upgrade');
+    const saved=await evaluate(pending),count=await evaluate('sm.calls.length');
+    assert.equal(saved.kind,'upgrade');assert.deepEqual(saved.targets,[6]);
+    assert.equal(saved.constructionKey,await evaluate('sm.calls.find(c=>c.type==="upgrade").idempotencyKey'));
+    await reloadCampaign();await settle('unknown handoff retained after refresh');
+    assert.equal(await evaluate(`${pending}.id`),saved.id);assert.equal(await evaluate('sm.calls.length'),count);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),1);
+    assert.ok(await evaluate('sm.view.state.residents.filter(p=>[9,10].includes(p.id)).every(p=>p.roomId===400)'));
+    assert.equal(await evaluate(`${state}.constructionLedger?.length||0`),0,'未知开工保留在途预留，不伪造成功账本');
+  });
   const neighbors=Array.from({length:8},(_,i)=>({userId:i+1,vaultNo:100+i,shelterName:'邻居避难所'+i,self:false,helpedToday:false,helpBlocked:null,helpScrap:13}));
   const growthScene=()=>scene({},`sm.view=${JSON.stringify(populationGrowthView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;sm.confirmFamily=true;
     ${construction}localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
@@ -33,6 +206,75 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     const jb=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));jb.scrapLimit=128;
     localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(jb));
     localStorage.setItem('arkengine:auto-shelter:population:v1','17');localStorage.setItem('arkengine:auto-shelter:level-target:v1','5');`);
+  const employmentSpaceScene=()=>{
+    const snapshot=JSON.parse(readFileSync(new URL('./arkengine-shelter-employment-space.fixture.json',import.meta.url),'utf8'));
+    return scene({},`const es=${JSON.stringify(snapshot)},offset=clock-es.view.serverTime;
+      const shift=x=>Array.isArray(x)?x.map(shift):x&&typeof x==='object'?Object.fromEntries(Object.entries(x).map(([k,v])=>[k,shift(v)])):
+        typeof x==='number'&&x>1e12?x+offset:x;
+      sm.view=shift(es.view);sm.view.state.lastSettledAt=clock;
+      // 原备料工程已确认完工：本场验证随后的岗位扩层，不能把已付费账本当作空白。
+      sm.view.state.rooms.find(r=>r.id===1002).level=3;sm.view.progress.score++;
+      sm.view.state.resources.scrap-=480;sm.view.state.resources.parts=0;delete es.state.campaign.materials;
+      sm.view.state.daily.day='2026-10-10';sm.view.state.season.month='2026-10';
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...shift(es.state),vaultNo:77,nextAt:0,note:'成年子女等待新岗位'}));
+      ${construction}localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+      localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','30');localStorage.setItem('arkengine:auto-shelter:level-target:v1','10');`);
+  };
+  await t.test('成年就业扩层浏览器：满层且旧站可升级时先开岗位空间，完工建站并实际安排子女生产',async()=>{
+    await setupShelter(employmentSpaceScene());
+    const initialSpent=await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.scrap,0)`);
+    await settle('dig for adult employment');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="dig").length'),1,JSON.stringify(await diagnose()));
+    assert.ok(await evaluate('sm.view.state.residents.filter(p=>[48,49].includes(p.id)).every(p=>[6,1000].includes(p.roomId))'));
+    const spent=await evaluate(`${state}.constructionLedger.reduce((n,r)=>n+r.scrap,0)`);
+    assert.equal(spent-initialSpent,Math.ceil(120*5**1.4));
+    await reloadCampaign();await settle('pending employment excavation is not repeated');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="dig").length'),1);
+    // 提供已确认的新楼层状态，不把浏览器夹具的一小时占位工期当作实号规则。
+    await evaluate(`const s=sm.view.state;s.depth=5;s.digging=null;
+      s.rooms.push({...s.rooms.find(r=>r.type==='elevator'),id:1900,floor:5});
+      sm.view.progress.score+=3;${panel}.getElementById('shelter-check').click();`);
+    await settle('build actual jobs on completed floor');
+    const room=await evaluate('sm.view.state.rooms.find(r=>r.floor===5&&r.type==="scrap")');
+    assert.ok(room,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="scrap").length'),1);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${room.id}).length`),0,'施工期间不提前安排');
+    await evaluate(`clock=${room.builtAt}+1;sm.view.state.lastSettledAt=clock;${panel}.getElementById('shelter-check').click();`);
+    await settle('first employment room starts production');
+    // 宿舍子女现在优先直接接第一间新房，不再为了排在临时冷却父母之后就业而等待第二间。
+    assert.deepEqual(await evaluate(`sm.view.state.residents.filter(p=>[48,49].includes(p.id)).map(p=>p.roomId)`),[room.id,room.id]);
+    // 两名子女到岗后仍有两名已退出备料的健康成人。新策略为他们扩建相邻一格，不能当成重复建房。
+    const extension=await evaluate(`sm.view.state.rooms.find(r=>r.floor===5&&r.type==='scrap'&&r.id!==${room.id})`);
+    assert.ok(extension);assert.equal(extension.col,room.col+1);
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>p.roomId===null).map(p=>p.id).sort((a,b)=>a-b)'),[3,10]);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="scrap").length'),2);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${extension.id}).length`),0);
+    await reloadCampaign();await settle('pending adjacent recycler is not duplicated');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="scrap").length'),2);
+    // 夹具不自行合并房间；提供相邻同类同级完工后的真实结构规则，再验证脚本按新容量安排人员。
+    await evaluate(`clock=${extension.builtAt}+1;sm.view.state.lastSettledAt=clock;
+      sm.view.state.rooms.find(r=>r.id===${room.id}).width=2;
+      sm.view.state.rooms=sm.view.state.rooms.filter(r=>r.id!==${extension.id});
+      ${panel}.getElementById('shelter-check').click();`);
+    await settle('merged recycler staffed by the remaining adults');
+    await evaluate(`${panel}.getElementById('shelter-check').click();`);await settle('next staffing check fills the remaining merge vacancy');
+    assert.deepEqual(await evaluate(`sm.view.state.residents.filter(p=>[3,10,48,49].includes(p.id)).map(p=>p.roomId)`),Array(4).fill(room.id),JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="scrap").length'),2);
+    await reloadCampaign();await settle('adult employment retained after reload');
+    assert.ok(await evaluate(`sm.view.state.residents.filter(p=>[48,49].includes(p.id)).every(p=>
+      sm.view.state.rooms.some(r=>r.id===p.roomId&&['power','diner','water','scrap','workshop'].includes(r.type)&&r.builtAt<=clock))`),JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="dig").length'),1);
+  });
+  await t.test('成年就业扩层浏览器：确认前待就业子女受伤则取消扩层，不为失效人选消费',async()=>{
+    await setupShelter(employmentSpaceScene());const initialLedger=await evaluate(`${state}.constructionLedger`);
+    await drive('!!document.querySelector("[data-construction-dialog]")','employment dig confirmation');
+    await evaluate('for(const p of sm.view.state.residents)if([48,49].includes(p.id))p.hp=1;');
+    await settle('cancel excavation without healthy job candidates');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="dig").length'),0,JSON.stringify(await diagnose()));
+    assert.deepEqual(await evaluate(`${state}.constructionLedger`),initialLedger);
+    assert.equal(await evaluate(pending),null);
+  });
   await t.test('成年就业浏览器：宿舍成年子女驱动岗位扩建，完工后直接上岗且刷新不重复',async()=>{
     await setupShelter(adultJobsScene());await settle('build jobs for adult children');
     assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='build'&&c.room==='scrap').length`),1,JSON.stringify(await diagnose()));
@@ -279,6 +521,34 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   const workshopBuildScene=()=>workshopUpgradeScene(workshopBuildView(),true)+`
     const bc=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));bc.scrapLimit=1600;
     localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(bc));`;
+  await t.test('工坊直接接岗浏览器：两名工人齐料后一次回生产，刷新不残留角色或重复释放',async()=>{
+    await setupShelter(workshopUpgradeScene(workshopBuildView())+`sm.view.state.resources.parts=100;
+      const rc=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));rc.scrapLimit=1;rc.dig=false;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(rc));`);
+    await settle('direct workshop return without idle assignment');
+    const moves=await evaluate(`sm.calls.filter(c=>c.type==='assign'&&[10,35].includes(c.residentId))`);
+    assert.equal(moves.length,2,JSON.stringify(await diagnose()));
+    assert.ok(moves.every(a=>a.roomId!==null));assert.equal(new Set(moves.map(a=>a.residentId)).size,2);
+    assert.ok(await evaluate('sm.view.state.residents.filter(p=>[10,35].includes(p.id)).every(p=>sm.view.state.rooms.some(r=>r.id===p.roomId&&r.type==="scrap"))'));
+    assert.ok(await evaluate(`${state}.campaign.roles.every(r=>![10,35].includes(r.id))`));
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('direct return survives reload');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&[10,35].includes(c.residentId)).length`),2);
+    assert.ok(await evaluate(`${state}.campaign.roles.every(r=>r.role!=='workshop-release')`));
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('工坊直接接岗浏览器：打开居民窗口后目标房失效，撤销原直接调岗',async()=>{
+    await setupShelter(workshopUpgradeScene(workshopBuildView())+`sm.view.state.resources.parts=100;
+      const rc=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));rc.scrapLimit=1;rc.dig=false;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(rc));`);
+    await drive(`!!document.querySelector('[role="dialog"] select')`,'direct assignment resident window');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign').length`),0);
+    await evaluate(`for(const r of sm.view.state.rooms.filter(r=>r.type==='scrap'))r.unpowered=true;`);
+    await settle('invalid target cancels planned direct assignment');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&[10,35].includes(c.residentId)&&c.roomId!==null).length`),0,
+      JSON.stringify(await diagnose()));
+    assert.equal(await evaluate(pending),null);
+  });
   await t.test('备料额度浏览器：等待额度时保留原回收生产者和八人工坊，刷新后材料与额度齐备才开工',async()=>{
     await setupShelter(workshopUpgradeScene(workshopBudgetCycleView())+`
       const schedule=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));
@@ -302,6 +572,405 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.notEqual(await evaluate(`${state}.campaign.materials?.id??null`),4);
     assert.equal(await evaluate(pending),null);
   });
+  const workshopPowerChainScene=(fixture='arkengine-shelter-workshop-power-chain.fixture.json')=>{
+    const snapshot=JSON.parse(readFileSync(new URL('./'+fixture,import.meta.url),'utf8'));
+    return scene({},`const ws=${JSON.stringify(snapshot)},offset=clock-ws.view.serverTime;
+      const shift=x=>Array.isArray(x)?x.map(shift):x&&typeof x==='object'?Object.fromEntries(Object.entries(x).map(([k,v])=>[k,shift(v)])):
+        typeof x==='number'&&x>1e12?x+offset:x;
+      sm.view=shift(ws.view);sm.view.state.lastSettledAt=clock;
+      sm.view.state.daily.day='2026-10-10';sm.view.state.season.month='2026-10';
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...shift(ws.state),vaultNo:77,nextAt:0,note:'工坊与原工程联合供电'}));
+      ${construction}localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+      localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','30');localStorage.setItem('arkengine:auto-shelter:level-target:v1','10');`);
+  };
+  await t.test('工坊扩建供电接续浏览器：保留原工程生产者与联合供电，实际开工且刷新不重复',async()=>{
+    await setupShelter(workshopPowerChainScene());
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    await settle('build workshop without displacing original production');
+    const calls=await evaluate('sm.calls'),index=calls.findIndex(c=>c.type==='build'&&c.room==='workshop');
+    assert.ok(index>=0,JSON.stringify(await diagnose()));
+    assert.ok(calls.slice(0,index).every(c=>c.type!=='assign'||![1,5].includes(c.residentId)),'开工前保留已补足的供电及原回收生产者');
+    // 原快照含恰在24小时边界的旧费用，检查本次新增条目，不把过期移出误当退款。
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,800);assert.equal(added[0].parts,0);
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),4);
+    await reloadCampaign();await settle('retain linked project across refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="workshop").length'),1);
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===5).roomId'),4);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('供水施工备料稳定浏览器：停产期间保留原生产者与工坊，完工后继续实际建设',async()=>{
+    await setupShelter(workshopPowerChainScene()+`Object.assign(sm.view.state.rooms.find(r=>r.id===3),{level:2,upgradeAt:clock+3600000});sm.view.progress.score-=3;`);
+    await settle('water construction retains original material shift');
+    assert.equal(await evaluate('sm.calls.filter(c=>["assign","build","upgrade","dig"].includes(c.type)).length'),0,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===5).roomId'),4);
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),4);
+    await reloadCampaign();await settle('water construction material shift across refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),0);
+    // 用公开完工状态恢复供水，随后仍须通过原生窗口和费用核对开工。
+    await evaluate(`Object.assign(sm.view.state.rooms.find(r=>r.id===3),{level:3,upgradeAt:null});sm.view.progress.score+=3;${panel}.getElementById('shelter-check').click();`);
+    await settle('resume linked construction after water completion');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="workshop").length'),1,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('原工程额度供电等待浏览器：等待额度不为备选补电，跨刷新保留目标，恢复后原生升级只扣一次费',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-funded-power-wait.fixture.json'));
+    await settle('funded material project awaits rolling budget');
+    assert.equal(await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type)).length'),0,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===1).length'),0);
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),4);
+    const waitingMoves=await evaluate('sm.calls.filter(c=>c.type==="assign").length');
+    await reloadCampaign();await settle('same budget wait after refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),waitingMoves,'普通优化已收敛，刷新不重新往返');
+    await evaluate(`clock+=86400001;sm.view.state.lastSettledAt=clock;${panel}.getElementById('shelter-check').click();`);
+    try{await drive('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===4)','resume original upgrade after rolling budget',600);}
+    catch(e){throw Error(e.message+' '+JSON.stringify(await diagnose()));}
+    await settle('confirm original funded upgrade');
+    const entries=await evaluate(`${state}.constructionLedger`);
+    assert.equal(entries.filter(r=>r.scrap===1440&&r.parts===45).length,1);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build").length'),0);
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('confirmed original upgrade survives refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===4).length'),1);
+  });
+
+  await t.test('就绪升级生产者稳定浏览器：补电后先实际升级仓库，不为普通换位抽空发电房',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-funded-producer.fixture.json'));
+    await settle('staffing converges before actual storage upgrade');
+    const calls=await evaluate('sm.calls');
+    assert.equal(calls.filter(c=>c.type==='upgrade'&&c.roomId===1026).length,1,JSON.stringify(await diagnose()));
+    // 原21a和当前候选都已采用就绪投资先开工，不能要求开工前额外进行一次普通换位。
+    assert.deepEqual(calls.map(c=>c.type==='assign'?[c.type,c.residentId,c.roomId]:[c.type,c.roomId]),
+      [['assign',2,1027],['upgrade',1026]],'一次补电后直接开工，没有往返或多余换位');
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>p.roomId===1027).map(p=>p.id)'),[2]);
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('funded upgrade confirmed after refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===1026).length'),1);
+  });
+
+  await t.test('发电升级备料稳定浏览器：缺件时补电一次并保留生产者，材料齐备后实际升级',async()=>{
+    // 本例单独核验缺件等待；防守快照的赛季奖励视为已领，避免奖励补齐材料提前开工。
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-power-material-producer.fixture.json')+
+      `sm.view.state.season.claimedFree=Array.from({length:30},(_,i)=>i+1);`);
+    await settle('power upgrade retains its last producer while gathering parts');
+    assert.equal(await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type)).length'),0,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===1026).length'),1);
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===4).roomId'),1026);
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),1026);
+    const moves=await evaluate('sm.calls.filter(c=>c.type==="assign").length');
+    await reloadCampaign();await settle('power material production survives refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),moves,
+      '刷新不撤工坊或重复补电 '+JSON.stringify({diagnostic:await diagnose(),calls:await evaluate('sm.calls')}));
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    await evaluate(`sm.view.state.resources.parts=15;${panel}.getElementById('shelter-check').click();`);
+    await settle('start confirmed power upgrade after parts arrive');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===1026).length'),1,JSON.stringify(await diagnose()));
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,600);assert.equal(added[0].parts,15);
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('confirmed power upgrade does not repeat');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===1026).length'),1);
+  });
+
+  await t.test('换位备料接续浏览器：先完成已有换位，六人工坊不撤补，刷新后材料齐备才升级',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-swap-material.fixture.json'));
+    const workers=await evaluate('sm.view.state.residents.filter(p=>[50,1010,1012].includes(p.roomId)).map(p=>({id:p.id,room:p.roomId}))');
+    // 满员优化可能需要多轮；等已确认的换位全部完成，不把单轮动作上限视为收敛。
+    for(let round=0;round<4;round++){
+      await settle('finish production swaps while retaining material workers');
+      if(await evaluate(`${state}.swap===null`))break;
+      await evaluate(`${panel}.getElementById('shelter-check').click();`);
+    }
+    assert.equal(await evaluate(`${state}.swap`),null,JSON.stringify(await diagnose()));
+    let calls=await evaluate('sm.calls');
+    assert.ok(calls.some(c=>c.type==='assign'),'实际完成原换位');
+    assert.ok(calls.every(c=>c.type!=='assign'||!workers.some(p=>p.id===c.residentId)),'工坊原六人均无撤补');
+    assert.equal(calls.filter(c=>['build','upgrade','dig'].includes(c.type)).length,0);
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),1006);
+    await reloadCampaign();await settle('retained material workers survive refresh');
+    calls=await evaluate('sm.calls');assert.ok(calls.every(c=>c.type!=='assign'||!workers.some(p=>p.id===c.residentId)));
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    assert.equal(await evaluate(`${state}.constructionLedger.filter(r=>clock-r.at<86400000).reduce((n,r)=>n+r.parts,0)`),90);
+    // 原快照还需等待最早15件支出满24小时；材料到齐并不授权突破100件滚动预算。
+    await evaluate(`sm.view.state.resources.parts=15;
+      clock=Math.max(clock,Math.min(...${state}.constructionLedger.filter(r=>clock-r.at<86400000).map(r=>r.at))+86400001);
+      sm.view.state.lastSettledAt=clock;${panel}.getElementById('shelter-check').click();`);
+    try{await drive('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===1006)','original dormitory after material and budget recovery',600);}
+    catch(e){throw Error(e.message+' '+JSON.stringify(await diagnose()));}
+    await settle('confirmed dormitory starts after swap completion and material arrival');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===1006).length'),1,JSON.stringify(await diagnose()));
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,720);assert.equal(added[0].parts,15);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('生产升级工坊交接浏览器：十人工坊先保留，餐厅实际开工后接续下一项备料',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-production-handoff.fixture.json'));
+    const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').map(r=>r.id)`);
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    assert.equal(workers.length,10);
+    await settle('funded diner upgrade before ten workshop releases');
+    const calls=await evaluate('sm.calls'),index=calls.findIndex(c=>c.type==='upgrade'&&c.roomId===2);
+    assert.ok(index>=0,JSON.stringify(await diagnose()));
+    assert.ok(calls.slice(0,index).every(c=>c.type!=='assign'||!workers.includes(c.residentId)),'十人不在本项开工前被调走');
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,1200);assert.equal(added[0].parts,30);
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('next material project after diner starts');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===2).length'),1);
+    assert.ok(await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').length>0`),'仍有实际备料需求时继续值班');
+  });
+
+  await t.test('生产升级交接浏览器：窗口打开后食物储备不足，撤销餐厅升级不消费',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-production-handoff.fixture.json'));
+    await drive('!!document.querySelector("[data-construction-dialog]")','production handoff upgrade window');
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    await evaluate(`sm.view.state.resources.food=30;`);
+    await settle('insufficient outage stock cancels diner upgrade');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===2).length'),0,JSON.stringify(await diagnose()));
+    assert.equal((await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id)).length,0);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('生产升级交接浏览器：餐厅开工回执未知时不撤十人工坊，刷新只核对原单',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-production-handoff.fixture.json'));
+    const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').map(r=>({id:r.id,room:r.room}))`);
+    await drive('!!document.querySelector("[data-construction-dialog]")','production handoff before unknown response');
+    await evaluate("sm.mode='unknown';");await drive('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===2)','submit original diner upgrade');
+    const saved=await evaluate(pending),count=await evaluate('sm.calls.length');
+    assert.equal(saved.kind,'upgrade');assert.deepEqual(saved.targets,[2]);
+    await reloadCampaign();await settle('unknown production handoff retained across reload');
+    assert.equal(await evaluate(`${pending}.id`),saved.id);assert.equal(await evaluate('sm.calls.length'),count);
+    for(const person of workers)assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${person.id}).roomId`),person.room);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===2).length'),1);
+  });
+
+  await t.test('施工期间工坊复岗浏览器：餐厅停产储备覆盖首批时十人直接回收，刷新无重复',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-outage-return.fixture.json'));
+    const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').map(r=>r.id)`);
+    assert.equal(workers.length,10);
+    for(let round=0;round<4;round++){
+      await settle('direct material return during funded food outage');
+      if(await evaluate(`${state}.campaign.roles.every(r=>!${JSON.stringify(workers)}.includes(r.id))`))break;
+      await evaluate(`${panel}.getElementById('shelter-check').click();`);
+    }
+    const moves=await evaluate(`sm.calls.filter(c=>c.type==='assign'&&${JSON.stringify(workers)}.includes(c.residentId))`);
+    assert.equal(moves.length,10,JSON.stringify(await diagnose()));assert.equal(new Set(moves.map(c=>c.residentId)).size,10);
+    assert.ok(moves.every(c=>c.roomId!==null),'施工已被库存覆盖，不经休息中转');
+    assert.ok(await evaluate(`sm.view.state.residents.filter(p=>${JSON.stringify(workers)}.includes(p.id)).every(p=>sm.view.state.rooms.some(r=>r.id===p.roomId&&r.type==='scrap'))`));
+    assert.equal(await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type)).length'),0,'原工程额度仍不足，不提前开工');
+    assert.ok(await evaluate('sm.view.state.rooms.find(r=>r.type==="diner").upgradeAt>clock'));
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('direct outage return remains stable after reload');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&${JSON.stringify(workers)}.includes(c.residentId)).length`),10);
+  });
+
+  await t.test('施工期间工坊复岗浏览器：打开居民窗口后停产库存不足，取消直接回收',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-outage-return.fixture.json'));
+    const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').map(r=>r.id)`);
+    await drive('!!document.querySelector("[role=dialog] select")','outage direct return resident window');
+    await evaluate('sm.view.state.resources.food=100;');
+    await settle('outage stock change cancels direct production return');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&${JSON.stringify(workers)}.includes(c.residentId)&&c.roomId!==null).length`),0,
+      JSON.stringify(await diagnose()));
+  });
+
+  await t.test('工坊供电复岗浏览器：一人直接补电，其他工坊不经休息撤补，重评后实际升级',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-power-return.fixture.json'));
+    const workers=await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').map(r=>r.id)`);
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    assert.equal(workers.length,10);
+    for(let round=0;round<4;round++){
+      await settle('direct workshop power return followed by actual upgrade');
+      if(await evaluate('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===2)'))break;
+      await evaluate(`${panel}.getElementById('shelter-check').click();`);
+    }
+    const calls=await evaluate('sm.calls'),index=calls.findIndex(c=>c.type==='upgrade'&&c.roomId===2);
+    assert.ok(index>=0,JSON.stringify(await diagnose()));
+    const moves=calls.slice(0,index).filter(c=>c.type==='assign'&&workers.includes(c.residentId));
+    assert.equal(moves.length,1,JSON.stringify(moves));assert.equal(moves[0].roomId,1);
+    assert.equal(moves[0].residentId,4);
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,1200);assert.equal(added[0].parts,30);
+    assert.equal(await evaluate(pending),null);
+    await reloadCampaign();await settle('power return and upgrade remain confirmed after reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===2).length'),1);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1).length'),1);
+  });
+
+  await t.test('工坊供电复岗浏览器：打开居民窗口后发电空岗被占用，取消原直接补电',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-power-return.fixture.json'));
+    await drive('!!document.querySelector("[role=dialog] select")','direct power return resident window');
+    await evaluate('sm.view.state.residents.find(p=>p.id===37).roomId=1;');
+    await settle('occupied power vacancy cancels original direct assignment');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1).length'),0,
+      JSON.stringify(await diagnose()));
+  });
+
+  await t.test('工坊供电复岗浏览器：调岗回执未知，刷新保留原单，不继续撤人或开工',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-power-return.fixture.json'));
+    await drive('!!document.querySelector("[role=dialog] select")','direct power return before unknown response');
+    await evaluate("sm.mode='unknown';");
+    await drive('sm.calls.some(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1)','submit original power return');
+    const saved=await evaluate(pending),count=await evaluate('sm.calls.length');
+    assert.equal(saved.kind,'assign');assert.deepEqual(saved.targets,[4,1]);
+    await reloadCampaign();await settle('unknown direct power return preserved after reload');
+    assert.equal(await evaluate(`${pending}.id`),saved.id);assert.equal(await evaluate('sm.calls.length'),count);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
+    assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').length`),10);
+  });
+
+  await t.test('工坊扩产原工程绑定浏览器：六人已在岗时建房确认记录餐厅目标，刷新后继续原升级',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-expansion-binding.fixture.json'));
+    assert.equal(await evaluate(`${state}.campaign.materials`),undefined);
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    await settle('confirmed expansion binds its original diner project');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="workshop").length'),1,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),2);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),0,'已有工人全留岗，也必须记录本次扩产目的');
+    const added=(await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id));
+    assert.equal(added.length,1);assert.equal(added[0].scrap,800);assert.equal(added[0].parts,0);
+    await reloadCampaign();await settle('original diner retained during expansion construction');
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),2);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build").length'),1);
+    await evaluate(`clock=Math.max(clock,...sm.view.state.rooms.map(r=>r.builtAt))+1;
+      sm.view.state.lastSettledAt=clock;sm.view.state.resources.parts=30;`);
+    await reloadCampaign();
+    for(let round=0;round<4;round++){
+      await settle('original diner begins after expansion and actual material stock');
+      if(await evaluate('sm.calls.some(c=>c.type==="upgrade"&&c.roomId===2)'))break;
+      await evaluate(`${panel}.getElementById('shelter-check').click();`);
+    }
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===2).length'),1,JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId===1004).length'),0);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('工坊扩产原工程绑定浏览器：开窗后最终等级改变，即使工坊造价相同也撤销旧目标',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-expansion-binding.fixture.json'));
+    await drive('!!document.querySelector("[data-construction-dialog]")','expansion binding before level change');
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    await evaluate(`const input=${panel}.getElementById('shelter-level-target');input.value='13';input.dispatchEvent(new Event('change',{bubbles:true}));`);
+    await settle('changed final target cancels original expansion confirmation');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build").length'),0,JSON.stringify(await diagnose()));
+    assert.equal((await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id)).length,0);
+    assert.equal(await evaluate(`${state}.campaign.materials`),undefined);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('工坊扩产原工程绑定浏览器：开工结果未知只保存原请求目标，不提前绑定或改投宿舍',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-expansion-binding.fixture.json'));
+    await drive('!!document.querySelector("[data-construction-dialog]")','expansion binding build window');
+    await evaluate("sm.mode='unknown';");await drive('sm.calls.some(c=>c.type==="build")','original workshop expansion submitted');
+    const saved=await evaluate(pending),count=await evaluate('sm.calls.length');
+    assert.equal(saved.before.construction.project.materials.id,2);
+    assert.equal(await evaluate(`${state}.campaign.materials`),undefined);
+    await reloadCampaign();await settle('unknown expansion binding across reload');
+    assert.equal(await evaluate(`${pending}.id`),saved.id);assert.equal(await evaluate('sm.calls.length'),count);
+    assert.equal(await evaluate(`${state}.campaign.materials`),undefined);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
+  });
+
+  await t.test('等级投资开工优先浏览器：仓库费用供电具备时先开工，不先触发普通换位循环',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-ready-investment.fixture.json'));
+    await settle('funded level investment before discretionary staff optimization');
+    const calls=await evaluate('sm.calls'),index=calls.findIndex(c=>c.type==='build'&&c.room==='storage');
+    assert.ok(index>=0,JSON.stringify(await diagnose()));
+    assert.ok(calls.slice(0,index).every(c=>c.type!=='assign'),'本项开工前不插入普通调岗');
+    assert.equal(calls.filter(c=>c.type==='build'&&c.room==='storage').length,1);
+    assert.ok(await evaluate(`${state}.constructionLedger.some(r=>r.scrap===240&&r.parts===0)`),'实际建房费用已记录');
+  });
+
+  const employmentPriorityScene=()=>workshopPowerChainScene('arkengine-shelter-employment-priority.fixture.json')+`
+    const employmentBudget=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));
+    employmentBudget.scrapReserve=100;localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(employmentBudget));`;
+  await t.test('高等级供电备料浏览器：持续模式释放工坊后实际补建发电，不反复召回杨初一',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-late-power-material.fixture.json')+`
+      const budget=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));budget.scrapReserve=100;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(budget));
+      localStorage.setItem('arkengine:auto-shelter:level-target:v1','auto');
+      const saved=${state};saved.campaign.materials.finalTarget=14;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(saved));`);
+    const before=await evaluate(`${state}.constructionLedger.map(e=>e.id)`);
+    await settle('late power prerequisite actually built');
+    const calls=await evaluate('sm.calls'),builds=calls.filter(c=>c.type==='build'&&c.room==='power');
+    assert.equal(builds.length,1,JSON.stringify(await diagnose()));
+    assert.equal(calls.filter(c=>c.type==='assign'&&c.residentId===21&&c.roomId===4).length,1);
+    assert.equal(calls.filter(c=>c.type==='assign'&&c.residentId===21&&c.roomId===50).length,0);
+    const entries=(await evaluate(`${state}.constructionLedger`)).filter(e=>!before.includes(e.id));
+    assert.equal(entries.length,1);assert.equal(entries[0].scrap,180);assert.equal(entries[0].parts,0);
+    await reloadCampaign();await settle('power construction preserved on reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="build"&&c.room==="power").length'),1);
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('在途等级接续浏览器：已有净水升级足够升8级时先等待，不在刷新间反复增撤备料人手',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-level-wait.fixture.json')+`
+      const waitBudget=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));
+      waitBudget.scrapReserve=100;localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(waitBudget));`);
+    await settle('await committed water upgrade before ordinary workshop preparation');
+    const count=await evaluate('sm.calls.length');
+    assert.equal(await evaluate('sm.calls.filter(c=>["build","upgrade","dig"].includes(c.type)).length'),0,
+      JSON.stringify(await diagnose()));
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&[50,1010,1013].includes(c.roomId)).length'),0);
+    assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/等待现有工程及新生儿增加等级分/);
+    await reloadCampaign();await settle('stable committed-level wait after refresh');
+    assert.equal(await evaluate('sm.calls.length'),count);assert.equal(await evaluate(pending),null);
+  });
+  await t.test('成年就业接岗浏览器：保留100废料时补电后子女接空岗，刷新不重建补电循环',async()=>{
+    await setupShelter(employmentPriorityScene());await settle('new adult fills vacancy released by power preparation');
+    const moves=await evaluate('sm.calls.filter(c=>c.type==="assign")');
+    assert.deepEqual(moves.slice(0,2).map(c=>[c.residentId,c.roomId]),[[1,1],[43,1004]],JSON.stringify(await diagnose()));
+    assert.equal(moves.filter(c=>c.residentId===1&&c.roomId===1004).length,0);
+    await reloadCampaign();await settle('employment handoff after reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===1&&c.roomId===1).length'),1);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===43&&c.roomId===1004).length'),1);
+    assert.equal(await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1')).scrapReserve`),100);
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('成年就业接岗浏览器：打开子女窗口后空岗被占满，撤销原接岗',async()=>{
+    await setupShelter(employmentPriorityScene()+`sm.view.state.residents.find(p=>p.id===1).roomId=1;`);
+    await drive('!!document.querySelector("[role=dialog] select")','new adult assignment window');
+    await evaluate(`sm.view.state.residents.find(p=>p.id===1).roomId=1004;`);
+    // 只验证当前窗口的撤销；以后可先补电腾出新空岗，再以新状态合法安排该子女。
+    await drive('!document.querySelector("[role=dialog] select")','cancel original new adult window after vacancy fills');
+    assert.equal(await evaluate('sm.calls.length'),0,
+      JSON.stringify(await diagnose()));
+  });
+
+  await t.test('同产量复岗追级浏览器：优先补空回收房形成便宜升级候选，六步内收敛且刷新不重排',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-vacancy-level.fixture.json'));
+    const before=await evaluate(`${state}.constructionLedger.map(r=>r.id)`);
+    // 正式页面每批有操作数上限，第一批五步后仍需下一批完成第六步，不能把批次结束当人员规划收敛。
+    for(let round=0;round<2;round++){
+      await settle('equal output vacancy creates useful upgrade sooner');
+      if(await evaluate('sm.calls.filter(c=>c.type==="assign").length>=6'))break;
+      await evaluate(`${panel}.getElementById('shelter-check').click();`);
+    }
+    const calls=await evaluate('sm.calls'),moves=calls.filter(c=>c.type==='assign');
+    assert.equal(moves.length,6,JSON.stringify(await diagnose()));
+    assert.equal(moves[0].residentId,2);assert.equal(moves[0].roomId,1009);
+    assert.ok(moves.every(c=>c.roomId!==null));
+    assert.equal(await evaluate(`${state}.campaign.materials.id`),1009);
+    assert.equal(calls.filter(c=>['build','upgrade','dig'].includes(c.type)).length,0,'实际零件仍未齐，不提前开工');
+    assert.equal((await evaluate(`${state}.constructionLedger`)).filter(r=>!before.includes(r.id)).length,0);
+    await reloadCampaign();await settle('equal output vacancy remains stable across reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),moves.length);
+    assert.equal(await evaluate(pending),null);
+  });
+
+  await t.test('同产量复岗追级浏览器：打开窗口后原空房停电，取消该直接调岗',async()=>{
+    await setupShelter(workshopPowerChainScene('arkengine-shelter-vacancy-level.fixture.json'));
+    await drive('!!document.querySelector("[role=dialog] select")','equal output vacancy resident window');
+    await evaluate('sm.view.state.rooms.find(r=>r.id===1009).unpowered=true;');
+    await settle('unpowered vacancy cancels original direct assignment');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===2&&c.roomId===1009).length'),0,
+      JSON.stringify(await diagnose()));
+  });
+
   await t.test('工坊新建浏览器：建房只扣一次费，完工前不撤原岗，补员后接续原工程',async()=>{
     await setupShelter(workshopBuildScene());await settle('build additional workshop');
     const room=await evaluate('sm.view.state.rooms.find(r=>r.type==="workshop"&&r.id!==50)');
@@ -320,7 +989,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await reloadCampaign();await settle('keep new material workers across refresh');
     assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${room.id}).length`),2);
     await evaluate(`sm.view.state.resources.parts=30;${panel}.getElementById('shelter-check').click();`);
-    // 四人释放、四人复岗与原工程跨两轮；每次原生窗口仍按既定延时收尾。
+    // 原工程实际开工仍经过原生窗口及费用核对；齐料后不先整组撤补工坊。
     try{await drive(`sm.calls.some(c=>c.type==='upgrade'&&c.roomId===1010)`,'original material project resumes',300);}
     catch(e){throw Error(e.message+' '+JSON.stringify(await diagnose()));}
     await settle('confirm original upgrade');
@@ -352,6 +1021,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await reloadCampaign();await settle('retain two workshops across refresh');
     assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===3000).length`),2);
     assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.role==='workshop').length`),4);
+    const fundedAt=await evaluate('sm.calls.length');
     await evaluate(`sm.view.state.resources.parts=30;${panel}.getElementById('shelter-check').click();`);
     await settle('collect sufficient materials and fund original upgrade');
     try{await drive(`sm.calls.some(c=>c.type==='upgrade'&&c.roomId===1010)`,
@@ -359,10 +1029,18 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     }catch(e){throw Error(e.message+' '+JSON.stringify(await diagnose()));}
     await settle('confirm original upgrade after the per-round action limit');
     assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='upgrade'&&c.roomId===1010).length`),1,JSON.stringify(await diagnose()));
-    for(const worker of workers)assert.ok(await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===${worker.id}&&c.roomId===null)`),
-      '原工程材料齐备后必须释放其值班；后续工程可重新安排');
+    const calls=await evaluate('sm.calls'),upgradeAt=calls.findIndex(c=>c.type==='upgrade'&&c.roomId===1010);
+    assert.ok(calls.slice(fundedAt,upgradeAt).every(c=>c.type!=='assign'||!workers.some(w=>w.id===c.residentId)),
+      '原工程已可开工时不先撤补四人工坊');
     assert.notEqual(await evaluate(`${state}.campaign.materials?.id??null`),1010,'开工后不能残留原材料工程归属');
     assert.equal(await evaluate(pending),null);
+    // 后续需求也已备齐且建设额度不足时，仍必须实际释放原工人，不能永久锁住岗位。
+    await evaluate(`sm.view.state.resources.parts=100;const no=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));
+      no.partsLimit=29;localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(no));
+      ${panel}.getElementById('shelter-check').click();`);
+    await settle('release material workers when no further funded project needs them');
+    for(const worker of workers)assert.notEqual(await evaluate(`sm.view.state.residents.find(p=>p.id===${worker.id}).roomId`),worker.room);
+    assert.ok(await evaluate(`${state}.campaign.roles.every(r=>!${JSON.stringify(workers.map(w=>w.id))}.includes(r.id))`));
   });
   await t.test('多工坊浏览器：第二房供料差一废料时保留原工坊，补齐后才调入新人',async()=>{
     await setupShelter(multiWorkshopScene()+`sm.view.state.resources.scrap=960+6*(31.5-1.1112)+180-1;`);
@@ -628,6 +1306,8 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.ok(worker,JSON.stringify(await diagnose()));assert.equal(material.id,1);
     const original=await evaluate('sm.view.state.residents.map(p=>({id:p.id,room:p.roomId}))');
     assert.equal(original.length,15);
+    const workshopPeople=original.filter(p=>p.room===108).map(p=>p.id);
+    assert.ok(workshopPeople.length>=1&&workshopPeople.length<=2,'现有一格工坊可能已安全补到两人，按战前实际岗位核对恢复');
     await evaluate(`sm.view.state.rooms.find(r=>r.id===900).incident={kind:'raiders',hp:80,maxHp:80};${panel}.getElementById('shelter-check').click();`);
     await drive(`sm.view.state.residents.every(p=>p.roomId===900)&&${state}.campaign.defense.length===15&&!${pending}`,'all fifteen defenders gathered across visits',320);
     assert.deepEqual(await evaluate(`${state}.campaign.materials`),material);
@@ -640,11 +1320,11 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await reloadCampaign();
     await evaluate(`sm.view.state.rooms.find(r=>r.id===4).incident=null;sm.view.state.rooms.find(r=>r.id===108).unpowered=true;
       ${panel}.getElementById('shelter-check').click();`);
-    await drive(`${state}.campaign.defense.length===1&&${state}.campaign.defense[0].id===${worker.id}&&!${pending}`,'other jobs resume while workshop is temporarily unavailable',320);
-    assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${worker.id}).roomId`),4);
+    await drive(`${state}.campaign.defense.length===${workshopPeople.length}&&${state}.campaign.defense.every(d=>${JSON.stringify(workshopPeople)}.includes(d.id))&&!${pending}`,'other jobs resume while workshop is temporarily unavailable',320);
+    assert.ok(await evaluate(`sm.view.state.residents.filter(p=>${JSON.stringify(workshopPeople)}.includes(p.id)).every(p=>p.roomId===4)`));
     assert.deepEqual(await evaluate(`${state}.campaign.materials`),material);
     await evaluate(`sm.view.state.rooms.find(r=>r.id===108).unpowered=false;${panel}.getElementById('shelter-check').click();`);
-    await drive(`${state}.campaign.defense.length===0&&sm.view.state.residents.find(p=>p.id===${worker.id}).roomId===108&&!${pending}`,'original workshop assignment restored',160);
+    await drive(`${state}.campaign.defense.length===0&&sm.view.state.residents.filter(p=>${JSON.stringify(workshopPeople)}.includes(p.id)).every(p=>p.roomId===108)&&!${pending}`,'original workshop assignment restored',160);
     await settle('continue original project after battle');
     assert.deepEqual(await evaluate(`${state}.campaign.materials`),material);
     assert.equal(await evaluate(`sm.calls.filter(c=>['build','upgrade','dig'].includes(c.type)).length`),0);
@@ -677,13 +1357,17 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.ok(await evaluate(`sm.view.state.resources.scrap>=1200`));
     await reloadCampaign();await settle('level materials continue after refresh');
     assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='build'&&c.room==='workshop').length`),1);
-    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${work.room}).length`),1,'refresh must not repeat the staffing cycle');
+    const staffed=await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===${work.room})`);
+    assert.ok(staffed.length>=1&&staffed.length<=2,'现有一格工坊可补满两人');
+    assert.equal(new Set(staffed.map(c=>c.residentId)).size,staffed.length,'刷新不能重复调入同一居民，新增安全补员不算往返');
+    assert.equal(staffed.filter(c=>c.residentId===work.id).length,1);
     assert.ok(!await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===${work.id}&&c.roomId===null)`));
     await evaluate(`sm.view.state.resources.parts=27;sm.view.state.rooms.find(r=>r.id===${work.room}).stored=3;
       ${panel}.getElementById('shelter-check').click();`);
     await settle('level project materials collected and upgrade starts');
     assert.ok(await evaluate(`sm.calls.some(c=>c.type==='upgrade'&&c.roomId===1)`),JSON.stringify(await diagnose()));
-    assert.ok(await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===${work.id}&&c.roomId===null)`));
+    assert.ok(await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===${work.id}&&c.roomId!==${work.room})`),'备料完成必须离开工坊，允许直接接生产岗位');
+    assert.ok(await evaluate(`${state}.campaign.roles.every(r=>r.id!==${work.id}||r.role!=='workshop')`));
     assert.ok(!await evaluate(`sm.calls.some(c=>c.type==='upgrade'&&c.roomId===${work.room})`));
   });
   const dailyScene=`s.daily.picks=[['build',2],['win',5],['collect_scrap',600]].map(([key,target])=>({key,target,reward:{scrap:240,parts:2,points:30}}));
@@ -805,19 +1489,27 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='craft').length`),1);
     }
   });
-  await t.test('持续等级浏览器：默认目标10级及人口限制明确展示，修改后刷新保留且不突破零预算',async()=>{
+  await t.test('持续等级浏览器：默认持续升级，固定终点与持续模式切换后刷新保留且不突破零预算',async()=>{
     await setupShelter(scene({},`sm.view=${JSON.stringify(levelGateView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
       localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:0,partsLimit:0,scrapReserve:0,partsReserve:0}));`));
     await settle('level goal shown under zero budget');
-    assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/4 → 10 级/);
+    assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/持续升级：4 → 5 级/);
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-level-continuous').checked`),true);
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-level-target').disabled`),true);
     const developmentText=await evaluate(`${panel}.getElementById('shelter-development').textContent`);
     assert.match(developmentText,/目标 14，新配对受限/);
     assert.match(developmentText,/自动防守未开启，请先确认手动防守安排或开启并核对留守/);
     assert.equal(await evaluate('sm.calls.length'),0);
-    await evaluate(`const input=${panel}.getElementById('shelter-level-target');input.value='6';input.dispatchEvent(new Event('change',{bubbles:true}));`);
+    await evaluate(`const mode=${panel}.getElementById('shelter-level-continuous');mode.checked=false;mode.dispatchEvent(new Event('change',{bubbles:true}));
+      const input=${panel}.getElementById('shelter-level-target');input.value='6';input.dispatchEvent(new Event('change',{bubbles:true}));`);
     await reloadCampaign();await settle('custom level target retained');
     assert.equal(await evaluate(`${panel}.getElementById('shelter-level-target').value`),'6');
     assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/4 → 6 级/);
+    assert.equal(await evaluate('sm.calls.length'),0);
+    await evaluate(`const mode=${panel}.getElementById('shelter-level-continuous');mode.checked=true;mode.dispatchEvent(new Event('change',{bubbles:true}));`);
+    await reloadCampaign();await settle('continuous level target retained');
+    assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:level-target:v1')`),'auto');
+    assert.match(await evaluate(`${panel}.getElementById('shelter-development').textContent`),/持续升级：4 → 5 级/);
     assert.equal(await evaluate('sm.calls.length'),0);
   });
   await t.test('实际阶段浏览器：17人口在建工程等到5级后自动生成6级计划，不重复提交现有升级',async()=>{

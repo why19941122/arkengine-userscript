@@ -443,6 +443,22 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     const snapshots=stockSnapshotsFromLog({events});assert.equal(snapshots.length,1);
     assert.equal(snapshots[0].view.stocks.length,67);assert.equal(snapshots[0].view.ticks.length,67*12);
   });
+  await t.test('股市详细诊断浏览器：普通模式记录67只股票未买原因及关联分片，不增加下单',async()=>{
+    await setupStock(settings+`
+      km.view.stocks=Array.from({length:67},(_,i)=>({id:i+1,modelName:'模型'.repeat(80)+i,priceCents:1050,volume24h:1000}));
+      km.view.ticks=km.view.stocks.flatMap(s=>[1000,1010,1020,1030,1040,1050].map((priceCents,i)=>({stockId:s.id,priceCents,createdAt:new Date(clock-(5-i)*300000).toISOString()})));`);
+    await drive(done,'detailed no-buy evaluation');assert.equal(await evaluate('km.calls.length'),0);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
+    assert.equal(events.filter(e=>e.type==='stock-diagnostic-error').length,0);
+    const summary=events.filter(e=>e.type==='stock-decision');assert.equal(summary.length,1);
+    const detail=events.filter(e=>e.type==='stock-decision-detail'),rows=detail.flatMap(e=>e.data.rows);
+    assert.equal(detail.length,summary[0].data.totalParts);assert.ok(detail.length>1);
+    assert.ok(detail.every(e=>!e.data.truncated&&e.data.diagnosticId===summary[0].data.diagnosticId));
+    assert.equal(new Set(rows.map(r=>r.stockId)).size,67);assert.equal(rows.length,67);
+    assert.ok(rows.every(r=>r.buy.blockers.includes('below-fee-threshold')&&r.trend.samples===6));
+    assert.equal(summary[0].data.selected,null);assert.equal(summary[0].data.policy.observeOnly,false);
+    assert.equal(events.filter(e=>e.type==='stock-check').at(-1).data.diagnosticId,summary[0].data.diagnosticId);
+  });
   await t.test('股市慢请求修复：提交前余额17秒返回后继续买入，回执和持仓均确认',async()=>{
     await setupStock(settings);
     await drive(`Number(document.querySelector('[aria-label="模型甲 交易数量"]').value)>1`,'quantity filled');

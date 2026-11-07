@@ -9,8 +9,10 @@ const buildTable=source.match(/const shelterBuildRules = [\s\S]*?;/)[0];
 const functions=source.slice(source.indexOf('  function shelterWorkerRate('),source.indexOf('  function readShelter('));
 const actions=source.slice(source.indexOf('  function shelterRequestAction('),source.indexOf('  function shelterSubmit('));
 const construction=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n${actions}\n({spent:shelterConstructionSpent,allow:shelterConstructionAllowance,proof:shelterConstructionProof,confirmed:shelterConstructionConfirmed,observation:typeof shelterDigObservation==='function'?shelterDigObservation:null,timing:typeof shelterDigTiming==='function'?shelterDigTiming:null});`,{
+  objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
   shelterResources:{scrap:'废料',parts:'零件'}});
 const {project,model,future,plan,render,proof,rewardProof,rewardConfirmed,periodCurrent,operations,explorers,exploreProof,exploreConfirmed,pendingWait,released,without,safe}=vm.runInNewContext(`${table}\n${buildTable}\n${functions}\n({project:shelterStoredProjection,model:shelterModel,future:shelterFutureCollection,plan:shelterDevelopmentPlan,render:shelterDevelopmentText,proof:shelterCollectProof,rewardProof:shelterRewardProof,rewardConfirmed:shelterRewardConfirmed,periodCurrent:shelterRewardPeriodCurrent,operations:shelterOperations,explorers:shelterExplorerCandidates,exploreProof:shelterExplorerProof,exploreConfirmed:shelterExplorerConfirmed,pendingWait:shelterPendingWait,released:shelterExplorerReleased,without:shelterProductionWithout,safe:shelterDepartureSafe});`,{
+  objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
   shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const now=2000000000;
 
@@ -199,7 +201,8 @@ test('人员离岗安全：最终产量充足不代表第一步安全，未来�
 test('发展规划：现有空位优先；一格扩建按已有同类格数涨价，不强推836废料下挖',()=>{
   const {state:s,view}=developmentScene();s.resources.scrap=269;
   const p=plan(model(view),14),house=p.candidates.find(c=>c.kind==='build'&&c.type==='quarters');
-  assert.equal(house.cost.scrap,192);assert.equal(house.floor,1);assert.equal(house.col,6);assert.equal(house.hours,1/6);
+  assert.equal(house.cost.scrap,192);assert.equal(house.floor,2);assert.equal(house.col,5);assert.equal(house.hours,1/6);
+  assert.equal(s.rooms.find(r=>r.id===4).col+s.rooms.find(r=>r.id===4).width,6,'第一层剩余空间留给一级回收站扩宽');
   assert.equal(p.candidates.some(c=>c.kind==='dig'),false);assert.match(render(p),/836 废料/);assert.match(render(p),/不加快培养感情/);
   s.rooms.find(r=>r.type==='quarters').width=2;
   const merge=plan(model(view),14).candidates.find(c=>c.kind==='build'&&c.type==='quarters');

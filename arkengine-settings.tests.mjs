@@ -93,7 +93,7 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     for(const previous of [14,28]){
       await setupShelter(`${paused}localStorage.setItem('arkengine:auto-shelter:population:v1','${previous}');`);
       assert.equal(await evaluate(`${panel}.getElementById('shelter-population').value`),String(previous));
-      assert.match(await evaluate(`${panel}.getElementById('shelter-preset-summary').textContent`),/人口阶段目标 30.*下一批人口/);
+      assert.match(await evaluate(`${panel}.getElementById('shelter-preset-summary').textContent`),/人口阶段目标 30.*开启持续分阶段增长.*逐对核对床位与口粮/);
       await click('shelter-preset');await pulse(10000);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
       assert.deepEqual(await evaluate('sm.calls'),[],'the preset must still respect the paused main switch');

@@ -13,7 +13,7 @@ const implementation=[declarations,segment('  function shelterWorkerRate(','  fu
   segment('  function recordShelterCampaign(','  function shelterFormValue('),
   segment('  function shelterConstructionChoice(','  function shelterBuildTitle(')].join('\n');
 
-test('连续发展模拟：固定15人口、满针不反复扩仓，自产零件完成四项升级后明确人口限制',()=>{
+test('连续发展模拟：固定15人口、满针不反复扩仓，自产四项升级后保留关闭新建的约束',()=>{
   // 此场景只授权最初的一间工坊，随后关闭新建，专验四项已有工程的连续备料。
   // 多工坊扩产另有完整人口追级场覆盖；这里不模拟随机来袭/生育/奖励，不代表实号耗时。
   const v=upperStageView(Date.parse('2026-11-06T00:00:00Z')),s=v.state,start=v.serverTime;
@@ -96,8 +96,11 @@ test('连续发展模拟：固定15人口、满针不反复扩仓，自产零件
   assert.equal(v.progress.score,104);assert.equal(v.progress.level,6);
   const m=api.model(v),next=api.development(m,14,api.campaign(m),10);
   assert.equal(next.levelProgress.targetLevel,7);assert.notEqual(next.next.project?.id,1);
-  assert.equal(next.next.status,'blocked');assert.equal(next.next.kind,'level');
-  assert.match(next.next.reason,/还差 7 分/);assert.match(next.next.reason,/15.*目标 14.*19 人/);
+  assert.equal(next.next.status,'ready');assert.equal(next.next.project.type,'storage');
+  assert.equal(next.next.project.levelInvestment,true);assert.equal(context.shelterConstruction.build,false);
+  assert.equal(api.construction(m),null,'等级投资不能绕过已经关闭的新建开关');
+  assert.equal(next.levelProgress.targetScore-next.levelProgress.committed,7);
+  assert.match(next.populationAdvice,/15.*目标 14.*19 人/);
   assert.match(next.populationAdvice,/自动防守未开启/);assert.doesNotMatch(next.populationAdvice,/可评估调到/);
   assert.ok(v.serverTime>start+24*3600000);
   assert.equal(s.residents.length,15);assert.equal(context.shelterPopulationTarget,14);

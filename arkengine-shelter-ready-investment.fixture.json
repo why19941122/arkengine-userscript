@@ -1,0 +1,1875 @@
+{
+  "sourceSHA256": "14a10f5ec4f183905163da876e292e3e1e0f667fda8adbb59a55ecf1bdf55abd",
+  "view": {
+    "vaultNo": 77,
+    "serverTime": 1794916200000,
+    "progress": {
+      "level": 9,
+      "score": 193,
+      "next": 213
+    },
+    "switches": {
+      "frozen": false
+    },
+    "nameRequired": false,
+    "drops": {
+      "enabled": true,
+      "minMinutes": 360,
+      "tierPermille": [
+        50,
+        70
+      ],
+      "perUserDaily": 2
+    },
+    "env": {
+      "week": "2026-W45",
+      "events": [],
+      "quests": [
+        {
+          "id": "w1",
+          "title": "旧地铁站",
+          "difficulty": 1,
+          "stages": 3,
+          "stageMinutes": 60,
+          "recommendedLevel": 1,
+          "rewards": {
+            "scrap": 30,
+            "parts": 1,
+            "itemTier": null,
+            "seasonPoints": 20
+          }
+        }
+      ]
+    },
+    "state": {
+      "lastSettledAt": 1794916200000,
+      "depth": 7,
+      "digging": null,
+      "resources": {
+        "scrap": 11927.320699999973,
+        "parts": 2.5,
+        "power": 4339.750033333347,
+        "food": 2565.2500000000005,
+        "water": 2862.2500000000005,
+        "stimpak": 9
+      },
+      "stats": {
+        "collected": 0
+      },
+      "legacy": {
+        "perks": {}
+      },
+      "items": [],
+      "births": [],
+      "achievements": [],
+      "explorers": [],
+      "quests": [],
+      "weekly": {
+        "completed": []
+      },
+      "daily": {
+        "day": "2026-10-10",
+        "claimed": []
+      },
+      "season": {
+        "month": "2026-10",
+        "points": 0,
+        "claimedFree": []
+      },
+      "residents": [
+        {
+          "id": 1,
+          "name": "居民1",
+          "roomId": 1027,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794018000000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 2,
+          "name": "居民2",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794024600000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 3,
+          "name": "居民3",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794018000000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 4,
+          "name": "居民4",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 5,
+          "name": "居民5",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 6,
+          "name": "居民6",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 7,
+          "name": "居民7",
+          "roomId": 1001,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 8,
+          "name": "居民8",
+          "roomId": 1001,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 9,
+          "name": "居民9",
+          "roomId": 1002,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 10,
+          "name": "居民10",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794024600000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 11,
+          "name": "居民11",
+          "roomId": 1006,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794026400000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 12,
+          "name": "居民12",
+          "roomId": 1006,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794026400000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 13,
+          "name": "居民13",
+          "roomId": 1006,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794039600000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 14,
+          "name": "居民14",
+          "roomId": 1006,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 1794039600000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 21,
+          "name": "杨初一",
+          "roomId": 1014,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 35,
+          "name": "居民16",
+          "roomId": 1,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 36,
+          "name": "居民17",
+          "roomId": 1004,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 0,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 5,
+            "per": 5,
+            "end": 5,
+            "cha": 5,
+            "int": 5,
+            "agi": 5,
+            "lck": 5
+          },
+          "parents": [],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 37,
+          "name": "子女38",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793952000000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 38,
+          "name": "子女39",
+          "roomId": 1016,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793959800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 39,
+          "name": "子女40",
+          "roomId": 1016,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793960400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 40,
+          "name": "子女41",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793981400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 41,
+          "name": "子女42",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793989200000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 42,
+          "name": "子女43",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793995800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 43,
+          "name": "子女44",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1793997600000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            11,
+            12
+          ],
+          "romance": null,
+          "familyCooldownUntil": 1794028800000,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 44,
+          "name": "子女45",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794010800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 45,
+          "name": "子女46",
+          "roomId": 3,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794018000000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            1,
+            3
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 46,
+          "name": "子女47",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794024600000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            2,
+            10
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 47,
+          "name": "子女48",
+          "roomId": 4,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794026400000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            11,
+            12
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 48,
+          "name": "子女49",
+          "roomId": 2,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794028800000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 3,
+            "per": 3,
+            "end": 3,
+            "cha": 3,
+            "int": 3,
+            "agi": 3,
+            "lck": 3
+          },
+          "parents": [
+            39,
+            43
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        },
+        {
+          "id": 49,
+          "name": "子女50",
+          "roomId": 1002,
+          "away": null,
+          "deadAt": null,
+          "adultAt": 1794039600000,
+          "xp": 0,
+          "happiness": 75,
+          "hp": 100,
+          "stats": {
+            "str": 4,
+            "per": 4,
+            "end": 4,
+            "cha": 4,
+            "int": 4,
+            "agi": 4,
+            "lck": 4
+          },
+          "parents": [
+            13,
+            14
+          ],
+          "romance": null,
+          "familyCooldownUntil": 0,
+          "weaponId": null,
+          "outfitId": null
+        }
+      ],
+      "rooms": [
+        {
+          "id": 1,
+          "type": "power",
+          "col": 2,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 55.44000000000049,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 2,
+          "type": "diner",
+          "col": 4,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 41.447999999997776,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 3,
+          "type": "water",
+          "col": 6,
+          "floor": 1,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 61.22400000000111,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 4,
+          "type": "scrap",
+          "col": 4,
+          "floor": 2,
+          "width": 3,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 5.060999999998586,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 5,
+          "type": "quarters",
+          "col": 2,
+          "floor": 2,
+          "width": 2,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 6,
+          "type": "quarters",
+          "col": 2,
+          "floor": 3,
+          "width": 3,
+          "level": 3,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 8,
+          "type": "training",
+          "col": 7,
+          "floor": 2,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false,
+          "trainStat": "agi"
+        },
+        {
+          "id": 20,
+          "type": "elevator",
+          "col": 1,
+          "floor": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 21,
+          "type": "elevator",
+          "col": 1,
+          "floor": 2,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 22,
+          "type": "elevator",
+          "col": 1,
+          "floor": 3,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 23,
+          "type": "elevator",
+          "col": 1,
+          "floor": 4,
+          "width": 1,
+          "level": 1,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 50,
+          "type": "workshop",
+          "col": 5,
+          "floor": 3,
+          "width": 1,
+          "level": 2,
+          "builtAt": 0,
+          "upgradeAt": null,
+          "stored": 3.841199999999962,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1000,
+          "type": "quarters",
+          "floor": 3,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793931600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1001,
+          "type": "scrap",
+          "floor": 3,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793952600000,
+          "upgradeAt": null,
+          "stored": 23.687999999999803,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1002,
+          "type": "scrap",
+          "floor": 4,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793960400000,
+          "upgradeAt": null,
+          "stored": 43.05599999999935,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1003,
+          "type": "quarters",
+          "floor": 4,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793968800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1004,
+          "type": "scrap",
+          "floor": 4,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793982000000,
+          "upgradeAt": null,
+          "stored": 45.095999999999506,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1005,
+          "type": "quarters",
+          "floor": 4,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1793996400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1006,
+          "type": "scrap",
+          "floor": 4,
+          "col": 6,
+          "width": 2,
+          "level": 3,
+          "builtAt": 1794028800000,
+          "upgradeAt": null,
+          "stored": 14.015999999999211,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1008,
+          "type": "elevator",
+          "floor": 5,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794361200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1009,
+          "type": "storage",
+          "floor": 5,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794361800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1010,
+          "type": "workshop",
+          "floor": 5,
+          "col": 3,
+          "width": 3,
+          "level": 1,
+          "builtAt": 1794410400000,
+          "upgradeAt": null,
+          "stored": 3.9599999999999977,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1013,
+          "type": "workshop",
+          "floor": 5,
+          "col": 6,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794412200000,
+          "upgradeAt": null,
+          "stored": 0.3120000000000027,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1014,
+          "type": "scrap",
+          "floor": 5,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794423600000,
+          "upgradeAt": null,
+          "stored": 25.079999999999703,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1015,
+          "type": "elevator",
+          "floor": 6,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794560400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1016,
+          "type": "scrap",
+          "floor": 6,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794562200000,
+          "upgradeAt": null,
+          "stored": 57.54000000000023,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1017,
+          "type": "storage",
+          "floor": 6,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794657600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1018,
+          "type": "storage",
+          "floor": 6,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794682200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1019,
+          "type": "storage",
+          "floor": 6,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794706200000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1020,
+          "type": "storage",
+          "floor": 6,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794730800000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1021,
+          "type": "storage",
+          "floor": 6,
+          "col": 7,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794755400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1022,
+          "type": "elevator",
+          "floor": 7,
+          "col": 1,
+          "width": 1,
+          "level": 1,
+          "builtAt": 1794800400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1023,
+          "type": "storage",
+          "floor": 7,
+          "col": 2,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794801000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1024,
+          "type": "storage",
+          "floor": 7,
+          "col": 3,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794821400000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1025,
+          "type": "storage",
+          "floor": 7,
+          "col": 4,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794846000000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1026,
+          "type": "storage",
+          "floor": 7,
+          "col": 5,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794870600000,
+          "upgradeAt": null,
+          "stored": 0,
+          "incident": null,
+          "unpowered": false
+        },
+        {
+          "id": 1027,
+          "type": "power",
+          "floor": 7,
+          "col": 6,
+          "width": 1,
+          "level": 3,
+          "builtAt": 1794892200000,
+          "upgradeAt": null,
+          "stored": 43.20000000000001,
+          "incident": null,
+          "unpowered": false
+        }
+      ]
+    }
+  },
+  "state": {
+    "campaign": {
+      "roles": [],
+      "defense": [],
+      "defenseManual": [],
+      "trips": [],
+      "attempts": [],
+      "heals": [],
+      "trainingRest": []
+    },
+    "families": [
+      {
+        "a": 1,
+        "b": 3,
+        "room": 6
+      },
+      {
+        "a": 2,
+        "b": 10,
+        "room": 1000
+      },
+      {
+        "a": 11,
+        "b": 12,
+        "room": 1003
+      },
+      {
+        "a": 13,
+        "b": 14,
+        "room": 5
+      },
+      {
+        "a": 39,
+        "b": 43,
+        "room": 1005
+      }
+    ],
+    "swap": null,
+    "constructionLedger": [
+      {
+        "id": "1793923200000",
+        "at": 1793923200000,
+        "scrap": 500,
+        "parts": 0
+      },
+      {
+        "id": "1793923800000",
+        "at": 1793923800000,
+        "scrap": 500,
+        "parts": 0
+      },
+      {
+        "id": "1793931000000",
+        "at": 1793931000000,
+        "scrap": 240,
+        "parts": 0
+      },
+      {
+        "id": "1793952000000",
+        "at": 1793952000000,
+        "scrap": 128,
+        "parts": 0
+      },
+      {
+        "id": "1793952600000",
+        "at": 1793952600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1793956200000",
+        "at": 1793956200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1793959800000",
+        "at": 1793959800000,
+        "scrap": 144,
+        "parts": 0
+      },
+      {
+        "id": "1793960400000",
+        "at": 1793960400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1793968200000",
+        "at": 1793968200000,
+        "scrap": 264,
+        "parts": 0
+      },
+      {
+        "id": "1793981400000",
+        "at": 1793981400000,
+        "scrap": 160,
+        "parts": 0
+      },
+      {
+        "id": "1793995800000",
+        "at": 1793995800000,
+        "scrap": 289,
+        "parts": 0
+      },
+      {
+        "id": "1794010800000",
+        "at": 1794010800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794027600000",
+        "at": 1794027600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794028200000",
+        "at": 1794028200000,
+        "scrap": 176,
+        "parts": 0
+      },
+      {
+        "id": "1794078600000",
+        "at": 1794078600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794079200000",
+        "at": 1794079200000,
+        "scrap": 193,
+        "parts": 0
+      },
+      {
+        "id": "1794079800000",
+        "at": 1794079800000,
+        "scrap": 400,
+        "parts": 0
+      },
+      {
+        "id": "1794087000000",
+        "at": 1794087000000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794089400000",
+        "at": 1794089400000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794090600000",
+        "at": 1794090600000,
+        "scrap": 300,
+        "parts": 0
+      },
+      {
+        "id": "1794093000000",
+        "at": 1794093000000,
+        "scrap": 600,
+        "parts": 0
+      },
+      {
+        "id": "1794133800000",
+        "at": 1794133800000,
+        "scrap": 1250,
+        "parts": 0
+      },
+      {
+        "id": "1794195000000",
+        "at": 1794195000000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794276000000",
+        "at": 1794276000000,
+        "scrap": 960,
+        "parts": 30
+      },
+      {
+        "id": "1794339600000",
+        "at": 1794339600000,
+        "scrap": 1143,
+        "parts": 0
+      },
+      {
+        "id": "1794361200000",
+        "at": 1794361200000,
+        "scrap": 80,
+        "parts": 0
+      },
+      {
+        "id": "1794377400000",
+        "at": 1794377400000,
+        "scrap": 1440,
+        "parts": 45
+      },
+      {
+        "id": "1794409800000",
+        "at": 1794409800000,
+        "scrap": 600,
+        "parts": 0
+      },
+      {
+        "id": "1794410400000",
+        "at": 1794410400000,
+        "scrap": 700,
+        "parts": 0
+      },
+      {
+        "id": "1794411000000",
+        "at": 1794411000000,
+        "scrap": 800,
+        "parts": 0
+      },
+      {
+        "id": "1794411600000",
+        "at": 1794411600000,
+        "scrap": 900,
+        "parts": 0
+      },
+      {
+        "id": "1794422400000",
+        "at": 1794422400000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794423000000",
+        "at": 1794423000000,
+        "scrap": 208,
+        "parts": 0
+      },
+      {
+        "id": "1794423600000",
+        "at": 1794423600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794427200000",
+        "at": 1794427200000,
+        "scrap": 900,
+        "parts": 0
+      },
+      {
+        "id": "1794438000000",
+        "at": 1794438000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794451800000",
+        "at": 1794451800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794463800000",
+        "at": 1794463800000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794474600000",
+        "at": 1794474600000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794484800000",
+        "at": 1794484800000,
+        "scrap": 720,
+        "parts": 15
+      },
+      {
+        "id": "1794508800000",
+        "at": 1794508800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794538200000",
+        "at": 1794538200000,
+        "scrap": 1440,
+        "parts": 30
+      },
+      {
+        "id": "1794538800000",
+        "at": 1794538800000,
+        "scrap": 1475,
+        "parts": 0
+      },
+      {
+        "id": "1794561000000",
+        "at": 1794561000000,
+        "scrap": 1200,
+        "parts": 30
+      },
+      {
+        "id": "1794561600000",
+        "at": 1794561600000,
+        "scrap": 224,
+        "parts": 0
+      },
+      {
+        "id": "1794624600000",
+        "at": 1794624600000,
+        "scrap": 2160,
+        "parts": 45
+      },
+      {
+        "id": "1794625200000",
+        "at": 1794625200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794635400000",
+        "at": 1794635400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794657000000",
+        "at": 1794657000000,
+        "scrap": 96,
+        "parts": 0
+      },
+      {
+        "id": "1794657600000",
+        "at": 1794657600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794670800000",
+        "at": 1794670800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794681600000",
+        "at": 1794681600000,
+        "scrap": 112,
+        "parts": 0
+      },
+      {
+        "id": "1794682200000",
+        "at": 1794682200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794694800000",
+        "at": 1794694800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794705600000",
+        "at": 1794705600000,
+        "scrap": 128,
+        "parts": 0
+      },
+      {
+        "id": "1794706200000",
+        "at": 1794706200000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794719400000",
+        "at": 1794719400000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794730200000",
+        "at": 1794730200000,
+        "scrap": 144,
+        "parts": 0
+      },
+      {
+        "id": "1794730800000",
+        "at": 1794730800000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794744000000",
+        "at": 1794744000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794754800000",
+        "at": 1794754800000,
+        "scrap": 160,
+        "parts": 0
+      },
+      {
+        "id": "1794755400000",
+        "at": 1794755400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794768000000",
+        "at": 1794768000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794778800000",
+        "at": 1794778800000,
+        "scrap": 1830,
+        "parts": 0
+      },
+      {
+        "id": "1794800400000",
+        "at": 1794800400000,
+        "scrap": 176,
+        "parts": 0
+      },
+      {
+        "id": "1794801000000",
+        "at": 1794801000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794810000000",
+        "at": 1794810000000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794820800000",
+        "at": 1794820800000,
+        "scrap": 193,
+        "parts": 0
+      },
+      {
+        "id": "1794821400000",
+        "at": 1794821400000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794834600000",
+        "at": 1794834600000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794845400000",
+        "at": 1794845400000,
+        "scrap": 208,
+        "parts": 0
+      },
+      {
+        "id": "1794846000000",
+        "at": 1794846000000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794859200000",
+        "at": 1794859200000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794870000000",
+        "at": 1794870000000,
+        "scrap": 224,
+        "parts": 0
+      },
+      {
+        "id": "1794870600000",
+        "at": 1794870600000,
+        "scrap": 200,
+        "parts": 0
+      },
+      {
+        "id": "1794880800000",
+        "at": 1794880800000,
+        "scrap": 480,
+        "parts": 15
+      },
+      {
+        "id": "1794891600000",
+        "at": 1794891600000,
+        "scrap": 140,
+        "parts": 0
+      },
+      {
+        "id": "1794892200000",
+        "at": 1794892200000,
+        "scrap": 250,
+        "parts": 0
+      },
+      {
+        "id": "1794905400000",
+        "at": 1794905400000,
+        "scrap": 600,
+        "parts": 15
+      }
+    ],
+    "pair": null
+  }
+}

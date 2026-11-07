@@ -5,7 +5,7 @@ import {createHash} from 'node:crypto';
 import vm from 'node:vm';
 import {upperStageView,workshopChurnView} from './arkengine-shelter-campaign.fixture.mjs';
 
-const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
+const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const sourceSHA256=createHash('sha256').update(source).digest('hex');
 const segment=(from,to)=>source.slice(source.indexOf(from),source.indexOf(to));
 const declarations=['shelterRooms','shelterBuildRules','campaignDefaults'].map(n=>source.match(new RegExp(`const ${n}\\s*=[^;]*;`))[0]).join('\n');
@@ -21,11 +21,23 @@ const productionRules={power:['str','power',12,30],diner:['agi','food',8,25],wat
   scrap:['end','scrap',8,30],medbay:['int','stimpak',.5,2],workshop:['int','parts',.6,3]},mult=[0,1,1.5,2.1];
 const stepMs=600000;
 
-function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0,finishLevel=0){
-  const v=(growth?workshopChurnView:upperStageView)(Date.parse('2026-11-06T00:00:00Z')),s=v.state,start=v.serverTime;
-  const developmentTarget=finishLevel||10;
+function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0,finishLevel=0,scrapReserve=0,continuous=false,deepSupport=false,progressive=false,populationSeed='arkengine-shelter-population-stage.fixture.json'){
+  const seed=progressive&&populationSeed?JSON.parse(readFileSync(new URL(populationSeed,import.meta.url),'utf8')):null;
+  const v=seed?.view||(growth?workshopChurnView:upperStageView)(Date.parse('2026-11-06T00:00:00Z')),s=v.state,start=v.serverTime;
+  const initialPopulation=s.residents.length,populationFinish=progressive?40:30,stages=[];
+  const initialLevel=v.progress.level;
+  const developmentTarget=continuous?'auto':finishLevel||10;
   if(!growth)s.resources.stimpak=60;
-  if(growth)s.residents.find(p=>p.id===35).parents=[13,14];
+  if(growth&&!seed)s.residents.find(p=>p.id===35).parents=[13,14];
+  if(deepSupport){
+    // 独立前置场景：已有人工医务室值班和留守武器；不是脚本购买装备或凭空获得奖励。
+    // 原无医疗/武器场已真实停在第20层防护门槛，失败记录保留，不能用绕过保护来验证16级。
+    s.rooms.push({...s.rooms[0],id:901,type:'medbay',floor:4,col:2,width:1,level:1,stored:0});
+    s.residents.find(p=>p.id===36).roomId=901;
+    s.items.push({id:71,slot:'weapon',tier:1,name:'已有留守武器',damage:[20,20]});
+    s.residents.find(p=>p.id===7).weaponId=71;
+    v.progress.score++;
+  }
   if(mixed&&!growth){
     // Independent scenario input: seventeen adults and one pregnancy already in progress, not new automatic population authority.
     for(const id of [16,17])s.residents.push({...structuredClone(s.residents[0]),id,name:`居民${id}`,roomId:null});
@@ -37,17 +49,18 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
   const context={objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
     shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'},
     shelterStaffMode:growth?'population':'production',shelterStaffHold:'',shelterOptimize:growth,shelterGear:false,shelterPopulationTarget:growth?30:14,shelterLevelTarget:developmentTarget,
-    shelterConstruction:{build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0},
+    shelterConstruction:{build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve,partsReserve:0},
     shelterState:{campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]}},shelterPending:null,shelterRead:null,
     shelterCaravanNote:'',shelterConstructionNote:'',shelterStaffNote:'',shelterPopulationNote:'',shelterSocialNote:'',
     Date:class extends Date{constructor(...args){super(...(args.length?args:[v.serverTime]));}static now(){return v.serverTime;}},
     crypto:{randomUUID:()=>String(v.serverTime)},log:{add:()=>{}},workshopAutomatic:()=>true,shelterRaidTiming:()=>{}};
   context.saveShelter=x=>context.shelterState=x;
   context.holdShelterStaff=message=>{context.shelterStaffHold=message;context.shelterState.swap=null;};
-  if(growth){context.shelterState.families=[{a:13,b:14,room:5}];context.shelterState.campaign.roles=[{id:21,room:50,role:'workshop',at:start}];}
+  if(seed)context.shelterState=seed.state;
+  else if(growth){context.shelterState.families=[{a:13,b:14,room:5}];context.shelterState.campaign.roles=[{id:21,room:50,role:'workshop',at:start}];}
   const api=vm.runInNewContext(`${implementation}\nshelterCampaign={...campaignDefaults,defense:${mixed},medical:${mixed},dailyGoals:${mixed}};
     ({model:shelterModel,staff:shelterStaffPlan,campaign:shelterCampaignSchedule,record:recordShelterCampaign,
-      construction:shelterConstructionChoice,development:shelterDevelopmentPlan,valid:validCampaignRecord,
+      construction:shelterConstructionChoice,materials:shelterConstructionMaterials,development:shelterDevelopmentPlan,valid:validCampaignRecord,populationStage:shelterPopulationStage,
       daily:shelterDailyGoals,reconcile:reconcileShelterDefense})`,context);
   const initialScore=v.progress.score,levels=[{level:v.progress.level,score:initialScore,at:start}],
     collected=Object.fromEntries(Object.keys(initial).map(k=>[k,0])),used={power:0,food:0,water:0,scrap:0,parts:0,stimpak:0},
@@ -69,8 +82,18 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
   };
   const maxHp=p=>Math.round(100+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*(2+.5*p.stats.end));
   let raid=null;
-  let nextId=1000,completedBuilds=0,completedUpgrades=0,completedDigs=0,feedSpent=0,partsMade=0,scoreGain=0;
-  for(let tick=0;tick<2000*6&&(growth?targetAt===null||v.serverTime<targetAt+12*3600000||v.progress.level<finishLevel:v.progress.level<10);tick++){
+  let nextId=Math.max(999,...s.rooms.map(r=>r.id))+1,completedBuilds=0,completedUpgrades=0,completedDigs=0,feedSpent=0,partsMade=0,scoreGain=0;
+  // 人口就业可能早于首个自然合并；继续验证到已有合并覆盖，不能把更早就业误当失败或为凑覆盖强制建房。
+  for(let tick=0;tick<2000*6&&(growth?progressive?
+      targetAt===null||!api.populationStage(api.model(v),context.shelterPopulationTarget,true,context.shelterState,null).ready:
+      targetAt===null||v.serverTime<targetAt+12*3600000||v.progress.level<finishLevel||!merges.length:v.progress.level<10);tick++){
+    if(progressive){
+      const stage=api.populationStage(api.model(v),context.shelterPopulationTarget,true,context.shelterState,null);
+      if(stage.ready){
+        assert.equal(stage.target,30,'本场只执行30→40，40人全部成年就业后另核对下一阶段50');
+        context.shelterPopulationTarget=stage.nextTarget;stages.push({at:v.serverTime,from:stage.target,to:stage.nextTarget});
+      }
+    }
     if(growth){
       context.shelterStaffHold='';
       for(const b of [...s.births])if(b.dueAt<=v.serverTime){
@@ -180,6 +203,12 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
     const c=api.construction(api.model(v));
     if(c){
       assert.ok(!s.rooms.some(r=>r.incident),'construction must wait until an incident has ended');
+      if(c.kind==='dig'&&c.floor>=20){
+        assert.ok(deepSupport,'深层验证必须明确提供医疗与武器前置，不能默认存在');
+        assert.ok(s.resources.stimpak>=1);
+        assert.ok(s.residents.some(p=>p.roomId===901&&p.hp>=.9*maxHp(p)&&p.away===null));
+        assert.ok(s.residents.some(p=>p.weaponId===71&&p.hp>=.9*maxHp(p)&&p.away===null));
+      }
       const room=s.rooms.find(r=>r.id===c.id);
       const cost=c.kind==='dig'?Math.ceil(120*(s.depth+1)**1.4):c.kind==='upgrade'?
         Math.ceil(baseCost[c.type]*room.width*(room.level===1?2.5:6)):
@@ -187,13 +216,15 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
       const parts=c.kind==='upgrade'&&room.level===2?15*room.width:0;
       assert.equal(c.cost.scrap,cost,'construction cost must agree with independently supplied public equations');
       assert.equal(c.cost.parts,parts);
-      assert.ok(s.resources.scrap>=cost&&s.resources.parts>=parts);
+      assert.ok(s.resources.scrap>=cost+scrapReserve&&s.resources.parts>=parts,'each construction must retain the configured scrap reserve');
       const recent=(context.shelterState.constructionLedger||[]).filter(e=>e.at>v.serverTime-86400000);
       assert.ok(recent.reduce((n,e)=>n+e.scrap,0)+cost<=10000,'rolling construction budget must remain binding');
       assert.ok(recent.reduce((n,e)=>n+e.parts,0)+parts<=100);
       s.resources.scrap-=cost;s.resources.parts-=parts;used.scrap+=cost;used.parts+=parts;
       (context.shelterState.constructionLedger??=[]).push({id:String(v.serverTime),at:v.serverTime,...c.cost});
       projects.push({kind:c.kind,type:c.type,floor:c.floor,at:v.serverTime,scrap:cost,parts});
+      const preparation=api.materials(c,api.model(v));
+      if(preparation)context.shelterState.campaign.materials=preparation;
       if(c.kind==='dig'){
         assert.equal(s.digging,null);assert.equal(c.floor,s.depth+1);
         s.digging={floor:c.floor,doneAt:v.serverTime+assumedDigMinutes*60000};
@@ -272,16 +303,16 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
     }
     v.progress={level,score,next:30+Math.ceil(2.25*level*level)};
     if(growth){
-      assert.ok(s.residents.length+s.births.length<=30,'real pregnancies and births must stay within the selected target');
+      assert.ok(s.residents.length+s.births.length<=context.shelterPopulationTarget,'real pregnancies and births must stay within the current stage');
       assert.ok(s.residents.length+s.births.length<=api.model(v).populationCap,'future beds do not count as completed capacity');
-      if(s.residents.length===30&&!s.births.length&&s.residents.every(p=>p.adultAt<=v.serverTime)){
+      if(s.residents.length===populationFinish&&!s.births.length&&s.residents.every(p=>p.adultAt<=v.serverTime)){
         adultTargetAt??=v.serverTime;
         // 人口达标后还需完成岗位建设；达到人数不结束验证，所有新成人实际就业后再验证12小时供应。
         if(born.every(child=>productiveResidents.has(child.id)&&assignments.some(a=>a.id===child.id&&a.at>=child.adultAt&&s.rooms.some(r=>r.id===a.room&&productionRules[r.type]))))
           targetAt??=v.serverTime;
       }
       if(tick%144===0){
-        const observed=api.model(v),next=api.development(observed,30,api.campaign(observed),developmentTarget).next;
+        const observed=api.model(v),next=api.development(observed,context.shelterPopulationTarget,api.campaign(observed),developmentTarget).next;
         process.stdout.write(JSON.stringify({kind:'population-state',hours:(v.serverTime-start)/3600000,
           population:s.residents.length,pending:s.births.length,level,projects:projects.length,assignments:assignments.length,
           production:observed.production,demand:observed.demand,next:next.title,reason:next.reason,
@@ -294,21 +325,28 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
     }
   }
   if(growth){
-    const final=api.model(v),campaign=api.campaign(final),plan=api.development(final,30,campaign,developmentTarget);
-    if(process.env.ARKENGINE_POPULATION_SNAPSHOT)writeFileSync(process.env.ARKENGINE_POPULATION_SNAPSHOT,JSON.stringify({sourceSHA256,inheritanceOffset,
+    const final=api.model(v),campaign=api.campaign(final),plan=api.development(final,context.shelterPopulationTarget,campaign,developmentTarget);
+    if(process.env.ARKENGINE_POPULATION_SNAPSHOT)writeFileSync(process.env.ARKENGINE_POPULATION_SNAPSHOT,JSON.stringify({sourceSHA256,inheritanceOffset,scrapReserve,continuous,deepSupport,progressive,stages,
       view:v,state:context.shelterState,assignments,firstProduction,born,pregnancies,projects,merges,production:final.production,demand:final.demand,next:plan.next,
       staff:context.shelterStaffNote,populationNote:context.shelterPopulationNote,
       ...(mixed?{rewards,claims,raids,heals,restarts}: {})},null,2));
-    assert.equal(s.residents.length,30,JSON.stringify({hours:(v.serverTime-start)/3600000,production:final.production,demand:final.demand,
+    assert.equal(s.residents.length,populationFinish,JSON.stringify({hours:(v.serverTime-start)/3600000,production:final.production,demand:final.demand,
       plan:plan.next,notes:plan.notes,staff:context.shelterStaffNote,population:context.shelterPopulationNote,state:context.shelterState}));
-    assert.equal(s.births.length,0);assert.equal(pregnancies.length,13);assert.equal(born.length,13);assert.ok(targetAt!==null);
+    assert.equal(s.births.length,0);assert.equal(pregnancies.length,populationFinish-initialPopulation);assert.equal(born.length,populationFinish-initialPopulation);assert.ok(targetAt!==null);
     assert.ok(s.residents.every(p=>p.adultAt<=v.serverTime));assert.ok(!s.residents.some(p=>p.romance),'no additional romances beyond the target');
     assert.ok(Object.keys(final.demand).every(k=>final.production[k]>=final.demand[k]*1.2-1e-9),'thirty adults must have sustainable supply with the configured margin');
     for(const child of born)assert.ok(assignments.some(a=>a.id===child.id&&a.at>=child.adultAt&&s.rooms.some(r=>r.id===a.room&&productionRules[r.type])),`child ${child.id} must work after adulthood`);
     for(const child of born)assert.ok(firstProduction.some(p=>p.id===child.id&&p.at>=child.adultAt),`child ${child.id} must actually produce after adulthood, not merely defend a production room`);
-    assert.ok(merges.length>0);assert.ok(restarts.length>1);assert.equal(context.shelterPopulationTarget,30);
+    if(!progressive)assert.ok(merges.length>0);assert.ok(restarts.length>1);assert.equal(context.shelterPopulationTarget,populationFinish);
+    if(progressive){
+      assert.deepEqual(stages.map(s=>[s.from,s.to]),[[30,40]]);
+      const nextStage=api.populationStage(final,context.shelterPopulationTarget,true,context.shelterState,null);
+      assert.equal(nextStage.ready,true,JSON.stringify(nextStage));assert.equal(nextStage.nextTarget,50);
+    }
     if(finishLevel){assert.ok(v.progress.level>=finishLevel,'thirty-person development must reach the requested level with actual completed projects');
-      assert.deepEqual(levels.map(x=>x.level),Array.from({length:finishLevel-4},(_,i)=>i+5),'every stage must be reached through actual births or completed projects');}
+      assert.deepEqual(levels.map(x=>x.level),Array.from({length:finishLevel-initialLevel+1},(_,i)=>i+initialLevel),'every stage must be reached through actual births or completed projects');}
+    if(continuous){assert.equal(context.shelterLevelTarget,'auto');assert.equal(plan.levelProgress.finalTarget,v.progress.level+1);
+      assert.equal(plan.levelProgress.targetLevel,v.progress.level+1,'到达本次验证终点后仍继续规划下一级');}
     if(mixed){
       assert.equal(raids.length,finishLevel-5);assert.ok(raids.every(r=>r.endedAt));assert.equal(raid,null);
       assert.ok(heals.length>0,'injured defenders must exercise the configured medical action');
@@ -317,7 +355,7 @@ function simulate(assumedDigMinutes,mixed=false,growth=false,inheritanceOffset=0
       assert.ok(claims.some(c=>c.key==='build')&&claims.some(c=>c.key==='collect_scrap')&&claims.some(c=>c.key==='collect_food'));
       assert.ok(new Set(claims.map(c=>c.day)).size>=2);
     }
-    return {kind:'conditional-population-continuity',sourceSHA256,assumedDigMinutes,inheritanceOffset,finishLevel,hours:(v.serverTime-start)/3600000,
+    return {kind:'conditional-population-continuity',sourceSHA256,assumedDigMinutes,inheritanceOffset,finishLevel,scrapReserve,continuous,deepSupport,progressive,stages,hours:(v.serverTime-start)/3600000,
       targetAt,adultTargetAt,hoursUntilEmployment:(targetAt-adultTargetAt)/3600000,hoursAfterEmployment:(v.serverTime-targetAt)/3600000,levels,pregnancies,born,merges,firstProduction,
       completedBuilds,completedUpgrades,completedDigs,assignmentCount:assignments.length,restarts:restarts.length,
       collected,used,feedSpent,finalResources:s.resources,production:final.production,demand:final.demand,
@@ -354,12 +392,27 @@ test('连续人口发展：等价5级17人向30增长，出生成年复岗、建
 test('连续人口低遗传：新生儿属性取均值减1，17→30后仍有持续供应和成年复岗',t=>{
   t.diagnostic(JSON.stringify(simulate(360,false,true,-1)));
 });
+test('连续低遗传追级：低属性子女全部就业后持续建设到10级，保留自然合并与资源核验',t=>{
+  t.diagnostic(JSON.stringify(simulate(360,false,true,-1,10)));
+});
 test('连续人口追级：5级17人分批发展到30人，成年就业后继续建设到10级',t=>{
   t.diagnostic(JSON.stringify(simulate(360,false,true,0,10)));
 });
 
+test('连续人口保留线：按实际设置保留100废料，30人就业后仍持续建设到10级',t=>{
+  t.diagnostic(JSON.stringify(simulate(360,false,true,0,10,100)));
+});
+
 test('连续人口十三：同一起点和30人阶段上限，持续建设逐级到13级',t=>{
   t.diagnostic(JSON.stringify(simulate(360,false,true,0,13)));
+});
+
+test('持续人口四十：从已就业30人自动进入40，新增十名成人实际生产后可继续50',t=>{
+  t.diagnostic(JSON.stringify(simulate(360,false,true,0,0,100,true,false,true)));
+});
+
+test('持续人口完整阶段：从5级17人开始先到30，再自动进入40并落实新增成人生产',t=>{
+  t.diagnostic(JSON.stringify(simulate(360,false,true,0,0,100,true,false,true,null)));
 });
 
 test('连续人口防守：5级17人分批到30人，五次来袭医疗复岗及实际奖励后持续到10级',t=>{

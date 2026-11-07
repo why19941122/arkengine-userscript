@@ -37,10 +37,10 @@ export async function launchTestBrowser(executable) {
       if (!closed && graceful) {
         try { await graceful(); } catch { /* 已退出或 CDP 断开时仍核对本次子进程。 */ }
       }
-      if (!await waitForClose(2000)) {
+      if (!await waitForClose(10000)) {
         // 只控制本函数创建的浏览器子进程，不枚举或结束其他浏览器/CLI。
         browser.kill();
-        if (!await waitForClose(5000)) throw new Error(`测试浏览器未确认退出，已保留目录：${profile}`);
+        if (!await waitForClose(30000)) throw new Error(`测试浏览器未确认退出，已保留目录：${profile}；pid=${browser.pid}, exit=${browser.exitCode}, signal=${browser.signalCode}`);
       }
     }
     await removeProfile();
