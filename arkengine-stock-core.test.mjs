@@ -7,6 +7,37 @@ const code=source.split('// STOCK_CORE_BEGIN')[1].split('// STOCK_CORE_END')[0];
 const c=vm.runInNewContext(code.slice(code.indexOf('\n'))+'\nstockCore;');
 const now=Date.parse('2026-11-03T03:00:00Z');
 const config={trade:true,predict:true,tradeLimit:3000,predictionLimit:500,stake:100,reserve:100};
+
+test('卖出到账：只接受绑定成功回执的 proceedsTokens，零到账有效，不用余额或预测赔付代替',()=>{
+  const p={key:'original-sale-key',input:{action:'sell',expectedUserId:7}},
+    body={ok:true,userId:7,action:'sell',idempotencyKey:p.key,tradeId:123,proceedsTokens:97,balanceAfter:99999};
+  assert.equal(c.saleProceeds(p,200,body),97);
+  assert.equal(c.saleProceeds(p,200,{...body,proceedsTokens:0}),0);
+  for(const proceedsTokens of [undefined,null,'97',-1,1.5,Infinity,Number.MAX_SAFE_INTEGER+1])
+    assert.equal(c.saleProceeds(p,200,{...body,proceedsTokens,payoutTokens:97}),null);
+  for(const changed of [{userId:8},{idempotencyKey:'other-key'},{action:'buy'},{ok:false}])
+    assert.equal(c.saleProceeds(p,200,{...body,...changed}),null);
+  assert.equal(c.saleProceeds(p,503,body),null);
+  assert.equal(c.saleProceeds({...p,input:{...p.input,action:'buy'}},200,{...body,action:'buy'}),null);
+});
+
+test('卖出收入：实际到账与释放成本分别保留，负盈亏与未知成本不被当作零',()=>{
+  assert.deepEqual(JSON.parse(JSON.stringify(c.saleReward(97,100))),{代币:97,股市返还:97,股市卖出到账:97,股市卖出成本:100,股市已实现盈亏:-3});
+  assert.deepEqual(JSON.parse(JSON.stringify(c.saleReward(97,null))),{代币:97,股市返还:97,股市卖出到账:97,股市卖出成本待核对:1});
+  assert.equal(c.saleReward(null,100)['股市卖出待核对'],1);
+  const totals=c.historyTotals([{action:'sell',result:'success',proceeds:97,releasedCost:null}]);
+  assert.equal(totals.knownProceeds,97);assert.equal(totals.realized,0);assert.equal(totals.unknownSales,1);
+});
+
+test('手动卖出成本：按原持仓与成交后持仓核对部分出售，数量或并发不符保持未知',()=>{
+  const input={action:'sell',modelName:'甲',shares:3,expectedUserId:7},entry={input,before:{stockId:1,shares:10,cost:103}},
+    view={userId:7,stocks:[{id:1,modelName:'甲'}],positions:[{stockId:1,shares:7,costBasisTokens:73}]};
+  assert.equal(c.incomeProof(entry,view).releasedCost,30);
+  for(const p of [{shares:6,costBasisTokens:73},{shares:7,costBasisTokens:104},{shares:7,costBasisTokens:-1}])
+    assert.equal(c.incomeProof(entry,{...view,positions:[{stockId:1,...p}]}),null);
+  assert.equal(c.incomeProof({...entry,ambiguous:true},view),null);
+  assert.equal(c.incomeProof({...entry,input:{...input,shares:10}},{...view,positions:[]}).releasedCost,103);
+});
 test('卖出回执诊断：只记录已绑定成功回执的字段结构，不泄露原始值或把候选金额入账',()=>{
   const p={key:'original-sale-key',input:{action:'sell',expectedUserId:7}},
     body={ok:true,userId:7,action:'sell',idempotencyKey:p.key,result:{payoutTokens:987654321,note:'private receipt text'},

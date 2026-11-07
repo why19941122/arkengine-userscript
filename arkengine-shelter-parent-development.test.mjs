@@ -76,6 +76,74 @@ test('父母选择：亲缘与供给门槛不能被高属性评分绕过，已�
   const c=parents();for(const p of c.v.state.residents.slice(4))p.romance={partnerId:p.id===5?6:5};
   assert.ok(!c.run().actions.some(a=>[5,6].includes(a.id)));
 });
+
+test('父母换届：旧家庭空宿舍不永久排斥高属性组合，原父母仍留生产且刷新不中断新计划',()=>{
+  const {v,context,api,choose,events}=pairScene();
+  context.shelterState.families=[{a:5,b:6,room:5}];
+  for(const p of v.state.residents.filter(p=>[5,6].includes(p.id)))p.familyCooldownUntil=v.serverTime-1;
+  const first=choose();assert.ok(first);assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
+  assert.equal(context.shelterState.families.length,0);assert.ok(events.some(e=>e[2]?.replacedFamilies?.length));
+  v.state.residents.find(p=>p.id===first.id).roomId=first.room;
+  context.shelterState=JSON.parse(JSON.stringify(context.shelterState));
+  const next=api.population(api.model(v),context.shelterState.families,{eligible:p=>p.id>=4,home:()=>true,healthy:()=>true});
+  assert.equal(next.id,8);assert.equal(next.room,5);
+  assert.ok(v.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===null));
+});
+
+test('父母换届：普通调度在旧配对返回前比较属性，不先把低属性父母塞回宿舍',()=>{
+  const {v,context,api}=pairScene();context.shelterState.families=[{a:5,b:6,room:5}];
+  const action=api.staff(api.model(v));assert.equal(action.id,7);assert.equal(action.room,5);
+  assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
+});
+
+test('父母换届：旧父母占基础岗位需要接替时，先执行已有供应支持的更优组合',()=>{
+  const {v,context,api}=pairScene(),s=v.state;context.shelterState.families=[{a:5,b:6,room:5}];
+  s.residents.find(p=>p.id===1).roomId=4;s.residents.find(p=>p.id===2).roomId=4;
+  Object.assign(s.residents.find(p=>p.id===5),{roomId:1,stats:{str:8,per:3,end:3,cha:3,int:3,agi:3,lck:3}});
+  Object.assign(s.residents.find(p=>p.id===6),{roomId:2,stats:{str:3,per:3,end:3,cha:3,int:3,agi:8,lck:3}});
+  const action=api.staff(api.model(v));assert.ok(action);assert.equal(action.room,5);
+  assert.ok([1,2,7,8].includes(action.id));
+  assert.ok(context.shelterState.pair);assert.ok(![5,6].includes(context.shelterState.pair.a));
+  assert.ok(![5,6].includes(context.shelterState.pair.b));
+  assert.equal(s.residents.find(p=>p.id===5).roomId,1);assert.equal(s.residents.find(p=>p.id===6).roomId,2);
+});
+
+test('父母换届：感情、待产、宿舍已有成人、原请求、换位和模式限制均不能被更高评分绕过',()=>{
+  for(const kind of ['romance','birth','unknown-birth','occupied','pending','swap','mode']){
+    const {v,context,choose}=pairScene(),s=v.state;context.shelterState.families=[{a:5,b:6,room:5}];
+    if(kind==='romance')s.residents.find(p=>p.id===5).romance={partnerId:6,progress:.3};
+    if(kind==='birth')s.births=[{roomId:5,parents:[5,6],dueAt:v.serverTime+1000}];
+    if(kind==='unknown-birth')s.births=[{roomId:5,dueAt:v.serverTime+1000}];
+    if(kind==='occupied')s.residents.find(p=>p.id===5).roomId=5;
+    if(kind==='pending')context.shelterPending={kind:'assign'};
+    if(kind==='swap')context.shelterState.swap={step:0};
+    if(kind==='mode')context.shelterStaffMode='family';
+    assert.equal(choose(),null,kind);assert.equal(context.shelterState.families.length,1,kind);
+  }
+});
+
+test('父母换届：不为小幅评分提升拆旧配对，未来供给或库存不足时不释放宿舍绑定',()=>{
+  for(const kind of ['small-gain','food','stock']){
+    const {v,context,choose}=pairScene(),s=v.state;context.shelterState.families=[{a:7,b:8,room:5}];
+    if(kind==='small-gain')for(const p of s.residents.filter(p=>[5,6,7,8].includes(p.id))){p.stats=Object.fromEntries(Object.keys(p.stats).map(k=>[k,5]));p.roomId=null;}
+    if(kind==='food')s.residents.find(p=>p.id===2).stats.agi=0;
+    if(kind==='stock')s.resources.food=0;
+    assert.equal(choose(),null,kind);assert.equal(context.shelterState.families.length,1,kind);
+  }
+});
+
+test('父母换届：生过孩子但冷却已过的未绑定成人可参选，历史子女不能冒充本轮配对成功',()=>{
+  const {v,context,api}=pairScene(),s=v.state;
+  for(const p of s.residents.filter(p=>[7,8].includes(p.id)))p.familyCooldownUntil=v.serverTime-1;
+  s.residents.push({...structuredClone(s.residents[3]),id:30,name:'历史子女',parents:[7,8],roomId:null,adultAt:v.serverTime+3600000});
+  const choose=()=>api.population(api.model(v),context.shelterState.families,{eligible:p=>[7,8].includes(p.id),home:()=>true,healthy:()=>true},true);
+  const first=choose();assert.equal(first?.id,7);assert.equal(context.shelterState.families.length,0);
+  s.residents.find(p=>p.id===7).roomId=5;
+  const second=choose();assert.equal(second?.id,8);assert.equal(context.shelterState.families.length,0);
+  s.residents.find(p=>p.id===8).roomId=5;assert.equal(choose(),null);assert.ok(context.shelterState.pair);
+  s.residents.find(p=>p.id===7).romance={partnerId:8,progress:.1};
+  choose();assert.equal(context.shelterState.pair,null);assert.equal(context.shelterState.families.length,1);
+});
 test('父母训练：现有空位优先、一次最多一名、不会用普通战斗训练占走另一名父母',()=>{
   const {run}=parents(),p=run();
   const actions=p.actions.filter(a=>a.role==='training');assert.equal(actions.length,1);

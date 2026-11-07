@@ -137,6 +137,21 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       assert.equal(await evaluate(`${incomeTotals}['避难所金额待核对']||0`),mode==='success'?1:0);
     }
   });
+  await t.test('避难所收入诊断浏览器：未知格式保存原成功提示与结构，不把库存或未知字段数值当收入',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;sm.resultMessages={collect_all:'收取完成',collect:'收取完成'};
+      const raw=window.fetch;window.fetch=async(url,options)=>{const r=await raw(url,options);
+        if(url==='/api/shelter/action'&&options?.method==='POST'){
+          const body=await r.json();body.result={...body.result,receiptDetail:{scrap:999},secretKey:'private-do-not-log'};
+          return new Response(JSON.stringify(body),{status:r.status});}return r;};`);
+    await drive(done,'unknown shelter receipt diagnosed');
+    const records=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-income')`);
+    assert.equal(records.length,1);assert.equal(records[0].data.receipt.message,'收取完成');
+    assert.equal(records[0].data.receipt.amountStatus,'unknown-or-partial');
+    assert.equal(records[0].data.reward['避难所金额待核对'],1);
+    assert.equal(await evaluate(`${incomeTotals}['避难所废料']||0`),0);
+    assert.ok(!JSON.stringify(records).includes('private-do-not-log'));assert.ok(!JSON.stringify(records).includes('999'));
+    assert.ok(!JSON.stringify(records).includes((await evaluate('sm.calls[0]')).idempotencyKey));
+  });
   await t.test('收入统计避难所：赛季各档独立累计，部分成功只记已确认档位',async()=>{
     for(const mode of ['success','partial']){
       await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='${mode}';sm.resultMessages={claim_season:'奖励：30 废料 · 零件 +2'};`);

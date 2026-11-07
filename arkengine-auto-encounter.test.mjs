@@ -25,7 +25,7 @@ import { crossFeatureMarkup } from './arkengine-cross-feature.fixture.mjs';
 import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
-const rawSource = await readFile(new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
+const rawSource = await readFile(process.env.ARKENGINE_TEST_SOURCE || new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
 const scriptVersion=rawSource.match(/^\/\/ @version\s+(\S+)/m)[1];
 // 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
 const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;')

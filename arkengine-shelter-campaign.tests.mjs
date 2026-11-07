@@ -18,6 +18,37 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   const reloadCampaign=async()=>{
     await pulse(1000);await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();
   };
+  const renewalScene=()=>scene({},`sm.confirmFamily=true;s.rooms.find(r=>r.id===4).width=3;
+    for(const p of s.residents.slice(3))Object.assign(p,{roomId:4,xp:0,hp:100,stats:{str:3,per:3,end:3,cha:3,int:3,agi:3,lck:3}});
+    for(const id of [7,8])s.residents.push({...structuredClone(s.residents[3]),id,name:'优质居民'+id,
+      stats:{str:8,per:8,end:8,cha:8,int:8,agi:8,lck:8}});
+    s.rooms.push({...s.rooms.find(r=>r.id===5),id:91,floor:3});
+    for(const id of [9,10])s.residents.push({...structuredClone(s.residents[3]),id,name:'已有感情'+id,roomId:91,
+      romance:{partnerId:id===9?10:9,progress:.3}});
+    localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
+    localStorage.setItem('arkengine:auto-shelter:population:v1','14');
+    localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,vaultNo:77,note:'旧家庭占住空宿舍',
+      families:[{a:5,b:6,room:5},{a:9,b:10,room:91}]}));`);
+  await t.test('父母换届浏览器：空宿舍改选高属性父母，原父母继续生产，已有30%感情保留且刷新不再换人',async()=>{
+    await setupShelter(renewalScene());await settle('replace idle family reservation');
+    assert.deepEqual(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===5).map(c=>c.residentId)'),[7,8]);
+    assert.ok(await evaluate(`${state}.families.some(f=>f.a===7&&f.b===8&&f.room===5)`));
+    assert.ok(await evaluate(`!${state}.families.some(f=>f.a===5&&f.b===6)`));
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).map(p=>p.roomId)'),[4,4]);
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[9,10].includes(p.id)).map(p=>p.romance.progress)'),[.3,.3]);
+    await reloadCampaign();await settle('replacement survives reload');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===5).length'),2);
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&[9,10].includes(c.residentId)).length'),0);
+  });
+  await t.test('父母换届浏览器：第一步原请求未知时刷新只核对，不换第二组合或重复调人',async()=>{
+    await setupShelter(renewalScene()+'sm.assignUnknown=true;');
+    await drive('sm.calls.filter(c=>c.type==="assign").length===1','first replacement unknown');await reloadShelter();
+    await drive(`${done}&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`,'replacement request isolated');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign").length'),1);
+    assert.deepEqual(await evaluate(`${pending}.targets`),[7,5]);
+    assert.deepEqual(await evaluate(`[${state}.pair.a,${state}.pair.b]`),[7,8]);
+    assert.ok(await evaluate(`${state}.families.some(f=>f.a===9&&f.b===10)`));
+  });
   const scrapInvestmentScene=()=>scene({},`${construction}
     Object.assign(s.rooms.find(r=>r.id===4),{width:3,level:2});
     Object.assign(s.rooms.find(r=>r.id===6),{floor:2,col:4,width:3});
@@ -59,7 +90,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await reloadCampaign();await settle('quality family survives reload');
     assert.ok(await evaluate(`${state}.families.some(f=>f.a===7&&f.b===8)`));
   });
-  await t.test('父母优化浏览器：魅力训练回执刷新保留，冷却结束退出并成对返回宿舍',async()=>{
+  await t.test('父母优化浏览器：魅力训练回执刷新保留，到期退出并按更优组合重新配对',async()=>{
     await setupShelter(scene({training:true},`sm.confirmFamily=true;
       for(const p of s.residents.slice(4))Object.assign(p,{roomId:5,xp:0,hp:100,familyCooldownUntil:clock+21600000,
         stats:{str:5,per:5,end:5,cha:2,int:5,agi:5,lck:5}});
@@ -76,7 +107,9 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await evaluate(`clock=${role.until}+1000;sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;`);
     await reloadCampaign();await settle('parent training deadline and family return');
     assert.equal(await evaluate(`${state}.campaign.roles.filter(r=>r.purpose==='parent').length`),0);
-    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).map(p=>p.roomId)'),[5,5]);
+    assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[4,5].includes(p.id)).map(p=>p.roomId)'),[5,5],JSON.stringify(await diagnose()));
+    assert.ok(await evaluate(`${state}.families.some(f=>f.a===4&&f.b===5&&f.room===5)`));
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===6).roomId'),4,'原低分配偶继续生产，不为旧家庭永久保留宿舍');
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.roomId===90).length'),1);
   });
   await t.test('父母优化浏览器：已有魅力训练室太慢时按预算升级，完工后入室且刷新不重复施工',async()=>{

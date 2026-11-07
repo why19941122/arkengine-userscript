@@ -492,14 +492,14 @@ export async function shelterPopulationTests({t,setupShelter,reloadShelter,evalu
     }
   });
   await t.test('人口发展：调岗结果未知时保留计划与原记录，不跨刷新重复安排',async()=>{
-    await setupShelter(`${scene}sm.assignUnknown=true;`);await drive(`${moves}.length===1`,'unknown family move');await reloadShelter();
+    await setupShelter(`${scene}${onlyIdle}sm.assignUnknown=true;`);await drive(`${moves}.length===1`,'unknown family move');await reloadShelter();
     await drive(`${done}&&localStorage.getItem('arkengine:auto-shelter:enabled:v1')==='true'&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`,'unknown placement isolated');
     assert.equal(await evaluate(`${moves}.length`),1);assert.deepEqual(await evaluate(`${pending}.targets`),[6,5]);assert.ok(await evaluate(`${state}.pair`));
   });
   await t.test('人口发展：第一人到宿舍后降低目标或供应下降，会退出未完成配对',async()=>{
     for(const mutation of [target(7),`sm.view.state.resources.food=0;`,
       `localStorage.setItem('arkengine:auto-shelter:population:v1','7');window.dispatchEvent(new StorageEvent('storage',{key:'arkengine:auto-shelter:population:v1',newValue:'7'}));`]){
-      await setupShelter(scene);await drive(`${moves}.length===1 && ${pending}===null`,'first placement confirmed');await evaluate(mutation);
+      await setupShelter(`${scene}${onlyIdle}`);await drive(`${moves}.length===1 && ${pending}===null`,'first placement confirmed');await evaluate(mutation);
       await drive(done,'cancel incomplete placement',200);
       assert.deepEqual(await evaluate(`${moves}.map(c=>[c.residentId,c.roomId])`),[[6,5],[6,null]]);assert.equal(await evaluate(`${state}.pair`),null);
     }

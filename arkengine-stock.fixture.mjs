@@ -45,7 +45,9 @@ window.fetch=async(url,options)=>{
     const cost=Math.ceil((gross+fee)/100);km.tokens-=cost;
     if(!p){p={stockId:s.id,shares:0,costBasisTokens:0,holdUntil:new Date(clock+3600000).toISOString()};v.positions.push(p);}
     p.shares+=a.shares;p.costBasisTokens+=cost;
-   }else{km.tokens+=Math.floor((gross-fee)/100);p.costBasisTokens=Math.ceil(p.costBasisTokens*(p.shares-a.shares)/p.shares);p.shares-=a.shares;}
+   }else{const proceeds=Math.floor((gross-fee)/100);km.tokens+=proceeds;
+    if(km.saleReceipt)body={...body,tradeId:km.calls.length,proceedsTokens:proceeds,balanceAfter:km.tokens};
+    p.costBasisTokens=Math.ceil(p.costBasisTokens*(p.shares-a.shares)/p.shares);p.shares-=a.shares;}
   }
   km.receipts[a.idempotencyKey]=body;
  }

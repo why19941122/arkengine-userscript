@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.12
+// @version      1.17.13
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -441,8 +441,9 @@
         if(e.action==='buy')sum.buyCost+=e.debit;
         else if(e.action==='sell'){
           if(whole(e.releasedCost))sum.releasedCost+=e.releasedCost;
+          if(whole(e.proceeds))sum.knownProceeds+=e.proceeds;
           if(whole(e.proceeds)&&whole(e.releasedCost)){
-            sum.knownProceeds+=e.proceeds;sum.realized+=e.proceeds-e.releasedCost;
+            sum.realized+=e.proceeds-e.releasedCost;
           }else sum.unknownSales++;
         }else if(e.action==='predict'&&e.settlement){
           sum.predictionStake+=e.debit;sum.predictionPaid+=e.settlement.payout;sum.predictionNet+=e.settlement.payout-e.debit;
@@ -830,6 +831,17 @@
       if(status===400 && r.executed===false && r.code!=='idempotency_conflict')return 'rejected';
       return null;
     }
+    function saleProceeds(p,status,body) {
+      // 实号成功回执的到账字段；不采用 balanceAfter、报价或预测/历史仓的 payoutTokens。
+      return p?.input?.action==='sell'&&receipt(p,status,body)==='success'&&whole(body.proceedsTokens)?body.proceedsTokens:null;
+    }
+    function saleReward(proceeds,releasedCost) {
+      const reward=whole(proceeds)?{代币:proceeds,股市返还:proceeds,股市卖出到账:proceeds}:{股市卖出待核对:1};
+      if(whole(releasedCost))reward['股市卖出成本']=releasedCost;
+      else reward['股市卖出成本待核对']=1;
+      if(whole(proceeds)&&whole(releasedCost))reward['股市已实现盈亏']=proceeds-releasedCost;
+      return reward;
+    }
     function saleReceiptShape(p,status,body) {
       // 只帮助核对网站回执契约，不采集字段值，也不把字段名称当作到账证据。
       try{
@@ -876,6 +888,13 @@
     }
     function incomeProof(entry,view) {
       const a=entry.input;if(!a||view?.userId!==a.expectedUserId)return null;
+      if(a.action==='sell'){
+        const b=entry.before;if(!b||entry.ambiguous||a.shares>b.shares)return null;
+        const stock=incomeStock(view,a.modelName),positions=view.positions?.filter(p=>sameStockId(p.stockId,b.stockId));
+        if(!stock||!sameStockId(stock.id,b.stockId)||!positions||positions.length>1)return null;
+        const expected=b.shares-a.shares,p=positions[0],afterCost=p?.costBasisTokens??(expected===0?0:null);
+        return (p?.shares||0)===expected&&whole(afterCost)&&afterCost<=b.cost&&(!expected?afterCost===0:true)?{releasedCost:b.cost-afterCost}:null;
+      }
       if(a.action==='buy'){
         const b=entry.before;if(!b||entry.ambiguous)return null;
         const stock=incomeStock(view,a.modelName),positions=view.positions?.filter(p=>sameStockId(p.stockId,b.stockId));
@@ -892,7 +911,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,historyTotals,performance,riskExposure,riskReason,sellPlan,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,historyTotals,performance,riskExposure,riskReason,sellPlan,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -953,7 +972,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.12';
+  const SCRIPT_VERSION = '1.17.13';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -1329,7 +1348,7 @@
       const totals = cached.day === logDay() ? cached.totals : {};
       const message = storageFailed ? '日志存储失败；部分事件未保存，自动操作仍继续。请检查站点空间后重新导出。' :
         `本组今日确认${group==='expedition'?'到账':'收入'}：代币 ${totals['代币'] || 0} · 修为 ${totals['修为'] || 0} · 钻石 ${totals['钻石'] || 0}（${group==='expedition'?'含股市本金返还，非净利润':'毛收入，不含未完成秘境'}）`+
-        (group==='expedition'?`\n股市：返还 ${totals['股市返还']||0} 代币（含本金）；买入支出 ${totals['股市买入支出']||0}，下注支出 ${totals['股市下注支出']||0}；已结算预测净盈亏 ${totals['股市预测净盈亏']||0}；卖出到账待核对 ${totals['股市卖出待核对']||0} 笔，买入金额未核实 ${totals['股市买入待核对']||0} 笔。`+
+        (group==='expedition'?`\n股市：返还 ${totals['股市返还']||0} 代币（含本金）；其中股票卖出到账 ${totals['股市卖出到账']||0}；买入支出 ${totals['股市买入支出']||0}，下注支出 ${totals['股市下注支出']||0}；股票已核对实现盈亏 ${totals['股市已实现盈亏']||0}，已结算预测净盈亏 ${totals['股市预测净盈亏']||0}；卖出到账待核对 ${totals['股市卖出待核对']||0} 笔，卖出成本待核对 ${totals['股市卖出成本待核对']||0} 笔，买入金额未核实 ${totals['股市买入待核对']||0} 笔。存在待核对时，已知盈亏不代表完整盈亏。`+
           `\n避难所领取入库：${['废料','零件','电力','食物','净水','治疗针','汽水'].map(k=>`${k} ${totals['避难所'+k]||0}`).join(' · ')}；商队代币 ${totals['避难所商队代币']||0}、装备 ${totals['避难所商队装备']||0} 件；金额待核对 ${totals['避难所金额待核对']||0} 笔。`+
           '\n含可核对的自动与手动操作。按本地确认日入账，资源可含返还，估值和缺失的旧历史不入账。':'');
       if (hint.textContent !== message) hint.textContent = message;
@@ -3225,6 +3244,7 @@
       (v.pending.confirmedAt===undefined || stockCore.whole(v.pending.confirmedAt)&&v.pending.confirmedAt>=v.pending.at) &&
       (v.pending.reserveFloor===undefined || stockCore.whole(v.pending.reserveFloor)&&v.pending.reserveFloor<=1e12) &&
       (v.pending.beforeCost===undefined||stockCore.whole(v.pending.beforeCost))&&
+      (v.pending.proceeds==null||v.pending.input.action==='sell'&&stockCore.whole(v.pending.proceeds))&&
       v.entries.some(e=>e.id===v.pending.id && e.action===v.pending.input.action) &&
       (v.pending.key===null || typeof v.pending.key==='string' && /^[a-zA-Z0-9-]{8,64}$/.test(v.pending.key)) &&
       [null,'success','rejected'].includes(v.pending.result));
@@ -3256,6 +3276,7 @@
       Boolean(stockCore.incomeInput({...e.input,idempotencyKey:'validation-key'}))&&stockCore.whole(e.at)&&typeof e.page==='string'&&
       ['confirmed','flow','settled','ambiguous','automatic'].every(k=>typeof e[k]==='boolean')&&
       (e.rejected===undefined||typeof e.rejected==='boolean')&&
+      (e.proceeds==null||e.input.action==='sell'&&stockCore.whole(e.proceeds))&&
       (e.betId===null||stockCore.id(e.betId))&&(before===null||objectState(before)&&
         (e.input.action==='predict'?Array.isArray(before.bets)&&before.bets.length<=50&&before.bets.every(stockCore.id)&&new Set(before.bets).size===before.bets.length:
           stockCore.id(before.stockId)&&stockCore.whole(before.shares)&&stockCore.whole(before.cost)));
@@ -3274,6 +3295,7 @@
     if(old){
       if(!stockCore.same(old.input,entry.input))throw Error('同一回执的交易内容变化');
       entry={...entry,confirmed:entry.confirmed||old.confirmed,flow:entry.flow||old.flow,settled:entry.settled||old.settled,
+        proceeds:old.proceeds??entry.proceeds,
         ambiguous:entry.ambiguous||old.ambiguous,automatic:entry.automatic||old.automatic,betId:old.betId??entry.betId,
         rejected:entry.confirmed||old.confirmed?false:Boolean(entry.rejected||old.rejected)};
     }
@@ -3295,8 +3317,21 @@
     let e=stockIncomeRead(entry.input.expectedUserId,entry.id);if(!e||!e.confirmed||e.automatic)return;
     const a=e.input;
     if(!e.flow){
-      let reward=null;
-      if(a.action==='sell')reward={'股市卖出待核对':1};
+      let reward=null,releasedCost=null;
+      if(a.action==='sell'){
+        // 成本核对只使用原观察页的连贯持仓；刷新或并发时保留到账，成本列待核对。
+        if(e.before&&!e.ambiguous){
+          if(e.page===stockIncomePage){
+            const proof=stockCore.incomeProof(e,view);if(!proof)return;
+            releasedCost=proof.releasedCost;
+          }else{
+            if(!navigator.locks?.query)return;
+            const locks=await navigator.locks.query(),name=stockIncomePageLock(e.page);
+            if([...locks.held,...locks.pending].some(lock=>lock.name===name))return;
+          }
+        }
+        reward=stockCore.saleReward(e.proceeds,releasedCost);
+      }
       else if(a.action==='predict')reward={'股市下注支出':a.betTokens};
       else if(!e.before||e.ambiguous)reward={'股市买入待核对':1};
       else if(e.page!==stockIncomePage){
@@ -3308,7 +3343,10 @@
       else {
         const proof=stockCore.incomeProof(e,view);if(proof)reward={'股市买入支出':proof.debit};
       }
-      if(reward&&await log.add('stock-income','手动股市原回执确认资金流',{action:a.action,source:'manual',reward},true,'stock-flow:'+e.id))
+      if(reward&&await log.add('stock-income','手动股市原回执确认资金流',{action:a.action,source:'manual',model:a.modelName,reward,
+        ...(a.action==='sell'?{shares:a.shares,proceeds:e.proceeds??null,releasedCost,
+          realized:stockCore.whole(e.proceeds)&&stockCore.whole(releasedCost)?e.proceeds-releasedCost:null,
+          amountSource:stockCore.whole(e.proceeds)?'receipt.proceedsTokens':'unknown'}:{})},true,'stock-flow:'+e.id))
         e=stockIncomeSave({...e,flow:true,...(a.action!=='predict'?{before:null}:{})});
     }
     if(a.action==='predict'&&!e.settled){
@@ -3325,12 +3363,13 @@
   }
   function stockIncomeRefreshNotice(user) {
     const all=stockIncomeEntries(user).filter(e=>!e.automatic&&!e.rejected),entries=all.filter(e=>e.confirmed),
-      buys=entries.filter(e=>e.input.action==='buy'&&!e.flow).length,bets=entries.filter(e=>e.input.action==='predict'&&!e.settled).length;
-    stockIncomeNotice(`手动统计：${buys} 笔买入等待持仓成本核对，${bets} 笔预测等待记录绑定或结算，${all.length-entries.length} 笔原回执待核对；仅随网页已有请求核对。`);
+      buys=entries.filter(e=>e.input.action==='buy'&&!e.flow).length,sales=entries.filter(e=>e.input.action==='sell'&&!e.flow).length,
+      bets=entries.filter(e=>e.input.action==='predict'&&!e.settled).length;
+    stockIncomeNotice(`手动统计：${buys} 笔买入、${sales} 笔卖出等待持仓成本核对，${bets} 笔预测等待记录绑定或结算，${all.length-entries.length} 笔原回执待核对；仅随网页已有请求核对。`);
   }
   function stockIncomeInvalidate(user) {
     if(!stockCore.id(user))return;
-    for(const e of stockIncomeEntries(user))if(!e.automatic&&!e.flow&&e.input.action==='buy')stockIncomeSave({...e,ambiguous:true});
+    for(const e of stockIncomeEntries(user))if(!e.automatic&&!e.flow&&e.input.action!=='predict')stockIncomeSave({...e,ambiguous:true});
   }
   observeStockIncome={
     begin(){
@@ -3354,7 +3393,7 @@
         if(await logStore.stockIncomeArchived(id))return null;
         await stockIncomeCompact(user,stockIncomeEntries(user));
         const entries=stockIncomeEntries(user);
-        for(const e of entries)if(!e.automatic&&!e.flow&&e.input.action==='buy'&&e.id!==id&&p.input.action!=='predict'&&e.input.modelName===p.input.modelName)
+        for(const e of entries)if(!e.automatic&&!e.flow&&e.input.action!=='predict'&&e.id!==id&&p.input.action!=='predict'&&e.input.modelName===p.input.modelName)
           stockIncomeSave({...e,ambiguous:true});
         const old=stockIncomeRead(user,id);
         if(old&&!stockCore.same(old.input,p.input))throw Error('同一统计编号的交易内容变化');
@@ -3382,9 +3421,9 @@
           stockIncomeRefreshNotice(user);return;
         }
         const shape=stockCore.saleReceiptShape(p,status,body);
-        e=stockIncomeSave({...e,confirmed:true});
-        if(shape)try{await log.add('stock-sell-receipt-shape','手动卖出成功回执的字段结构，字段值未记录、到账含义待核对',
-          {source:'manual',receiptShape:shape},true,'stock-sale-shape:'+id);}catch{ /* 诊断失败不影响原收入核对。 */ }
+        e=stockIncomeSave({...e,confirmed:true,...(p.input.action==='sell'?{proceeds:stockCore.saleProceeds(p,status,body)}:{})});
+        if(shape)try{await log.add('stock-sell-receipt-shape','手动卖出成功回执：到账金额与字段结构',
+          {source:'manual',receiptShape:shape,proceeds:e.proceeds??null},true,'stock-sale-shape:'+id);}catch{ /* 诊断失败不影响原收入核对。 */ }
         await stockIncomeResolve(e,stockIncomeCache?.view);stockIncomeRefreshNotice(user);
       });
     },
@@ -3443,7 +3482,7 @@
     const el=shadow.getElementById('stock-status');if(el.textContent!==text)el.textContent=text;
     const totals=stockCore.historyTotals(l.entries,l.archive),valuation=stockRead&&Date.now()-stockRead.at<=10000?
       {...stockCore.performance(stockRead.model,l,Date.now()),positions:stockCore.positionReport(stockRead.model,l,Date.now()),at:stockRead.at}:l.valuation;
-    shadow.getElementById('stock-performance').textContent=`已记录买入成本 ${totals.buyCost}；已知卖出净额 ${totals.knownProceeds}；已知已实现盈亏 ${totals.realized}`+
+    shadow.getElementById('stock-performance').textContent=`脚本交易：已记录买入成本 ${totals.buyCost}；已知卖出净额 ${totals.knownProceeds}；已知已实现盈亏 ${totals.realized}`+
       `${totals.unknownSales?`；另有 ${totals.unknownSales} 笔卖出到账/成本未知，累计盈亏不完整`:''}。预测已结算净额 ${totals.predictionNet}。`+
       (valuation?`\n最近核对 ${new Date(valuation.at).toLocaleTimeString('zh-CN')}：脚本持仓成本 ${valuation.heldCost}，按报价扣费估算浮盈亏 ${valuation.unrealized}${valuation.unknownPositions?`（另有${valuation.unknownPositions}只无法估值）`:''}。估值不代表可实际成交。`:'\n持仓估值等待下次完整检查。');
     const positions=valuation?.positions;
@@ -3690,15 +3729,17 @@
           stockReload();const current=stockLedger.pending;if(!current || current.id!==p.id)return;
           const result=stockCore.receipt(current,status,body);
           const resolved=current.result || result;
+          const proceeds=current.proceeds??stockCore.saleProceeds(current,status,body);
           const confirmedAt=resolved==='success'?current.confirmedAt??Math.max(current.at,
             current.result==='success'&&stockCore.whole(current.responseAt)?current.responseAt:Date.now()):null;
           stockPersist({...stockLedger,
             entries:confirmedAt!==null?stockLedger.entries.map(e=>e.id===current.id?{...e,confirmedAt}:e):stockLedger.entries,
-            pending:{...current,result:resolved,...(confirmedAt!==null?{confirmedAt}:{}),responseAt:Date.now(),httpStatus:status}});
+            pending:{...current,result:resolved,...(current.input.action==='sell'?{proceeds}:{}),
+              ...(confirmedAt!==null?{confirmedAt}:{}),responseAt:Date.now(),httpStatus:status}});
           stockRead=null;stockReadAt=Date.now()+1000;
           log.add('stock-response',result==='success'?'股市原交易回执已核对':result==='rejected'?'股市原交易明确未执行':'股市交易结果仍未知',
             {action:current.input.action,status,confirmed:Boolean(result),...(confirmedAt!==null?{confirmedAt}:{}),
-              ...(result==='success'&&current.input.action==='sell'?{receiptShape:stockCore.saleReceiptShape(current,status,body)}:{})});schedule();
+              ...(result==='success'&&current.input.action==='sell'?{proceeds,receiptShape:stockCore.saleReceiptShape(current,status,body)}:{})});schedule();
         }catch{stockFault='无法保存股市响应，原交易保留';schedule();}
       }
     };
@@ -3786,8 +3827,7 @@
         else {
           const beforeCost=p.beforeCost??owned[String(a.stockId)]?.cost,afterCost=expected?pos.costBasisTokens:0;
           entry.releasedCost=stockCore.whole(beforeCost)&&beforeCost>=afterCost?beforeCost-afterCost:null;
-          // 公开普通买卖回执未核实实际到账字段。保留未知，不用余额差或报价猜测。
-          entry.proceeds=null;
+          entry.proceeds=p.proceeds??null;
         }
         if(expected)owned[String(a.stockId)]={shares:pos.shares,cost:pos.costBasisTokens,modelName:a.modelName,manual:false};
         else delete owned[String(a.stockId)];
@@ -3810,10 +3850,14 @@
         note:p.result==='rejected'?'交易被网站拒绝，未执行':reason||`${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测下注'}已确认`});
       if(p.result==='success')stockRecordIncome(p,{
         action:a.action,model:a.modelName,reward:a.action==='buy'?{'股市买入支出':entry.debit}:
-          a.action==='predict'?{'股市下注支出':entry.debit}:{'股市卖出待核对':1}});
+          a.action==='predict'?{'股市下注支出':entry.debit}:stockCore.saleReward(entry.proceeds,entry.releasedCost),
+        ...(a.action==='sell'?{shares:a.shares,proceeds:entry.proceeds,releasedCost:entry.releasedCost,
+          realized:stockCore.whole(entry.proceeds)&&stockCore.whole(entry.releasedCost)?entry.proceeds-entry.releasedCost:null,
+          amountSource:stockCore.whole(entry.proceeds)?'receipt.proceedsTokens':'unknown'}:{})});
       log.add('stock-confirmed',stockLedger.note,{action:a.action,model:a.modelName,result:p.result,
         submittedAt:entry.at,...(entry.confirmedAt!==undefined?{confirmedAt:entry.confirmedAt}:{}),
-        ...(a.action==='sell'?{shares:a.shares}:{debitTokens:entry.debit})});
+        ...(a.action==='sell'?{shares:a.shares,proceeds:entry.proceeds,releasedCost:entry.releasedCost,
+          realized:stockCore.whole(entry.proceeds)&&stockCore.whole(entry.releasedCost)?entry.proceeds-entry.releasedCost:null}:{debitTokens:entry.debit})});
       stockRead=null;stockReadAt=Date.now()+2000;
       if(p.result==='rejected' || over)stockFinish(stockLedger.note,true);
       return true;
@@ -6490,7 +6534,15 @@
       const bytes=new TextEncoder().encode(JSON.stringify([p.vaultNo,request.idempotencyKey]));
       const digest=await crypto.subtle.digest('SHA-256',bytes);
       const receipt='shelter-income:'+Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');
-      await log.add('shelter-income','避难所原领取回执记账',{kind:p.kind,source,reward},true,receipt);
+      // 保留原成功提示供核对未知格式；不保存整个响应、请求键或账号资料。
+      const message=typeof body.result?.message==='string'?body.result.message.replace(/[\u0000-\u001f\u007f]/g,' ')
+        .replace(/https?:\/\/\S+/gi,'[链接已省略]').slice(0,1000):null;
+      const fields=objectState(body.result)?Object.keys(body.result)
+        .filter(k=>/^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(k)&&!/key|auth|secret|password|cookie|session|credential|signature|token|balance/i.test(k))
+        .slice(0,24).map(name=>({name,type:body.result[name]===null?'null':Array.isArray(body.result[name])?'array':typeof body.result[name]})):[];
+      await log.add('shelter-income','避难所原领取回执记账',{kind:p.kind,source,reward,
+        receipt:{message,fields,amountStatus:reward['避难所金额待核对']?'unknown-or-partial':'parsed',
+          ...(reward['避难所金额待核对']?{reason:message?'原领取已确认，但成功提示不含当前可核对的资源数量':'原领取已确认，但响应缺少带数量的成功提示'}:{})}},true,receipt);
     }catch{log.add('shelter-income-error','原领取已确认，但收入回执无法保存，请核对本次金额');}
   }
   function shelterAuxIncomeReward(kind,request,status,body) {
@@ -7202,7 +7254,8 @@
       return p && (!p.romance || p.romance.partnerId === (id === f.a ? f.b : f.a));
     }));
     const candidates = s.residents.filter(p => p.romance).map(p => [p.id,p.romance.partnerId]);
-    for (const child of s.residents) if (child.parents.length === 2) candidates.push(child.parents);
+    for (const child of s.residents) if (child.parents.length === 2 &&
+        !(shelterState.pair&&child.parents.every(id=>[shelterState.pair.a,shelterState.pair.b].includes(id)))) candidates.push(child.parents);
     for (const ids of candidates) {
       const [a,b] = ids.map(id => s.residents.find(p => p.id === id));
       if (!a || !b || a.id === b.id || a.roomId !== b.roomId || a.deadAt !== null || b.deadAt !== null ||
@@ -7586,7 +7639,7 @@
     saveShelter({...shelterState,pair:null}); shelterPopulationNote = message;
     log.add('shelter-population',message,{phase:'cancelled'}); holdShelterStaff(message);
   }
-  function shelterPopulationPlan(m,families,{eligible,home,healthy},create = false) {
+  function shelterPopulationPlan(m,families,{eligible,home,healthy},create = false,reconsider = false) {
     if (shelterStaffMode !== 'population') return null;
     const s = m.state, blocks = shelterState.pairBlocks || [];
     if (!Array.isArray(blocks) || blocks.length > 200 || blocks.some(b => !b || ![b.a,b.b].every(id => Number.isSafeInteger(id) && id > 0) ||
@@ -7605,13 +7658,16 @@
           !(plan.first===undefined || [plan.a,plan.b].includes(plan.first)) ||
           ![0,1,2].includes(plan.step) || !Number.isFinite(plan.at) || !(plan.waitAt === null || Number.isFinite(plan.waitAt)) ||
           !(plan.roomWaitAt == null || Number.isFinite(plan.roomWaitAt)) ||
+          !(plan.childrenBefore===undefined||Array.isArray(plan.childrenBefore)&&plan.childrenBefore.length<=2000&&
+            plan.childrenBefore.every(id=>Number.isSafeInteger(id)&&id>0)&&new Set(plan.childrenBefore).size===plan.childrenBefore.length) ||
           typeof plan.release !== 'boolean' || typeof plan.failed !== 'boolean') throw new Error('新配对计划无法核对');
       const pair = [plan.a,plan.b].map(id => s.residents.find(p => p.id === id)), room = s.rooms.find(r => r.id === plan.room);
       if (pair.some((p,i) => !p || p.deadAt !== null || p.romance && p.romance.partnerId !== [plan.b,plan.a][i])) {
         stopPopulationPlan('新配对人员或关系已变化，保留当前安排'); return null;
       }
       const relation = shelterFamilyExpecting(s,plan.a,plan.b) || pair.some((p,i) => p.romance?.partnerId === pair[1-i].id) ||
-        s.residents.some(child => child.parents.length === 2 && child.parents.includes(plan.a) && child.parents.includes(plan.b));
+        s.residents.some(child => child.parents.length === 2 && child.parents.includes(plan.a) && child.parents.includes(plan.b)&&
+          !plan.childrenBefore?.includes(child.id));
       if (relation) {
         if (families.some(f => familyKey(f.a,f.b) !== key && [f.a,f.b].some(id => [plan.a,plan.b].includes(id)))) {
           stopPopulationPlan('新配对与原家庭记录冲突，本轮等待核对'); return null;
@@ -7689,16 +7745,24 @@
       }
       return {id:p.id,room:plan.room,from:p.roomId,name:p.name,reason:`安排新配对（${plan.step+1}/2）`};
     }
-    if (!create) return null;
+    if (!create || shelterPending || shelterState.swap) return null;
     const budget = populationBudget(m,families);
     shelterPopulationNote = `人口 ${budget.living}；待产及已预约名额 ${budget.future-budget.living-budget.recovering}；${budget.recovering ? `倒下居民预留 ${budget.recovering}；` : ''}设置目标 ${shelterPopulationTarget}；按已建床位本轮最多 ${budget.limit} 人。`;
     if (budget.future >= budget.limit) { shelterPopulationNote+='已有名额达到当前目标或已建床位上限，暂缓新增生育。'; return null; }
-    const rooms = s.rooms.filter(r => roomReady(r,[]) && !families.some(f => f.room === r.id)).sort((a,b) => a.id-b.id);
-    if (!rooms.length) { shelterPopulationNote+='暂无未被原家庭占用的空宿舍。'; return null; }
+    // 历史亲缘仍由 residents.parents 保留；家庭记录只表示本轮生育安排，不永久占用空宿舍。
+    // 已有成人入住、感情、待产（含父母不明）时不换人，也不挪走人工放入宿舍的居民。
+    const replaceable=new Set(families.filter(f=>roomReady(s.rooms.find(r=>r.id===f.room),[])&&
+      [f.a,f.b].every(id=>s.residents.some(p=>p.id===id))&&
+      !s.residents.some(p=>[f.a,f.b].includes(p.id)&&p.romance||p.romance&&[f.a,f.b].includes(p.romance.partnerId))&&
+      !shelterFamilyExpecting(s,f.a,f.b)));
+    const rooms = s.rooms.filter(r => roomReady(r,[]) && families.filter(f=>f.room===r.id).every(f=>replaceable.has(f)))
+      .sort((a,b)=>Number(families.some(f=>f.room===a.id))-Number(families.some(f=>f.room===b.id))||a.id-b.id);
+    if (!rooms.length) { shelterPopulationNote+='暂无可重新安排的空宿舍；已入住成人、感情及待产仍保留。'; return null; }
     // 原生居民详情明确要求双方心情 >= 50；不能先调离生产，再等无效配对超时。
     const unrelated = populationKinship(s), candidates = s.residents.filter(p => eligible(p) && p.happiness >= 50 &&
       (p.roomId === null || s.rooms.some(r => r.id === p.roomId && staffRoomTypes.includes(r.type))) &&
-      !(p.familyCooldownUntil > 0) && !families.some(f => [f.a,f.b].includes(p.id)) && !s.residents.some(child => child.parents.includes(p.id)))
+      !p.romance&&!(p.familyCooldownUntil > m.now)&&!s.births.some(b=>shelterBirthParents(s,b)?.includes(p.id))&&
+      !families.some(f => [f.a,f.b].includes(p.id)&&!replaceable.has(f)))
       .sort((a,b) => a.id-b.id);
     const loss = pair => {
       // 人选排序同样比较两人离岗后的实际产量；容量外驻留和接替者不能按个人理论产量计损失。
@@ -7709,22 +7773,35 @@
     let best = null;
     for (let i=0;i<candidates.length;i++) for (let j=i+1;j<candidates.length;j++) {
       const pair = [candidates[i],candidates[j]], key = familyKey(pair[0].id,pair[1].id);
+      // 原组合继续走已有家庭返宿舍流程；只有实际换人或解除占位才建立新的两步计划。
+      if(families.some(f=>familyKey(f.a,f.b)===key))continue;
       if (activeBlocks.some(b => familyKey(b.a,b.b) === key) || !unrelated(...pair) || !populationCanHouse(m,families,pair)) continue;
       const first=pair.find(p=>shelterDepartureSafe(m,[p.id]));if(!first)continue;
       const score = loss(pair),assessment=shelterParentAssessment(m,pair);
       if(!assessment)continue;
+      const options=rooms.map(room=>({room,replacedFamilies:families.filter(f=>f.room===room.id||[f.a,f.b].some(id=>pair.some(p=>p.id===id)))}));
+      const choice=options.find(c=>(!reconsider||c.replacedFamilies.length)&&c.replacedFamilies.every(f=>{
+        const previous=shelterParentAssessment(m,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)));
+        // 20% 为换届稳定阈值，不是游戏规则；微小产速/心情变化不能反复拆换原配对。
+        return replaceable.has(f)&&previous&&assessment.score>previous.score*1.2+1e-6;
+      }));
+      if(!choice)continue;
       if (!best || assessment.score>best.assessment.score+1e-6 || Math.abs(assessment.score-best.assessment.score)<1e-6&&
           (score.idle > best.score.idle || score.idle === best.score.idle &&
-          (score.scrap < best.score.scrap-1e-6 || Math.abs(score.scrap-best.score.scrap) < 1e-6 && score.total < best.score.total-1e-6))) best = {pair,score,assessment,first:first.id};
+          (score.scrap < best.score.scrap-1e-6 || Math.abs(score.scrap-best.score.scrap) < 1e-6 && score.total < best.score.total-1e-6))) best = {pair,score,assessment,first:first.id,...choice};
     }
     if (!best) { shelterPopulationNote+='当前没有双方心情均达50、亲缘资料完整且离岗后供应仍充足的新组合。'; return null; }
     const [a,b] = best.pair;
-    plan = {a:a.id,b:b.id,room:rooms[0].id,fromA:a.roomId,fromB:b.roomId,step:0,at:Date.now(),waitAt:null,release:false,failed:false,
+    plan = {a:a.id,b:b.id,room:best.room.id,fromA:a.roomId,fromB:b.roomId,step:0,at:Date.now(),waitAt:null,release:false,failed:false,
+      childrenBefore:s.residents.filter(p=>p.parents.includes(a.id)&&p.parents.includes(b.id)).map(p=>p.id),
       ...(best.first!==a.id?{first:best.first}:{})};
-    saveShelter({...shelterState,pair:plan});
-    log.add('shelter-population','按子女基础属性、生育速度及生产损失选择新父母',{phase:'placing',residents:[a.id,b.id],
-      firstResident:plan.first??plan.a,room:plan.room,target:shelterPopulationTarget,assessment:best.assessment});
-    return shelterPopulationPlan(m,families,{eligible,home,healthy});
+    const nextFamilies=families.filter(f=>!best.replacedFamilies.includes(f));
+    saveShelter({...shelterState,families:nextFamilies,pair:plan});
+    log.add('shelter-population',best.replacedFamilies.length?'空宿舍重新选择父母，释放旧家庭占位':'按子女基础属性、生育速度及生产损失选择新父母',
+      {phase:'placing',residents:[a.id,b.id],firstResident:plan.first??plan.a,room:plan.room,target:shelterPopulationTarget,assessment:best.assessment,
+        replacedFamilies:best.replacedFamilies.map(f=>({...f,assessment:shelterParentAssessment(m,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)))})),
+        replacementThreshold:1.2});
+    return shelterPopulationPlan(m,nextFamilies,{eligible,home,healthy});
   }
   function shelterStaffPlan(m,skippedFamilies = []) {
     if (shelterStaffMode === 'off' || shelterStaffHold) return null;
@@ -7773,6 +7850,12 @@
     if (populationMode && shelterState.pair) {
       const next = shelterPopulationPlan(m,families,{eligible,home,healthy});
       if (next || shelterStaffHold) return next;
+    }
+    // 在为旧组合抽调接替者之前比较可立即执行的新组合；不能让旧家庭的准备流程永久挡住更优父母。
+    if(populationMode&&!skippedFamilies.length&&!campaign.defense?.busy&&!shelterState.pair&&
+        Object.keys(dailySupply).every(k=>m.production[k]>=dailySupply[k]*1.2-1e-9)){
+      const next=shelterPopulationPlan(m,families,{eligible,home,healthy},true,true);
+      if(next||shelterStaffHold||shelterState.pair)return next;
     }
     const pool = s.residents.filter(p => eligible(p) && !(populationMode && shelterState.pair && [shelterState.pair.a,shelterState.pair.b].includes(p.id)));
     const future = populationMode ? shelterPopulationPreparation(m,families) : 0;

@@ -17,6 +17,87 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     localStorage.setItem('arkengine:auto-stock:config:v1',JSON.stringify({...${cfg},trade:false,predict:false}));`;
   const readManualIncome=async()=>{await evaluate(`fetch('/api/stock').then(r=>r.json())`);await pulse(1000);};
   const incomeRecords=`Object.keys(localStorage).filter(k=>k.startsWith('arkengine:income-stock:v1:')).map(k=>JSON.parse(localStorage.getItem(k)))`;
+  await t.test('卖出实际收入浏览器：自动成交按回执到账和释放成本计亏损，归档刷新不重复',async()=>{
+    await setupStock(settings+owned+`km.saleReceipt=true;km.fillPrice=800;`);await drive(done,'actual sale receipt');
+    const sale=await evaluate(`${ledger}.entries.find(e=>e.action==='sell')`);
+    assert.equal(sale.proceeds,78);assert.equal(sale.releasedCost,100);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']`),-22);
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),78);
+    assert.equal(await evaluate(`${incomeTotals}['代币']`),78);
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出待核对']||0`),0);
+    assert.match(await evaluate(`${panel}.getElementById('stock-performance').textContent`),/已知已实现盈亏 -22/);
+    assert.match(await evaluate(`${panel}.getElementById('log-summary').textContent`),/股票已核对实现盈亏 -22/);
+    const original=await evaluate('km.calls[0]');
+    await evaluate(`fetch('/api/stock',{method:'POST',body:JSON.stringify(${JSON.stringify(original)})}).then(r=>r.json())`);await pulse(1000);
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),78);
+    await evaluate(`clock+=8*86400000;km.tokens=0;${panel}.getElementById('stock-check').click();`);
+    await drive(`${ledger}.archive?.knownProceeds===78`,'sale archive');
+    await reloadStock();await drive(done,'sale archive retained');
+    assert.equal(await evaluate(`${ledger}.archive.knownProceeds`),78);assert.equal(await evaluate(`${ledger}.archive.realized`),-22);
+    await evaluate(`fetch('/api/stock',{method:'POST',body:JSON.stringify(${JSON.stringify(original)})}).then(r=>r.json())`);await pulse(1000);
+    // 七日日志自然过期；账本归档保留累计收益，旧单重放不得在今天重新产生收入。
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']||0`),0);
+    assert.equal(await evaluate(`${ledger}.archive.knownProceeds`),78);assert.equal(await evaluate(`${ledger}.archive.realized`),-22);
+  });
+  await t.test('卖出实际收入浏览器：自动部分卖出按实际成交价只释放对应成本，不重复扣手续费',async()=>{
+    const close=`const original=window.fetch;window.fetch=async(url,options)=>{const r=await original(url,options);
+      if(url==='/api/stock'&&options?.method==='POST'&&JSON.parse(options.body).action==='sell')km.view.rules.reserveTokens=0;return r;};`;
+    await setupStock(settings+owned+`km.saleReceipt=true;km.fillPrice=1500;km.view.rules.reserveTokens=60;`+close);
+    await drive(done,'actual partial sale');
+    const sale=await evaluate(`${ledger}.entries.find(e=>e.action==='sell')`);
+    assert.equal(sale.shares,5);assert.equal(sale.proceeds,73);assert.equal(sale.releasedCost,50);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']`),23);
+    assert.equal(await evaluate(`${ledger}.owned['1'].cost`),50);assert.equal(await evaluate('km.calls.length'),1);
+    await reloadStock();await drive(done,'partial sale retained');
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),73);assert.equal(await evaluate('km.calls.length'),1);
+  });
+  await t.test('卖出实际收入浏览器：手动部分卖出与余额杂项分开，原请求重放及刷新只记一次',async()=>{
+    await setupStock(manualIncomeSetup+owned+`km.saleReceipt=true;km.fillPrice=1500;`);await readManualIncome();
+    await evaluate(`stockAct('sell',{modelName:'模型甲',shares:3})`);
+    await evaluate('km.tokens+=99999;');await readManualIncome();
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),43);
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出成本']`),30);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']`),13);
+    const original=await evaluate('km.calls[0]');await reloadStock();await readManualIncome();
+    await evaluate(`fetch('/api/stock',{method:'POST',body:JSON.stringify(${JSON.stringify(original)})}).then(r=>r.json())`);await readManualIncome();
+    assert.equal(await evaluate(`${incomeTotals}['代币']`),43);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']`),13);
+    assert.equal(await evaluate(`${ledger}.entries.length`),0);
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='stock-income')`);
+    assert.equal(events.length,1);assert.equal(events[0].data.amountSource,'receipt.proceedsTokens');
+    assert.ok(!JSON.stringify(events).includes(original.idempotencyKey));
+  });
+  await t.test('卖出实际收入浏览器：手动缺成本仍记到账，原观察页刷新后不借新持仓猜成本',async()=>{
+    for(const before of [false,true]){
+      await setupStock(manualIncomeSetup+owned+`km.saleReceipt=true;`);
+      if(before)await readManualIncome();
+      await evaluate(`stockAct('sell',{modelName:'模型甲',shares:3})`);await pulse(1000);
+      await reloadStock();await readManualIncome();
+      assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),35,String(before));
+      assert.equal(await evaluate(`${incomeTotals}['股市卖出成本待核对']`),1);
+      assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']??null`),null);
+    }
+  });
+  await t.test('卖出实际收入浏览器：成功回执先持久保存金额，持仓延迟跨刷新后核对且不重卖',async()=>{
+    const close=`const raw=window.fetch;window.fetch=async(url,options)=>{const r=await raw(url,options);
+      if(url==='/api/stock'&&options?.method==='POST'){km.hidePositions=true;km.view.rules.reserveTokens=0;}return r;};`;
+    await setupStock(settings+owned+`km.saleReceipt=true;km.view.rules.reserveTokens=60;`+close);
+    await drive(`${ledger}.pending?.proceeds===58`,'receipt amount durable before position sync');
+    assert.equal(await evaluate(`${ledger}.pending.result`),'success');
+    await reloadStock(`km.hidePositions=false;`);await drive(done,'pending amount reconciled after reload');
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),58);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']`),8);
+    assert.equal(await evaluate('km.calls.length'),1);
+  });
+  await t.test('卖出实际收入浏览器：同股手动成交交错时到账各记一次，无法独立核对的成本不猜测',async()=>{
+    await setupStock(manualIncomeSetup+owned+`km.saleReceipt=true;`);await readManualIncome();
+    await evaluate(`stockAct('sell',{modelName:'模型甲',shares:3})`);
+    await evaluate(`stockAct('buy',{modelName:'模型甲',shares:1})`);await readManualIncome();
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出到账']`),35);
+    assert.equal(await evaluate(`${incomeTotals}['股市卖出成本待核对']`),1);
+    assert.equal(await evaluate(`${incomeTotals}['股市已实现盈亏']??null`),null);
+    assert.equal(await evaluate('km.calls.length'),2);
+  });
   await t.test('股市独立预算浏览器：人工仓成本未知时按未设置总风险的固定预测预算执行，刷新不重复',async()=>{
     await setupStock(prediction+`km.view.positions=[{stockId:2,shares:10,costBasisTokens:null,holdUntil:null}];`);
     await drive(done,'prediction independent of unknown manual lot');
