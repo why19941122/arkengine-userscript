@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.13
+// @version      1.17.20
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -434,6 +434,257 @@
       return cap({...config,tradeLimit:Math.min(allocation,m.rules.maxDailyBuyTokens),positionLimit,
         perStockLimit:Math.floor(positionLimit/3),reserve,capital});
     }
+    // 独立股票试验账本。原始起点与事件为权威记录，不从全账户余额差推算盈利。
+    // 回放与未来实号适配共用；此处不自动建立实号试验或改变线上设置。
+    const account = (() => {
+      const copy=x=>JSON.parse(JSON.stringify(x));
+      const check=(ok,message)=>{if(!ok)throw Error('Stock account: '+message);};
+      const sum=xs=>{const n=xs.reduce((n,x)=>n+BigInt(x),0n);check(n>=BigInt(Number.MIN_SAFE_INTEGER)&&n<=BigInt(Number.MAX_SAFE_INTEGER),'amount overflow');return Number(n);};
+      const stamp=n=>whole(n)&&n<=8640000000000000;
+      const position=p=>{
+        check(p&&id(p.stockId)&&typeof p.modelName==='string'&&p.modelName.trim()&&positive(p.shares)&&p.shares<=2147483647&&
+          whole(p.costBasisTokens)&&(p.holdUntil===null||stamp(p.holdUntil)),'incomplete opening position');
+        return {stockId:String(p.stockId),modelName:p.modelName,shares:p.shares,costBasisTokens:p.costBasisTokens,holdUntil:p.holdUntil};
+      };
+      function normalize(e) {
+        check(e&&id(e.id)&&stamp(e.at)&&['submit','fill','reject','transfer','halt'].includes(e.type),'invalid event');
+        const base={id:String(e.id),at:e.at,type:e.type};
+        if(e.type==='submit'){
+          check(['buy','sell'].includes(e.action)&&id(e.stockId)&&typeof e.modelName==='string'&&e.modelName.trim()&&
+            positive(e.shares)&&e.shares<=2147483647&&whole(e.reservedTokens)&&(e.action==='sell'?e.reservedTokens===0:e.reservedTokens>0),'invalid order');
+          return {...base,action:e.action,stockId:String(e.stockId),modelName:e.modelName,shares:e.shares,reservedTokens:e.reservedTokens};
+        }
+        if(e.type==='fill'){
+          check(id(e.orderId)&&whole(e.amount)&&(e.remainingCost===undefined||whole(e.remainingCost))&&
+            (e.holdUntil===undefined||e.holdUntil===null||stamp(e.holdUntil)),'incomplete fill');
+          return {...base,orderId:String(e.orderId),amount:e.amount,
+            ...(e.remainingCost!==undefined?{remainingCost:e.remainingCost}:{}),...(e.holdUntil!==undefined?{holdUntil:e.holdUntil}:{})};
+        }
+        if(e.type==='reject'){check(id(e.orderId)&&typeof e.reason==='string'&&e.reason,'invalid rejection');return {...base,orderId:String(e.orderId),reason:e.reason};}
+        if(e.type==='transfer'){check(Number.isSafeInteger(e.amount)&&e.amount!==0&&typeof e.reason==='string'&&e.reason,'invalid external flow');return {...base,amount:e.amount,reason:e.reason};}
+        check(typeof e.reason==='string'&&e.reason,'invalid halt');return {...base,reason:e.reason};
+      }
+      function read(record) {
+        check(record?.schema===1&&id(record.trialId)&&id(record.userId)&&stamp(record.startedAt)&&whole(record.initialCash)&&
+          Array.isArray(record.initialPositions)&&Array.isArray(record.events)&&whole(record.limits?.capital)&&whole(record.limits?.loss)&&
+          (record.initialBudgetLoss===undefined||whole(record.initialBudgetLoss)),'invalid record');
+        const positions=record.initialPositions.map(position);check(distinct(positions,p=>p.stockId),'duplicate opening position');
+        const state={trialId:record.trialId,userId:record.userId,startedAt:record.startedAt,at:record.startedAt,
+          cash:record.initialCash,positions,orders:[],externalNet:0,realized:0,grossRealizedLoss:0,halt:null};
+        const seen=new Set(),identities=new Map(positions.map(p=>[p.stockId,p.modelName]));
+        for(const raw of record.events){
+          const e=normalize(raw);check(!seen.has(e.id),'duplicate event in stored record');seen.add(e.id);
+          check(e.at>=state.at,'out-of-order event');state.at=e.at;
+          if(e.type==='submit'){
+            check(!state.orders.some(o=>o.id===e.id),'duplicate order');
+            check(!identities.has(e.stockId)||identities.get(e.stockId)===e.modelName,'stock identity changed');identities.set(e.stockId,e.modelName);
+            const pos=positions.find(p=>p.stockId===e.stockId);
+            if(e.action==='sell')check(pos&&e.shares<=pos.shares-state.orders.filter(o=>o.status==='pending'&&o.action==='sell'&&o.stockId===e.stockId).reduce((n,o)=>n+o.shares,0),'sell shares already reserved or missing');
+            state.orders.push({...e,status:'pending'});continue;
+          }
+          if(e.type==='transfer'){state.cash=sum([state.cash,e.amount]);state.externalNet=sum([state.externalNet,e.amount]);continue;}
+          if(e.type==='halt'){state.halt??={at:e.at,reason:e.reason};continue;}
+          const order=state.orders.find(o=>o.id===e.orderId);check(order?.status==='pending','receipt has no pending order');
+          order.resolvedAt=e.at;order.status=e.type==='reject'?'rejected':'filled';
+          if(e.type==='reject'){order.reason=e.reason;continue;}
+          order.amount=e.amount;
+          let pos=positions.find(p=>p.stockId===order.stockId);
+          if(order.action==='buy'){
+            check(e.holdUntil===null||stamp(e.holdUntil)&&e.holdUntil>=order.at,'buy lock evidence missing');
+            state.cash=sum([state.cash,-e.amount]);
+            if(pos){pos.shares=sum([pos.shares,order.shares]);check(pos.shares<=2147483647,'shares overflow');
+              pos.costBasisTokens=sum([pos.costBasisTokens,e.amount]);pos.holdUntil=Math.max(pos.holdUntil||0,e.holdUntil||0)||null;}
+            else positions.push({stockId:order.stockId,modelName:order.modelName,shares:order.shares,costBasisTokens:e.amount,holdUntil:e.holdUntil});
+            if(e.amount>order.reservedTokens)state.halt??={at:e.at,reason:'buy-reservation-exceeded'};
+          }else{
+            check(pos&&pos.shares>=order.shares&&whole(e.remainingCost)&&e.remainingCost<=pos.costBasisTokens&&
+              (pos.shares!==order.shares||e.remainingCost===0),'sale remaining cost evidence missing');
+            const released=pos.costBasisTokens-e.remainingCost,profit=e.amount-released;
+            state.cash=sum([state.cash,e.amount]);state.realized=sum([state.realized,profit]);state.grossRealizedLoss=sum([state.grossRealizedLoss,Math.max(0,-profit)]);
+            order.releasedCost=released;pos.shares-=order.shares;pos.costBasisTokens=e.remainingCost;
+            if(!pos.shares)positions.splice(positions.indexOf(pos),1);
+          }
+          const capital=sum([...positions.map(p=>p.costBasisTokens),...state.orders.filter(o=>o.status==='pending'&&o.action==='buy').map(o=>o.reservedTokens)]);
+          if(capital>record.limits.capital||state.cash<0)state.halt??={at:e.at,reason:capital>record.limits.capital?'capital-exceeded':'cash-overdrawn'};
+        }
+        state.heldCost=sum(positions.map(p=>p.costBasisTokens));
+        state.pendingBuy=sum(state.orders.filter(o=>o.status==='pending'&&o.action==='buy').map(o=>o.reservedTokens));
+        state.capital=sum([state.heldCost,state.pendingBuy]);state.availableCash=sum([state.cash,-state.pendingBuy]);
+        const buys=sum(state.orders.filter(o=>o.status==='filled'&&o.action==='buy').map(o=>o.amount));
+        const sales=state.orders.filter(o=>o.status==='filled'&&o.action==='sell');
+        check(state.cash===sum([record.initialCash,state.externalNet,-buys,...sales.map(o=>o.amount)]),'cash conservation');
+        check(state.heldCost===sum([...record.initialPositions.map(p=>p.costBasisTokens),buys,...sales.map(o=>-o.releasedCost)]),'cost conservation');
+        return state;
+      }
+      function create({trialId,userId,at,cash,positions=[],initialBudgetLoss=0,limits={capital:400000,loss:100000}}) {
+        const record={schema:1,trialId,userId,startedAt:at,initialCash:cash,initialPositions:positions.map(position),initialBudgetLoss,limits:copy(limits),events:[]};
+        read(record);return record;
+      }
+      function append(record,event) {
+        read(record);const e=normalize(event),previous=record.events.find(x=>String(x.id)===e.id);
+        if(previous){check(JSON.stringify(normalize(previous))===JSON.stringify(e),'conflicting duplicate event');return record;}
+        const next={...record,events:[...record.events,e]};read(next);return next;
+      }
+      function report(record,{at,values=[]}={}) {
+        const s=read(record);check(stamp(at)&&at>=s.at&&Array.isArray(values)&&distinct(values,v=>String(v.stockId)),'invalid valuation time or identities');
+        for(const v of values)check(id(v.stockId)&&whole(v.lower)&&(v.upper===null||whole(v.upper)&&v.upper>=v.lower)&&
+          (v.quoted===undefined||v.quoted===null||whole(v.quoted)),'invalid valuation interval');
+        let lower=s.cash,upper=s.cash,quoted=s.cash,unrealizedLoss=0,unknown=0;
+        for(const p of s.positions){
+          const v=values.find(v=>sameStockId(v.stockId,p.stockId))||{lower:0,upper:null,quoted:null};
+          lower=sum([lower,v.lower]);upper=upper===null||v.upper===null?null:sum([upper,v.upper]);
+          quoted=quoted===null||v.quoted==null?null:sum([quoted,v.quoted]);
+          unrealizedLoss=sum([unrealizedLoss,Math.max(0,p.costBasisTokens-v.lower)]);
+          if(v.upper===null||v.lower!==v.upper)unknown++;
+        }
+        const initialBudgetLoss=record.initialBudgetLoss||0;
+        const loss=Math.max(0,sum([initialBudgetLoss,-s.realized,unrealizedLoss]));
+        const stressLoss=Math.max(0,sum([initialBudgetLoss,-s.realized,s.capital])); // 无可信尾部界时按投入全损，含未决买单。
+        const reasons=[];
+        if(s.halt)reasons.push(s.halt.reason);
+        if(s.capital>record.limits.capital)reasons.push('capital-exceeded');
+        if(s.availableCash<0)reasons.push('cash-overdrawn');
+        if(loss>=record.limits.loss)reasons.push('loss-limit');
+        if(stressLoss>=record.limits.loss)reasons.push('risk-budget-exhausted');
+        const newRiskCapacity=Math.max(0,Math.min(record.limits.capital-s.capital,s.availableCash,
+          sum([record.limits.loss,-initialBudgetLoss,s.realized,-s.capital])));
+        return {trialId:s.trialId,userId:s.userId,at,cash:s.cash,heldCost:s.heldCost,pendingBuy:s.pendingBuy,capital:s.capital,
+          externalNet:s.externalNet,realized:s.realized,initialBudgetLoss,grossRealizedLoss:s.grossRealizedLoss,unrealizedLoss,loss,stressLoss,
+          equity:{lower,upper,quoted},unknownPositions:unknown,pending:s.orders.filter(o=>o.status==='pending').length,
+          newRiskCapacity:reasons.length?0:newRiskCapacity,reasons:[...new Set(reasons)],halt:s.halt};
+      }
+      function reserve(record,event,valuation) {
+        const e=normalize(event);check(e.type==='submit','expected submission');
+        const r=report(record,valuation);
+        check(e.at===r.at,'submission valuation time differs');
+        if(e.action==='buy')check(!r.halt&&e.reservedTokens<=r.newRiskCapacity,'new risk exceeds budget');
+        else {const p=read(record).positions.find(p=>p.stockId===e.stockId);check(p&&(p.holdUntil===null||p.holdUntil<=e.at),'position still locked');}
+        return append(record,e);
+      }
+      function mark(record,valuation) {
+        let result=report(record,valuation);
+        const reason=result.reasons.find(r=>['capital-exceeded','cash-overdrawn','loss-limit'].includes(r));
+        if(reason&&!result.halt){record=append(record,{id:'risk-stop-'+valuation.at,at:valuation.at,type:'halt',reason});result=report(record,valuation);}
+        return {record,report:result};
+      }
+      function window(from,to) {
+        check(from?.trialId===to?.trialId&&from?.userId===to?.userId&&stamp(from?.at)&&stamp(to?.at)&&to.at>=from.at,'incompatible window');
+        const flow=sum([to.externalNet,-from.externalNet]);
+        const lower=from.equity.upper===null?null:sum([to.equity.lower,-from.equity.upper,-flow]);
+        const upper=to.equity.upper===null?null:sum([to.equity.upper,-from.equity.lower,-flow]);
+        const complete=to.at-from.at===7*86400000&&!from.pending&&!to.pending;
+        // complete只核对窗口端点及未决单；目标数值越线不等于独立验证或实号验收通过。
+        return {from:from.at,to:to.at,externalNet:flow,lower,upper,complete,
+          targetExceeded:complete&&lower!==null&&lower>700000};
+      }
+      return {create,append,read,report,reserve,mark,window};
+    })();
+    // 纯适配层：与原执行账本原子保存；清理旧执行明细不清独立试验起点和事件。
+    const accountRuntime = (()=>{
+      const manualIssue='检测到手动股票交易，实际成本与到账须独立归属，停止新增风险';
+      const issue=(state,reason)=>({...state,issue:state.issue||reason});
+      function valid(state,userId) {
+        try {
+          if(!state||state.version!==1||typeof state.issue!=='string'||!whole(state.legacyUnknownSales)||
+            state.manualRevision!==undefined&&!whole(state.manualRevision)||state.manualUnresolved!==undefined&&
+              (!Array.isArray(state.manualUnresolved)||!distinct(state.manualUnresolved,e=>e.id)||
+                !state.manualUnresolved.every(e=>id(e.id)&&whole(e.revision))))return false;
+          const s=account.read(state.record);
+          return s.userId===userId&&state.record.limits.capital<=400000&&state.record.limits.loss<=100000&&
+            state.baseline?.trialId===s.trialId&&state.baseline.userId===userId&&state.baseline.at===s.startedAt;
+        }catch{return false;}
+      }
+      function values(m,now) {
+        return m.view.positions.filter(p=>p.shares>0).map(p=>{
+          const s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),q=s&&!s.stale&&!s.suspended?quote(s.priceCents,p.shares,m.rules.sellFeePct,false):null;
+          const can=q!==null&&m.view.enabled&&p.holdUntil!==undefined&&(p.holdUntil===null||time(p.holdUntil)<=now)&&
+            BigInt(s.priceCents)*BigInt(p.shares)<=BigInt(Math.min(m.rules.maxTradeTokens,m.rules.reserveTokens))*100n;
+          return {stockId:p.stockId,lower:can?q:0,upper:can?q:null,quoted:q};
+        });
+      }
+      function start(m,ledger,now,trialId) {
+        if(ledger.pending)return null;
+        const totals=historyTotals(ledger.entries,ledger.archive),positions=m.view.positions.filter(p=>p.shares>0).map(p=>({
+          ...p,modelName:m.view.stocks.find(s=>sameStockId(s.id,p.stockId))?.modelName,
+          holdUntil:p.holdUntil===null?null:time(p.holdUntil)}));
+        const record=account.create({trialId,userId:m.view.userId,at:now,cash:Math.min(m.balance,400000),positions,
+          initialBudgetLoss:Math.max(0,-totals.realized)});
+        const baseline=account.report(record,{at:now,values:values(m,now)});
+        return {version:1,record,baseline,legacyUnknownSales:totals.unknownSales,
+          issue:totals.unknownSales?'旧卖出到账或成本有缺口，独立试验不得以新起点重置未知亏损':''};
+      }
+      function refresh(state,m,now) {
+        const s=account.read(state.record),actual=m.view.positions.filter(p=>p.shares>0);
+        if(s.userId!==m.view.userId)return issue(state,'独立账本账号变化，保留原记录');
+        if(s.positions.length!==actual.length||s.positions.some(p=>!actual.some(a=>sameStockId(a.stockId,p.stockId)&&
+            a.shares===p.shares&&a.costBasisTokens===p.costBasisTokens&&
+            m.view.stocks.some(stock=>sameStockId(stock.id,p.stockId)&&stock.modelName===p.modelName))))
+          return issue(state,'独立账本与实际持仓不一致，可能有手动或未核对成交，停止新增风险');
+        const marked=account.mark(state.record,{at:now,values:values(m,now)});
+        return {...state,record:marked.record,report:marked.report};
+      }
+      function submit(state,m,p) {
+        if(p.choice.action==='predict')return state;
+        if(p.choice.action==='buy'&&state.issue)throw Error(state.issue);
+        const r=account.read(state.record),a=p.choice;
+        const next=account.reserve(state.record,{id:p.id,type:'submit',at:p.at,action:a.action,stockId:a.stockId,
+          modelName:a.modelName,shares:a.shares,reservedTokens:a.action==='buy'?a.debit:0},{at:p.at,values:values(m,p.at)});
+        if(r.userId!==m.view.userId)throw Error('独立账本账号不一致');
+        return {...state,record:next};
+      }
+      function reconcile(state,m,p,entry,now) {
+        if(p.choice.action==='predict')return state;
+        const s=account.read(state.record),order=s.orders.find(o=>o.id===p.id);
+        if(!order)return issue(state,'原交易未绑定独立账本，保留起点并等待人工核对');
+        const at=Math.max(now,s.at),a=p.choice;
+        let event;
+        if(p.result==='rejected')event={id:'receipt-'+p.id,type:'reject',orderId:p.id,at,reason:'native-rejected'};
+        else {
+          const pos=m.view.positions.find(v=>sameStockId(v.stockId,a.stockId)),remaining=p.beforeShares+(a.action==='buy'?a.shares:-a.shares);
+          if((pos?.shares||0)!==remaining)return issue(state,'成交后的持仓数量尚未核对，保留独立预留');
+          if(a.action==='buy'){
+            const debit=pos?.costBasisTokens-p.beforeCost;
+            if(!positive(debit)||pos.holdUntil===undefined||pos.holdUntil!==null&&!Number.isFinite(time(pos.holdUntil)))
+              return issue(state,'实际买入成本或持有期证据不足，保留独立预留');
+            // 事件at是核对时间，原生持有期可能已过，不延长实际锁定。
+            event={id:'receipt-'+p.id,type:'fill',orderId:p.id,at,amount:debit,holdUntil:pos.holdUntil===null?null:time(pos.holdUntil)};
+          }else{
+            if(!whole(entry.proceeds)||!whole(entry.releasedCost))return issue(state,'卖出到账或对应成本未知，保留独立预留并停止新增风险');
+            const expectedCost=p.beforeCost-entry.releasedCost;
+            if(!whole(expectedCost)||(remaining?pos?.costBasisTokens:0)!==expectedCost)return issue(state,'卖出剩余成本不一致，保留独立预留');
+            event={id:'receipt-'+p.id,type:'fill',orderId:p.id,at,amount:entry.proceeds,remainingCost:expectedCost};
+          }
+        }
+        return {...state,record:account.append(state.record,event)};
+      }
+      function capacity(state,m,now) {
+        if(!state||state.issue)return 0;
+        return Math.min(account.report(state.record,{at:now,values:values(m,now)}).newRiskCapacity,m.balance);
+      }
+      function manual(state,entry,view,now) {
+        const e=entry,input=e.input,s=account.read(state.record),id='manual-'+e.id;
+        if(input?.action==='predict'||s.userId!==input?.expectedUserId)return state;
+        if(s.orders.some(o=>o.id===id&&o.status==='filled'))return state;
+        if(!e.confirmed||e.automatic||e.ambiguous||!e.before||e.at<s.startedAt||e.at<s.at)return issue(state,manualIssue);
+        const before=s.positions.find(p=>sameStockId(p.stockId,e.before.stockId));
+        if((before?.shares||0)!==e.before.shares||(before?.costBasisTokens||0)!==e.before.cost)return issue(state,manualIssue);
+        const proof=incomeProof(e,view);if(!proof)return issue(state,manualIssue);
+        const pos=view.positions.find(p=>sameStockId(p.stockId,e.before.stockId));
+        if(input.action==='sell'&&!whole(e.proceeds)||input.action==='buy'&&
+          (pos?.holdUntil===undefined||pos.holdUntil!==null&&!Number.isFinite(time(pos.holdUntil))))return issue(state,manualIssue);
+        let record=account.append(state.record,{id,type:'submit',at:e.at,action:input.action,stockId:e.before.stockId,
+          modelName:input.modelName,shares:input.shares,reservedTokens:input.action==='buy'?proof.debit:0});
+        record=account.append(record,{id:'receipt-'+id,type:'fill',orderId:id,at:Math.max(now,e.at),
+          amount:input.action==='buy'?proof.debit:e.proceeds,...(input.action==='buy'?
+            {holdUntil:pos.holdUntil===null?null:time(pos.holdUntil)}:{remainingCost:e.before.cost-proof.releasedCost})});
+        // 仅解开这一类已经完整归属的临时缺口；未知历史及预算触线不随手动盈利解除。
+        const marker=state.manualUnresolved?.find(e=>e.id===entry.id),manualUnresolved=(state.manualUnresolved||[]).filter(e=>e.id!==entry.id);
+        const clear=state.issue===manualIssue&&!manualUnresolved.length&&(marker?.revision??0)===(state.manualRevision??0);
+        const next={...state,record,manualUnresolved,issue:clear?'':state.issue};
+        return refresh(next,model(view,{tokens:0}),Math.max(now,e.at));
+      }
+      return {valid,values,start,refresh,submit,reconcile,capacity,issue,manual,manualIssue};
+    })();
     function historyTotals(entries,archive={}) {
       const sum={buyCost:0,knownProceeds:0,releasedCost:0,realized:0,unknownSales:0,predictionNet:0,predictionStake:0,predictionPaid:0,...archive};
       for(const e of entries){
@@ -521,10 +772,15 @@
           result('holding','尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
       });
     }
-    function observationParts(m) {
+    function observationParts(m,ledger=null) {
       const parts=[];let stocks=[],ticks=[];
       const rules=Object.fromEntries(['buyFeePct','sellFeePct','maxTradeTokens','maxDailyBuyTokens','maxPositionTokens','reserveTokens'].map(k=>[k,m.rules[k]]));
-      const snapshot=()=>({userId:m.view.userId,enabled:m.view.enabled,rules,stocks,ticks});
+      const pendingKnown=ledger?.userId===m.view.userId,p=pendingKnown?ledger.pending:null;
+      const accountSnapshot={userId:m.view.userId,balanceTokens:m.balance,
+        positions:m.view.positions.map(p=>Object.fromEntries(['stockId','shares','costBasisTokens','holdUntil'].map(k=>[k,p[k]]))),
+        pendingKnown,...(pendingKnown?{pending:p?{id:p.id,at:p.at,action:p.choice?.action,stockId:p.choice?.stockId,
+          modelName:p.choice?.modelName,shares:p.choice?.shares,reservedTokens:p.choice?.action==='buy'?p.choice.debit:0,result:p.result??null}:null}:{})};
+      const snapshot=()=>({userId:m.view.userId,enabled:m.view.enabled,rules,stocks,ticks,...(!parts.length?{accountSnapshot}:{})});
       for(const stock of m.view.stocks){
         const s=Object.fromEntries(['id','modelName','priceCents','volume24h','stale','suspended'].filter(k=>stock[k]!==undefined).map(k=>[k,stock[k]]));
         const history=m.view.ticks.filter(t=>sameStockId(t.stockId,stock.id)).sort((a,b)=>time(a.createdAt)-time(b.createdAt)).slice(-12)
@@ -911,7 +1167,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,historyTotals,performance,riskExposure,riskReason,sellPlan,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -972,7 +1228,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.13';
+  const SCRIPT_VERSION = '1.17.20';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -1046,6 +1302,81 @@
   const logBytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
   const normalLog = event => ['state', 'heartbeat'].includes(event.type) ||
     event.type === 'request-result' && event.data?.status >= 200 && event.data.status < 400;
+  const LOG_PRIORITY_VERSION = 2;
+  const criticalLog = event => Boolean(event.receiptId) || [
+    'stock-submit','stock-response','stock-confirmed','stock-income','stock-prediction-settled',
+    'shelter-submitted','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed',
+    'shelter-population','shelter-training-adopted','shelter-defense-settled','shelter-trips-recovered',
+    'page-lifecycle','reward','pause',
+  ].includes(event.type) || /-(error|held|blocked|recovered|resumed)$/.test(event.type) ||
+    event.type==='request-result' && Number.isFinite(event.data?.status) && event.data.status>=400;
+  const logPriority = event => criticalLog(event)?2:
+    normalLog(event)||['stock-decision-detail','shelter-decision-detail','shelter-check-detail'].includes(event.type)?0:1;
+  // STOCK_OBSERVATION_CODEC_BEGIN
+  function createStockObservationCodec() {
+    const maximum=4*1024*1024;
+    const digest=async bytes=>[...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(b=>b.toString(16).padStart(2,'0')).join('');
+    const bytesFrom64=value=>{
+      if(typeof value!=='string'||value.length>maximum*2||! /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))throw Error('Invalid observation base64');
+      return Uint8Array.from(atob(value),c=>c.charCodeAt(0));
+    };
+    const base64=bytes=>{let s='';for(let i=0;i<bytes.length;i+=8192)s+=String.fromCharCode(...bytes.subarray(i,i+8192));return btoa(s);};
+    async function bounded(stream,limit) {
+      const reader=stream.getReader(),chunks=[];let size=0;
+      try{for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;
+        if(size>limit)throw Error('Observation decoded size exceeded');chunks.push(value);}}
+      catch(error){await reader.cancel().catch(()=>{});throw error;}finally{reader.releaseLock();}
+      const result=new Uint8Array(size);let offset=0;for(const part of chunks){result.set(part,offset);offset+=part.length;}return result;
+    }
+    async function encode(common) {
+      if(!common||!Array.isArray(common.parts)||!common.parts.length||common.parts.length>1000||
+        common.parts.some(p=>!p||!Array.isArray(p.stocks)||!Array.isArray(p.ticks)))throw Error('Invalid observation payload');
+      const bytes=new TextEncoder().encode(JSON.stringify(common));if(bytes.length>maximum)throw Error('Observation payload too large');
+      const compressed=typeof CompressionStream==='function'?
+        await bounded(new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip')),maximum):null;
+      const packed=compressed&&compressed.length<bytes.length;
+      return {encoding:packed?'gzip-base64':'utf8',rawBytes:bytes.length,sha256:await digest(bytes),
+        payload:packed?base64(compressed):new TextDecoder().decode(bytes)};
+    }
+    async function decode(content) {
+      if(!content||!['gzip-base64','utf8'].includes(content.encoding)||!Number.isSafeInteger(content.rawBytes)||
+        content.rawBytes<1||content.rawBytes>maximum||!/^[a-f0-9]{64}$/.test(content.sha256)||typeof content.payload!=='string'||content.payload.length>maximum*2)
+        throw Error('Invalid observation content');
+      let bytes;
+      if(content.encoding==='utf8')bytes=new TextEncoder().encode(content.payload);
+      else{
+        if(typeof DecompressionStream!=='function')throw Error('Observation decompression unavailable');
+        bytes=await bounded(new Blob([bytesFrom64(content.payload)]).stream().pipeThrough(new DecompressionStream('gzip')),content.rawBytes);
+      }
+      if(bytes.length!==content.rawBytes||await digest(bytes)!==content.sha256)throw Error('Observation content integrity failed');
+      const common=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+      if(!common||!Array.isArray(common.parts)||!common.parts.length||common.parts.length>1000||
+        common.parts.some(p=>!p||!Array.isArray(p.stocks)||!Array.isArray(p.ticks)))throw Error('Invalid decoded observation');
+      return common;
+    }
+    async function expand(event) {
+      const d=event.data;
+      if(event.type!=='stock-observation-block'||d?.blockVersion!==1||!Array.isArray(d.readings)||
+        !d.readings.length||d.readings.length>64)throw Error('Invalid observation block');
+      const common=await decode(d.content),ids=new Set();let previous=-1;
+      if(d.readings[0]?.at!==event.at)throw Error('Invalid observation block origin');
+      for(const r of d.readings){const x=r?.reading;
+        if(!r||!Number.isSafeInteger(r.at)||r.at<previous||r.at<event.at||r.at-event.at>3600000||
+          typeof r.observationId!=='string'||!r.observationId||ids.has(r.observationId)||!x||
+          !Number.isSafeInteger(x.generation)||x.generation<1||!['scan','pre-submit','reconcile'].includes(x.phase)||
+          !['marketAt','balanceAt','freshnessAt'].every(k=>Number.isSafeInteger(x[k])&&x[k]>=0&&x[k]<=r.at)||
+          x.freshnessAt!==Math.min(x.marketAt,x.balanceAt))throw Error('Invalid packed reading metadata');
+        previous=r.at;ids.add(r.observationId);
+      }
+      return d.readings.flatMap(r=>common.parts.map((snapshot,part)=>({...event,at:r.at,
+        beijing:new Date(r.at+8*3600000).toISOString().replace('Z','+08:00'),visibility:r.visibility,
+        type:'stock-observation',data:{observationVersion:2,observationId:r.observationId,at:r.at,reading:r.reading,
+          part,totalParts:common.parts.length,settings:common.settings,snapshot}})));
+    }
+    return {encode,decode,expand};
+  }
+  // STOCK_OBSERVATION_CODEC_END
+  const stockObservationCodec=createStockObservationCodec();
   const idbResult = request => new Promise((resolve, reject) => {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -1067,8 +1398,8 @@
     let queue = Promise.resolve();
     const warnings = new Set();
     const blank = (group, day) => ({ key: `${group}:${day}`, group, day, counts: {}, totals: {},
-      dropped: 0, sampled: 0, firstAt: null, lastAt: null });
-    const emptyBudget = () => ({ key: 'budget', bytes: 0, normalBytes: 0, day: '' });
+      dropped: 0, criticalDropped: 0, unclassifiedDropped: 0, sampled: 0, firstAt: null, lastAt: null });
+    const emptyBudget = () => ({ key: 'budget', bytes: 0, normalBytes: 0, day: '', priorityVersion: LOG_PRIORITY_VERSION });
     const stores = ['events', 'days', 'meta'];
     async function open() {
       if (connection) return connection;
@@ -1113,7 +1444,24 @@
     async function maintain(tx, budget) {
       const events = tx.objectStore('events');
       const days = tx.objectStore('days');
-      const earliest = logDay(Date.now() - (LOG_DAYS - 1) * 86400000);
+      if(budget.priorityVersion!==LOG_PRIORITY_VERSION){
+        // Reclassify existing IDB rows in this transaction before any deletion. Upgrading
+        // only new writes would leave older receipts at the same priority as check logs.
+        budget.bytes=0;budget.normalBytes=0;
+        await walk(events.openCursor(),cursor=>{
+          const event=cursor.value,priority=logPriority(event);
+          if(event.priority!==priority)cursor.update({...event,priority});
+          budget.bytes+=event.bytes;if(!priority)budget.normalBytes+=event.bytes;
+        });
+        await walk(days.openCursor(),cursor=>{
+          const day=cursor.value;
+          if(day.criticalDropped===undefined)cursor.update({...day,criticalDropped:0,unclassifiedDropped:day.dropped||0});
+        });
+        budget.priorityVersion=LOG_PRIORITY_VERSION;
+      }
+      // Include seven complete days plus the current partial day: six prior calendar days
+      // can never prove a full rolling 168-hour window.
+      const earliest = logDay(Date.now() - LOG_DAYS * 86400000);
       if (budget.day !== logDay()) {
         await walk(events.index('day').openCursor(IDBKeyRange.upperBound(earliest, true)), cursor => {
           budget.bytes -= cursor.value.bytes;
@@ -1122,32 +1470,39 @@
         });
         await walk(days.openCursor(), cursor => { if (cursor.value.day < earliest) cursor.delete(); });
         await walk(tx.objectStore('meta').openCursor(), cursor => {
-          if (cursor.value.day && /^(migration|receipt):/.test(cursor.value.key) && cursor.value.day < earliest) cursor.delete();
+          if (cursor.value.day && /^(migration|receipt|observation):/.test(cursor.value.key) && cursor.value.day < earliest) cursor.delete();
         });
         budget.day = logDay();
       }
       const dropped = new Map();
-      for (const priority of [0, 1]) {
+      for (const priority of [0, 1, 2]) {
         if (budget.bytes <= LOG_BUDGET && budget.normalBytes <= LOG_BUDGET * 0.8) break;
         await walk(events.index('priorityAt').openCursor(IDBKeyRange.bound([priority, 0], [priority, Number.MAX_VALUE])), cursor => {
           if (budget.bytes <= LOG_BUDGET && budget.normalBytes <= LOG_BUDGET * 0.8) return false;
           const event = cursor.value;
           budget.bytes -= event.bytes;
           if (!priority) budget.normalBytes -= event.bytes;
-          dropped.set(event.bucket, (dropped.get(event.bucket) || 0) + 1);
+          const loss=dropped.get(event.bucket)||{events:0,observations:0,critical:0};loss.events++;
+          if(priority===2)loss.critical++;
+          if(event.type==='stock-observation-block')loss.observations+=event.data.readings.length;
+          dropped.set(event.bucket,loss);
           cursor.delete();
         });
       }
       for (const [key, count] of dropped) {
         const day = await idbResult(days.get(key));
-        if (day) { day.dropped += count; days.put(day); }
+        if (day) {
+          if(day.criticalDropped===undefined){day.criticalDropped=0;day.unclassifiedDropped=day.dropped||0;}
+          day.dropped+=count.events;day.criticalDropped+=count.critical;
+          day.observationDropped=(day.observationDropped||0)+count.observations;days.put(day);
+        }
       }
       budget.bytes = Math.max(0, budget.bytes);
       budget.normalBytes = Math.max(0, budget.normalBytes);
       tx.objectStore('meta').put(budget);
     }
     async function migrate(db) {
-      const earliest = logDay(Date.now() - (LOG_DAYS - 1) * 86400000);
+      const earliest = logDay(Date.now() - LOG_DAYS * 86400000);
       const keys = Object.keys(localStorage).filter(key => /^arkengine:auto-log:v1:(cultivate|expedition):\d{4}-\d{2}-\d{2}$/.test(key));
       for (const key of keys) {
         const day = key.slice(-10);
@@ -1172,11 +1527,12 @@
               if (Number.isFinite(value)) entry[field][name] = (entry[field][name] || 0) + value;
             }
           }
-          entry.dropped += Number.isSafeInteger(old.dropped) && old.dropped > 0 ? old.dropped : 0;
+          const legacyDropped=Number.isSafeInteger(old.dropped)&&old.dropped>0?old.dropped:0;
+          entry.dropped+=legacyDropped;entry.unclassifiedDropped=(entry.unclassifiedDropped||0)+legacyDropped;
           for (const event of old.events) {
-            if (!objectState(event)) { entry.dropped++; continue; }
+            if (!objectState(event)) { entry.dropped++;entry.unclassifiedDropped++;continue; }
             const item = { ...event, at: Number.isFinite(event.at) ? event.at : Date.parse(`${day}T00:00:00+08:00`),
-              bucket: entry.key, day, priority: normalLog(event) ? 0 : 1 };
+              bucket: entry.key, day, priority: logPriority(event) };
             delete item.id;
             item.bytes = logBytes(item);
             tx.objectStore('events').add(item);
@@ -1197,7 +1553,46 @@
     }
     let migrated = false;
     const ready = async db => { if (!migrated) { await migrate(db); migrated = true; } };
+    async function expandEvents(events) {
+      const expanded=[];
+      for(const event of events)expanded.push(...(event.type==='stock-observation-block'?await stockObservationCodec.expand(event):[event]));
+      return expanded.sort((a,b)=>a.at-b.at||(a.id??0)-(b.id??0));
+    }
     return {
+      appendObservation(event,common,reading) {
+        // Compression runs inside the per-page queue, outside the IDB transaction. Export
+        // waits for it; transaction failure cannot leave a half-written multipart frame.
+        return enqueue(async db=>{
+          await ready(db);const content=await stockObservationCodec.encode(common);
+          const trial={...event,type:'stock-observation-block',data:{blockVersion:1,content,readings:[reading]}};
+          await stockObservationCodec.expand(trial);
+          return logTransaction(db,stores,'readwrite',async tx=>{
+            const day=logDay(event.at),key=event.group+':'+day,events=tx.objectStore('events'),meta=tx.objectStore('meta'),days=tx.objectStore('days');
+            const bucket=await idbResult(days.get(key))||blank(event.group,day),budget=await idbResult(meta.get('budget'))||emptyBudget();
+            const markerKey='observation:'+event.pageId+':'+day,marker=await idbResult(meta.get(markerKey));
+            const prior=marker?await idbResult(events.get(marker.eventId)):null;
+            const duplicate=prior?.data?.readings?.find(r=>r.observationId===reading.observationId);
+            if(duplicate){
+              if(prior.data.content.sha256!==content.sha256||JSON.stringify(duplicate)!==JSON.stringify(reading))throw Error('Conflicting observation reading');
+              return bucket;
+            }
+            const merge=prior?.type==='stock-observation-block'&&prior.version===event.version&&prior.bucket===key&&
+              prior.data.content.sha256===content.sha256&&prior.data.content.payload===content.payload&&prior.data.readings.length<64&&
+              reading.at>=prior.data.readings.at(-1).at&&reading.at-prior.at<=3600000;
+            let item=merge?{...prior,data:{...prior.data,readings:[...prior.data.readings,reading]}}:
+              {...trial,bucket:key,day,priority:1};
+            if(merge)budget.bytes-=prior.bytes;
+            delete item.bytes;const id=item.id;delete item.id;item.bytes=logBytes(item);
+            const eventId=merge?(events.put({...item,id}),id):await idbResult(events.add(item));
+            budget.bytes+=item.bytes;
+            bucket.counts['stock-observation']=(bucket.counts['stock-observation']||0)+1;
+            bucket.observationReadings=(bucket.observationReadings||0)+1;
+            bucket.firstAt=bucket.firstAt===null?event.at:Math.min(bucket.firstAt,event.at);bucket.lastAt=Math.max(bucket.lastAt||0,event.at);
+            days.put(bucket);meta.put({key:markerKey,day,eventId});await maintain(tx,budget);
+            return idbResult(days.get(key));
+          });
+        });
+      },
       append(event, reward, sampled) {
         return enqueue(async db => {
           await ready(db);
@@ -1217,7 +1612,7 @@
             const budget = await idbResult(tx.objectStore('meta').get('budget')) || emptyBudget();
             if (sampled) entry.sampled++;
             else {
-              const item = { ...event, bucket: key, day, priority: normalLog(event) ? 0 : 1 };
+              const item = { ...event, bucket: key, day, priority: logPriority(event) };
               item.bytes = logBytes(item);
               tx.objectStore('events').add(item);
               budget.bytes += item.bytes;
@@ -1261,7 +1656,7 @@
       read(group, day = logDay(), limit = 30) {
         return enqueue(async db => {
           await ready(db);
-          return logTransaction(db, ['days', 'events'], 'readonly', async tx => {
+          const result=await logTransaction(db, ['days', 'events'], 'readonly', async tx => {
             const key = `${group}:${day}`;
             const entry = await idbResult(tx.objectStore('days').get(key));
             if (!entry) return null;
@@ -1271,12 +1666,13 @@
             });
             return { ...entry, events: events.reverse() };
           });
+          if(result)result.events=await expandEvents(result.events);return result;
         });
       },
       export() {
         return enqueue(async db => {
           await ready(db);
-          return logTransaction(db, stores, 'readwrite', async tx => {
+          const result=await logTransaction(db, stores, 'readwrite', async tx => {
             const budget = await idbResult(tx.objectStore('meta').get('budget')) || emptyBudget();
             await maintain(tx, budget);
             const days = await idbResult(tx.objectStore('days').getAll());
@@ -1286,9 +1682,34 @@
               for (const event of day.events) { delete event.id; delete event.bytes; delete event.bucket; delete event.priority; }
               delete day.key;
             }
-            return { days, retentionDays: LOG_DAYS, budgetBytes: LOG_BUDGET, estimatedEventBytes: budget.bytes,
+            return { days, retentionDays: LOG_DAYS, retentionMode:'seven-full-days-plus-current-calendar-day',
+              budgetBytes: LOG_BUDGET, estimatedEventBytes: budget.bytes,
               byteAccounting: '事件序列化 UTF-8 估算；索引、数据库元数据和每日汇总不计入', warnings: [...warnings] };
           });
+          const coverage={acceptedReadings:0,retainedPackedReadings:0,droppedReadings:0,blocks:0,accounts:[]};
+          for(const day of result.days){
+            coverage.acceptedReadings+=day.observationReadings||0;coverage.droppedReadings+=day.observationDropped||0;
+            for(const e of day.events)if(e.type==='stock-observation-block'){coverage.blocks++;coverage.retainedPackedReadings+=e.data.readings.length;}
+            day.events=await expandEvents(day.events);
+          }
+          const accounts=new Map();
+          for(const day of result.days)for(const e of day.events)if(e.type==='stock-observation'&&(e.data.part??0)===0){
+            const userId=e.data.snapshot?.userId;if(!accounts.has(userId))accounts.set(userId,[]);accounts.get(userId).push(e.data.at);
+          }
+          for(const [userId,times] of accounts){times.sort((a,b)=>a-b);const gaps=[];
+            for(let i=1;i<times.length;i++)if(times[i]-times[i-1]>600000)gaps.push({from:times[i-1],to:times[i],durationMs:times[i]-times[i-1]});
+            coverage.accounts.push({userId,observations:times.length,firstAt:times[0],lastAt:times.at(-1),spanMs:times.at(-1)-times[0],gapsOverTenMinutes:gaps});
+          }
+          const critical={priorityVersion:LOG_PRIORITY_VERSION,retainedEvents:0,droppedEvents:0,unclassifiedDropped:0,days:[],
+            scope:'仅统计保留日期内关键记录及已知淘汰；旧版未分类损失保持未知，首尾跨度不证明连续执行或完整七天。'};
+          for(const day of result.days){
+            const retained=day.events.filter(criticalLog),dropped=day.criticalDropped??0;
+            const unknown=day.unclassifiedDropped??day.dropped??0;
+            critical.retainedEvents+=retained.length;critical.droppedEvents+=dropped;critical.unclassifiedDropped+=unknown;
+            critical.days.push({group:day.group,day:day.day,retainedEvents:retained.length,droppedEvents:dropped,
+              unclassifiedDropped:unknown,firstAt:retained.length?retained[0].at:null,lastAt:retained.length?retained.at(-1).at:null});
+          }
+          return {...result,stockObservationCoverage:coverage,criticalEventCoverage:critical};
         });
       },
     };
@@ -1384,6 +1805,12 @@
       return logStore.append(event, sum ? data.reward : null, sampled)
         .then(value => committed(event, value)).catch(() => { failed(); return false; });
     }
+    function observation(common,reading) {
+      const event={at:reading.at,group,page:diagnosticPage(),pageId,version:SCRIPT_VERSION,
+        visibility:document.visibilityState,type:'stock-observation-block',detail:'保留已读取行情与账户快照；采集不代表允许交易'};
+      return logStore.appendObservation(event,common,{...reading,visibility:event.visibility})
+        .then(value=>committed(event,value)).catch(()=>{failed();return false;});
+    }
     function saveReceipt(value) {
       pending = value;
       try { sessionStorage.setItem(receiptKey, JSON.stringify(value)); } catch { storageFailed = true; }
@@ -1468,7 +1895,7 @@
       const box = shadow.querySelector('.box');
       hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'log-summary';hint.style.whiteSpace='pre-line'; box.append(hint);
       const details = document.createElement('details'); details.id = 'local-log';
-      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">北京时间今天及前 6 天；两组共用约 20 MiB 事件预算。重复普通状态会合并；关键故障、结果与收益汇总优先保留。导出包含采样、截断和覆盖时间。</p><button type="button">导出两页日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
+      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">保留前 7 个完整自然日及今天，两组共用约 20 MiB 事件预算。行情压缩保存，关键故障、结果与收益汇总优先于重复详情。容量不足仍可能提前清理；导出注明实际覆盖和缺口。</p><button type="button">导出两页日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
       details.addEventListener('toggle', async () => {
         if (!details.open) return;
         const value = await refreshLog();
@@ -1496,7 +1923,7 @@
         add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
       }
     }
-    const log = { add, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites };
+    const log = { add, observation, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites };
 
     diagnosticLogs[group] = log;
     return log;
@@ -3226,6 +3653,8 @@
     ['tradeLimit','predictionLimit','stake','reserve'].every(k=>stockCore.whole(v[k]) && v[k]<=1e12);
   // 结算记录是历史清理的完成凭据，损坏字段不能被当作已经结算。
   const validStockLedger = v => objectState(v) && v.version===1 && (v.userId===null || stockCore.positive(v.userId)) &&
+    (v.accounting===undefined||stockCore.accountRuntime.valid(v.accounting,v.userId))&&
+    (v.accountingWait===undefined||typeof v.accountingWait==='string')&&
     (v.archive===undefined||objectState(v.archive)&&['buyCost','knownProceeds','releasedCost','unknownSales','predictionStake','predictionPaid'].every(k=>stockCore.whole(v.archive[k]))&&
       ['realized','predictionNet'].every(k=>Number.isSafeInteger(v.archive[k])))&&
     stockCore.whole(v.nextAt) && typeof v.note==='string' && typeof v.hold==='boolean' && objectState(v.owned) &&
@@ -3343,6 +3772,7 @@
       else {
         const proof=stockCore.incomeProof(e,view);if(proof)reward={'股市买入支出':proof.debit};
       }
+      if(reward&&a.action!=='predict'&&e.page===stockIncomePage&&view)stockAccountManual(e,view);
       if(reward&&await log.add('stock-income','手动股市原回执确认资金流',{action:a.action,source:'manual',model:a.modelName,reward,
         ...(a.action==='sell'?{shares:a.shares,proceeds:e.proceeds??null,releasedCost,
           realized:stockCore.whole(e.proceeds)&&stockCore.whole(releasedCost)?e.proceeds-releasedCost:null,
@@ -3373,7 +3803,7 @@
   }
   observeStockIncome={
     begin(){
-      const context={before:null,user:stockIncomeUser,at:Date.now(),page:stockIncomePage};
+      const context={before:null,user:stockIncomeUser,at:Date.now(),page:stockIncomePage,accountRevision:stockLedger?.accounting?.manualRevision??0};
       try{
         const revision=stockIncomeRevision(),next=crypto.randomUUID();
         if(stockIncomeCache?.revision===revision)context.before=stockIncomeCache.view;
@@ -3390,7 +3820,9 @@
         const p=stockCore.incomeInput(body);if(!p){stockIncomeInvalidate(context.user);return null;}
         const user=p.input.expectedUserId,id=await stockIncomeId(user,p.key),current=stockLedger?.pending;
         automatic=automatic||current?.key===p.key&&stockCore.same(current.input,p.input)||stockIncomeAutomatic.has(id);
-        if(await logStore.stockIncomeArchived(id))return null;
+        const archived=await logStore.stockIncomeArchived(id);
+        if(!automatic&&p.input.action!=='predict')stockAccountManualPost(user,id,context.accountRevision);
+        if(archived)return null;
         await stockIncomeCompact(user,stockIncomeEntries(user));
         const entries=stockIncomeEntries(user);
         for(const e of entries)if(!e.automatic&&!e.flow&&e.input.action!=='predict'&&e.id!==id&&p.input.action!=='predict'&&e.input.modelName===p.input.modelName)
@@ -3475,6 +3907,52 @@
     stockLedger=loadState(localStorage,STOCK_LEDGER,emptyStockLedger(),'stock',validStockLedger);
     return previous!==JSON.stringify([stockConfig,stockLedger]);
   }
+  function stockAccountRefresh(m) {
+    if(stockRead.accountDone)return;
+    let accounting=stockLedger.accounting,accountingWait='';
+    if(!accounting){
+      if(stockLedger.pending||stockNative().length)return;
+      try {
+        accounting=stockCore.accountRuntime.start(m,stockLedger,Date.now(),crypto.randomUUID());
+        const manual=stockIncomeEntries(m.view.userId).some(e=>!e.automatic&&!e.rejected&&e.input.action!=='predict');
+        if(manual)accounting=stockCore.accountRuntime.issue(accounting,'存在未独立核对的手动股票交易，保留起点并停止新增风险');
+      }catch{accountingWait='独立股市起点的持仓成本、身份或持有期不完整，停止新买入，继续核对原记录';}
+    }
+    if(accounting)accounting=stockCore.accountRuntime.refresh(accounting,m,Date.now());
+    stockPersist({...stockLedger,...(accounting?{accounting}:{}),accountingWait});
+    stockRead.accountDone=true;
+  }
+  function stockAccountManual(entry,view) {
+    stockReload();
+    const current=stockLedger.accounting;
+    if(!current||entry.input.expectedUserId!==stockLedger.userId)return;
+    const accounting=stockCore.accountRuntime.manual(current,entry,view,Date.now());
+    if(JSON.stringify(accounting)!==JSON.stringify(current))stockPersist({...stockLedger,accounting});
+  }
+  function stockAccountManualPost(user,id,revision) {
+    stockReload();const current=stockLedger.accounting;
+    if(!current||user!==stockLedger.userId)return;
+    const done=stockCore.account.read(current.record).orders.some(o=>o.id==='manual-'+id&&o.status==='filled');
+    const manualUnresolved=(current.manualUnresolved||[]).filter(e=>e.id!==id);
+    if(!done)manualUnresolved.push({id,revision});
+    const clear=done&&!manualUnresolved.length&&revision===(current.manualRevision??0)&&current.issue===stockCore.accountRuntime.manualIssue;
+    const accounting={...current,manualUnresolved,issue:clear?'':current.issue};
+    if(JSON.stringify(accounting)!==JSON.stringify(current))stockPersist({...stockLedger,accounting});
+  }
+  function stockAccountBudget(m) {
+    const capacity=stockCore.accountRuntime.capacity(stockLedger.accounting,m,Date.now());
+    const funded=stockCore.funding(m,stockConfig),spent=stockCore.spend(stockLedger.entries,'buy',Date.now());
+    // 仅限制新买入，不降低原生卖出资格或把预测收益混入股票试验。
+    return {...funded,autoBudget:false,tradeLimit:Math.min(funded.tradeLimit,spent+capacity)};
+  }
+  function stockAccountWait() {
+    const s=stockLedger.accounting;
+    if(stockLedger.accountingWait)return stockLedger.accountingWait;
+    if(s?.issue)return s.issue;
+    if(s?.report?.halt)return '独立股票试验已停止新增风险：'+s.report.halt.reason+'；跨日和刷新不重置';
+    if(s?.report?.newRiskCapacity===0)return '独立股票本金或累计试验风险预算无新增空间，继续核对已有仓位';
+    return '';
+  }
   function stockHint() {
     const c=stockConfig,l=stockLedger;
     const reason=stockHoldReason();
@@ -3485,6 +3963,10 @@
     shadow.getElementById('stock-performance').textContent=`脚本交易：已记录买入成本 ${totals.buyCost}；已知卖出净额 ${totals.knownProceeds}；已知已实现盈亏 ${totals.realized}`+
       `${totals.unknownSales?`；另有 ${totals.unknownSales} 笔卖出到账/成本未知，累计盈亏不完整`:''}。预测已结算净额 ${totals.predictionNet}。`+
       (valuation?`\n最近核对 ${new Date(valuation.at).toLocaleTimeString('zh-CN')}：脚本持仓成本 ${valuation.heldCost}，按报价扣费估算浮盈亏 ${valuation.unrealized}${valuation.unknownPositions?`（另有${valuation.unknownPositions}只无法估值）`:''}。估值不代表可实际成交。`:'\n持仓估值等待下次完整检查。');
+    const accounting=l.accounting,report=accounting?.report;
+    if(accounting)shadow.getElementById('stock-performance').textContent+=`\n独立股票试验自 ${new Date(accounting.record.startedAt).toLocaleString('zh-CN')}：`+
+      (report?`本金占用 ${report.capital}/400000（含未决预留 ${report.pendingBuy}）；累计保守亏损 ${report.loss}/100000；起点前已知亏损保留 ${report.initialBudgetLoss}。`:'等待本轮完整核对。')+
+      (accounting.issue?` ${accounting.issue}`:' 七天结果仍须完整记录核验。');
     const positions=valuation?.positions;
     shadow.getElementById('stock-positions').textContent=!positions?'检查后显示脚本持仓及等待原因。':positions.length?
       `最近核对 ${new Date(valuation.at).toLocaleString('zh-CN')}；以下为当时扣费报价估算，不是已到账收益。\n`+
@@ -3592,6 +4074,21 @@
   function cancelStockRead() {
     stockGeneration++;stockController?.abort();stockController=null;stockRead=null;stockReadAt=0;stockReadStarted=0;
   }
+  function stockObservationLog(m,reading) {
+    // One accepted read, independent of permission to trade or the later reconciliation
+    // outcome. Freshness uses the older response; evidence becomes visible only when both
+    // responses have arrived and the active read/account have passed validation.
+    const observationId=crypto.randomUUID(),at=Date.now();
+    try {
+      const native=stockNative(),known=!native.length||stockLedger.pending&&stockOwnNative(stockLedger.pending,native);
+      const parts=stockCore.observationParts(m,known?stockLedger:null);
+      log.observation({settings:structuredClone(stockConfig),parts},{observationId,at,reading});
+      return {observationId,observationAt:at};
+    }catch{
+      log.add('stock-observation-error','原始行情采集失败，本次资料不能用于完整回放',{observationId,at,reading});
+      return {observationId:null,observationAt:null};
+    }
+  }
   function stockDecisionLog(selected) {
     if(!stockRead||stockRead.diagnosticDone)return;
     stockRead.diagnosticDone=true;
@@ -3601,8 +4098,11 @@
       const parts=stockCore.diagnosticParts([...stocks.map(row=>({kind:'stock',...row})),...rounds.map(row=>({kind:'prediction',...row}))]);
       stockRead.diagnosticId=diagnosticId;
       log.add('stock-decision','逐股核对行情、费用、预算和冷却；候选不代表成交',{
-        diagnosticId,snapshotAt:stockRead.at,readAgeMs:at-stockRead.at,...summary,
+        diagnosticId,observationId:stockRead.observationId??null,observedAt:stockRead.observationAt??null,
+        snapshotAt:stockRead.at,readAgeMs:at-stockRead.at,...summary,
         pending:Boolean(stockLedger.pending),held:Boolean(stockLedger.hold),holdReason:stockHoldReason(),
+        accounting:stockLedger.accounting?{trialId:stockLedger.accounting.record.trialId,issue:stockLedger.accounting.issue,
+          report:stockLedger.accounting.report}:null,accountingWait:stockLedger.accountingWait||null,
         decisionScope:stockLedger.pending||stockLedger.hold?'blocked-or-reconciling':'candidate-evaluation',
         stockCount:stocks.length,roundCount:rounds.length,totalParts:parts.length});
       for(const [part,rows] of parts.entries())log.add('stock-decision-detail','逐股及预测轮次诊断分片',
@@ -3615,7 +4115,8 @@
       ...(stockRead?{valuation:{...stockCore.performance(stockRead.model,stockLedger,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),at:stockRead.at}}:{}),
       holdReason:hold?note:stockHoldReason()});
     stockDecisionLog();
-    log.add(hold?'stock-held':'stock-check',note,{diagnosticId:stockRead?.diagnosticId??null,pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),
+    log.add(hold?'stock-held':'stock-check',note,{diagnosticId:stockRead?.diagnosticId??null,observationId:stockRead?.observationId??null,
+      pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),
       buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now()),
       ...(stockRead?{market:stockCore.marketSummary(stockRead.model,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),
         performance:stockCore.performance(stockRead.model,stockLedger,Date.now())}:{}),
@@ -3672,7 +4173,9 @@
       const funding=stockCore.funding(m,stockConfig);
       stockFundingNote=funding.fundingUnknown?'资产不可核对，暂不投入':`最近核对：24小时买入上限 ${funding.tradeLimit}、持仓上限 ${funding.positionLimit}、保留代币 ${funding.reserve}`;
       // 较慢接口不能给先返回的行情/余额续期；提交仍按两份资料中较旧的时间检查。
-      stockRead={at:Math.min(market.at,funds.at),model:m};
+      const freshnessAt=Math.min(market.at,funds.at);
+      stockRead={at:freshnessAt,model:m,...stockObservationLog(m,{generation,phase,
+        marketAt:market.at,balanceAt:funds.at,freshnessAt})};
       stockReadFailures=0;
     }).catch(error=>{
       if(generation!==stockGeneration || !enabled || !inStock() || accountStopReason())return;
@@ -3758,7 +4261,10 @@
         const owned={...stockLedger.owned};let changed=false;
         for(const [id,o] of Object.entries(owned))if(o.modelName===input.modelName && !o.manual){owned[id]={...o,manual:true};changed=true;}
         const touched=p?.choice.modelName===input.modelName && p.input.action!=='predict';
-        if(changed || touched)stockPersist({...stockLedger,owned,pending:touched?{...p,manualTouched:true}:p,note:'检测到手动交易，相关模型交回人工管理'});
+        const accounting=stockLedger.accounting&&stockCore.accountRuntime.issue({...stockLedger.accounting,
+          manualRevision:(stockLedger.accounting.manualRevision||0)+1},stockCore.accountRuntime.manualIssue);
+        if(changed || touched || accounting)stockPersist({...stockLedger,owned,...(accounting?{accounting}:{}),
+          pending:touched?{...p,manualTouched:true}:p,note:'检测到手动交易，相关模型交回人工管理'});
       }
     }catch{stockFault='手动交易后的持仓归属无法核对，停止股市操作';}
     return null;
@@ -3846,7 +4352,8 @@
         (stockHoldReason()==='本页没有匹配的原交易，请回原标签页核对；不新建交易'||
           a.action!=='predict'&&stockHoldReason()==='交易已执行，但持仓成本或数量尚未对应，保留原记录');
       const reason=over?'实际买入超过预留金额，已停止后续自动交易':stockLedger.hold&&!resolvedWait?stockHoldReason():null;
-      stockPersist({...stockLedger,owned,entries,pending:null,hold:Boolean(reason),holdReason:reason,
+      const accounting=stockLedger.accounting&&stockCore.accountRuntime.reconcile(stockLedger.accounting,m,p,entry,Date.now());
+      stockPersist({...stockLedger,owned,entries,...(accounting?{accounting}:{}),pending:null,hold:Boolean(reason),holdReason:reason,
         note:p.result==='rejected'?'交易被网站拒绝，未执行':reason||`${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测下注'}已确认`});
       if(p.result==='success')stockRecordIncome(p,{
         action:a.action,model:a.modelName,reward:a.action==='buy'?{'股市买入支出':entry.debit}:
@@ -3855,6 +4362,7 @@
           realized:stockCore.whole(entry.proceeds)&&stockCore.whole(entry.releasedCost)?entry.proceeds-entry.releasedCost:null,
           amountSource:stockCore.whole(entry.proceeds)?'receipt.proceedsTokens':'unknown'}:{})});
       log.add('stock-confirmed',stockLedger.note,{action:a.action,model:a.modelName,result:p.result,
+        observationId:stockRead?.observationId??null,
         submittedAt:entry.at,...(entry.confirmedAt!==undefined?{confirmedAt:entry.confirmedAt}:{}),
         ...(a.action==='sell'?{shares:a.shares,proceeds:entry.proceeds,releasedCost:entry.releasedCost,
           realized:stockCore.whole(entry.proceeds)&&stockCore.whole(entry.releasedCost)?entry.proceeds-entry.releasedCost:null}:{debitTokens:entry.debit})});
@@ -3901,6 +4409,7 @@
     const m=stockRead.model;
     if(stockReconcile(m))return;
     if(stockNative().length){stockFinish('存在手动股市原请求，请先在网页核对',true);return;}
+    stockAccountRefresh(m);
     // 手动改变持仓后停止管理该模型，避免出售人工买入的股票。
     const owned={...stockLedger.owned},capacityWait=stockCapacityWait();let changed=capacityWait;
     for(const [id,o] of Object.entries(owned)) {
@@ -3928,16 +4437,13 @@
         reward:{代币:entry.settlement.payout,股市返还:entry.settlement.payout,'股市预测净盈亏':entry.settlement.payout-entry.debit}},true,`stock-settled:${stockLedger.userId}:${entry.betId}`);
     if(stockLedger.entries.length>=2000){stockFinish('股市账本暂满，暂停新交易，五分钟后核对结算与到期记录');return;}
     if(stockActions>=3){stockFinish('本轮股市检查结束，五分钟后继续');return;}
-    const a=stockCore.choose(m,stockConfig,stockLedger,Date.now());
+    const accountConfig=stockAccountBudget(m),a=stockCore.choose(m,accountConfig,stockLedger,Date.now());
     stockDecisionLog(a);
     if(stockConfig.observeOnly){
-      const parts=stockCore.observationParts(m),observationId=crypto.randomUUID(),at=Date.now();
-      for(const [index,snapshot] of parts.entries())log.add('stock-observation','只观察当时信号，不提交交易',{
-        at,observationId,part:index,totalParts:parts.length,settings:stockConfig,choice:a,market:stockCore.marketSummary(m,at),snapshot});
       stockFinish(a?`仅观察：${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测'}候选 ${a.modelName}，${a.reason}；未执行`:
         `仅观察：${stockCore.waitReason(m,stockConfig,stockLedger,Date.now())}`);return;
     }
-    if(!a){stockFinish(stockCore.waitReason(m,stockConfig,stockLedger,Date.now()));return;}
+    if(!a){stockFinish(stockAccountWait()||stockCore.waitReason(m,accountConfig,stockLedger,Date.now()));return;}
     const control=stockControls(a,m),quantity=a.action==='predict'?a.betTokens:a.shares;
     if(!usable(control.input)){stockWaitForControl(a,control);return;}
     stockUiWait=null;
@@ -3951,13 +4457,16 @@
     const key=`stock:submit:${JSON.stringify(a)}`;
     if(queued?.key===key && Date.now()>=queued.dueAt && Date.now()-stockRead.at>1500){offered=true;readStock();return;}
     offer(key,`${a.action==='predict'?'预测'+(a.direction==='up'?'涨':'跌'):a.action==='buy'?'买入':'卖出'} ${a.modelName}`,()=>{
+      const observationId=stockRead?.observationId??null;
       const p={id:crypto.randomUUID(),at:Date.now(),retries:0,key:null,result:null,choice:a,input:stockCore.input(a,m.view.userId),
         beforeCost:m.view.positions.find(p=>stockCore.sameStockId(p.stockId,a.stockId))?.costBasisTokens??0,
         beforeShares:m.view.positions.find(p=>stockCore.sameStockId(p.stockId,a.stockId))?.shares || 0,beforeBets:m.view.myBets.map(b=>b.id)};
-      stockPersist({...stockLedger,pending:p,entries:[...stockLedger.entries,{id:p.id,at:p.at,action:a.action,stockId:a.stockId,roundId:a.roundId,debit:a.debit,result:'reserved'}]});
+      const accounting=stockLedger.accounting&&stockCore.accountRuntime.submit(stockLedger.accounting,m,p);
+      if(a.action==='buy'&&!accounting)throw Error('独立股票账本尚未建立，不能提交买入');
+      stockPersist({...stockLedger,...(accounting?{accounting}:{}),pending:p,entries:[...stockLedger.entries,{id:p.id,at:p.at,action:a.action,stockId:a.stockId,roundId:a.roundId,debit:a.debit,result:'reserved'}]});
       stockActions++;stockRead=null;stockReadAt=Date.now()+2000;
       const funds=stockCore.funding(m,stockConfig);
-      log.add('stock-submit',a.reason,{action:a.action,model:a.modelName,shares:a.shares,stake:a.betTokens,reservedDebit:a.debit,
+      log.add('stock-submit',a.reason,{action:a.action,model:a.modelName,shares:a.shares,stake:a.betTokens,reservedDebit:a.debit,observationId,
         autoBudget:Boolean(stockConfig.autoBudget),buyLimit:funds.tradeLimit,positionLimit:funds.positionLimit,reserve:funds.reserve});
       stockClick(control.button,p);
     });
@@ -3987,7 +4496,8 @@
   let shelterCampaignForm='',shelterCampaignNote='',shelterRecallWork=null,shelterCampaignEditing=false,shelterCampaignHeld='';
   const campaignKind=kind=>['explore-start','explore-recall','quest-start','quest-claim','stimpak','craft'].includes(kind);
   const workshopAutomatic=()=>shelterConstruction.upgrade&&shelterConstruction.partsLimit>0&&shelterConstruction.scrapLimit>0&&shelterStaffMode!=='off';
-  const campaignActive=()=>campaignFlags.some(k=>shelterCampaign[k])||workshopAutomatic()||shelterState.campaign?.roles?.some(r=>r.purpose==='parent');
+  const campaignActive=()=>campaignFlags.some(k=>shelterCampaign[k])||workshopAutomatic()||
+    shelterStaffMode!=='off'&&!shelterStaffHold||shelterState.campaign?.roles?.some(r=>['parent','production'].includes(r.purpose));
   const validConstructionConfig=v=>objectState(v)&&['build','upgrade','dig'].every(k=>typeof v[k]==='boolean')&&
     ['scrapLimit','partsLimit','scrapReserve','partsReserve'].every(k=>Number.isSafeInteger(v[k])&&v[k]>=0);
   let shelterConstruction=loadState(localStorage,SHELTER_CONSTRUCTION,
@@ -4030,6 +4540,8 @@
     (v.social===undefined||validShelterSocial(v.social))&&
     (v.caravan===undefined||validShelterCaravan(v.caravan))&&
     (v.sodaReceipts===undefined||validShelterSodaReceipts(v.sodaReceipts))&&
+    (v.developmentWindow===undefined||objectState(v.developmentWindow)&&Number.isSafeInteger(v.developmentWindow.start)&&
+      v.developmentWindow.start>=0&&v.developmentWindow.end-v.developmentWindow.start===168*3600000)&&
     (v.constructionLedger===undefined||Array.isArray(v.constructionLedger)&&v.constructionLedger.every(e=>objectState(e)&&
       typeof e.id==='string'&&Number.isFinite(e.at)&&['scrap','parts'].every(k=>Number.isSafeInteger(e[k])&&e[k]>=0)));
   let shelterState = loadState(localStorage, SHELTER_STATE, { nextAt: 0, note: '等待首次检查' }, 'shelter',validShelterState);
@@ -4076,6 +4588,3178 @@
   let shelterPending = loadState(localStorage, SHELTER_PENDING, null, 'shelter', validShelterPending);
   function shelterReadOnlyWait() { return Boolean(shelterPending && shelterState.pendingReadOnly === shelterPending.id); }
   let shelterRead = null, shelterController = null, shelterGeneration = 0, shelterReadAt = 0;
+  // BEGIN GENERATED SHELTER PLANNING WORKER
+  const shelterPlanningWorkerSource=[
+    "'use strict';",
+    "const {createShelterSelectionDigest}=(()=>{",
+    "// Synchronous SHA-256 for the identical Node/browser planner. No external script loads.",
+    "function createShelterSelectionDigest() {",
+    "  const constants=[],initial=[];",
+    "  for(let n=2;constants.length<64;n++){",
+    "    let prime=true;for(let d=2;d*d<=n;d++)if(n%d===0){prime=false;break;}",
+    "    if(!prime)continue;",
+    "    if(initial.length<8)initial.push((Math.sqrt(n)%1*4294967296)|0);",
+    "    constants.push((Math.cbrt(n)%1*4294967296)|0);",
+    "  }",
+    "  const rotate=(v,n)=>(v>>>n)|(v<<(32-n)),encoder=new TextEncoder();",
+    "  return value=>{",
+    "    const input=encoder.encode(JSON.stringify(value)),length=Math.ceil((input.length+9)/64)*64;",
+    "    const bytes=new Uint8Array(length);bytes.set(input);bytes[input.length]=128;",
+    "    const view=new DataView(bytes.buffer),bits=input.length*8;",
+    "    view.setUint32(length-8,Math.floor(bits/4294967296));view.setUint32(length-4,bits>>>0);",
+    "    const state=initial.slice(),words=new Int32Array(64);",
+    "    for(let offset=0;offset<length;offset+=64){",
+    "      for(let i=0;i<16;i++)words[i]=view.getInt32(offset+i*4);",
+    "      for(let i=16;i<64;i++){",
+    "        const a=words[i-15],b=words[i-2];",
+    "        words[i]=(words[i-16]+(rotate(a,7)^rotate(a,18)^(a>>>3))+words[i-7]+(rotate(b,17)^rotate(b,19)^(b>>>10)))|0;",
+    "      }",
+    "      let [a,b,c,d,e,f,g,h]=state;",
+    "      for(let i=0;i<64;i++){",
+    "        const t1=(h+(rotate(e,6)^rotate(e,11)^rotate(e,25))+((e&f)^(~e&g))+constants[i]+words[i])|0;",
+    "        const t2=((rotate(a,2)^rotate(a,13)^rotate(a,22))+((a&b)^(a&c)^(b&c)))|0;",
+    "        h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;",
+    "      }",
+    "      for(const [i,v] of [a,b,c,d,e,f,g,h].entries())state[i]=(state[i]+v)|0;",
+    "    }",
+    "    return state.map(v=>(v>>>0).toString(16).padStart(8,'0')).join('');",
+    "  };",
+    "}",
+    "",
+    "return {createShelterSelectionDigest};",
+    "})();",
+    "const {createShelterResourceSimulation}=(()=>{",
+    "// Deterministic resource transitions for offline development comparisons and opt-in DOM fixtures.",
+    "// Production, capacity and batching equations are independently transcribed from the saved public",
+    "// page (eP/et/tw). Consumption uses the script's explicit adult/child and room-demand contract.",
+    "// This is a conditional model: constant mood/XP/health, no random rewards, births or auto-upgrades.",
+    "// Callers must apply confirmed non-resource events between advances; it is not a server emulator.",
+    "// Room array order resolves competing feed/automatic collection here; the public projection does",
+    "// not establish server settlement order. Route selection must disclose/test that assumption.",
+    "// Rates sample each tick's start, using the supplied roster. Missing historical assignments or",
+    "// changes within a partly elapsed tick cannot be reconstructed from a later snapshot.",
+    "// Keep this factory self-contained so the same transition can run in the browser fixture.",
+    "function createShelterResourceSimulation() {",
+    "  const tick=600000,keys=['power','food','water','scrap','parts','stimpak'],multipliers=[0,1,1.5,2.1];",
+    "  const rules={power:['str','power',12,30],diner:['agi','food',8,25],water:['per','water',8,25],",
+    "    scrap:['end','scrap',8,30],medbay:['int','stimpak',.5,2],workshop:['int','parts',.6,3]};",
+    "  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));",
+    "  const finite=n=>Number.isFinite(n)&&n>=0;",
+    "  function check(view) {",
+    "    const s=view?.state;",
+    "    if(!s||!finite(view.serverTime)||!finite(s.lastSettledAt)||s.lastSettledAt>view.serverTime||",
+    "      !Array.isArray(s.rooms)||!Array.isArray(s.residents)||!Array.isArray(s.items)||!finite(s.stats?.collected)||",
+    "      !keys.every(k=>finite(s.resources?.[k])))throw Error('Incomplete resource simulation state');",
+    "    if(s.rooms.some(r=>!multipliers[r.level]||![1,2,3].includes(r.width)||!finite(r.stored)||!finite(r.builtAt)||",
+    "      !(r.upgradeAt===null||finite(r.upgradeAt)))||",
+    "      new Set(s.rooms.map(r=>r.id)).size!==s.rooms.length)throw Error('Invalid resource simulation rooms');",
+    "    for(const p of s.residents)if(!finite(p.adultAt)||!finite(p.xp)||!finite(p.happiness)||",
+    "      !(p.away===null||p.away&&typeof p.away==='object')||!(p.deadAt===null||finite(p.deadAt))||",
+    "      !['str','per','end','cha','int','agi','lck'].every(k=>finite(p.stats?.[k])))throw Error('Invalid resource simulation resident');",
+    "    if(!Array.isArray(s.births)||s.births.some(b=>!finite(b.dueAt))||",
+    "      s.digging!=null&&!finite(s.digging.doneAt))throw Error('Invalid resource simulation future event');",
+    "    for(const k of ['storage','production'])if(!Number.isInteger(s.legacy?.perks?.[k]??0)||",
+    "      (s.legacy?.perks?.[k]??0)<0||(s.legacy?.perks?.[k]??0)>10)throw Error('Invalid resource simulation perk');",
+    "    if((view.env?.events??[]).some(e=>e.kind==='production'&&(!finite(e.startsAt)||!finite(e.endsAt)||",
+    "      e.endsAt<e.startsAt||!finite(e.percent))))throw Error('Invalid resource simulation event');",
+    "  }",
+    "  function capacities(view,at=view.serverTime) {",
+    "    const s=view.state,built=s.rooms.filter(r=>r.builtAt<=at);",
+    "    const storage=built.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width*r.level,0);",
+    "    return Object.fromEntries(keys.map(k=>{",
+    "      const [base,warehouse,room]=k==='scrap'?[1500,1200,600]:k==='parts'?[100,60,40]:k==='stimpak'?[10,5,5]:[600,400,250];",
+    "      const cells=built.filter(r=>rules[r.type]?.[1]===k).reduce((n,r)=>n+r.width*multipliers[r.level],0);",
+    "      return [k,Math.floor((base+warehouse*storage+room*cells)*(1+.05*(s.legacy?.perks?.storage??0)))];",
+    "    }));",
+    "  }",
+    "  function demand(view,at) {",
+    "    const s=view.state,home=s.residents.filter(p=>p.away===null&&p.deadAt===null);",
+    "    const mouths=home.reduce((n,p)=>n+(p.adultAt<=at?1:.5),0);",
+    "    return {power:s.rooms.filter(r=>r.builtAt<=at).reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:",
+    "      (rules[r.type]?1:.5)*r.width*r.level),0),food:mouths,water:mouths};",
+    "  }",
+    "  function rate(view,room,at) {",
+    "    const s=view.state,rule=rules[room.type];",
+    "    if(!rule||room.builtAt>at||room.incident||room.unpowered||room.upgradeAt!==null)return 0;",
+    "    const [stat,,base]=rule,boost=Math.min(150,Math.max(100,...(view.env?.events??[])",
+    "      .filter(e=>e.kind==='production'&&e.startsAt<=at&&at<e.endsAt).map(e=>e.percent)))/100;",
+    "    const workers=s.residents.filter(p=>p.roomId===room.id&&p.away===null&&p.deadAt===null&&p.adultAt<=at).slice(0,room.width*2);",
+    "    return workers.reduce((n,p)=>{",
+    "      const bonus=s.items.find(i=>i.id===p.outfitId)?.bonus?.[stat]??0;",
+    "      if(!finite(bonus))throw Error('Invalid resource simulation outfit');",
+    "      return n+base*multipliers[room.level]*(.5+Math.min(17,p.stats[stat]+bonus)/10)*",
+    "        (.6+.4*Math.min(100,p.happiness)/100)*(1+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*.01);",
+    "    },0)*(1+.03*(s.legacy?.perks?.production??0))*boost;",
+    "  }",
+    "  function take(view,room,caps,ledger,{at=view.serverTime,sampledAt=at,method='manual'}={}) {",
+    "    const rule=rules[room.type];if(!rule)return;",
+    "    const key=rule[1],batch=rule[3]*room.width*multipliers[room.level];",
+    "    const ready=Math.floor(room.stored/batch+1e-9)*batch;",
+    "    const amount=Math.min(ready,Math.max(0,Math.floor(caps[key]-view.state.resources[key])));",
+    "    if(amount<=0)return;",
+    "    const storedBefore=room.stored;",
+    "    room.stored=Math.max(0,room.stored-amount);view.state.resources[key]+=amount;",
+    "    view.state.stats.collected+=amount;ledger.collected[key]+=amount;",
+    "    // Preserve the actual room and roster, including the distinction between tick-start",
+    "    // automatic collection and manual collection after adulthood/merges. Aggregated income",
+    "    // cannot identify the workers entitled to collection XP.",
+    "    ledger.collections.push({at,sampledAt,method,roomId:room.id,resource:key,batch,",
+    "      readyBatches:Math.round(ready/batch),amount,storedBefore,storedAfter:room.stored,",
+    "      workerIds:view.state.residents.filter(p=>p.roomId===room.id&&p.away===null&&p.deadAt===null&&p.adultAt<=sampledAt)",
+    "        .slice(0,room.width*2).map(p=>p.id)});",
+    "  }",
+    "  function storedTotals(view) {",
+    "    const stored=zero();for(const r of view.state.rooms)if(rules[r.type])stored[rules[r.type][1]]+=r.stored;",
+    "    return stored;",
+    "  }",
+    "  function ledgerFor(view) {",
+    "    return {initial:{...view.state.resources},initialStored:storedTotals(view),minimumInventory:{...view.state.resources},",
+    "      produced:zero(),collected:zero(),consumed:zero(),feed:zero(),",
+    "      unserved:zero(),roomOverflow:zero(),collections:[],feedBlockedParts:0,ticks:0,from:view.serverTime,to:view.serverTime};",
+    "  }",
+    "  function finish(view,ledger) {",
+    "    ledger.final={...view.state.resources};ledger.finalStored=storedTotals(view);",
+    "    for(const k of keys){",
+    "      if(Math.abs(ledger.initial[k]+ledger.collected[k]-ledger.consumed[k]-ledger.feed[k]-ledger.final[k])>1e-7)",
+    "        throw Error('Resource simulation conservation failed: '+k);",
+    "      if(Math.abs(ledger.initialStored[k]+ledger.produced[k]-ledger.collected[k]-ledger.finalStored[k])>1e-7)",
+    "        throw Error('Room storage conservation failed: '+k);",
+    "    }",
+    "    return {view,ledger};",
+    "  }",
+    "  function advanceResources(input,to,{scrapFloor=0}={},oneEventTick=false) {",
+    "    check(input);",
+    "    if(!finite(scrapFloor))throw Error('Invalid manufacturing scrap floor');",
+    "    if(!finite(to)||to<input.serverTime||to-input.state.lastSettledAt>86400000)",
+    "      throw Error('Advance requires monotone time and at most 24 hours; compose explicit event segments');",
+    "    // A due non-resource event needs its own explicit transition. Do not silently freeze a child",
+    "    // that ought to be born, or count production from an upgrade whose completion is unverified.",
+    "    const cutoff=oneEventTick?input.serverTime:to;",
+    "    if(input.state.births.some(b=>b.dueAt<=cutoff)||",
+    "      input.state.rooms.some(r=>r.upgradeAt!==null&&r.upgradeAt<=cutoff)||",
+    "      input.state.digging!=null&&input.state.digging.doneAt<=cutoff)",
+    "      throw Error('Non-resource event requires an explicit transition');",
+    "    const view=structuredClone(input),s=view.state,ledger=ledgerFor(view);",
+    "    while(s.lastSettledAt+tick<=to) {",
+    "      const at=s.lastSettledAt,caps=capacities(view,at),needs=demand(view,at);",
+    "      // Consumption before collection is an explicit conservative ordering assumption.",
+    "      for(const [k,hourly] of Object.entries(needs)) {",
+    "        const wanted=hourly/6,used=Math.min(wanted,s.resources[k]);",
+    "        s.resources[k]-=used;ledger.consumed[k]+=used;ledger.unserved[k]+=wanted-used;",
+    "        ledger.minimumInventory[k]=Math.min(ledger.minimumInventory[k],s.resources[k]);",
+    "      }",
+    "      for(const room of s.rooms) {",
+    "        const rule=rules[room.type];if(!rule)continue;",
+    "        const key=rule[1],batch=rule[3]*room.width*multipliers[room.level],possible=rate(view,room,at)/6;",
+    "        let made=Math.min(possible,Math.max(0,4*batch-room.stored));",
+    "        ledger.roomOverflow[key]+=possible-made;",
+    "        if(key==='parts'){",
+    "          const funded=Math.min(made,Math.max(0,s.resources.scrap-scrapFloor)/6);",
+    "          ledger.feedBlockedParts+=made-funded;made=funded;",
+    "          s.resources.scrap-=made*6;ledger.feed.scrap+=made*6;",
+    "          ledger.minimumInventory.scrap=Math.min(ledger.minimumInventory.scrap,s.resources.scrap);",
+    "        }",
+    "        room.stored+=made;ledger.produced[key]+=made;",
+    "        if(room.builtAt<=at&&(s.handies??[]).some(h=>h.floor===room.floor))",
+    "          take(view,room,caps,ledger,{at:at+tick,sampledAt:at,method:'automatic'});",
+    "      }",
+    "      s.lastSettledAt+=tick;ledger.ticks++;",
+    "    }",
+    "    view.serverTime=to;ledger.to=to;",
+    "    return finish(view,ledger);",
+    "  }",
+    "  function advance(input,to,options) {return advanceResources(input,to,options);}",
+    "  // One interval, sampled from its start, leaving its due events unprocessed. The event layer",
+    "  // must resolve those events before another tick: overdue events still fail the cutoff above.",
+    "  // No fractional initial interval is accepted because its earlier roster is unavailable.",
+    "  function settleTick(input,options) {",
+    "    check(input);",
+    "    if(input.serverTime!==input.state.lastSettledAt)throw Error('Event tick requires a settled starting snapshot');",
+    "    return advanceResources(input,input.serverTime+tick,options,true);",
+    "  }",
+    "  function collect(input,roomId=null) {",
+    "    check(input);const view=structuredClone(input),ledger=ledgerFor(view),caps=capacities(view);",
+    "    for(const r of view.state.rooms)if(r.builtAt<=view.serverTime&&(roomId===null||r.id===roomId))take(view,r,caps,ledger);",
+    "    return finish(view,ledger);",
+    "  }",
+    "  return {advance,settleTick,collect,capacities,rate,demand,storedTotals,validate:check};",
+    "}",
+    "",
+    "return {createShelterResourceSimulation};",
+    "})();",
+    "const {createShelterFamilySimulation}=(()=>{",
+    "// Conditional family transitions used by offline route comparisons. The public page establishes",
+    "// eligibility, charm speed, pregnancy/childhood duration, tick-start housing and cooldown.",
+    "// Callers still declare their rule version and exact child template; random outcomes and",
+    "// server ordering cannot be inferred from the public descriptions.",
+    "function createShelterFamilySimulation() {",
+    "  const tick=600000,stats=['str','per','end','cha','int','agi','lck'];",
+    "  const id=n=>Number.isSafeInteger(n)&&n>0;",
+    "  const time=n=>Number.isSafeInteger(n)&&n>=0;",
+    "  const label=s=>typeof s==='string'&&s.trim().length>0;",
+    "  const key=parents=>[...parents].sort((a,b)=>a-b).join('/');",
+    "  const same=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&key(a)===key(b);",
+    "  const stages=['planned','romance','pregnant','born','cancelled'];",
+    "  function validate(plans,rules) {",
+    "    if(!Array.isArray(plans))throw Error('Invalid family plans');",
+    "    if(!plans.length)return;",
+    "    if(!rules||rules.romance!=='base-charm-sum-per-120-per-tick'||!label(rules.source)||",
+    "      ![rules.pregnancyMs,rules.childhoodMs,rules.cooldownMs].every(n=>time(n)&&n>=tick))",
+    "      throw Error('Explicit conditional family rules required');",
+    "    if(new Set(plans.map(p=>p.key)).size!==plans.length)throw Error('Duplicate family plan key');",
+    "    const pairs=new Set(),children=new Set(),parents=new Set();",
+    "    for(const p of plans){",
+    "      if(!label(p.key)||!label(p.source)||!Array.isArray(p.parents)||p.parents.length!==2||!p.parents.every(id)||",
+    "        p.parents[0]===p.parents[1]||!id(p.roomId)||!stages.includes(p.stage)||!p.child||!id(p.child.id)||",
+    "        !same(p.child.parents,p.parents)||![null,p.roomId].includes(p.child.roomId)||p.child.away!==null||p.child.deadAt!==null||",
+    "        p.child.romance!==null||p.child.training!==0||p.child.outfitId!==null||p.child.weaponId!==null||",
+    "        !label(p.child.name)||!Number.isFinite(p.child.hp)||p.child.hp<=0||",
+    "        !Number.isFinite(p.child.xp)||p.child.xp<0||!Number.isFinite(p.child.happiness)||p.child.happiness<0||p.child.happiness>100||",
+    "        !stats.every(k=>Number.isInteger(p.child.stats?.[k])&&p.child.stats[k]>=0&&p.child.stats[k]<=10))",
+    "        throw Error('Invalid explicit family or child template');",
+    "      if(children.has(p.child.id))throw Error('Duplicate planned child identity');children.add(p.child.id);",
+    "      if(!['born','cancelled'].includes(p.stage)){",
+    "        if(pairs.has(key(p.parents)))throw Error('Overlapping family cycles');pairs.add(key(p.parents));",
+    "        for(const id of p.parents){if(parents.has(id))throw Error('Parent has overlapping family plans');parents.add(id);}",
+    "      }",
+    "      for(const field of ['startedAt','conceivedAt','dueAt','bornAt','pausedAt'])if(p[field]!==undefined&&!time(p[field]))",
+    "        throw Error('Invalid family event time');",
+    "      if(['pregnant','born'].includes(p.stage)&&(!time(p.conceivedAt)||!time(p.dueAt)||p.dueAt<=p.conceivedAt))",
+    "        throw Error('Incomplete confirmed family cycle');",
+    "    }",
+    "  }",
+    "  function ancestry(view,residentId,path=new Set()) {",
+    "    const p=view.state.residents.find(p=>p.id===residentId);",
+    "    if(!p||path.has(residentId)||!Array.isArray(p.parents)||![0,2].includes(p.parents.length)||",
+    "      !p.parents.every(id)||new Set(p.parents).size!==p.parents.length)return null;",
+    "    const result=new Set([residentId]),next=new Set([...path,residentId]);",
+    "    for(const parent of p.parents){const ancestors=ancestry(view,parent,next);if(!ancestors)return null;for(const a of ancestors)result.add(a);}",
+    "    return result;",
+    "  }",
+    "  function eligibility(view,plan,{ignoreLocation=false,existing=false}={}) {",
+    "    const s=view.state,at=view.serverTime,blocked=[],pair=plan.parents.map(id=>s.residents.find(p=>p.id===id));",
+    "    const room=s.rooms.find(r=>r.id===plan.roomId);",
+    "    const issue=reason=>blocked.push({kind:'family',key:plan.key,reason});",
+    "    if(pair.some(p=>!p)){issue('missing-parent');return blocked;}",
+    "    const left=ancestry(view,pair[0].id),right=ancestry(view,pair[1].id);",
+    "    if(!left||!right)issue('unknown-ancestry');else if([...left].some(id=>right.has(id)))issue('related-parents');",
+    "    for(const p of pair){",
+    "      const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));",
+    "      if(p.away!==null||p.deadAt!==null||p.adultAt>at||!Number.isFinite(p.hp)||p.hp<.6*maxHp)issue('parent-unavailable');",
+    "      if(!Number.isFinite(p.happiness)||p.happiness<50)issue('low-happiness');",
+    "      if(!(p.familyCooldownUntil==null||time(p.familyCooldownUntil)))issue('unknown-cooldown');",
+    "      else if(p.familyCooldownUntil>at)issue('cooldown');",
+    "      if(p.romance&&(!existing||p.romance.partnerId!==pair.find(q=>q.id!==p.id).id))issue('other-romance');",
+    "      if(!ignoreLocation&&p.roomId!==plan.roomId)issue('parents-not-together');",
+    "      if(!Number.isFinite(p.stats.cha)||p.stats.cha<0)issue('unknown-charm');",
+    "    }",
+    "    if(!room||room.type!=='quarters'||room.builtAt>at||room.upgradeAt!==null||room.incident||room.unpowered)issue('quarters-unavailable');",
+    "    if(!existing&&s.births.some(b=>b.roomId===plan.roomId||b.parents?.some(id=>plan.parents.includes(id))))issue('pending-birth');",
+    "    if(!existing&&s.residents.some(p=>p.deadAt===null&&p.adultAt<=at&&p.roomId===plan.roomId&&!plan.parents.includes(p.id)))",
+    "      issue('quarters-not-cleared');",
+    "    if(s.residents.some(p=>p.id===plan.child.id)&&plan.stage!=='born')issue('child-identity-already-used');",
+    "    return blocked;",
+    "  }",
+    "  function prepare(view,plans,rules) {",
+    "    validate(plans,rules);const next=structuredClone(plans),s=view.state,at=view.serverTime,end=at+tick;",
+    "    const blocked=[],paused=[],updates=[],births=[],outcomes=[],events=[];",
+    "    const issue=(p,reason)=>blocked.push({kind:'family',key:p?.key??null,reason});",
+    "    const expected=new Set(next.filter(p=>p.stage==='romance').flatMap(p=>p.parents));",
+    "    for(const p of s.residents)if(p.romance&&!expected.has(p.id))issue(null,'unregistered-romance');",
+    "    const capacity=Math.min(200,s.rooms.filter(r=>r.type==='quarters'&&r.builtAt<=at)",
+    "      .reduce((n,r)=>n+r.width*(2+2*r.level),0));",
+    "    let occupied=s.residents.length+s.births.length;",
+    "    // Competing simultaneous cycles cannot silently take the last bed by array order.",
+    "    const ready=[];",
+    "    for(const p of next){",
+    "      if(['cancelled','born'].includes(p.stage))continue;",
+    "      if(p.stage==='pregnant'){",
+    "        if(!s.births.some(b=>b.dueAt===p.dueAt&&same(b.parents,p.parents)))issue(p,'confirmed-pregnancy-missing');",
+    "        continue;",
+    "      }",
+    "      if(p.stage==='planned'){",
+    "        if(!p.parents.every(id=>s.residents.some(q=>q.id===id&&q.roomId===p.roomId)))continue;",
+    "        const reasons=eligibility(view,p);if(reasons.length){paused.push(...reasons);continue;}",
+    "        p.stage='romance';p.startedAt=end;",
+    "        updates.push(...p.parents.map((id,i)=>({id,romance:{partnerId:p.parents[1-i],progress:0}})));",
+    "        events.push({kind:'romance-start',at:end,key:p.key,parents:[...p.parents],roomId:p.roomId,source:p.source});",
+    "        continue;",
+    "      }",
+    "      const pair=p.parents.map(id=>s.residents.find(q=>q.id===id));",
+    "      if(pair.some((q,i)=>!q?.romance||q.romance.partnerId!==p.parents[1-i]||",
+    "        !Number.isFinite(q.romance.progress)||q.romance.progress<0||q.romance.progress>1)||",
+    "        Math.abs(pair[0]?.romance?.progress-pair[1]?.romance?.progress)>1e-9){issue(p,'romance-state-mismatch');continue;}",
+    "      const reasons=eligibility(view,p,{existing:true});",
+    "      if(reasons.length){",
+    "        p.pausedAt??=at;paused.push(...reasons);",
+    "        // The page permits partner changes after a long pause. No deterministic re-pairing",
+    "        // rule is known; do not keep a convenient old pair if a competing single is present.",
+    "        const parentRooms=new Set(pair.map(q=>q.roomId).filter(roomId=>s.rooms.some(r=>r.id===roomId&&r.type==='quarters')));",
+    "        if(end-p.pausedAt>1800000&&s.residents.some(q=>!p.parents.includes(q.id)&&q.deadAt===null&&q.away===null&&",
+    "          q.adultAt<=at&&parentRooms.has(q.roomId)&&!q.romance))issue(p,'paused-repairing-rule-unknown');",
+    "        continue;",
+    "      }",
+    "      delete p.pausedAt;",
+    "      const progress=Math.min(1,pair[0].romance.progress+(pair[0].stats.cha+pair[1].stats.cha)/120);",
+    "      updates.push(...pair.map(q=>({id:q.id,romance:{partnerId:q.romance.partnerId,progress}})));",
+    "      if(progress>=1-1e-9)ready.push(p);",
+    "    }",
+    "    if(ready.length>Math.max(0,capacity-occupied)&&capacity>occupied){",
+    "      issue(null,'simultaneous-pregnancies-exceed-known-capacity');return {plans:next,blocked,paused,updates:[],births:[],outcomes:[],events:[]};",
+    "    }",
+    "    for(const p of ready){",
+    "      if(occupied>=capacity){paused.push({kind:'family',key:p.key,reason:'beds-at-tick-start'});continue;}",
+    "      occupied++;p.stage='pregnant';p.conceivedAt=end;p.dueAt=end+rules.pregnancyMs;",
+    "      const birth={roomId:p.roomId,parents:[...p.parents],dueAt:p.dueAt};births.push(birth);",
+    "      outcomes.push({...birth,resident:{...structuredClone(p.child),adultAt:p.dueAt+rules.childhoodMs,familyCooldownUntil:0},source:p.source});",
+    "      for(const id of p.parents){",
+    "        const update=updates.find(u=>u.id===id);update.romance=null;update.familyCooldownUntil=end+rules.cooldownMs;",
+    "      }",
+    "      events.push({kind:'pregnancy',at:end,key:p.key,parents:[...p.parents],roomId:p.roomId,dueAt:p.dueAt,",
+    "        childId:p.child.id,source:p.source});",
+    "    }",
+    "    return {plans:next,blocked,paused,updates,births,outcomes,events};",
+    "  }",
+    "  return {validate,eligibility,prepare};",
+    "}",
+    "",
+    "return {createShelterFamilySimulation};",
+    "})();",
+    "const {createShelterMoodSimulation}=(()=>{",
+    "// Public mood targets and ten-minute relaxation, with explicit interpretations for details",
+    "// not established by the saved UI: stat basis/ties, room eligibility, sampling and rounding.",
+    "// This changes mood only. It does not invent incident outcomes, recruitment, health or XP.",
+    "function createShelterMoodSimulation() {",
+    "  const stats=['str','per','end','cha','int','agi','lck'];",
+    "  const roomStats={door:'end',power:'str',diner:'agi',water:'per',scrap:'end',quarters:'cha',",
+    "    medbay:'int',workshop:'int',armory:'str',tailor:'cha',radio:'cha'};",
+    "  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;",
+    "  const active=(r,at)=>r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;",
+    "  function validate(view,rules) {",
+    "    if(!rules||!['base','equipped'].includes(rules.statBasis)||rules.matching!=='any-highest-staffed-room-stat'||",
+    "      rules.shortage!=='unserved-interval'||rules.timing!=='tick-start'||rules.rounding!=='none'||",
+    "      typeof rules.source!=='string'||!rules.source.trim())throw Error('Explicit conditional mood rules required');",
+    "    if(!Number.isInteger(view.state.legacy?.perks?.happiness??0)||(view.state.legacy?.perks?.happiness??0)<0||",
+    "      (view.state.legacy?.perks?.happiness??0)>10)throw Error('Invalid happiness legacy perk');",
+    "    for(const p of view.state.residents)if(!Number.isFinite(p.happiness)||p.happiness<0||p.happiness>100||",
+    "      !stats.every(k=>Number.isFinite(p.stats?.[k])&&p.stats[k]>=0&&p.stats[k]<=10))throw Error('Invalid mood resident state');",
+    "  }",
+    "  function step(view,unserved,rules) {",
+    "    validate(view,rules);",
+    "    if(!['food','water'].every(k=>Number.isFinite(unserved?.[k])&&unserved[k]>=0))throw Error('Mood needs interval shortage evidence');",
+    "    const s=view.state,at=view.serverTime,updates=[],events=[],blocked=[];",
+    "    const radio=s.rooms.some(r=>r.type==='radio'&&active(r,at)&&s.residents.some(p=>p.roomId===r.id&&present(p,at)));",
+    "    for(const p of s.residents){",
+    "      if(p.deadAt!==null||p.away!==null)continue;",
+    "      const r=s.rooms.find(r=>r.id===p.roomId),adult=p.adultAt<=at,reasons={base:65,legacy:s.legacy?.perks?.happiness??0};",
+    "      if(p.roomId!==null&&!r){blocked.push({kind:'mood',id:p.id,reason:'unknown-assigned-room'});continue;}",
+    "      let values={...p.stats};",
+    "      if(rules.statBasis==='equipped'&&p.outfitId!==null){",
+    "        const outfit=s.items.find(i=>i.id===p.outfitId);",
+    "        if(!outfit||!stats.every(k=>Number.isFinite(outfit.bonus?.[k]??0)&&(outfit.bonus?.[k]??0)>=0)){",
+    "          blocked.push({kind:'mood',id:p.id,reason:'unknown-outfit-for-matching'});continue;",
+    "        }",
+    "        values=Object.fromEntries(stats.map(k=>[k,Math.min(17,p.stats[k]+(outfit.bonus?.[k]??0))]));",
+    "      }",
+    "      const stat=r?.type==='training'?r.trainStat:roomStats[r?.type];",
+    "      if(r&&adult&&!['storage','elevator'].includes(r.type)&&!stats.includes(stat)){",
+    "        blocked.push({kind:'mood',id:p.id,reason:'unknown-room-matching-stat'});continue;",
+    "      }",
+    "      // Matching is earned by an actual adult slot in an operational room. Extra occupants,",
+    "      // children and a room still under construction cannot gain a free work bonus.",
+    "      const assigned=r?s.residents.filter(q=>q.roomId===r.id&&present(q,at)).slice(0,r.width*2):[];",
+    "      if(r&&adult&&active(r,at)&&assigned.some(q=>q.id===p.id)&&stat&&values[stat]===Math.max(...stats.map(k=>values[k])))reasons.matching=15;",
+    "      if(radio)reasons.radio=10;",
+    "      if(adult&&p.roomId===null)reasons.unassigned=-20;",
+    "      if(r?.incident)reasons.incident=-20;",
+    "      if(r?.unpowered)reasons.outage=-10;",
+    "      if(unserved.food>1e-9)reasons.food=-25;",
+    "      if(unserved.water>1e-9)reasons.water=-25;",
+    "      const target=Math.min(100,Math.max(5,Object.values(reasons).reduce((a,b)=>a+b,0)));",
+    "      const next=p.happiness+.05*(target-p.happiness);",
+    "      updates.push({id:p.id,before:p.happiness,after:next,target,reasons});",
+    "      if(adult&&(p.happiness>=50)!==(next>=50))events.push({kind:'family-mood-threshold',at:at+600000,id:p.id,",
+    "        from:p.happiness,to:next,meetsMoodMinimum:next>=50});",
+    "    }",
+    "    const values=updates.map(u=>u.after);",
+    "    return {updates,events,blocked,summary:{at:at+600000,radio,changed:updates.filter(u=>u.before!==u.after).length,",
+    "      min:values.length?Math.min(...values):null,max:values.length?Math.max(...values):null,",
+    "      belowFamilyMood:updates.filter(u=>u.after<50&&s.residents.find(p=>p.id===u.id).adultAt<=at).length}};",
+    "  }",
+    "  return {validate,step};",
+    "}",
+    "",
+    "return {createShelterMoodSimulation};",
+    "})();",
+    "const {createShelterXpSimulation}=(()=>{",
+    "// Public duty/collection XP and resident level/max-HP equations. This optional offline",
+    "// model declares tick sampling and numerical precision. It does not invent healing,",
+    "// activity multipliers or XP for an ambiguously capacity-limited collection.",
+    "function createShelterXpSimulation() {",
+    "  const tick=600000,precision=1e9;",
+    "  const rooms=new Set(['door','elevator','power','diner','water','scrap','quarters','storage',",
+    "    'medbay','training','workshop','armory','tailor','radio']);",
+    "  const fields={duty:'tick-start-prorated',collection:'full-ready-batches',health:'fixed-current-hp',",
+    "    activity:'block-unmodeled-xp',precision:'1e-9'};",
+    "  const level=p=>Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)));",
+    "  const maxHp=p=>Math.round(100+(level(p)-1)*(2+.5*p.stats.end));",
+    "  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;",
+    "  function validate(view,rules) {",
+    "    if(!rules||Object.entries(fields).some(([k,v])=>rules[k]!==v)||",
+    "      Object.keys(rules).some(k=>!(k in fields)&&k!=='source')||typeof rules.source!=='string'||!rules.source.trim())",
+    "      throw Error('Explicit conditional XP and fixed-health rules required');",
+    "    for(const p of view.state.residents)if(!Number.isFinite(p.xp)||p.xp<0||!Number.isFinite(p.hp)||p.hp<0||",
+    "      !Number.isFinite(p.stats?.end)||p.stats.end<0||p.stats.end>10)",
+    "      throw Error('Invalid XP or current-health state');",
+    "    for(const e of view.env?.events??[])if(e.kind==='xp'&&(!Number.isSafeInteger(e.startsAt)||e.startsAt<0||",
+    "      !Number.isSafeInteger(e.endsAt)||e.endsAt<e.startsAt||!Number.isFinite(e.percent)||e.percent<0))",
+    "      throw Error('Invalid XP activity interval');",
+    "  }",
+    "  function duty(view,rules) {",
+    "    validate(view,rules);const at=view.serverTime,awards=[],blocked=[];",
+    "    // The saved page identifies affected XP sources but does not prove the server's XP",
+    "    // multiplier, cap or boundary handling. Do not silently assume no active boost.",
+    "    if((view.env?.events??[]).some(e=>e.kind==='xp'&&e.startsAt<at+tick&&e.endsAt>at))",
+    "      blocked.push({kind:'xp',at,reason:'xp-activity-rule-not-modeled'});",
+    "    for(const p of view.state.residents)if(present(p,at)&&p.roomId!==null&&",
+    "      !view.state.rooms.some(r=>r.id===p.roomId))blocked.push({kind:'xp',id:p.id,at,reason:'unknown-assigned-room'});",
+    "    for(const r of view.state.rooms){",
+    "      if(!rooms.has(r.type)){blocked.push({kind:'xp',roomId:r.id,at,reason:'unknown-duty-room-type'});continue;}",
+    "      if(['quarters','elevator','storage'].includes(r.type)||r.builtAt>at||r.upgradeAt!==null||r.incident||r.unpowered)continue;",
+    "      for(const p of view.state.residents.filter(p=>p.roomId===r.id&&present(p,at)).slice(0,r.width*2))",
+    "        awards.push({id:p.id,roomId:r.id,amount:1/6,kind:'duty',at:at+tick,sampledAt:at});",
+    "    }",
+    "    return {awards,blocked};",
+    "  }",
+    "  function collection(view,receipts,rules) {",
+    "    validate(view,rules);const awards=[],blocked=[],seen=new Set();",
+    "    if(!Array.isArray(receipts))throw Error('Per-room collection receipts required for XP');",
+    "    for(const r of receipts){",
+    "      const room=view.state.rooms.find(room=>room.id===r.roomId),key=r.at+':'+r.method+':'+r.roomId;",
+    "      const workers=room?view.state.residents.filter(p=>p.roomId===room.id&&present(p,r.sampledAt)).slice(0,room.width*2).map(p=>p.id):[];",
+    "      if(!Number.isFinite(r.batch)||r.batch<=0||!Number.isSafeInteger(r.readyBatches)||r.readyBatches<1||",
+    "        !Number.isFinite(r.amount)||r.amount<=0||r.amount>r.batch*r.readyBatches+1e-7||",
+    "        !room||seen.has(key)||!Number.isFinite(r.storedBefore)||!Number.isFinite(r.storedAfter)||r.storedAfter<0||",
+    "        Math.abs(r.storedBefore-r.amount-r.storedAfter)>1e-7||Math.floor(r.storedBefore/r.batch+1e-9)!==r.readyBatches||",
+    "        !Array.isArray(r.workerIds)||new Set(r.workerIds).size!==r.workerIds.length||",
+    "        !['automatic','manual'].includes(r.method)||!Number.isSafeInteger(r.at)||r.at!==view.serverTime||",
+    "        !Number.isSafeInteger(r.sampledAt)||r.sampledAt!==(r.method==='automatic'?r.at-tick:r.at)||",
+    "        JSON.stringify(r.workerIds)!==JSON.stringify(workers))",
+    "        throw Error('Invalid per-room XP collection receipt');",
+    "      seen.add(key);",
+    "      if(r.workerIds.length&&Math.abs(r.amount-r.batch*r.readyBatches)>1e-7){",
+    "        blocked.push({kind:'xp',roomId:r.roomId,at:r.at,reason:'partial-collection-xp-unknown',",
+    "          amount:r.amount,readyBatches:r.readyBatches,batch:r.batch});continue;",
+    "      }",
+    "      for(const id of r.workerIds)awards.push({id,roomId:r.roomId,amount:2*r.readyBatches,",
+    "        kind:'collection',method:r.method,at:r.at,sampledAt:r.sampledAt});",
+    "    }",
+    "    return {awards,blocked};",
+    "  }",
+    "  function apply(view,awards) {",
+    "    // Called only on a private tick copy. Normalize tiny binary additions consistently",
+    "    // across JSON/repeated advances; this precision is a model condition, not UI evidence.",
+    "    for(const a of awards){const p=view.state.residents.find(p=>p.id===a.id);",
+    "      if(!p||!Number.isFinite(a.amount)||a.amount<0)throw Error('Invalid XP award');",
+    "      p.xp=Math.round((p.xp+a.amount)*precision)/precision;",
+    "    }",
+    "  }",
+    "  function changes(before,after,awards) {",
+    "    const events=[],at=after.serverTime;",
+    "    for(const p of before.state.residents){",
+    "      const q=after.state.residents.find(q=>q.id===p.id);if(!q)continue;",
+    "      const oldLevel=level(p),newLevel=level(q),oldMax=maxHp(p),newMax=maxHp(q);",
+    "      if(oldLevel!==newLevel)events.push({kind:'resident-level',at,id:p.id,from:oldLevel,to:newLevel,xp:q.xp});",
+    "      if(oldMax!==newMax)events.push({kind:'resident-max-hp',at,id:p.id,from:oldMax,to:newMax,hp:q.hp});",
+    "      if(present(p,before.serverTime)&&(p.hp>=.6*oldMax)!==(q.hp>=.6*newMax))",
+    "        events.push({kind:'resident-health-threshold',at,id:p.id,hp:q.hp,maxHp:newMax,meetsHealthMinimum:q.hp>=.6*newMax});",
+    "    }",
+    "    return {events,summary:{at,duty:awards.filter(a=>a.kind==='duty').reduce((n,a)=>n+a.amount,0),",
+    "      collection:awards.filter(a=>a.kind==='collection').reduce((n,a)=>n+a.amount,0),",
+    "      workers:new Set(awards.map(a=>a.id)).size,levels:events.filter(e=>e.kind==='resident-level').length,",
+    "      belowHealthMinimum:after.state.residents.filter(p=>present(p,at)&&p.hp<.6*maxHp(p)).length}};",
+    "  }",
+    "  return {validate,duty,collection,apply,changes,level,maxHp};",
+    "}",
+    "",
+    "return {createShelterXpSimulation};",
+    "})();",
+    "const {createShelterEventSimulation}=(()=>{",
+    "",
+    "// Conditional, deterministic natural-event progression for D.14. This is an offline model,",
+    "// not a server emulator and not an action executor. Every run declares the same timing,",
+    "// training remainder and merge assumptions for all compared routes. Unknown outcomes stop",
+    "// before their interval; no fake children, elevator IDs or training progress are synthesized.",
+    "function createShelterEventSimulation() {",
+    "  const resources=createShelterResourceSimulation(),family=createShelterFamilySimulation(),mood=createShelterMoodSimulation(),tick=600000;",
+    "  const xp=createShelterXpSimulation();",
+    "  const stats=['str','per','end','cha','int','agi','lck'];",
+    "  const keys=['power','food','water','scrap','parts','stimpak'];",
+    "  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));",
+    "  const id=n=>Number.isSafeInteger(n)&&n>0;",
+    "  const time=n=>Number.isSafeInteger(n)&&n>=0;",
+    "  const sameParents=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&",
+    "    a[0]!==a[1]&&a.every(id)&&b.every(id)&&a.every(p=>b.includes(p));",
+    "  const sameBirth=(a,b)=>a.roomId===b.roomId&&a.dueAt===b.dueAt&&sameParents(a.parents,b.parents);",
+    "  const active=(r,at)=>r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;",
+    "  function validate(view,assumptions,outcomes) {",
+    "    resources.validate(view);const s=view.state;",
+    "    if(!assumptions||assumptions.eventTiming!=='tick-end'||assumptions.trainingOverflow!=='reset'||",
+    "      assumptions.merge!=='left-neighbor'||typeof assumptions.source!=='string'||!assumptions.source.trim())",
+    "      throw Error('Explicit conditional timing, training and merge assumptions required');",
+    "    if(view.serverTime!==s.lastSettledAt)throw Error('Event simulation needs a settled snapshot; missing tick history');",
+    "    if(!Number.isInteger(s.depth)||s.depth<1||s.rooms.some(r=>!id(r.id)||!Number.isInteger(r.floor)||r.floor<1||",
+    "      !Number.isInteger(r.col)||r.col<0)||s.residents.some(p=>!id(p.id))||",
+    "      new Set(s.residents.map(p=>p.id)).size!==s.residents.length)throw Error('Invalid event simulation identities or layout');",
+    "    if(!outcomes||!Array.isArray(outcomes.births)||!Array.isArray(outcomes.digs))throw Error('Explicit outcome lists required');",
+    "    for(const [i,b] of outcomes.births.entries())if(!time(b.dueAt)||!id(b.roomId)||!sameParents(b.parents,b.parents)||",
+    "      !b.resident||typeof b.source!=='string'||!b.source.trim()||outcomes.births.slice(0,i).some(a=>sameBirth(a,b)))",
+    "      throw Error('Invalid or duplicate birth outcome');",
+    "    for(const [i,d] of outcomes.digs.entries())if(!time(d.doneAt)||!Number.isInteger(d.floor)||d.floor<2||",
+    "      !d.elevator||typeof d.source!=='string'||!d.source.trim()||outcomes.digs.slice(0,i).some(a=>a.floor===d.floor&&a.doneAt===d.doneAt))",
+    "      throw Error('Invalid or duplicate digging outcome');",
+    "  }",
+    "  function progress(view) {",
+    "    const s=view.state,at=view.serverTime;",
+    "    const score=2*s.residents.filter(p=>p.deadAt===null).length+3*s.depth+s.rooms",
+    "      .filter(r=>r.builtAt<=at&&!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);",
+    "    let level=1;while(score>=30+Math.ceil(2.25*level*level))level++;",
+    "    return {level,score,next:30+Math.ceil(2.25*level*level)};",
+    "  }",
+    "  function dueIssues(view,end,outcomes,familyPlans=[]) {",
+    "    const s=view.state,start=view.serverTime,issues=[];",
+    "    const issue=(kind,target,at,reason)=>issues.push({kind,target,at,reason});",
+    "    const usedPeople=new Set(s.residents.map(p=>p.id)),usedRooms=new Set(s.rooms.map(r=>r.id));",
+    "    if(view.switches?.frozen)issue('shelter',null,start,'frozen-shelter');",
+    "    for(const b of s.births){",
+    "      if(b.dueAt<=start){issue('birth',b.roomId,b.dueAt,'overdue-event-needs-snapshot');continue;}",
+    "      if(b.dueAt>end)continue;",
+    "      const o=outcomes.births.find(o=>sameBirth(o,b)),p=o?.resident;",
+    "      if(!o){issue('birth',b.roomId,b.dueAt,'missing-child-outcome');continue;}",
+    "      if(!id(p.id)||usedPeople.has(p.id)||!sameParents(p.parents,b.parents)||!time(p.adultAt)||p.adultAt<=end||",
+    "        !(p.roomId===null||p.roomId===b.roomId&&s.rooms.some(r=>r.id===b.roomId&&r.type==='quarters'))||",
+    "        p.deadAt!==null||p.away!==null||p.romance!==null||p.training!==0||",
+    "        p.outfitId!==null||p.weaponId!==null||!Number.isFinite(p.hp)||p.hp<=0||",
+    "        !stats.every(k=>Number.isInteger(p.stats?.[k])&&p.stats[k]>=0&&p.stats[k]<=10)||",
+    "        !Number.isFinite(p.xp)||p.xp<0||!Number.isFinite(p.happiness)||p.happiness<0||p.happiness>100)",
+    "        issue('birth',b.roomId,b.dueAt,'invalid-or-conflicting-child-outcome');",
+    "      usedPeople.add(p.id);",
+    "    }",
+    "    for(const r of s.rooms)if(r.upgradeAt!==null){",
+    "      if(r.upgradeAt<=start)issue('upgrade',r.id,r.upgradeAt,'overdue-event-needs-snapshot');",
+    "      else if(r.upgradeAt<=end&&(r.level>=3||r.builtAt>start))issue('upgrade',r.id,r.upgradeAt,'invalid-upgrade-state');",
+    "    }",
+    "    // A merge would change the identity referenced by pending family/crafting outcomes.",
+    "    // Until those dependencies have a remapping contract, stop before changing their room.",
+    "    const after=s.rooms.map(r=>({...r,level:r.level+(r.upgradeAt!==null&&r.upgradeAt<=end?1:0),",
+    "      upgradeAt:r.upgradeAt!==null&&r.upgradeAt<=end?null:r.upgradeAt}));",
+    "    for(const original of s.rooms.filter(r=>r.builtAt>start&&r.builtAt<=end||r.upgradeAt!==null&&r.upgradeAt<=end)){",
+    "      const r=after.find(r=>r.id===original.id),left=after.find(l=>l.id!==r.id&&l.floor===r.floor&&",
+    "        l.col+l.width===r.col&&l.type===r.type&&l.level===r.level&&l.width+r.width<=3&&active(l,end)&&active(r,end)&&",
+    "        (r.type!=='training'||l.trainStat===r.trainStat));",
+    "      if(left&&(s.births.some(b=>b.roomId===r.id||b.roomId===left.id)||r.craft||left.craft||",
+    "        familyPlans.some(p=>!['born','cancelled'].includes(p.stage)&&[r.id,left.id].includes(p.roomId))))",
+    "        issue('merge',r.id,end,'dependent-room-outcome-remap-not-modeled');",
+    "    }",
+    "    const d=s.digging;",
+    "    if(d&&d.doneAt<=start)issue('dig',d.floor,d.doneAt,'overdue-event-needs-snapshot');",
+    "    else if(d&&d.doneAt<=end){",
+    "      const o=outcomes.digs.find(o=>o.floor===d.floor&&o.doneAt===d.doneAt),r=o?.elevator;",
+    "      if(!o)issue('dig',d.floor,d.doneAt,'missing-elevator-outcome');",
+    "      else if(d.floor!==s.depth+1||!id(r.id)||usedRooms.has(r.id)||r.type!=='elevator'||r.floor!==d.floor||",
+    "        r.col!==1||r.width!==1||r.level!==1||r.builtAt!==d.doneAt||r.upgradeAt!==null||r.stored!==0||r.incident||r.unpowered)",
+    "        issue('dig',d.floor,d.doneAt,'invalid-or-conflicting-elevator-outcome');",
+    "    }",
+    "    for(const p of s.residents)if(p.romance&&!familyPlans.some(f=>f.stage==='romance'&&f.parents.includes(p.id)))",
+    "      issue('romance',p.id,start,'future-romance-rule-not-supplied');",
+    "    for(const r of s.rooms){",
+    "      if(r.incident)issue('incident',r.id,start,'incident-evolution-not-modeled');",
+    "      if(r.type==='radio'&&active(r,start)&&s.residents.some(p=>p.roomId===r.id&&p.deadAt===null&&p.away===null&&p.adultAt<=start)){",
+    "        const capacity=Math.min(200,s.rooms.filter(q=>q.type==='quarters'&&q.builtAt<=start).reduce((n,q)=>n+q.width*(2+2*q.level),0));",
+    "        if(s.residents.length+s.births.length<capacity)issue('radio',r.id,start,'recruitment-outcome-not-modeled');",
+    "      }",
+    "      if(r.craft&&(!time(r.craft.doneAt)||r.craft.doneAt<=end))issue('craft',r.id,r.craft.doneAt,'craft-outcome-not-supplied');",
+    "    }",
+    "    for(const e of s.explorers??[])if(e.returnAt===null||!time(e.returnAt)||e.returnAt<=end)",
+    "      issue('explorer',e.id,e.returnAt,'exploration-outcome-not-supplied');",
+    "    for(const q of s.quests??[])if(!time(q.nextStageAt)||q.nextStageAt<=end||q.returnAt!=null&&q.returnAt<=end)",
+    "      issue('quest',q.id,q.nextStageAt,'quest-outcome-not-supplied');",
+    "    return issues;",
+    "  }",
+    "  // Shared with native-decision window tests. Missing observations remain blocked;",
+    "  // neither an unknown attribute nor missing progress can become a fresh course.",
+    "  function trainingStep(view,assumptions) {",
+    "    if(assumptions?.trainingOverflow!=='reset'||typeof assumptions.source!=='string'||!assumptions.source.trim())",
+    "      throw Error('Explicit conditional training assumptions required');",
+    "    const s=view.state,start=view.serverTime,perk=s.legacy?.perks?.training??0,updates=[],blocked=[];",
+    "    for(const r of s.rooms.filter(r=>r.type==='training'&&active(r,start)))for(const p of s.residents",
+    "      .filter(p=>p.roomId===r.id&&p.away===null&&p.deadAt===null&&p.adultAt<=start).slice(0,r.width*2)){",
+    "      const base=p.stats[r.trainStat];",
+    "      if(!stats.includes(r.trainStat)||!Number.isInteger(base)||base<0||base>10||",
+    "        !Number.isInteger(perk)||perk<0||perk>10||base<10&&(!Number.isFinite(p.training)||p.training<0||p.training>=1)){",
+    "        blocked.push({kind:'training',target:p.id,at:start,reason:'unknown-training-state'});continue;",
+    "      }",
+    "      if(base<10)updates.push({id:p.id,stat:r.trainStat,base,",
+    "        progress:p.training+r.level*(1+.05*perk)/(base+1)/6});",
+    "    }",
+    "    return {updates,blocked};",
+    "  }",
+    "  function mergeCompleted(view,completed,events) {",
+    "    const s=view.state,at=view.serverTime;",
+    "    // Explicit conditional rule, matching the existing long-development fixture: only a",
+    "    // finished compatible left neighbor. Stored products and resident identities survive.",
+    "    const ordered=[...new Set(completed)].sort((a,b)=>{",
+    "      const ra=s.rooms.find(r=>r.id===a),rb=s.rooms.find(r=>r.id===b);",
+    "      return ra.floor-rb.floor||ra.col-rb.col||ra.id-rb.id;",
+    "    });",
+    "    for(const roomId of ordered){",
+    "      const r=s.rooms.find(r=>r.id===roomId);if(!r||['door','elevator'].includes(r.type)||!active(r,at))continue;",
+    "      const left=s.rooms.find(l=>l.id!==r.id&&l.floor===r.floor&&l.col+l.width===r.col&&l.type===r.type&&",
+    "        l.level===r.level&&l.width+r.width<=3&&active(l,at)&&(r.type!=='training'||l.trainStat===r.trainStat));",
+    "      if(!left)continue;",
+    "      left.width+=r.width;left.stored+=r.stored;",
+    "      for(const p of s.residents)if(p.roomId===r.id)p.roomId=left.id;",
+    "      s.rooms=s.rooms.filter(x=>x.id!==r.id);",
+    "      events.push({kind:'merge',at,roomId:r.id,into:left.id,width:left.width});",
+    "    }",
+    "  }",
+    "  function advance(input,to,{assumptions,outcomes={births:[],digs:[]},familyPlans=[],familyRules=null,moodRules=null,xpRules=null,scrapFloor=0,collect=false,stopAtEvent=false}={}) {",
+    "    validate(input,assumptions,outcomes);",
+    "    family.validate(familyPlans,familyRules);",
+    "    if(moodRules!==null)mood.validate(input,moodRules);",
+    "    if(xpRules!==null)xp.validate(input,xpRules);",
+    "    if(!time(to)||to<input.serverTime||to-input.serverTime>168*3600000||(to-input.serverTime)%tick!==0)",
+    "      throw Error('Event horizon must use whole ticks, monotone time and at most 168 hours');",
+    "    if(typeof collect!=='boolean'||typeof stopAtEvent!=='boolean'||!Number.isFinite(scrapFloor)||scrapFloor<0)",
+    "      throw Error('Invalid event simulation options');",
+    "    let view=structuredClone(input),plans=structuredClone(familyPlans),known=structuredClone(outcomes);",
+    "    const events=[],segments=[],blocked=[],familyPauses=[];",
+    "    let lastMood=null,lastXp=null;",
+    "    const earnedXp={duty:0,collection:0};",
+    "    const ledger={initial:{...view.state.resources},initialStored:resources.storedTotals(view),final:null,",
+    "      produced:zero(),collected:zero(),consumed:zero(),feed:zero(),",
+    "      unserved:zero(),roomOverflow:zero(),collections:[],minimumInventory:{...view.state.resources},feedBlockedParts:0,ticks:0};",
+    "    function accumulate(l){",
+    "      for(const k of keys){for(const field of ['produced','collected','consumed','feed','unserved','roomOverflow'])ledger[field][k]+=l[field][k];",
+    "        ledger.minimumInventory[k]=Math.min(ledger.minimumInventory[k],l.minimumInventory[k]);}",
+    "      ledger.feedBlockedParts+=l.feedBlockedParts;ledger.ticks+=l.ticks;",
+    "      ledger.collections.push(...l.collections);",
+    "    }",
+    "    while(view.serverTime<to){",
+    "      const start=view.serverTime,end=start+tick,s=view.state,issues=dueIssues(view,end,known,plans);",
+    "      const familyStep=plans.length?family.prepare(view,plans,familyRules):null;",
+    "      if(familyStep)issues.push(...familyStep.blocked);",
+    "      const dutyStep=xpRules===null?null:xp.duty(view,xpRules);",
+    "      if(dutyStep)issues.push(...dutyStep.blocked);",
+    "      const training=trainingStep(view,assumptions);issues.push(...training.blocked);",
+    "      if(issues.length){blocked.push(...issues);break;}",
+    "      const beforeEvents=events.length;",
+    "      const tickEvents=[],awards=dutyStep?[...dutyStep.awards]:[];",
+    "      const step=resources.settleTick(view,{scrapFloor});",
+    "      const moodStep=moodRules===null?null:mood.step(view,step.ledger.unserved,moodRules);",
+    "      if(moodStep?.blocked.length){blocked.push(...moodStep.blocked);break;}",
+    "      const autoXp=xpRules===null?null:xp.collection(step.view,step.ledger.collections,xpRules);",
+    "      if(autoXp?.blocked.length){blocked.push(...autoXp.blocked);break;}",
+    "      if(autoXp)awards.push(...autoXp.awards);",
+    "      let nextView=step.view;",
+    "      const next=nextView.state,completed=[],nextKnown=structuredClone(known);",
+    "      let nextPlans=structuredClone(plans);",
+    "      if(xpRules!==null)xp.apply(nextView,awards);",
+    "      if(moodStep){",
+    "        for(const update of moodStep.updates)next.residents.find(p=>p.id===update.id).happiness=update.after;",
+    "        tickEvents.push(...moodStep.events);",
+    "      }",
+    "      if(familyStep){",
+    "        for(const update of familyStep.updates){const {id,...changes}=update;Object.assign(next.residents.find(p=>p.id===id),changes);}",
+    "        next.births.push(...familyStep.births);nextKnown.births.push(...familyStep.outcomes);nextPlans=familyStep.plans;",
+    "        tickEvents.push(...familyStep.events);",
+    "      }",
+    "      for(const t of training.updates){",
+    "        const p=next.residents.find(p=>p.id===t.id);",
+    "        if(t.progress>=1-1e-9){p.stats[t.stat]++;p.training=0;tickEvents.push({kind:'training',at:end,id:p.id,stat:t.stat,from:t.base,to:p.stats[t.stat]});}",
+    "        else p.training=t.progress;",
+    "      }",
+    "      for(const r of next.rooms){",
+    "        if(r.upgradeAt!==null&&r.upgradeAt<=end){",
+    "          const dueAt=r.upgradeAt;r.upgradeAt=null;r.level++;completed.push(r.id);",
+    "          tickEvents.push({kind:'upgrade',at:end,dueAt,roomId:r.id,level:r.level});",
+    "        }",
+    "        if(r.builtAt>start&&r.builtAt<=end){completed.push(r.id);tickEvents.push({kind:'build',at:end,dueAt:r.builtAt,roomId:r.id});}",
+    "      }",
+    "      if(next.digging&&next.digging.doneAt<=end){",
+    "        const d=next.digging,o=nextKnown.digs.find(o=>o.floor===d.floor&&o.doneAt===d.doneAt);",
+    "        next.depth=d.floor;next.rooms.push(structuredClone(o.elevator));next.digging=null;",
+    "        tickEvents.push({kind:'dig',at:end,dueAt:d.doneAt,floor:d.floor,roomId:o.elevator.id,source:o.source});",
+    "      }",
+    "      for(const b of [...next.births])if(b.dueAt<=end){",
+    "        const o=nextKnown.births.find(o=>sameBirth(o,b));next.residents.push(structuredClone(o.resident));",
+    "        next.births.splice(next.births.indexOf(b),1);",
+    "        tickEvents.push({kind:'birth',at:end,dueAt:b.dueAt,id:o.resident.id,adultAt:o.resident.adultAt,parents:[...b.parents],source:o.source});",
+    "        for(const p of nextPlans)if(p.stage==='pregnant'&&p.dueAt===b.dueAt&&sameParents(p.parents,b.parents)){",
+    "          p.stage='born';p.bornAt=end;",
+    "        }",
+    "      }",
+    "      for(const p of next.residents)if(p.deadAt===null&&p.adultAt>start&&p.adultAt<=end)",
+    "        tickEvents.push({kind:'adult',at:end,dueAt:p.adultAt,id:p.id});",
+    "      for(const e of view.env?.events??[])if(e.kind==='production'){",
+    "        if(e.startsAt>start&&e.startsAt<=end)tickEvents.push({kind:'production-modifier-start',at:end,dueAt:e.startsAt,percent:e.percent});",
+    "        if(e.endsAt>start&&e.endsAt<=end)tickEvents.push({kind:'production-modifier-end',at:end,dueAt:e.endsAt,percent:e.percent});",
+    "      }",
+    "      mergeCompleted(nextView,completed,tickEvents);",
+    "      nextView.progress={...nextView.progress,...progress(nextView)};",
+    "      resources.validate(nextView);",
+    "      // Manual collection is a modeled action at the interval end, after natural transitions.",
+    "      // It must be explicitly requested and carries no implication of real browser execution.",
+    "      let manual=null;",
+    "      if(collect){",
+    "        manual=resources.collect(nextView);nextView=manual.view;",
+    "        if(xpRules!==null){",
+    "          const manualXp=xp.collection(nextView,manual.ledger.collections,xpRules);",
+    "          if(manualXp.blocked.length){blocked.push(...manualXp.blocked);break;}",
+    "          xp.apply(nextView,manualXp.awards);awards.push(...manualXp.awards);",
+    "        }",
+    "      }",
+    "      const xpStep=xpRules===null?null:xp.changes(view,nextView,awards);",
+    "      // Commit one whole tick only after all modeled transitions are known. In particular,",
+    "      // partial-collection uncertainty cannot leak production, births, XP or ledger changes.",
+    "      view=nextView;known=nextKnown;plans=nextPlans;accumulate(step.ledger);",
+    "      if(manual)accumulate(manual.ledger);",
+    "      if(moodStep)lastMood=moodStep;",
+    "      if(xpStep){tickEvents.push(...xpStep.events);lastXp=xpStep;",
+    "        earnedXp.duty+=xpStep.summary.duty;earnedXp.collection+=xpStep.summary.collection;}",
+    "      events.push(...tickEvents);",
+    "      if(familyStep)familyPauses.push(...familyStep.paused.map(p=>({...p,at:end})));",
+    "      segments.push({from:start,to:end,events:events.slice(beforeEvents),progress:{...view.progress},",
+    "        resources:{...view.state.resources},demand:resources.demand(view,end),...(moodStep?{mood:moodStep.summary}:{}),",
+    "        ...(xpStep?{xp:xpStep.summary}:{})});",
+    "      if(stopAtEvent&&events.length>beforeEvents)break;",
+    "    }",
+    "    ledger.final={...view.state.resources};ledger.finalStored=resources.storedTotals(view);",
+    "    for(const k of keys){",
+    "      if(Math.abs(ledger.initial[k]+ledger.collected[k]-ledger.consumed[k]-ledger.feed[k]-ledger.final[k])>1e-7)",
+    "        throw Error('Event resource conservation failed: '+k);",
+    "      if(Math.abs(ledger.initialStored[k]+ledger.produced[k]-ledger.collected[k]-ledger.finalStored[k])>1e-7)",
+    "        throw Error('Event room storage conservation failed: '+k);",
+    "    }",
+    "    return {view,ledger,events,segments,blocked,outcomes:known,familyPlans:plans,familyPauses,",
+    "      mood:{enabled:moodRules!==null,rules:structuredClone(moodRules),lastStep:lastMood},complete:view.serverTime===to,requestedTo:to,",
+    "      xp:{enabled:xpRules!==null,rules:structuredClone(xpRules),earned:earnedXp,lastStep:lastXp},",
+    "      model:{kind:'conditional-natural-events',assumptions:structuredClone(assumptions),",
+    "        limits:[moodRules===null?'constant-mood':'conditional-dynamic-mood',",
+    "          xpRules===null?'constant-xp-and-current-hp':'conditional-dynamic-xp-fixed-current-hp-no-healing',",
+    "          'radio-recruitment-requires-explicit-outcomes-when-beds-available','no-random-rewards-or-incidents','no-action-or-reservation-planner',",
+    "          'tick-start-roster-and-tick-end-events','birth-and-dig-outcomes-explicit','collection-only-if-requested',",
+    "          'room-array-order-for-feed-and-automatic-collection','training-one-increment-then-reset',",
+    "          'merge-completions-by-floor-column-into-left-neighbor',...(plans.length?['family-rules-and-child-templates-explicit']:[])]}};",
+    "  }",
+    "  return {advance,trainingStep};",
+    "}",
+    "",
+    "return {createShelterEventSimulation};",
+    "})();",
+    "const {createShelterReservations}=(()=>{",
+    "// Shared commitments for offline D.14 route states. No browser storage, requests or account",
+    "// mutations. Money is held, not paid, until a caller supplies a bound simulated outcome.",
+    "// The runtime adapter must retain its existing request/receipt proofs before using this model.",
+    "function createShelterReservations() {",
+    "  const resources=['power','food','water','scrap','parts','stimpak'];",
+    "  const id=n=>Number.isSafeInteger(n)&&n>0;",
+    "  const at=n=>Number.isSafeInteger(n)&&n>=0;",
+    "  const amount=n=>Number.isFinite(n)&&n>=0;",
+    "  const label=s=>typeof s==='string'&&s.length>0&&s.length<=160;",
+    "  const zero=()=>Object.fromEntries(resources.map(k=>[k,0]));",
+    "  const active=e=>!['cancelled','complete'].includes(e.status);",
+    "  const familyKey=p=>[...p].sort((a,b)=>a-b).join('/');",
+    "  const span=c=>at(c.from)&&at(c.until)&&c.until>c.from;",
+    "  const overlaps=(a,b)=>a.from<b.until&&b.from<a.until;",
+    "  const normalize=x=>Object.fromEntries(resources.map(k=>[k,x?.[k]??0]));",
+    "  function validate(book,view) {",
+    "    if(book?.version!==1||!id(book.vaultNo)||view.vaultNo!==book.vaultNo||!at(book.startedAt)||!at(book.windowEnd)||",
+    "      book.windowEnd<=book.startedAt||book.windowEnd-book.startedAt>168*3600000||!Array.isArray(book.entries)||!Array.isArray(book.receipts)||!at(view.serverTime)||",
+    "      !resources.every(k=>amount(book.safety?.[k])&&amount(view.state.resources?.[k])))throw Error('Invalid reservation account');",
+    "    if(new Set(book.entries.map(e=>e.id)).size!==book.entries.length)throw Error('Duplicate reservation identity');",
+    "    for(const e of book.entries){",
+    "      if(!label(e.id)||!label(e.purpose)||!['held','submitted','cancelled','complete'].includes(e.status)||",
+    "        !at(e.at)||!at(e.deadline)||e.deadline<=e.at||e.deadline>book.windowEnd||",
+    "        !resources.every(k=>amount(e.resources?.[k])&&amount(e.paid?.[k]))||!amount(e.feedScrap)||!amount(e.feedSpent)||",
+    "        !Array.isArray(e.people)||!Array.isArray(e.seats)||!Array.isArray(e.families))throw Error('Invalid reservation entry');",
+    "      for(const c of [...e.people,...e.seats])if(!id(c.residentId)||!span(c)||c.from<book.startedAt||c.until>book.windowEnd||",
+    "        e.seats.includes(c)&&!id(c.roomId))throw Error('Invalid reservation interval');",
+    "      for(const f of e.families)if(!Array.isArray(f.parents)||f.parents.length!==2||!f.parents.every(id)||f.parents[0]===f.parents[1]||",
+    "        !(f.dueAt===null||at(f.dueAt))||!(f.childId===null||id(f.childId)))throw Error('Invalid family reservation');",
+    "      if(e.status==='submitted'&&(!e.pending||!label(e.pending.id)||!label(e.pending.fingerprint)||",
+    "        !at(e.pending.at)||!resources.every(k=>amount(e.pending.cost?.[k]))))throw Error('Invalid pending reservation');",
+    "      if(e.status!=='submitted'&&e.pending!==null)throw Error('Unexpected pending reservation');",
+    "    }",
+    "    if(new Set(book.receipts.map(r=>r.requestId)).size!==book.receipts.length||book.receipts.some(r=>!label(r.requestId)||",
+    "      !label(r.intentId)||!label(r.fingerprint)||!at(r.at)||!['confirmed','rejected'].includes(r.result)))",
+    "      throw Error('Invalid reservation receipts');",
+    "  }",
+    "  function create(view,{safety={},windowEnd}={}) {",
+    "    const book={version:1,vaultNo:view.vaultNo,startedAt:view.serverTime,windowEnd,safety:normalize(safety),entries:[],receipts:[]};",
+    "    validate(book,view);return book;",
+    "  }",
+    "  function inspect(view,book,{owner=null}={}) {",
+    "    validate(book,view);const now=view.serverTime,held=book.entries.filter(active),blocked=[];",
+    "    const direct=zero(),others=zero();let feed=0,otherFeed=0;",
+    "    for(const e of held){",
+    "      for(const k of resources){direct[k]+=e.resources[k];if(e.id!==owner)others[k]+=e.resources[k];}",
+    "      feed+=e.feedScrap;if(e.id!==owner)otherFeed+=e.feedScrap;",
+    "      if(e.deadline<=now)blocked.push({kind:'deadline',intentId:e.id,pending:e.status==='submitted'});",
+    "    }",
+    "    const free=zero(),ownSpendable=zero();",
+    "    for(const k of resources){",
+    "      free[k]=view.state.resources[k]-book.safety[k]-direct[k]-(k==='scrap'?feed:0);",
+    "      // Own construction allocation is usable; its separately promised feed still is not.",
+    "      ownSpendable[k]=view.state.resources[k]-book.safety[k]-others[k]-(k==='scrap'?feed:0);",
+    "      if(free[k]<-1e-7)blocked.push({kind:'material-deficit',resource:k,amount:-free[k]});",
+    "    }",
+    "    const people=held.flatMap(e=>e.people.filter(c=>c.until>now||e.status==='submitted').map(c=>({...c,intentId:e.id,pending:e.status==='submitted'})));",
+    "    // A pending intent keeps outsiders from taking its resident, but its own sequential",
+    "    // stages are not simultaneous assignments. The route cannot advance while unresolved.",
+    "    for(let i=0;i<people.length;i++)for(let j=0;j<i;j++)if(people[i].residentId===people[j].residentId&&",
+    "      (overlaps(people[i],people[j])||people[i].intentId!==people[j].intentId&&(people[i].pending||people[j].pending)))",
+    "      blocked.push({kind:'resident-conflict',residentId:people[i].residentId,intents:[people[j].intentId,people[i].intentId]});",
+    "    for(const c of people){",
+    "      const p=view.state.residents.find(p=>p.id===c.residentId);",
+    "      if(!p||p.deadAt!==null||p.away!==null||p.adultAt>c.from)blocked.push({kind:'resident-unavailable',intentId:c.intentId,residentId:c.residentId});",
+    "    }",
+    "    const seats=held.flatMap(e=>e.seats.filter(c=>c.until>now||e.status==='submitted').map(c=>({...c,intentId:e.id,pending:e.status==='submitted'})));",
+    "    for(let i=0;i<seats.length;i++)for(let j=0;j<i;j++)if(seats[i].residentId===seats[j].residentId&&",
+    "      (overlaps(seats[i],seats[j])||seats[i].intentId!==seats[j].intentId&&(seats[i].pending||seats[j].pending)))",
+    "      blocked.push({kind:'resident-seat-conflict',residentId:seats[i].residentId,intents:[seats[j].intentId,seats[i].intentId]});",
+    "    for(const c of seats){",
+    "      if(!people.some(p=>p.intentId===c.intentId&&p.residentId===c.residentId&&p.from<=c.from&&p.until>=c.until))",
+    "        blocked.push({kind:'seat-without-resident',intentId:c.intentId,residentId:c.residentId});",
+    "      const r=view.state.rooms.find(r=>r.id===c.roomId);",
+    "      if(!r||r.builtAt>c.from||r.upgradeAt!==null&&r.upgradeAt>c.from||r.incident||r.unpowered)",
+    "        blocked.push({kind:'seat-unavailable',intentId:c.intentId,roomId:c.roomId});",
+    "    }",
+    "    for(const roomId of new Set(seats.map(c=>c.roomId))){",
+    "      const r=view.state.rooms.find(r=>r.id===roomId);if(!r)continue;",
+    "      const claims=seats.filter(c=>c.roomId===roomId),boundaries=new Set([now,...claims.map(c=>Math.max(now,c.from)),",
+    "        ...view.state.residents.filter(p=>p.roomId===roomId&&p.adultAt>now).map(p=>p.adultAt)]);",
+    "      for(const t of boundaries){",
+    "        const current=claims.filter(c=>c.pending||c.from<=t&&t<c.until);if(!current.length)continue;",
+    "        // A planned departure never frees a real seat. Only an applied move updates roomId.",
+    "        // Away residents retain recorded occupancy, and one's own return is counted once.",
+    "        const occupants=new Set(view.state.residents.filter(p=>p.deadAt===null&&p.roomId===roomId&&p.adultAt<=t).map(p=>p.id));",
+    "        for(const c of current)occupants.add(c.residentId);",
+    "        if(occupants.size>r.width*2)blocked.push({kind:'seat-capacity',roomId,at:t,used:occupants.size,capacity:r.width*2});",
+    "      }",
+    "    }",
+    "    const families=held.flatMap(e=>e.families.map(f=>({...f,intentId:e.id}))),births=view.state.births,extra=new Set();",
+    "    const familyOwners=new Map(),parentOwners=new Map();",
+    "    for(const f of families){",
+    "      const key=familyKey(f.parents);",
+    "      if(f.parents.some(id=>!view.state.residents.some(p=>p.id===id)))blocked.push({kind:'unknown-family-parents',intentId:f.intentId});",
+    "      if(familyOwners.has(key))blocked.push({kind:'family-conflict',parents:f.parents,intents:[familyOwners.get(key),f.intentId]});",
+    "      familyOwners.set(key,f.intentId);",
+    "      if(f.childId===null)for(const id of f.parents){",
+    "        if(parentOwners.has(id))blocked.push({kind:'family-parent-conflict',residentId:id,intents:[parentOwners.get(id),f.intentId]});",
+    "        parentOwners.set(id,f.intentId);",
+    "      }",
+    "      if(f.childId!==null){",
+    "        const p=view.state.residents.find(p=>p.id===f.childId);",
+    "        if(!p||!Array.isArray(p.parents)||familyKey(p.parents)!==key)blocked.push({kind:'unknown-family-child',intentId:f.intentId});",
+    "      }else if(f.dueAt!==null){",
+    "        if(!births.some(b=>b.dueAt===f.dueAt&&familyKey(b.parents??[])===key))blocked.push({kind:'unknown-family-birth',intentId:f.intentId});",
+    "      }else if(births.some(b=>familyKey(b.parents??[])===key))blocked.push({kind:'family-transition-unreconciled',intentId:f.intentId});",
+    "      else extra.add(key);",
+    "    }",
+    "    // Existing romance and an explicit planned reservation for the same parents count once.",
+    "    for(const p of view.state.residents)if(p.romance?.partnerId){",
+    "      const pair=[p.id,p.romance.partnerId],key=familyKey(pair);",
+    "      if(!births.some(b=>familyKey(b.parents??[])===key))extra.add(key);",
+    "    }",
+    "    const capacity=Math.min(200,view.state.rooms.filter(r=>r.type==='quarters'&&r.builtAt<=now)",
+    "      .reduce((n,r)=>n+r.width*(2+2*r.level),0));",
+    "    const population=view.state.residents.length+births.length+extra.size;",
+    "    if(families.length&&population>capacity)blocked.push({kind:'beds',used:population,capacity});",
+    "    return {free,ownSpendable,direct,feedScrap:feed,otherFeedScrap:otherFeed,people,seats,population,capacity,blocked,",
+    "      expired:held.filter(e=>e.deadline<=now).map(e=>e.id)};",
+    "  }",
+    "  function reserve(view,input,intent) {",
+    "    validate(input,view);const book=structuredClone(input);",
+    "    if(book.entries.some(e=>e.id===intent.id))throw Error('Reservation identity already used');",
+    "    if(view.serverTime>=book.windowEnd)throw Error('Reservation window expired');",
+    "    const e={id:intent.id,purpose:intent.purpose,at:view.serverTime,deadline:intent.deadline??book.windowEnd,status:'held',",
+    "      people:structuredClone(intent.people??[]),seats:structuredClone(intent.seats??[]),families:structuredClone(intent.families??[]),",
+    "      resources:normalize(intent.resources),feedScrap:intent.feedScrap??0,paid:zero(),feedSpent:0,pending:null};",
+    "    if([...e.people,...e.seats].some(c=>c.from<view.serverTime))throw Error('Reservation starts before snapshot');",
+    "    book.entries.push(e);const report=inspect(view,book);",
+    "    return report.blocked.length?{book:input,accepted:false,report}:{book,accepted:true,report};",
+    "  }",
+    "  function release(view,input,intentId,{complete=false,reason}={}) {",
+    "    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId);",
+    "    if(!e||!active(e)||!label(reason))throw Error('Unknown reservation or missing release reason');",
+    "    if(e.status==='submitted')throw Error('Pending action must be reconciled before release');",
+    "    e.status=complete?'complete':'cancelled';e.releasedAt=view.serverTime;e.releaseReason=reason;",
+    "    return book;",
+    "  }",
+    "  function amend(view,input,intentId,changes) {",
+    "    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId);",
+    "    if(!e||e.status!=='held'||e.deadline<=view.serverTime||!changes||Object.keys(changes)",
+    "      .some(k=>!['people','seats','families','resources','feedScrap'].includes(k)))throw Error('Invalid commitment amendment');",
+    "    for(const [key,value] of Object.entries(changes))e[key]=key==='resources'?normalize(value):structuredClone(value);",
+    "    const report=inspect(view,book);",
+    "    return report.blocked.length?{book:input,accepted:false,report}:{book,accepted:true,report};",
+    "  }",
+    "  function submit(view,input,intentId,{requestId,fingerprint,cost={}}) {",
+    "    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId),payment=normalize(cost);",
+    "    if(!e||e.status!=='held'||book.entries.some(e=>e.status==='submitted')||!label(requestId)||!label(fingerprint)||",
+    "      book.receipts.some(r=>r.requestId===requestId)||!resources.every(k=>amount(payment[k])&&payment[k]<=e.resources[k]))",
+    "      throw Error('Invalid submission or unreserved cost');",
+    "    const report=inspect(view,book,{owner:intentId});",
+    "    if(report.blocked.length||resources.some(k=>payment[k]>report.ownSpendable[k]+1e-7))",
+    "      return {book:input,accepted:false,report};",
+    "    e.status='submitted';e.pending={id:requestId,fingerprint,at:view.serverTime,cost:payment};",
+    "    return {book,accepted:true,report};",
+    "  }",
+    "  function resolve(view,input,intentId,receipt) {",
+    "    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId),p=e?.pending;",
+    "    const prior=book.receipts.find(r=>r.requestId===receipt?.requestId);",
+    "    if(prior){",
+    "      if(JSON.stringify(prior)!==JSON.stringify(receipt)||prior.intentId!==intentId)throw Error('Conflicting duplicate receipt');",
+    "      return {view,book:input,duplicate:true};",
+    "    }",
+    "    if(!p||receipt?.intentId!==intentId||receipt.requestId!==p.id||receipt.fingerprint!==p.fingerprint||",
+    "      !['confirmed','rejected','unknown'].includes(receipt.result)||!at(receipt.at)||receipt.at<p.at||receipt.at>view.serverTime)",
+    "      throw Error('Receipt does not bind pending action');",
+    "    if(receipt.result==='unknown')return {view,book:input,duplicate:false};",
+    "    const next=structuredClone(view);",
+    "    if(receipt.result==='confirmed')for(const k of resources){",
+    "      if(next.state.resources[k]+1e-7<p.cost[k])throw Error('Confirmed payment cannot be funded');",
+    "      next.state.resources[k]-=p.cost[k];e.resources[k]-=p.cost[k];e.paid[k]+=p.cost[k];",
+    "    }",
+    "    e.status='held';e.pending=null;book.receipts.push(structuredClone(receipt));",
+    "    return {view:next,book,duplicate:false};",
+    "  }",
+    "  function reconcileEvents(view,input,events) {",
+    "    validate(input,view);const book=structuredClone(input);",
+    "    for(const event of events){",
+    "      if(event.kind==='merge')for(const e of book.entries.filter(active))for(const c of e.seats)if(c.roomId===event.roomId)c.roomId=event.into;",
+    "      if(event.kind==='pregnancy'){",
+    "        const claims=book.entries.filter(active).flatMap(e=>e.families).filter(f=>",
+    "          f.childId===null&&familyKey(f.parents)===familyKey(event.parents));",
+    "        if(claims.length!==1||!at(event.dueAt)||claims[0].dueAt!==null&&claims[0].dueAt!==event.dueAt)",
+    "          throw Error('Pregnancy event needs one matching family reservation');",
+    "        claims[0].dueAt=event.dueAt;",
+    "      }",
+    "      if(event.kind==='birth')for(const e of book.entries.filter(active))for(const f of e.families)",
+    "        if(f.dueAt===event.dueAt&&familyKey(f.parents)===familyKey(event.parents))f.childId=event.id;",
+    "    }",
+    "    return book;",
+    "  }",
+    "  function feedAllowance(view,book,owner=null) {",
+    "    const report=inspect(view,book),e=owner===null?null:book.entries.find(e=>e.id===owner&&active(e));",
+    "    if(owner!==null&&(!e||e.status==='submitted'))throw Error('Invalid manufacturing owner');",
+    "    const allowed=e?Math.min(e.feedScrap,Math.max(0,report.free.scrap+e.feedScrap)):Math.max(0,report.free.scrap);",
+    "    return {floor:Math.max(0,view.state.resources.scrap-allowed),allowed,report};",
+    "  }",
+    "  function consumeFeed(view,input,owner,spent) {",
+    "    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===owner&&active(e));",
+    "    if(!e||!amount(spent)||spent>e.feedScrap+1e-7)throw Error('Manufacturing exceeds reserved feed');",
+    "    e.feedScrap=Math.max(0,e.feedScrap-spent);e.feedSpent+=spent;return book;",
+    "  }",
+    "  return {create,inspect,reserve,amend,release,submit,resolve,reconcileEvents,feedAllowance,consumeFeed};",
+    "}",
+    "",
+    "return {createShelterReservations};",
+    "})();",
+    "const {createShelterExistingState}=(()=>{",
+    "",
+    "// Imports actual schedule/role records into the shared offline route state. This is a",
+    "// snapshot adapter, not a native receipt verifier. Unresolved native operations cannot",
+    "// be completed by the route simulator's synthetic receipts.",
+    "function createShelterExistingState() {",
+    "  const holds=createShelterReservations(),stats=['str','per','end','cha','int','agi','lck'];",
+    "  const id=n=>Number.isSafeInteger(n)&&n>0,time=n=>Number.isSafeInteger(n)&&n>=0;",
+    "  const label=s=>typeof s==='string'&&s.trim().length>0;",
+    "  const active=e=>!['complete','cancelled'].includes(e.status);",
+    "  const pairKey=p=>[...p].sort((a,b)=>a-b).join('/');",
+    "  const pair=p=>Array.isArray(p)&&p.length===2&&p.every(id)&&p[0]!==p[1];",
+    "  const roomId=n=>n===null||id(n);",
+    "  const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));",
+    "  const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));",
+    "  const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop'].includes(r.role)&&",
+    "    (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&",
+    "      (r.purpose===undefined||['production','parent'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&",
+    "      (r.purpose!=='production'||['str','per','end','agi','int'].includes(r.stat)&&time(r.windowEnd)&&r.windowEnd>r.at&&id(r.destination)));",
+    "  const validMaterial=m=>m&&id(m.vaultNo)&&id(m.id)&&['power','diner','water','scrap','medbay','workshop','storage','quarters'].includes(m.type)&&",
+    "    m.level===3&&id(m.targetLevel)&&id(m.finalTarget)&&m.targetLevel<=m.finalTarget;",
+    "  function validateSwap(swap) {",
+    "    if(!swap)return;",
+    "    if(!label(swap.id)||!time(swap.at)||![undefined,'allocation'].includes(swap.kind)||",
+    "      !Array.isArray(swap.people)||!swap.people.length||swap.people.some(p=>!id(p.id)||!roomId(p.room))||",
+    "      new Set(swap.people.map(p=>p.id)).size!==swap.people.length||!Array.isArray(swap.moves)||!swap.moves.length||",
+    "      swap.moves.some(p=>!swap.people.some(q=>q.id===p.id)||!roomId(p.room))||",
+    "      !Number.isInteger(swap.step)||swap.step<0||swap.step>swap.moves.length||",
+    "      swap.futureSupply!==undefined&&typeof swap.futureSupply!=='boolean'||",
+    "      swap.prepareFamily!==undefined&&(!Array.isArray(swap.prepareFamily)||swap.prepareFamily.length!==3||",
+    "        !swap.prepareFamily.every(id)||swap.prepareFamily[0]>=swap.prepareFamily[1]))throw Error('Invalid inherited swap');",
+    "    if(swap.kind==='allocation'&&(!Array.isArray(swap.targets)||swap.targets.length!==swap.people.length||",
+    "      new Set(swap.targets.map(p=>p.id)).size!==swap.people.length||swap.targets.some(p=>!roomId(p.room)||",
+    "        !swap.people.some(q=>q.id===p.id)||[...swap.moves].reverse().find(q=>q.id===p.id)?.room!==p.room)||",
+    "      !['power','food','water'].every(k=>Number.isFinite(swap.supplyFloor?.[k])&&swap.supplyFloor[k]>=0)))",
+    "      throw Error('Invalid inherited allocation');",
+    "  }",
+    "  function swapMatches(view,swap,step) {",
+    "    const expected=new Map(swap.people.map(p=>[p.id,p.room]));",
+    "    for(const p of swap.moves.slice(0,step))expected.set(p.id,p.room);",
+    "    return swap.people.every(p=>view.state.residents.some(q=>q.id===p.id&&q.roomId===expected.get(p.id)));",
+    "  }",
+    "  function syncSwap(view,state,book,{confirmed=false}={}) {",
+    "    const s=state.swap;if(!s||['complete','cancelled','changed'].includes(s.status)||state.native.length)return;",
+    "    if(s.step<s.moves.length&&swapMatches(view,s,s.step+1)){s.step++;s.observedAt=view.serverTime;}",
+    "    else if(confirmed||!swapMatches(view,s,s.step)){s.status='changed';return;}",
+    "    const e=book.entries.find(e=>e.id===s.intentId);",
+    "    if(s.step===s.moves.length){s.status='complete';e.status='complete';e.releasedAt=view.serverTime;e.releaseReason='observed all inherited moves';return;}",
+    "    s.status='active';const next=s.moves[s.step];",
+    "    // Only the next destination is held: reserving every later full-room target would",
+    "    // reject a valid sequence before its preceding departure has actually happened.",
+    "    e.seats=next.room===null?[]:[{residentId:next.id,roomId:next.room,from:view.serverTime,until:book.windowEnd}];",
+    "  }",
+    "  function pendingRecord(p,vaultNo,parent=null) {",
+    "    if(!p||!label(p.id)||!label(p.kind)||p.vaultNo!==vaultNo||!time(p.at)||!Array.isArray(p.targets)||",
+    "      !p.targets.length||p.targets.some(x=>x!==null&&typeof x!=='string'&&!Number.isSafeInteger(x))||",
+    "      parent!==null&&(p.blockedBy!==parent||p.emergency!==undefined))throw Error('Invalid inherited native request');",
+    "    const project=p.before?.construction?.project,cost=project?.cost??p.before?.campaign?.choice?.cost;",
+    "    if(cost&&(!['scrap','parts'].every(k=>Number.isSafeInteger(cost[k])&&cost[k]>=0)))throw Error('Invalid inherited pending cost');",
+    "    const result={id:p.id,kind:p.kind,vaultNo,at:p.at,targets:structuredClone(p.targets),blockedBy:parent,",
+    "      sourceServerTime:time(p.before?.serverTime)?p.before.serverTime:null,costBound:cost?{scrap:cost.scrap,parts:cost.parts}:null,",
+    "      responseFinishedAt:time(p.result?.responseFinishedAt)?p.result.responseFinishedAt:null};",
+    "    // No idempotency keys, request bodies, or purported success proof are copied.",
+    "    return [result,...(p.emergency?[...pendingRecord(p.emergency,vaultNo,p.id)]:[])];",
+    "  }",
+    "  function capture(view,{schedule,pending,source,windowEnd,safety={},clock=null}={}) {",
+    "    if(!id(view.vaultNo)||!time(view.serverTime)||!schedule||schedule.vaultNo!==view.vaultNo||",
+    "      !Object.hasOwn(arguments[1]??{},'pending')||!label(source))throw Error('Explicit same-vault schedule, pending state and source required');",
+    "    const now=view.serverTime,s=view.state,book=holds.create(view,{windowEnd,safety});",
+    "    const c=schedule.campaign??{},list=(o,k)=>{",
+    "      if(o[k]!==undefined&&!Array.isArray(o[k]))throw Error('Invalid inherited list: '+k);",
+    "      return structuredClone(o[k]??[]);",
+    "    };",
+    "    const native=pending===null?[]:pendingRecord(pending,view.vaultNo);",
+    "    if(new Set(native.map(p=>p.id)).size!==native.length)throw Error('Duplicate inherited request identity');",
+    "    const state={version:1,vaultNo:view.vaultNo,at:now,source,native,nativeIds:native.map(p=>p.id),priorPayments:[],roles:[],families:[],defense:list(c,'defense'),",
+    "      trips:list(c,'trips'),attempts:list(c,'attempts'),heals:list(c,'heals'),trainingRest:list(c,'trainingRest'),",
+    "      historicalFamilies:list(schedule,'families'),defenseManual:list(c,'defenseManual'),",
+    "      materialPurpose:c.materials===undefined?null:structuredClone(c.materials),",
+    "      materialRecord:c.materials===undefined?null:structuredClone(c.materials),material:null,",
+    "      swap:schedule.swap==null?null:{...pick(schedule.swap,['id','kind','people','targets','moves','step','at','prepareFamily','futureSupply','supplyFloor']),",
+    "        record:pick(schedule.swap,['id','kind','people','targets','moves','step','at','prepareFamily','futureSupply','supplyFloor']),status:'active'},",
+    "      constructionKnown:Array.isArray(schedule.constructionLedger),paymentBounds:[],notes:[]};",
+    "    const add=(key,purpose,{people=[],seats=[],families=[]}={})=>{",
+    "      if(book.entries.some(e=>e.id===key))throw Error('Duplicate imported intent');",
+    "      book.entries.push({id:key,purpose,at:now,deadline:windowEnd,status:'held',people,seats,families,",
+    "        resources:zero(),feedScrap:0,paid:zero(),feedSpent:0,pending:null});",
+    "      return key;",
+    "    };",
+    "    const person=(residentId,from=now,until=windowEnd)=>({residentId,from,until});",
+    "    const seat=(residentId,roomId,from=now,until=windowEnd)=>({...person(residentId,from,until),roomId});",
+    "    const entries=list(c,'roles');",
+    "    if(new Set(entries.map(r=>r.id)).size!==entries.length)throw Error('Duplicate inherited role');",
+    "    for(const d of state.defense)if(!id(d.id)||!id(d.room)||!(d.from===null||id(d.from))||!time(d.at))throw Error('Invalid inherited defense');",
+    "    if(new Set(state.defense.map(d=>d.id)).size!==state.defense.length)throw Error('Duplicate inherited defender');",
+    "    if(state.defenseManual.some(x=>!id(x)))throw Error('Invalid manual defense identity');",
+    "    for(const r of entries){",
+    "      if(!validRole(r))throw Error('Invalid inherited role');",
+    "      const p=s.residents.find(p=>p.id===r.id),d=state.defense.find(d=>d.id===r.id&&d.from===r.room&&p&&[d.room,null].includes(p.roomId));",
+    "      const current=p&&p.deadAt===null&&p.away===null&&p.adultAt<=now&&(p.roomId===r.room||d);",
+    "      const row={residentId:r.id,roomId:r.room,destination:r.destination??null,intentId:null,",
+    "        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination'])};",
+    "      if(current){",
+    "        const due=r.role==='training'&&(p.stats[r.stat]>r.base||time(r.until)&&r.until<=now||time(r.windowEnd)&&r.windowEnd<=now);",
+    "        const returnAt=due?now:Math.min(windowEnd,r.until??windowEnd);",
+    "        const seats=[];",
+    "        // The runtime already promises the return seat. Training may finish before its",
+    "        // latest-return deadline, so reserving it only from `until` would strand a graduate.",
+    "        // Current training occupancy remains in the real roster and is not a second future seat.",
+    "        if(r.purpose==='production')seats.push(seat(p.id,r.destination));",
+    "        else if(!d&&returnAt>now)seats.push(seat(p.id,r.room,now,returnAt));",
+    "        row.intentId=add('existing:role:'+p.id,'inherited '+r.role,{people:[person(p.id)],seats});",
+    "        if(due)row.status='return-due';",
+    "      }",
+    "      state.roles.push(row);",
+    "    }",
+    "    // No old automatic marker does not mean a permanent manual lock. Retain the actual",
+    "    // special post for candidate review, without manufacturing a training purpose/deadline.",
+    "    for(const p of s.residents){",
+    "      const room=s.rooms.find(r=>r.id===p.roomId);",
+    "      if(p.deadAt===null&&p.away===null&&p.adultAt<=now&&['training','medbay','workshop','radio','armory','tailor','door'].includes(room?.type)&&",
+    "        !state.roles.some(r=>r.residentId===p.id&&r.status!=='stale'))",
+    "        state.roles.push({residentId:p.id,roomId:room.id,destination:null,intentId:null,status:'historical',record:{role:room.type}});",
+    "    }",
+    "    const families=new Map();",
+    "    const addFamily=(parents,roomId,kind)=>{",
+    "      if(!pair(parents)||!id(roomId))throw Error('Invalid inherited family');",
+    "      const key=pairKey(parents),old=families.get(key);",
+    "      if(old&&old.roomId!==roomId)throw Error('Conflicting inherited family room');",
+    "      if(!old||kind==='romance')families.set(key,{parents:[...parents],roomId,kind});",
+    "    };",
+    "    if(schedule.pair){const f=schedule.pair;addFamily([f.a,f.b],f.room,'pair');}",
+    "    for(const p of s.residents)if(p.romance){",
+    "      const other=s.residents.find(q=>q.id===p.romance.partnerId);",
+    "      if(!other||other.romance?.partnerId!==p.id||p.roomId!==other.roomId||",
+    "        !Number.isFinite(p.romance.progress)||p.romance.progress<0||p.romance.progress>1||",
+    "        Math.abs(p.romance.progress-other.romance.progress)>1e-9)throw Error('Inconsistent inherited romance');",
+    "      if(!s.births.some(b=>pair(b.parents)&&pairKey(b.parents)===pairKey([p.id,other.id])))addFamily([p.id,other.id],p.roomId,'romance');",
+    "    }",
+    "    for(const f of families.values()){",
+    "      const birth=s.births.find(b=>pair(b.parents)&&pairKey(b.parents)===pairKey(f.parents));",
+    "      if(birth){state.families.push({...f,intentId:null,status:'pregnant',dueAt:birth.dueAt});continue;}",
+    "      const intentId=add('existing:family:'+pairKey(f.parents),'inherited active family',{",
+    "        people:f.parents.map(p=>person(p)),seats:f.parents.map(p=>seat(p,f.roomId)),",
+    "        families:[{parents:f.parents,dueAt:null,childId:null}]});",
+    "      state.families.push({...f,intentId,status:'needs-plan'});",
+    "    }",
+    "    for(const birth of s.births)if(!pair(birth.parents)){",
+    "      const people=new Set(s.residents.filter(p=>p.roomId===birth.roomId&&p.adultAt<=now).map(p=>p.id));",
+    "      for(const f of state.historicalFamilies)if(f.room===birth.roomId){people.add(f.a);people.add(f.b);}",
+    "      if([...people].some(p=>!id(p)))throw Error('Invalid historical family identity');",
+    "      state.families.push({roomId:birth.roomId,parents:[...people],intentId:null,status:'unknown-birth',dueAt:birth.dueAt});",
+    "    }",
+    "    for(const d of state.defense){",
+    "      const p=s.residents.find(p=>p.id===d.id);",
+    "      d.intentId=state.roles.find(r=>r.residentId===d.id&&r.status!=='stale')?.intentId??null;",
+    "      if(!d.intentId&&p&&p.deadAt===null&&p.away===null&&[d.room,null].includes(p.roomId)&&!state.defenseManual.includes(p.id))",
+    "        d.intentId=add('existing:defense:'+p.id,'inherited defense return',{people:[person(p.id)]});",
+    "    }",
+    "    if(state.swap){",
+    "      validateSwap(state.swap);",
+    "      state.swap.intentId=add('existing:swap','inherited unfinished swap',{people:state.swap.people.map(p=>person(p.id))});",
+    "      syncSwap(view,state,book);",
+    "    }",
+    "    const payments=[];",
+    "    if(schedule.constructionLedger!==undefined&&!Array.isArray(schedule.constructionLedger))throw Error('Invalid inherited construction ledger');",
+    "    const ledger=schedule.constructionLedger??[];",
+    "    if(ledger.length&&(!clock||!time(clock.localAt)||clock.serverAt!==now||!time(clock.uncertaintyMs)||!label(clock.source)))",
+    "      throw Error('Explicit local/server clock bounds required for prior construction payments');",
+    "    for(const e of ledger){",
+    "      if(!label(e.id)||!time(e.at)||e.at>clock.localAt||!['scrap','parts'].every(k=>Number.isSafeInteger(e[k])&&e[k]>=0)||payments.some(p=>p.id===e.id))",
+    "        throw Error('Invalid inherited construction payment');",
+    "      const mapped=e.at+clock.serverAt-clock.localAt,earliest=Math.max(0,mapped-clock.uncertaintyMs),latest=Math.min(now,mapped+clock.uncertaintyMs);",
+    "      if(latest<earliest)throw Error('Construction clock bounds do not intersect prior time');",
+    "      payments.push({id:e.id,at:latest,cost:{scrap:e.scrap,parts:e.parts}});",
+    "      state.paymentBounds.push({id:e.id,localAt:e.at,earliest,latest,source:clock.source});",
+    "    }",
+    "    state.priorPayments=structuredClone(payments);",
+    "    if(state.materialPurpose&&(!validMaterial(state.materialPurpose)||state.materialPurpose.vaultNo!==view.vaultNo))throw Error('Invalid inherited material purpose');",
+    "    const report=holds.inspect(view,book);validate(view,state,book);",
+    "    return {book,state,payments,blocked:report.blocked};",
+    "  }",
+    "  function validate(view,state,book) {",
+    "    if(state?.version!==1||state.vaultNo!==view.vaultNo||!time(state.at)||state.at>view.serverTime||!label(state.source)||",
+    "      !['native','nativeIds','priorPayments','roles','families','defense','trips','attempts','heals','trainingRest','historicalFamilies','defenseManual','paymentBounds','notes']",
+    "        .every(k=>Array.isArray(state[k]))||typeof state.constructionKnown!=='boolean')throw Error('Invalid inherited route state');",
+    "    for(const row of [...state.roles,...state.families,...state.defense,...(state.swap?[state.swap]:[])])",
+    "      if(row.intentId&&!book.entries.some(e=>e.id===row.intentId))throw Error('Inherited intent binding missing');",
+    "    for(const row of state.roles){",
+    "      if(!id(row.residentId)||!id(row.roomId)||!['active','preempted','return-due','stale','historical','completed'].includes(row.status)||",
+    "        !row.record||row.status!=='historical'&&(!validRole(row.record)||row.record.id!==row.residentId))",
+    "        throw Error('Invalid inherited role binding');",
+    "      if(!['active','preempted','return-due'].includes(row.status))continue;",
+    "      const e=book.entries.find(e=>e.id===row.intentId&&active(e));",
+    "      if(!e||!e.people.some(p=>p.residentId===row.residentId&&p.from<=state.at&&p.until===book.windowEnd)||",
+    "        row.record.purpose==='production'&&(!id(row.destination)||!e.seats.some(p=>p.residentId===row.residentId&&",
+    "          p.roomId===row.destination&&p.from<=state.at&&p.until===book.windowEnd)))",
+    "        throw Error('Inherited role lost its commitment');",
+    "    }",
+    "    for(const f of state.families)if(f.status==='needs-plan'){",
+    "      const e=book.entries.find(e=>e.id===f.intentId&&active(e));",
+    "      if(!pair(f.parents)||!id(f.roomId)||!e||!e.families.some(p=>pairKey(p.parents)===pairKey(f.parents))||",
+    "        f.parents.some(id=>!e.people.some(p=>p.residentId===id)||!e.seats.some(p=>p.residentId===id&&p.roomId===f.roomId)))",
+    "        throw Error('Inherited family lost its commitment');",
+    "    }",
+    "    if(state.swap){",
+    "      const s=state.swap;validateSwap(s);validateSwap(s.record);",
+    "      if(!['active','changed','complete','cancelled'].includes(s.status))throw Error('Invalid inherited swap status');",
+    "      const e=book.entries.find(e=>e.id===s.intentId);",
+    "      if(!e||['active','changed'].includes(s.status)&&(!active(e)||s.people.some(p=>",
+    "        !e.people.some(c=>c.residentId===p.id&&c.until===book.windowEnd))))throw Error('Inherited swap lost its commitment');",
+    "      if(s.status==='active'&&!state.native.length&&!swapMatches(view,s,s.step))throw Error('Inherited swap position mismatch');",
+    "    }",
+    "    if(state.material){",
+    "      const m=state.material,e=book.entries.find(e=>e.id===m.intentId);",
+    "      if(!label(m.source)||!id(m.roomId)||m.roomId!==state.materialPurpose?.id||!id(m.fromLevel)||!id(m.targetLevel)||",
+    "        !['preparing','ready','constructing','complete','cancelled'].includes(m.status)||!Array.isArray(m.workers)||",
+    "        m.workers.some(p=>!id(p.id)||!label(p.intentId))||!Array.isArray(m.rooms)||!m.rooms.every(id)||",
+    "        !e||m.status!=='cancelled'&&!active(e)||",
+    "        !['scrap','parts'].every(k=>Number.isSafeInteger(m.cost?.[k])&&m.cost[k]>=0&&e.resources[k]===m.allocated?.[k])||",
+    "        e.feedScrap!==m.allocated?.feedScrap)throw Error('Invalid inherited material allocation');",
+    "      if(m.status!=='cancelled')for(const w of m.workers){",
+    "        const p=view.state.residents.find(p=>p.id===w.id);",
+    "        if(p&&m.rooms.includes(p.roomId)&&!book.entries.some(e=>e.id===w.intentId&&active(e)&&",
+    "          e.people.some(c=>c.residentId===w.id&&c.until>view.serverTime)))throw Error('Inherited material worker lost its commitment');",
+    "      }",
+    "    }",
+    "    if(state.materialPurpose&&(!validMaterial(state.materialPurpose)||!validMaterial(state.materialRecord)))throw Error('Invalid inherited material purpose');",
+    "    if(new Set(state.native.map(p=>p.id)).size!==state.native.length||JSON.stringify(state.nativeIds)!==JSON.stringify(state.native.map(p=>p.id))||",
+    "      state.native.some(p=>!label(p.id)||!label(p.kind)||p.vaultNo!==view.vaultNo||!time(p.at)||!Array.isArray(p.targets)||!p.targets.length||",
+    "        p.costBound!==null&&!['scrap','parts'].every(k=>Number.isSafeInteger(p.costBound?.[k])&&p.costBound[k]>=0)||",
+    "        p.blockedBy!==null&&!state.nativeIds.includes(p.blockedBy)))",
+    "      throw Error('Invalid inherited request binding');",
+    "    if(state.priorPayments.length!==state.paymentBounds.length||state.priorPayments.some(p=>!label(p.id)||!time(p.at)||",
+    "      !['scrap','parts'].every(k=>Number.isSafeInteger(p.cost?.[k])&&p.cost[k]>=0)||",
+    "      !state.paymentBounds.some(b=>b.id===p.id&&b.latest===p.at)))throw Error('Invalid inherited payment history');",
+    "  }",
+    "  function issues(view,state,book,{action=null,intentId=null,advancing=false,nextAt=null,familyPlans=[]}={}) {",
+    "    if(!state)return [];",
+    "    validate(view,state,book);const problems=[],s=view.state;",
+    "    const held=id=>book.entries.some(e=>e.id===id&&active(e));",
+    "    if(state.native.length)return state.native.map(p=>({kind:'inherited-native-pending',requestId:p.id,action:p.kind}));",
+    "    if(state.swap&&held(state.swap.intentId)){",
+    "      const swap=state.swap,move=swap.moves[swap.step];",
+    "      if(swap.status==='changed')problems.push({kind:'inherited-swap-position-changed'});",
+    "      if(swap.prepareFamily&&!familyPlans.some(p=>p.stage==='planned'&&pairKey(p.parents)===pairKey(swap.prepareFamily.slice(0,2))&&",
+    "        p.roomId===swap.prepareFamily[2]))problems.push({kind:'inherited-swap-family-context-needed'});",
+    "      if(action&&!(intentId===swap.intentId&&action.kind==='assign'&&action.residentId===move?.id&&action.roomId===move.room))",
+    "        problems.push({kind:'inherited-swap-next-action-required',step:swap.step});",
+    "    }",
+    "    if(action&&['build','upgrade','dig'].includes(action.kind)&&!state.constructionKnown)problems.push({kind:'prior-construction-spending-unknown'});",
+    "    if(state.materialPurpose&&!state.material&&(advancing&&s.residents.some(p=>p.deadAt===null&&p.away===null&&p.adultAt<=view.serverTime&&",
+    "      s.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&r.builtAt<=view.serverTime&&r.upgradeAt===null&&!r.unpowered&&!r.incident))||",
+    "      action&&['build','upgrade','dig'].includes(action.kind)))problems.push({kind:'inherited-material-allocation-needed',roomId:state.materialPurpose.id});",
+    "    if(state.material&&action&&intentId===state.material.intentId&&['build','upgrade','dig'].includes(action.kind)&&",
+    "      (action.kind!=='upgrade'||action.roomId!==state.material.roomId||action.fromLevel!==state.material.fromLevel||state.material.status!=='ready'))",
+    "      problems.push({kind:'inherited-material-project-not-ready'});",
+    "    for(const f of state.families){",
+    "      if(f.status==='unknown-birth'&&(advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))",
+    "        problems.push({kind:'inherited-birth-ownership-unknown',roomId:f.roomId});",
+    "      if(f.status==='needs-plan'&&held(f.intentId)&&!familyPlans.some(p=>p.intentId===f.intentId)&&",
+    "        (advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))",
+    "        problems.push({kind:'inherited-family-plan-needed',intentId:f.intentId});",
+    "    }",
+    "    if(advancing)for(const row of state.roles)if(row.intentId&&held(row.intentId)&&row.record.role==='training'){",
+    "      const r=row.record,p=s.residents.find(p=>p.id===row.residentId);",
+    "      if(p?.roomId===row.roomId&&(p.stats[r.stat]>r.base||time(r.until)&&view.serverTime>=r.until||time(r.windowEnd)&&view.serverTime>=r.windowEnd))",
+    "        problems.push({kind:'inherited-training-return-due',residentId:row.residentId,intentId:row.intentId,until:r.until??null});",
+    "      else if(p?.roomId===row.roomId&&time(nextAt)){",
+    "        const until=Math.min(...[r.until,r.windowEnd].filter(time));",
+    "        if(until>view.serverTime&&until<nextAt)problems.push({kind:'inherited-training-deadline-boundary',",
+    "          residentId:row.residentId,intentId:row.intentId,until,nextAt});",
+    "      }",
+    "    }",
+    "    return problems;",
+    "  }",
+    "  function remap(input,events) {",
+    "    if(!input)return input;const state=structuredClone(input);",
+    "    for(const e of events)if(e.kind==='merge'){",
+    "      for(const r of state.roles){if(r.roomId===e.roomId)r.roomId=e.into;if(r.destination===e.roomId)r.destination=e.into;}",
+    "      for(const f of state.families)if(f.roomId===e.roomId)f.roomId=e.into;",
+    "      for(const d of state.defense){if(d.room===e.roomId)d.room=e.into;if(d.from===e.roomId)d.from=e.into;}",
+    "      if(state.materialPurpose?.id===e.roomId)state.materialPurpose.id=e.into;",
+    "      if(state.material){if(state.material.roomId===e.roomId)state.material.roomId=e.into;",
+    "        state.material.rooms=[...new Set(state.material.rooms.map(id=>id===e.roomId?e.into:id))];}",
+    "      if(state.swap){for(const p of [...state.swap.people,...state.swap.moves,...(state.swap.targets??[])])if(p.room===e.roomId)p.room=e.into;",
+    "        if(state.swap.prepareFamily?.[2]===e.roomId)state.swap.prepareFamily[2]=e.into;}",
+    "    }",
+    "    for(const e of events)if(['pregnancy','birth'].includes(e.kind))for(const f of state.families)",
+    "      if(pair(f.parents)&&pairKey(f.parents)===pairKey(e.parents??[])){",
+    "        f.status=e.kind==='pregnancy'?'pregnant':'born';f.dueAt=e.dueAt;if(e.kind==='birth')f.childId=e.id;",
+    "      }",
+    "    return state;",
+    "  }",
+    "  return {capture,validate,issues,remap,syncSwap};",
+    "}",
+    "",
+    "return {createShelterExistingState};",
+    "})();",
+    "const {createShelterRouteSimulation}=(()=>{",
+    "",
+    "// Offline D.14 state transitions, with an explicit one-action-per-tick execution assumption.",
+    "// Does not generate/rank routes or send requests. Bound simulated receipts must never be",
+    "// substituted for the userscript's native DOM/network proof when a runtime adapter is added.",
+    "function createShelterRouteSimulation() {",
+    "  const resource=createShelterResourceSimulation(),natural=createShelterEventSimulation(),holds=createShelterReservations(),",
+    "    family=createShelterFamilySimulation(),mood=createShelterMoodSimulation(),xp=createShelterXpSimulation(),existing=createShelterExistingState();",
+    "  const tick=600000,day=86400000,keys=['power','food','water','scrap','parts','stimpak'];",
+    "  const production={power:'power',diner:'food',water:'water',scrap:'scrap',workshop:'parts',medbay:'stimpak'};",
+    "  const builds={power:[100,1],diner:[100,1],water:[100,1],scrap:[80,1],quarters:[120,1],storage:[80,2],",
+    "    medbay:[300,3],training:[400,4],workshop:[500,5],armory:[600,6],tailor:[600,6],radio:[800,8]};",
+    "  const validId=n=>Number.isSafeInteger(n)&&n>0;",
+    "  const evidence=s=>typeof s==='string'&&s.trim().length>0;",
+    "  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));",
+    "  const active=e=>!['cancelled','complete'].includes(e.status);",
+    "  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;",
+    "  const activeRoom=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;",
+    "  const sameParents=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&a.every(id=>b.includes(id));",
+    "  const upgradeCost=r=>({scrap:Math.ceil(builds[r.type][0]*r.width*(r.level===1?2.5:6)),parts:r.level===1?0:15*r.width});",
+    "  function create(view,{assumptions,outcomes={births:[],digs:[]},familyRules=null,moodRules=null,xpRules=null,safety={},windowEnd,",
+    "    windowStart=view.serverTime,firstActionOnly=false,construction,constructionLedger}={}) {",
+    "    if(typeof firstActionOnly!=='boolean'||!Number.isSafeInteger(windowStart)||windowStart<0||windowStart>view.serverTime||",
+    "      windowEnd-windowStart>168*3600000||view.serverTime>=windowEnd)throw Error('Invalid original planning window');",
+    "    // A native read between settlements supports current-action checks only. Never",
+    "    // replace lastSettledAt or invent history to make it a full simulation snapshot.",
+    "    if(firstActionOnly)resource.validate(view);",
+    "    else natural.advance(view,view.serverTime,{assumptions,outcomes,moodRules,xpRules});",
+    "    if(!construction||!['build','upgrade','dig'].every(k=>typeof construction[k]==='boolean')||",
+    "      !['scrap','parts'].every(k=>Number.isSafeInteger(construction[k+'Limit'])&&construction[k+'Limit']>=0))",
+    "      throw Error('Explicit construction switches and rolling limits required');",
+    "    if(!Array.isArray(constructionLedger)||constructionLedger.some(e=>!e||!evidence(e.id)||",
+    "      !Number.isSafeInteger(e.at)||e.at<0||e.at>view.serverTime||!['scrap','parts'].every(k=>Number.isSafeInteger(e.cost?.[k])&&e.cost[k]>=0))||",
+    "      new Set(constructionLedger.map(e=>e.id)).size!==constructionLedger.length)",
+    "      throw Error('Explicit prior construction payments required');",
+    "    return {version:1,view:structuredClone(view),book:{...holds.create(view,{safety,windowEnd}),startedAt:windowStart},assumptions:structuredClone(assumptions),",
+    "      outcomes:structuredClone(outcomes),familyRules:structuredClone(familyRules),familyPlans:[],familyPauses:[],",
+    "      moodRules:structuredClone(moodRules),mood:null,xpRules:structuredClone(xpRules),xp:null,",
+    "      construction:structuredClone(construction),spent:structuredClone(constructionLedger),pending:null,lastActionAt:null,",
+    "      accounting:{initial:{...view.state.resources},produced:zero(),collected:zero(),consumed:zero(),feed:zero(),paid:zero()},events:[],",
+    "      model:firstActionOnly?'native-snapshot-first-action-only':'offline-one-confirmed-action-per-ten-minute-tick'};",
+    "  }",
+    "  function validate(n) {",
+    "    if(n?.version!==1||!Array.isArray(n.spent)||!Array.isArray(n.events)||!n.accounting||",
+    "      !keys.every(k=>['initial','produced','collected','consumed','feed','paid'].every(f=>Number.isFinite(n.accounting[f][k])&&n.accounting[f][k]>=0)))",
+    "      throw Error('Invalid route state');",
+    "    resource.validate(n.view);holds.inspect(n.view,n.book);",
+    "    if(n.existing)existing.validate(n.view,n.existing,n.book);",
+    "    if(n.existing?.priorPayments.some(p=>!n.spent.some(s=>s.id===p.id&&s.at===p.at&&",
+    "      s.cost.scrap===p.cost.scrap&&s.cost.parts===p.cost.parts)))throw Error('Inherited construction payments cannot be reset');",
+    "    family.validate(n.familyPlans??[],n.familyRules);",
+    "    if(n.moodRules!=null)mood.validate(n.view,n.moodRules);",
+    "    if(n.mood&&['statBasis','matching','shortage','timing','rounding','source'].some(k=>n.mood.rules?.[k]!==n.moodRules?.[k]))",
+    "      throw Error('Stored mood rules disagree with the route policy');",
+    "    if(n.xpRules!=null)xp.validate(n.view,n.xpRules);",
+    "    if(n.xp&&['duty','collection','health','activity','precision','source'].some(k=>n.xp.rules?.[k]!==n.xpRules?.[k]))",
+    "      throw Error('Stored XP rules disagree with the route policy');",
+    "    if((n.familyPlans??[]).some(p=>!evidence(p.intentId)||!n.book.entries.some(e=>e.id===p.intentId)))",
+    "      throw Error('Family plan is not bound to its reservation');",
+    "    if(n.book.entries.filter(e=>e.status==='submitted').length!==(n.pending?1:0))throw Error('Route pending mismatch');",
+    "    if(n.pending){",
+    "      const p=n.book.entries.find(e=>e.id===n.pending.intentId)?.pending;",
+    "      if(!p||p.id!==n.pending.requestId||p.fingerprint!==n.pending.fingerprint||p.fingerprint!==JSON.stringify(n.pending.action))",
+    "        throw Error('Route pending binding mismatch');",
+    "    }",
+    "  }",
+    "  function checkConservation(n) {",
+    "    for(const k of keys){const a=n.accounting;",
+    "      if(Math.abs(a.initial[k]+a.collected[k]-a.consumed[k]-a.feed[k]-a.paid[k]-n.view.state.resources[k])>1e-6)",
+    "        throw Error('Route inventory conservation failed: '+k);",
+    "    }",
+    "  }",
+    "  function accumulate(n,ledger) {for(const field of ['produced','collected','consumed','feed'])for(const k of keys)n.accounting[field][k]+=ledger[field][k];}",
+    "  function fromRuntime(view,options={}) {",
+    "    if(!options.runtime||options.constructionLedger!==undefined)throw Error('Runtime import requires its own native construction history');",
+    "    const imported=existing.capture(view,{...options.runtime,windowEnd:options.windowEnd,safety:options.safety});",
+    "    const node=create(view,{...options,constructionLedger:imported.payments});",
+    "    node.book={...imported.book,startedAt:node.book.startedAt};node.existing=imported.state;validate(node);",
+    "    return {node,blocked:imported.blocked};",
+    "  }",
+    "  const inheritedIssues=(n,options={})=>existing.issues(n.view,n.existing,n.book,{familyPlans:n.familyPlans,...options});",
+    "  function reserve(input,intent) {",
+    "    validate(input);if(input.pending)throw Error('Reconcile pending before changing route commitments');",
+    "    const blocked=inheritedIssues(input,{action:{kind:'reserve'}});if(blocked.length)return {node:input,accepted:false,blocked};",
+    "    const result=holds.reserve(input.view,input.book,intent);",
+    "    return {node:result.accepted?{...input,book:result.book}:input,accepted:result.accepted,blocked:result.report.blocked};",
+    "  }",
+    "  function release(input,id,options) {",
+    "    validate(input);",
+    "    if(input.existing?.native.length)throw Error('Native pending action must be reconciled outside the simulator');",
+    "    if(input.existing?.roles.some(r=>r.intentId===id&&['active','preempted','return-due'].includes(r.status)))",
+    "      throw Error('Inherited role must end with a confirmed assignment before release');",
+    "    if(input.existing?.material?.intentId===id&&input.existing.material.workers.some(w=>",
+    "      input.existing.material.rooms.includes(input.view.state.residents.find(p=>p.id===w.id)?.roomId)))",
+    "      throw Error('Inherited material workers must leave or transfer their use before release');",
+    "    if(input.existing?.families.some(f=>f.intentId===id&&f.kind==='romance'&&f.status==='needs-plan'&&",
+    "      input.book.entries.some(e=>e.id===id&&active(e))))throw Error('Inherited romance must retain its reservation');",
+    "    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='romance'))throw Error('Active romance cannot lose its reservation');",
+    "    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='planned'&&p.parents.every(id=>",
+    "      input.view.state.residents.some(r=>r.id===id&&r.roomId===p.roomId))))",
+    "      throw Error('Co-located parents cannot be cancelled without resolving their next family transition');",
+    "    const n={...input,book:holds.release(input.view,input.book,id,options),familyPlans:structuredClone(input.familyPlans??[])};",
+    "    for(const p of n.familyPlans)if(p.intentId===id&&p.stage==='planned')p.stage='cancelled';",
+    "    if(n.existing){n.existing=structuredClone(n.existing);for(const f of n.existing.families)if(f.intentId===id&&f.status==='needs-plan')f.status='cancelled';}",
+    "    if(n.existing?.swap?.intentId===id)n.existing.swap.status='cancelled';",
+    "    if(n.existing?.material?.intentId===id)n.existing.material.status='cancelled';",
+    "    return n;",
+    "  }",
+    "  function amend(input,intentId,changes) {",
+    "    validate(input);if(input.pending)throw Error('Reconcile pending before amending commitments');",
+    "    const blocked=inheritedIssues(input,{action:{kind:'amend'}});if(blocked.length)return {node:input,accepted:false,blocked};",
+    "    const result=holds.amend(input.view,input.book,intentId,changes);",
+    "    if(result.accepted){",
+    "      try{if(input.existing)existing.validate(input.view,input.existing,result.book);}",
+    "      catch{return {node:input,accepted:false,blocked:[{kind:'inherited-commitment-amendment-invalid'}]};}",
+    "      const blocked=familyCommitments({...input,book:result.book});",
+    "      if(blocked.length)return {node:input,accepted:false,blocked};",
+    "    }",
+    "    return {node:result.accepted?{...input,book:result.book}:input,accepted:result.accepted,blocked:result.report.blocked};",
+    "  }",
+    "  function familyCommitments(n) {",
+    "    const blocked=[],at=n.view.serverTime;",
+    "    for(const p of n.familyPlans??[])if(['planned','romance'].includes(p.stage)){",
+    "      const e=n.book.entries.find(e=>e.id===p.intentId&&active(e));",
+    "      if(!e||!e.families.some(f=>sameParents(f.parents,p.parents)&&f.dueAt===null&&f.childId===null)||",
+    "        p.parents.some(id=>!e.people.some(c=>c.residentId===id&&c.from<=at&&c.until>at)||",
+    "          !e.seats.some(c=>c.residentId===id&&c.roomId===p.roomId&&c.from<=at&&c.until>at)))",
+    "        blocked.push({kind:'family-commitment-missing',key:p.key,intentId:p.intentId});",
+    "    }",
+    "    return blocked;",
+    "  }",
+    "  function registerFamily(input,intentId,plan) {",
+    "    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before registering family');",
+    "    if(plan?.stage!=='planned')throw Error('New family must start as an explicit planned cycle');",
+    "    const n=structuredClone(input);n.familyPlans??=[];",
+    "    n.familyPlans.push({...structuredClone(plan),intentId});family.validate(n.familyPlans,n.familyRules);",
+    "    const blocked=familyCommitments(n);",
+    "    blocked.push(...family.eligibility(n.view,plan,{ignoreLocation:true}));",
+    "    if(n.outcomes.births.some(o=>o.resident.id===plan.child.id))blocked.push({kind:'family-child-already-promised',key:plan.key});",
+    "    return {node:blocked.length?input:n,accepted:!blocked.length,blocked};",
+    "  }",
+    "  function bindExistingFamily(input,intentId,plan) {",
+    "    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before binding inherited family');",
+    "    const f=input.existing?.families.find(f=>f.intentId===intentId&&f.status==='needs-plan');",
+    "    if(!f||plan?.roomId!==f.roomId||!sameParents(plan.parents,f.parents)||",
+    "      plan.stage!==(f.kind==='romance'?'romance':'planned'))throw Error('Family plan does not bind inherited family');",
+    "    if(plan.stage==='planned')return registerFamily(input,intentId,plan);",
+    "    const n=structuredClone(input);n.familyPlans.push({...structuredClone(plan),intentId});family.validate(n.familyPlans,n.familyRules);",
+    "    const blocked=familyCommitments(n);",
+    "    if(n.view.state.residents.some(p=>p.id===plan.child.id)||n.outcomes.births.some(o=>o.resident.id===plan.child.id))",
+    "      blocked.push({kind:'family-child-already-promised',key:plan.key});",
+    "    if(!f.parents.every(id=>n.view.state.residents.some(p=>p.id===id&&p.roomId===f.roomId&&",
+    "      p.romance&&f.parents.includes(p.romance.partnerId))))blocked.push({kind:'inherited-romance-state-changed'});",
+    "    return {node:blocked.length?input:n,accepted:!blocked.length,blocked};",
+    "  }",
+    "  function nextExistingSwap(input) {",
+    "    validate(input);const s=input.existing?.swap;",
+    "    if(!s||s.status==='complete'||s.status==='cancelled')return {action:null,intentId:null,blocked:[]};",
+    "    const move=s.moves[s.step],p=input.view.state.residents.find(p=>p.id===move?.id);",
+    "    if(!move||!p)return {action:null,intentId:s.intentId,blocked:[{kind:'inherited-swap-position-changed'}]};",
+    "    const action={kind:'assign',residentId:p.id,fromRoomId:p.roomId,roomId:move.room};",
+    "    const result=preview(input,s.intentId,action);",
+    "    return {action:result.blocked.length?null:action,intentId:s.intentId,blocked:result.blocked};",
+    "  }",
+    "  function refreshMaterials(n) {",
+    "    const m=n.existing?.material;if(!m||m.status==='cancelled')return;",
+    "    const e=n.book.entries.find(e=>e.id===m.intentId),r=n.view.state.rooms.find(r=>r.id===m.roomId);",
+    "    if(e.status==='submitted')return;",
+    "    if(m.status==='constructing'&&r?.level>=m.targetLevel&&r.upgradeAt===null)m.status='complete';",
+    "    const preparing=['preparing','ready'].includes(m.status);",
+    "    if(preparing&&(!r||r.type!==n.existing.materialPurpose.type||r.level!==m.fromLevel||r.upgradeAt!==null))",
+    "      throw Error('Inherited material target changed before payment');",
+    "    if(preparing)m.cost=upgradeCost(r);",
+    "    const report=holds.inspect(n.view,n.book,{owner:m.intentId});",
+    "    // Existing allocations are replaceable by their own purpose, not extra inventory.",
+    "    const availableScrap=Math.max(0,report.ownSpendable.scrap+e.feedScrap),availableParts=Math.max(0,report.ownSpendable.parts);",
+    "    e.resources.scrap=preparing?Math.min(m.cost.scrap,availableScrap):0;",
+    "    e.resources.parts=preparing?Math.min(m.cost.parts,availableParts):0;",
+    "    let collected=structuredClone(n.view),ready=0;",
+    "    for(const roomId of m.rooms){const result=resource.collect(collected,roomId);collected=result.view;ready+=result.ledger.collected.parts;}",
+    "    m.shortage={scrap:preparing?m.cost.scrap-e.resources.scrap:0,parts:preparing?m.cost.parts-e.resources.parts:0};",
+    "    m.collectableParts=ready;",
+    "    // Grant at most the next actual tick's feed, then re-evaluate collected inventory.",
+    "    // Capping at fractional remaining parts would strand an incomplete whole batch.",
+    "    const feedNeed=preparing&&m.shortage.parts>ready+1e-7?n.view.state.rooms.filter(r=>m.rooms.includes(r.id))",
+    "      .reduce((sum,r)=>sum+resource.rate(n.view,r,n.view.serverTime),0):0;",
+    "    e.feedScrap=Math.min(Math.max(0,availableScrap-e.resources.scrap),feedNeed);",
+    "    m.allocated={scrap:e.resources.scrap,parts:e.resources.parts,feedScrap:e.feedScrap};m.updatedAt=n.view.serverTime;",
+    "    if(preparing)m.status=m.shortage.scrap<1e-7&&m.shortage.parts<1e-7?'ready':'preparing';",
+    "  }",
+    "  function bindExistingMaterials(input,{workers,source}={}) {",
+    "    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before binding inherited materials');",
+    "    const purpose=input.existing?.materialPurpose;",
+    "    if(!purpose||input.existing.material||!evidence(source)||!Array.isArray(workers)||workers.some(id=>!validId(id))||",
+    "      new Set(workers).size!==workers.length)throw Error('Explicit inherited material workers and source required');",
+    "    const n=structuredClone(input),r=n.view.state.rooms.find(r=>r.id===purpose.id),at=n.view.serverTime;",
+    "    if(!r||r.type!==purpose.type||r.level+1!==purpose.level||!builds[r.type]||r.level>=3||!activeRoom(r,at))",
+    "      return {node:input,accepted:false,blocked:[{kind:'inherited-material-target-changed'}]};",
+    "    const report=holds.inspect(n.view,n.book),bindings=[],people=[],seats=[],rooms=new Set(),blocked=[];",
+    "    for(const id of workers){",
+    "      const p=n.view.state.residents.find(p=>p.id===id),room=n.view.state.rooms.find(r=>r.id===p?.roomId);",
+    "      if(!p||!present(p,at)||p.romance||room?.type!=='workshop'||!activeRoom(room,at)){",
+    "        blocked.push({kind:'inherited-material-worker-unavailable',residentId:id});continue;",
+    "      }",
+    "      const claims=report.people.filter(c=>c.residentId===id),role=n.existing.roles.find(r=>r.residentId===id&&",
+    "        r.record.role==='workshop'&&['active','return-due'].includes(r.status));",
+    "      if(claims.length&&(!role||claims.some(c=>c.intentId!==role.intentId))){",
+    "        blocked.push({kind:'inherited-material-worker-already-promised',residentId:id});continue;",
+    "      }",
+    "      rooms.add(room.id);const intentId=claims.length?role.intentId:'existing:materials';",
+    "      bindings.push({id,intentId});",
+    "      if(!claims.length){people.push({residentId:id,from:at,until:n.book.windowEnd});",
+    "        seats.push({residentId:id,roomId:room.id,from:at,until:n.book.windowEnd});}",
+    "    }",
+    "    for(const p of n.view.state.residents)if(present(p,at)&&n.view.state.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&activeRoom(r,at))&&!workers.includes(p.id))",
+    "      blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});",
+    "    if(blocked.length)return {node:input,accepted:false,blocked};",
+    "    const held=holds.reserve(n.view,n.book,{id:'existing:materials',purpose:'inherited project material allocation',people,seats});",
+    "    if(!held.accepted)return {node:input,accepted:false,blocked:held.report.blocked};n.book=held.book;",
+    "    n.existing.material={intentId:'existing:materials',source,roomId:r.id,fromLevel:r.level,targetLevel:purpose.level,",
+    "      cost:upgradeCost(r),workers:bindings,rooms:[...rooms],status:'preparing',allocated:{scrap:0,parts:0,feedScrap:0}};",
+    "    refreshMaterials(n);validate(n);",
+    "    return {node:n,accepted:true,blocked:holds.inspect(n.view,n.book).blocked};",
+    "  }",
+    "  function manufacturing(n,requestedOwner=null) {",
+    "    const m=n.existing?.material,owner=m&&m.status!=='cancelled'?m.intentId:requestedOwner;",
+    "    if(m&&m.status!=='cancelled'&&requestedOwner!==null&&requestedOwner!==owner)",
+    "      return {blocked:[{kind:'manufacturing-owner-conflict'}]};",
+    "    const allowance=holds.feedAllowance(n.view,n.book,owner),blocked=[];",
+    "    if(owner!==null){",
+    "      const owned=new Set(allowance.report.people.filter(p=>p.intentId===owner&&p.from<=n.view.serverTime&&p.until>n.view.serverTime).map(p=>p.residentId));",
+    "      if(m?.intentId===owner)for(const p of m.workers)owned.add(p.id);",
+    "      for(const p of n.view.state.residents)if(present(p,n.view.serverTime)&&n.view.state.rooms.some(r=>r.id===p.roomId&&",
+    "        r.type==='workshop'&&activeRoom(r,n.view.serverTime))&&!owned.has(p.id))blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});",
+    "    }",
+    "    return {...allowance,owner,blocked};",
+    "  }",
+    "  function committedFamilySupply(n) {",
+    "    const v=structuredClone(n.view);",
+    "    // All prospective parents are removed together, including other reserved families.",
+    "    // Checking only the parent moved by this action could strand the second supply worker.",
+    "    for(const e of n.book.entries.filter(active))for(const f of e.families)if(f.dueAt===null&&f.childId===null)",
+    "      for(const id of f.parents){const p=v.state.residents.find(p=>p.id===id);if(p)p.roomId=null;}",
+    "    return supply(v,n.book);",
+    "  }",
+    "  function growthNeeds(view,book) {",
+    "    const at=view.serverTime,s=view.state,report=holds.inspect(view,book);",
+    "    const current=resource.demand(view,at),needs={...current,food:report.population,water:report.population};",
+    "    // Reserve the electricity of already paid construction and upgrade increments.",
+    "    for(const r of s.rooms){",
+    "      const per=['power','door','elevator'].includes(r.type)?0:production[r.type]?1:.5;",
+    "      if(r.builtAt>at)needs.power+=per*r.width*r.level;",
+    "      else if(r.upgradeAt!==null)needs.power+=per*r.width;",
+    "    }",
+    "    return needs;",
+    "  }",
+    "  function supply(view,book) {",
+    "    const need=growthNeeds(view,book),rates=zero();",
+    "    for(const r of view.state.rooms)if(production[r.type])rates[production[r.type]]+=resource.rate(view,r,view.serverTime);",
+    "    return Object.fromEntries(['power','food','water'].map(k=>[k,{need:need[k],rate:rates[k],",
+    "      deficit:Math.max(0,need[k]*1.2-rates[k]),inventoryGap:Math.max(0,need[k]*2-view.state.resources[k])}]));",
+    "  }",
+    "  function constructionSupplyTrajectory(node,intentId,cost) {",
+    "    // Use the same event/stock model as the route, including whole-batch collection. Completion",
+    "    // itself gives no inventory. This assumes one collection opportunity per tick; the runtime",
+    "    // must measure its real delay before these offline times can be used as an execution claim.",
+    "    const projected=structuredClone(node),e=projected.book.entries.find(e=>e.id===intentId),begin=projected.view.serverTime;",
+    "    for(const k of ['scrap','parts']){projected.view.state.resources[k]-=cost[k];e.resources[k]-=cost[k];}",
+    "    if(projected.existing?.material?.intentId===intentId)projected.existing.material.status='constructing';",
+    "    refreshMaterials(projected);",
+    "    const first=supply(projected.view,projected.book),waiting=Object.keys(first).filter(k=>first[k].deficit>1e-7);",
+    "    const minimum=Object.fromEntries(Object.entries(first).map(([k])=>[k,projected.view.state.resources[k]])),restored={};",
+    "    const blocked=[];",
+    "    for(const [k,v] of Object.entries(first))if(v.inventoryGap>1e-7)blocked.push({kind:'construction-stock-floor',resource:k});",
+    "    const end=Math.min(begin+day,projected.book.windowEnd);",
+    "    while(waiting.some(k=>restored[k]===undefined)&&projected.view.serverTime+tick<=end&&!blocked.length){",
+    "      blocked.push(...inheritedIssues(projected,{advancing:true,nextAt:projected.view.serverTime+tick}));",
+    "      if(blocked.length)break;",
+    "      const feed=manufacturing(projected);blocked.push(...feed.blocked);if(blocked.length)break;",
+    "      const floor=feed.floor;",
+    "      const step=natural.advance(projected.view,projected.view.serverTime+tick,{assumptions:projected.assumptions,",
+    "        outcomes:projected.outcomes,familyPlans:projected.familyPlans,familyRules:projected.familyRules,",
+    "        moodRules:projected.moodRules??null,xpRules:projected.xpRules??null,scrapFloor:floor,collect:true});",
+    "      if(!step.complete){blocked.push(...step.blocked);break;}",
+    "      projected.view=step.view;projected.outcomes=step.outcomes;projected.familyPlans=step.familyPlans;",
+    "      if(feed.owner!==null)projected.book=holds.consumeFeed(projected.view,projected.book,feed.owner,step.ledger.feed.scrap);",
+    "      projected.book=holds.reconcileEvents(projected.view,projected.book,step.events);",
+    "      if(projected.existing)projected.existing=existing.remap(projected.existing,step.events);",
+    "      refreshMaterials(projected);",
+    "      const after=supply(projected.view,projected.book);",
+    "      for(const [k,v] of Object.entries(after)){",
+    "        minimum[k]=Math.min(minimum[k],step.ledger.minimumInventory[k]);",
+    "        if(step.ledger.unserved[k]>1e-7||step.ledger.minimumInventory[k]<2*v.need-1e-7)",
+    "          blocked.push({kind:'construction-stock-floor',resource:k,at:projected.view.serverTime});",
+    "        if(waiting.includes(k)&&v.deficit<=1e-7&&step.ledger.collected[k]>0)restored[k]??=projected.view.serverTime;",
+    "      }",
+    "    }",
+    "    for(const k of waiting)if(restored[k]===undefined&&!blocked.length)blocked.push({kind:'construction-supply-unresolved',resource:k});",
+    "    return {blocked,restored,minimum,assumption:'whole-batch collection at every ten-minute boundary',from:begin,checkedUntil:projected.view.serverTime};",
+    "  }",
+    "  function preview(input,intentId,action) {",
+    "    validate(input);const n=structuredClone(input),at=n.view.serverTime,s=n.view.state,blocked=[];",
+    "    const entry=n.book.entries.find(e=>e.id===intentId&&active(e));",
+    "    if(!entry)return {blocked:[{kind:'unknown-intent'}]};",
+    "    const cost={scrap:0,parts:0},beforeSupply=supply(n.view,n.book);let supplyRecovery=null;",
+    "    const people=new Set(entry.people.filter(c=>c.from<=at&&at<c.until).map(c=>c.residentId));",
+    "    const seats=entry.seats.filter(c=>c.from<=at&&at<c.until);",
+    "    if(s.lastSettledAt!==at&&n.model!=='native-snapshot-first-action-only'||at>=n.book.windowEnd)blocked.push({kind:'invalid-action-time'});",
+    "    if(n.view.switches?.frozen)blocked.push({kind:'frozen-shelter'});",
+    "    if(n.model==='native-snapshot-first-action-only'&&action.kind!=='assign')blocked.push({kind:'native-current-assignment-only'});",
+    "    blocked.push(...inheritedIssues(n,{intentId,action}));",
+    "    blocked.push(...familyCommitments(n));",
+    "    if(input.lastActionAt!==null&&at<input.lastActionAt+tick)blocked.push({kind:'action-cadence'});",
+    "    const a=action,r=s.rooms.find(r=>r.id===a.roomId);",
+    "    if(a.kind==='assign'){",
+    "      const p=s.residents.find(p=>p.id===a.residentId);",
+    "      const maxHp=p?Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end)):Infinity;",
+    "      if(!p||!people.has(p.id)||!present(p,at)||p.romance||!Number.isFinite(p.hp)||p.hp<.6*maxHp||p.roomId!==a.fromRoomId||a.roomId===a.fromRoomId)",
+    "        blocked.push({kind:'resident-action-invalid'});",
+    "      const familyPlan=r?.type==='quarters'?(n.familyPlans??[]).find(f=>f.key===a.familyKey&&f.intentId===intentId&&",
+    "        f.stage==='planned'&&f.roomId===a.roomId&&f.parents.includes(a.residentId)):null;",
+    "      if(a.roomId!==null&&(!activeRoom(r,at)||!production[r?.type]&&!['training','radio'].includes(r?.type)&&!familyPlan||",
+    "        !seats.some(c=>c.residentId===a.residentId&&c.roomId===a.roomId)))blocked.push({kind:'destination-not-reserved'});",
+    "      if(r?.type==='radio'){",
+    "        const capacity=Math.min(200,s.rooms.filter(q=>q.type==='quarters'&&q.builtAt<=at).reduce((n,q)=>n+q.width*(2+2*q.level),0));",
+    "        if(s.residents.length+s.births.length<capacity||s.rooms.some(q=>q.type==='quarters'&&(q.builtAt>at||q.upgradeAt!==null)))",
+    "          blocked.push({kind:'radio-recruitment-not-modeled'});",
+    "      }",
+    "      if(familyPlan){",
+    "        blocked.push(...family.eligibility(n.view,familyPlan,{ignoreLocation:true}));",
+    "        for(const [k,v] of Object.entries(committedFamilySupply(n)))if(v.deficit>1e-7||v.inventoryGap>1e-7)",
+    "          blocked.push({kind:'family-supply-not-covered',resource:k,...v});",
+    "      }",
+    "      if(r&&s.residents.filter(q=>q.id!==p?.id&&q.deadAt===null&&q.adultAt<=at&&q.roomId===r.id).length>=r.width*2)",
+    "        blocked.push({kind:'destination-full'});",
+    "      if(r?.type==='training'&&(!['str','per','end','cha','int','agi','lck'].includes(r.trainStat)||p?.stats[r.trainStat]>=10))",
+    "        blocked.push({kind:'invalid-training-destination'});",
+    "      if(!blocked.length){p.roomId=a.roomId;if(a.fromRoomId!==a.roomId)p.training=0;}",
+    "    }else if(['build','upgrade','dig'].includes(a.kind)){",
+    "      if(!n.construction[a.kind])blocked.push({kind:'construction-disabled'});",
+    "      if(!Number.isSafeInteger(a.finishAt)||a.finishAt<=at||a.finishAt>n.book.windowEnd||!evidence(a.source))",
+    "        blocked.push({kind:'unknown-construction-time'});",
+    "      if(a.kind!=='dig'&&s.rooms.filter(r=>r.builtAt>at||r.upgradeAt!==null).length>=2)blocked.push({kind:'construction-slots'});",
+    "      if(a.kind==='upgrade'){",
+    "        if(!activeRoom(r,at)||!builds[r?.type]||r.level!==a.fromLevel||r.level>=3)blocked.push({kind:'upgrade-state-changed'});",
+    "        else{",
+    "          Object.assign(cost,upgradeCost(r));",
+    "          r.upgradeAt=a.finishAt;",
+    "        }",
+    "      }else if(a.kind==='build'){",
+    "        if(!builds[a.type]||!validId(a.roomId)||r||!Number.isInteger(a.floor)||a.floor<1||a.floor>s.depth||",
+    "          !Number.isInteger(a.col)||a.col<2||a.col>7||n.view.progress.level<(builds[a.type]?.[1]??Infinity))blocked.push({kind:'build-state-invalid'});",
+    "        const floor=s.rooms.filter(r=>r.floor===a.floor).sort((a,b)=>a.col-b.col);let next=2;",
+    "        for(const room of floor.filter(r=>!['door','elevator'].includes(r.type))){if(room.col!==next)blocked.push({kind:'layout-gap'});next=room.col+room.width;}",
+    "        if(a.col!==next)blocked.push({kind:'build-not-at-free-edge'});",
+    "        if(a.type==='training'&&!['str','per','end','cha','int','agi','lck'].includes(a.trainStat))blocked.push({kind:'unknown-training-stat'});",
+    "        if(builds[a.type])cost.scrap=Math.ceil(builds[a.type][0]*(1+.2*s.rooms.filter(r=>r.type===a.type).reduce((n,r)=>n+r.width,0)));",
+    "        if(!blocked.length)s.rooms.push({id:a.roomId,type:a.type,floor:a.floor,col:a.col,width:1,level:1,builtAt:a.finishAt,",
+    "          upgradeAt:null,stored:0,incident:null,unpowered:false,...(a.type==='training'?{trainStat:a.trainStat}:{})});",
+    "      }else{",
+    "        if(s.digging||a.floor!==s.depth+1||a.floor>=20||!validId(a.elevatorId)||s.rooms.some(r=>r.id===a.elevatorId))",
+    "          blocked.push({kind:'dig-state-or-unmodeled-defense'});",
+    "        cost.scrap=Math.ceil(120*(s.depth+1)**1.4);",
+    "        if(!blocked.length){",
+    "          s.digging={floor:a.floor,doneAt:a.finishAt};",
+    "          n.outcomes.digs.push({floor:a.floor,doneAt:a.finishAt,source:a.source,",
+    "            elevator:{id:a.elevatorId,type:'elevator',floor:a.floor,col:1,width:1,level:1,builtAt:a.finishAt,",
+    "              upgradeAt:null,stored:0,incident:null,unpowered:false}});",
+    "        }",
+    "      }",
+    "      for(const k of ['scrap','parts']){",
+    "        const spent=n.spent.filter(x=>x.at>at-day).reduce((sum,x)=>sum+x.cost[k],0);",
+    "        if(cost[k]+spent>n.construction[k+'Limit'])blocked.push({kind:'rolling-construction-limit',resource:k});",
+    "      }",
+    "    }else blocked.push({kind:'unsupported-action'});",
+    "    if(!blocked.length){",
+    "      const after=supply(n.view,n.book);",
+    "      if(a.kind==='assign'&&input.existing?.swap?.intentId===intentId)for(const k of ['power','food','water'])",
+    "        if(after[k].rate<(input.existing.swap.supplyFloor?.[k]??0)-1e-7)",
+    "          blocked.push({kind:'inherited-swap-supply-floor',resource:k});",
+    "      for(const k of ['power','food','water'])if(a.kind==='assign'&&",
+    "        (after[k].deficit>beforeSupply[k].deficit+1e-7||after[k].inventoryGap>1e-7))",
+    "        blocked.push({kind:'supply-not-covered',resource:k,before:beforeSupply[k],after:after[k]});",
+    "      // Existing deficits may be repaired incrementally but never worsened by a free move.",
+    "      const report=holds.inspect(n.view,n.book,{owner:intentId});",
+    "      blocked.push(...report.blocked);",
+    "      for(const k of ['scrap','parts'])if(cost[k]>entry.resources[k]+1e-7||cost[k]>report.ownSpendable[k]+1e-7)",
+    "        blocked.push({kind:'construction-cost-not-reserved',resource:k,cost:cost[k]});",
+    "      if(!blocked.length&&['build','upgrade','dig'].includes(a.kind)){",
+    "        supplyRecovery=constructionSupplyTrajectory(n,intentId,cost);blocked.push(...supplyRecovery.blocked);",
+    "      }",
+    "    }",
+    "    return {node:n,cost,blocked,supplyRecovery};",
+    "  }",
+    "  function submit(input,intentId,action,requestId) {",
+    "    validate(input);if(input.pending)throw Error('Route already has a pending action');",
+    "    if(input.model==='native-snapshot-first-action-only')return {node:input,accepted:false,blocked:[{kind:'native-receipt-required'}]};",
+    "    const proposal=preview(input,intentId,action);if(proposal.blocked.length)return {node:input,accepted:false,blocked:proposal.blocked};",
+    "    const fingerprint=JSON.stringify(action),result=holds.submit(input.view,input.book,intentId,{requestId,fingerprint,cost:proposal.cost});",
+    "    if(!result.accepted)return {node:input,accepted:false,blocked:result.report.blocked};",
+    "    return {node:{...input,book:result.book,pending:{intentId,requestId,fingerprint,action:structuredClone(action),at:input.view.serverTime}},accepted:true,blocked:[]};",
+    "  }",
+    "  function resolve(input,receipt) {",
+    "    validate(input);const pending=input.pending;",
+    "    if(!pending){",
+    "      const found=input.book.receipts.find(r=>r.requestId===receipt?.requestId);",
+    "      if(!found)throw Error('No matching pending action');",
+    "      holds.resolve(input.view,input.book,found.intentId,receipt);return {node:input,duplicate:true,blocked:[]};",
+    "    }",
+    "    // Check the exact request binding before previewing or applying any local state change.",
+    "    const payment=holds.resolve(input.view,input.book,pending.intentId,receipt);",
+    "    if(receipt.result==='unknown')return {node:input,duplicate:false,blocked:[{kind:'pending-outcome'}]};",
+    "    const n=structuredClone(input);",
+    "    if(receipt.result==='confirmed'){",
+    "      // The bound receipt has resolved uncertainty. Validate the confirmed action against",
+    "      // still-unpaid allocations without treating this same request as pending forever;",
+    "      // otherwise valid later intents for the resident prevent confirming the first move.",
+    "      const confirmedInput=structuredClone(input),confirmedEntry=confirmedInput.book.entries.find(e=>e.id===pending.intentId);",
+    "      confirmedEntry.status='held';confirmedEntry.pending=null;confirmedInput.pending=null;",
+    "      const proposal=preview(confirmedInput,pending.intentId,pending.action);",
+    "      if(proposal.blocked.length)return {node:input,duplicate:false,blocked:proposal.blocked};",
+    "      const reserved=input.book.entries.find(e=>e.id===pending.intentId).pending.cost;",
+    "      if(['scrap','parts'].some(k=>reserved[k]!==proposal.cost[k]))",
+    "        return {node:input,duplicate:false,blocked:[{kind:'submitted-cost-changed'}]};",
+    "      n.view=proposal.node.view;n.outcomes=proposal.node.outcomes;n.familyPlans=proposal.node.familyPlans;",
+    "      n.view.state.resources=payment.view.state.resources;",
+    "      for(const k of keys)n.accounting.paid[k]+=input.book.entries.find(e=>e.id===pending.intentId).pending.cost[k];",
+    "      if(['build','upgrade','dig'].includes(pending.action.kind))n.spent.push({id:pending.requestId,at:n.view.serverTime,cost:proposal.cost});",
+    "    }",
+    "    n.book=payment.book;n.pending=null;n.lastActionAt=n.view.serverTime;",
+    "    if(receipt.result==='confirmed'&&pending.intentId===n.existing?.material?.intentId&&pending.action.kind==='upgrade')",
+    "      n.existing.material.status='constructing';",
+    "    if(receipt.result==='confirmed'&&pending.action.kind==='assign'&&n.existing){",
+    "      const role=n.existing.roles.find(r=>r.intentId===pending.intentId&&r.residentId===pending.action.residentId);",
+    "      if(role&&pending.action.roomId!==role.roomId){",
+    "        role.status='completed';role.completedAt=n.view.serverTime;",
+    "        n.book=holds.release(n.view,n.book,pending.intentId,{complete:true,reason:'inherited role ended by confirmed simulated assignment'});",
+    "      }",
+    "      if(n.existing.swap?.intentId===pending.intentId)existing.syncSwap(n.view,n.existing,n.book,{confirmed:true});",
+    "    }",
+    "    refreshMaterials(n);",
+    "    n.events.push({kind:'action',at:n.view.serverTime,action:pending.action,result:receipt.result,requestId:pending.requestId});",
+    "    checkConservation(n);return {node:n,duplicate:false,blocked:[]};",
+    "  }",
+    "  function advanceInternal(input,to,{feedOwner=null,collect=false,stopAtEvent=false}={},owned=false) {",
+    "    if(input.model==='native-snapshot-first-action-only')throw Error('Unsettled native snapshot cannot be advanced as a simulated route');",
+    "    validate(input);let n=owned?input:structuredClone(input);const blocked=[];",
+    "    const metrics={ticks:0,minimumInventory:{...input.view.state.resources},unserved:zero(),roomOverflow:zero()};",
+    "    if(!Number.isSafeInteger(to)||to<n.view.serverTime||to>n.book.windowEnd||(to-n.view.serverTime)%tick!==0)throw Error('Invalid route horizon');",
+    "    if(n.pending)return {node:input,complete:false,blocked:[{kind:'pending-action-timing-unknown'}],metrics};",
+    "    const inherited=inheritedIssues(n,{advancing:true});if(inherited.length)return {node:input,complete:false,blocked:inherited,metrics};",
+    "    while(n.view.serverTime<to){",
+    "      const inherited=inheritedIssues(n,{advancing:true,nextAt:n.view.serverTime+tick});if(inherited.length){blocked.push(...inherited);break;}",
+    "      const report=holds.inspect(n.view,n.book);if(report.blocked.length){blocked.push(...report.blocked);break;}",
+    "      const familyIssues=familyCommitments(n);if(familyIssues.length){blocked.push(...familyIssues);break;}",
+    "      if((n.familyPlans??[]).some(p=>p.stage==='romance'||p.stage==='planned'&&p.parents.every(id=>",
+    "        n.view.state.residents.some(r=>r.id===id&&r.roomId===p.roomId)))){",
+    "        for(const [k,v] of Object.entries(committedFamilySupply(n)))if(v.deficit>1e-7||v.inventoryGap>1e-7)",
+    "          blocked.push({kind:'family-supply-not-covered',resource:k,...v});",
+    "        if(blocked.length)break;",
+    "      }",
+    "      const feed=manufacturing(n,feedOwner);if(feed.blocked.length){blocked.push(...feed.blocked);break;}",
+    "      const {floor,allowed,owner}=feed;",
+    "      const next=natural.advance(n.view,n.view.serverTime+tick,{assumptions:n.assumptions,outcomes:n.outcomes,",
+    "        familyPlans:n.familyPlans,familyRules:n.familyRules,moodRules:n.moodRules??null,xpRules:n.xpRules??null,scrapFloor:floor,collect});",
+    "      if(!next.complete){blocked.push(...next.blocked);break;}",
+    "      if(next.ledger.feed.scrap>allowed+1e-7)throw Error('Feed allowance exceeded');",
+    "      metrics.ticks++;",
+    "      for(const k of keys){metrics.minimumInventory[k]=Math.min(metrics.minimumInventory[k],next.ledger.minimumInventory[k]);",
+    "        metrics.unserved[k]+=next.ledger.unserved[k];metrics.roomOverflow[k]+=next.ledger.roomOverflow[k];}",
+    "      n.view=next.view;n.outcomes=next.outcomes;n.familyPlans=next.familyPlans;n.mood=next.mood;n.xp=next.xp;",
+    "      n.familyPauses??=[];n.familyPauses.push(...next.familyPauses);",
+    "      accumulate(n,next.ledger);n.events.push(...next.events);",
+    "      if(owner!==null)n.book=holds.consumeFeed(n.view,n.book,owner,next.ledger.feed.scrap);",
+    "      n.book=holds.reconcileEvents(n.view,n.book,next.events);",
+    "      if(n.existing)n.existing=existing.remap(n.existing,next.events);",
+    "      refreshMaterials(n);",
+    "      const after=holds.inspect(n.view,n.book);",
+    "      // Depletion and new adulthood are real state transitions, not silently undone to make a",
+    "      // route look feasible. Retain that state and its explicit failure for the route search.",
+    "      for(const k of ['power','food','water'])if(next.ledger.unserved[k]>1e-7||",
+    "        next.ledger.minimumInventory[k]+1e-7<2*resource.demand(n.view,n.view.serverTime)[k])",
+    "        blocked.push({kind:'supply-inventory-floor',resource:k});",
+    "      blocked.push(...after.blocked.filter(b=>b.kind!=='deadline'||n.view.serverTime<to));",
+    "      if(blocked.length||stopAtEvent&&next.events.length)break;",
+    "    }",
+    "    checkConservation(n);return {node:n,complete:n.view.serverTime===to&&!blocked.length,blocked,metrics};",
+    "  }",
+    "  const advance=(input,to,options)=>advanceInternal(input,to,options,false);",
+    "  // For the continuation interpreter's already private clone only. Avoid copying the",
+    "  // growing immutable event prefix on every ten-minute tick of a full-week projection.",
+    "  const advanceOwned=(input,to,options)=>advanceInternal(input,to,options,true);",
+    "  return {create,fromRuntime,reserve,amend,release,registerFamily,bindExistingFamily,bindExistingMaterials,nextExistingSwap,preview,submit,resolve,advance,advanceOwned,",
+    "    inspect:n=>({...holds.inspect(n.view,n.book),inherited:inheritedIssues(n)}),supply:n=>supply(n.view,n.book)};",
+    "}",
+    "",
+    "return {createShelterRouteSimulation};",
+    "})();",
+    "const {createShelterExchangeCandidates}=(()=>{",
+    "",
+    "// Two-person exchanges for offline development routes. Every move is a separately",
+    "// checked assignment, with a real settlement/collection between confirmations.",
+    "// This is bounded candidate generation, not an allocation optimum or native executor.",
+    "function createShelterExchangeCandidates() {",
+    "  const routes=createShelterRouteSimulation(),resources=createShelterResourceSimulation();",
+    "  const tick=600000,types={power:'power',diner:'food',water:'water',scrap:'scrap'};",
+    "  const keys=['power','food','water','scrap','parts','stimpak'];",
+    "  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;",
+    "  const rates=v=>Object.fromEntries(keys.map(k=>[k,v.state.rooms.filter(r=>types[r.type]===k)",
+    "    .reduce((sum,r)=>sum+resources.rate(v,r,v.serverTime),0)]));",
+    "  function enumerate(n,{people,goal,maxCandidates}) {",
+    "    if(!Array.isArray(people)||!goal||typeof goal.id!=='string'||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>2000)",
+    "      throw Error('Explicit exchange roster, goal and bounded generation budget required');",
+    "    const at=n.view.serverTime,s=n.view.state;",
+    "    const jobs=s.rooms.filter(r=>types[r.type]&&usable(r,at)).sort((a,b)=>a.id-b.id);",
+    "    const ids=new Set(people.filter(p=>p.eligible&&!p.intentId).map(p=>p.residentId));",
+    "    const workers=s.residents.filter(p=>ids.has(p.id)&&jobs.some(r=>r.id===p.roomId)).sort((a,b)=>a.id-b.id);",
+    "    const count=r=>s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=at).length;",
+    "    const buffers=[null,...jobs.filter(r=>count(r)<r.width*2).map(r=>r.id)],pairs=[],seen=new Set();",
+    "    const contributions=new Map(),before=rates(n.view);",
+    "    function contribution(p,r){",
+    "      const key=p.id+':'+r.id;if(contributions.has(key))return contributions.get(key);",
+    "      const view={...n.view,state:{...s,residents:[{...p,roomId:r.id}]}};",
+    "      const value=resources.rate(view,r,at);contributions.set(key,value);return value;",
+    "    }",
+    "    // Rotate through the full roster before increasing pair distance. A budget must",
+    "    // not silently turn the roster into its first sixteen residents.",
+    "    for(let distance=1;distance<workers.length;distance++)for(let i=0;i<workers.length;i++){",
+    "      const a=workers[i],b=workers[(i+distance)%workers.length],key=[a.id,b.id].sort((a,b)=>a-b).join('/');",
+    "      if(seen.has(key))continue;seen.add(key);",
+    "      if(a.roomId===b.roomId)continue;",
+    "      const ra=jobs.find(r=>r.id===a.roomId),rb=jobs.find(r=>r.id===b.roomId);",
+    "      if(count(ra)>ra.width*2||count(rb)>rb.width*2||count(ra)<ra.width*2&&count(rb)<rb.width*2)continue;",
+    "      const delta=Object.fromEntries(keys.map(k=>[k,0]));",
+    "      delta[types[ra.type]]+=contribution(b,ra)-contribution(a,ra);",
+    "      delta[types[rb.type]]+=contribution(a,rb)-contribution(b,rb);",
+    "      // Keep cross-resource tradeoffs for the later full-window selector. A food gain",
+    "      // may unlock a family even when the current stock goal names scrap.",
+    "      if(!keys.some(k=>delta[k]>1e-7))continue;",
+    "      pairs.push({a,b,delta});",
+    "    }",
+    "    const rows=[];let totalVariants=0;",
+    "    for(const buffer of buffers)for(const reverse of [false,true])for(const pair of pairs){",
+    "      const a=reverse?pair.b:pair.a,b=reverse?pair.a:pair.b;",
+    "      if(buffer===a.roomId||buffer===b.roomId)continue;",
+    "      totalVariants++;if(rows.length>=maxCandidates)continue;",
+    "      const key='exchange:'+a.id+':'+b.id+':'+(buffer??'idle');",
+    "      const moves=[{kind:'assign',residentId:a.id,fromRoomId:a.roomId,roomId:buffer},",
+    "        {kind:'assign',residentId:b.id,fromRoomId:b.roomId,roomId:a.roomId},",
+    "        {kind:'assign',residentId:a.id,fromRoomId:buffer,roomId:b.roomId}];",
+    "      const people=[a,b].map(p=>({residentId:p.id,from:at,until:n.book.windowEnd}));",
+    "      const seats=buffer===null?[]:[{...people[0],roomId:buffer}];",
+    "      rows.push({id:key,kind:'assign',intentId:key,intent:{id:key,purpose:'exchange for '+goal.id,people,seats},action:moves[0],",
+    "        blocked:at+2*tick>=n.book.windowEnd?[{kind:'exchange-cannot-finish-before-window'}]:[],",
+    "        continuation:{kind:'exchange-sequence',moves,expectedRates:Object.fromEntries(keys.map(k=>[k,before[k]+pair.delta[k]])),",
+    "          finalDelta:pair.delta,bufferRoomId:buffer,requiresWholePath:true}});",
+    "    }",
+    "    return {rows,coverage:{eligibleResidents:workers.map(p=>p.id),improvingPairs:pairs.length,totalVariants,",
+    "      emitted:rows.length,unemitted:totalVariants-rows.length,generationTruncated:totalVariants>rows.length,",
+    "      pairScope:'two workers in existing basic production rooms; at least one full room; any positive resource delta retains cross-resource tradeoffs',",
+    "      bufferScope:'idle or currently free basic production room; both orders',maxCandidates}};",
+    "  }",
+    "  function stage(n,intentId,action) {",
+    "    const entry=n.book.entries.find(e=>e.id===intentId);",
+    "    if(!entry)return {node:n,accepted:false,blocked:[{kind:'exchange-reservation-missing'}]};",
+    "    const p=n.view.state.residents.find(p=>p.id===action.residentId);",
+    "    if(!p||p.roomId!==action.fromRoomId)return {node:n,accepted:false,blocked:[{kind:'exchange-position-changed',residentId:action.residentId}]};",
+    "    // Reserve only the next legal destination. A future departure never frees an",
+    "    // occupied seat. Continuation keeps the sequence exclusive until its last move.",
+    "    const seats=action.roomId===null?[]:[{residentId:action.residentId,roomId:action.roomId,from:n.view.serverTime,until:n.book.windowEnd}];",
+    "    return routes.amend(n,intentId,{seats});",
+    "  }",
+    "  function check(prepared,row,{inspectNode=()=>[]}={}) {",
+    "    let n=prepared;const trace=[],minimum={...n.view.state.resources};",
+    "    for(let i=0;i<row.continuation.moves.length;i++){",
+    "      const action=row.continuation.moves[i];",
+    "      if(i){const next=routes.advance(n,n.view.serverTime+tick,{collect:true});",
+    "        for(const k of keys)minimum[k]=Math.min(minimum[k],next.metrics.minimumInventory[k]);",
+    "        if(!next.complete)return {accepted:false,blocked:next.blocked,trace,checkedMoves:i,minimum};n=next.node;}",
+    "      const ready=stage(n,row.intentId,action);",
+    "      if(!ready.accepted)return {accepted:false,blocked:ready.blocked,trace,checkedMoves:i,minimum};n=ready.node;",
+    "      const submitted=routes.submit(n,row.intentId,action,'exchange-admission:'+i+':'+n.view.serverTime);",
+    "      if(!submitted.accepted)return {accepted:false,blocked:submitted.blocked,trace,checkedMoves:i+1,minimum};",
+    "      const pending=submitted.node.pending,resolved=routes.resolve(submitted.node,{requestId:pending.requestId,intentId:row.intentId,",
+    "        fingerprint:pending.fingerprint,at:n.view.serverTime,result:'confirmed'});",
+    "      if(resolved.blocked.length)return {accepted:false,blocked:resolved.blocked,trace,checkedMoves:i+1,minimum};n=resolved.node;",
+    "      const extra=inspectNode(n);if(extra.length)return {accepted:false,blocked:extra,trace,checkedMoves:i+1,minimum};",
+    "      trace.push({at:n.view.serverTime,action,supply:routes.supply(n),inventory:{...n.view.state.resources}});",
+    "    }",
+    "    return {accepted:true,blocked:[],trace,checkedMoves:trace.length,minimum,finalRates:rates(n.view),",
+    "      collected:structuredClone(n.accounting.collected),assumptions:'simulated immediate receipts; one action and collection per ten-minute tick'};",
+    "  }",
+    "  return {enumerate,stage,check};",
+    "}",
+    "",
+    "return {createShelterExchangeCandidates};",
+    "})();",
+    "const {createShelterMaterialCandidates}=(()=>{",
+    "",
+    "// Explicit new upgrade purposes. No invented inherited role, future inventory or payment.",
+    "function createShelterMaterialCandidates() {",
+    "  const routes=createShelterRouteSimulation(),resources=createShelterResourceSimulation(),holds=createShelterReservations();",
+    "  const basic=['power','diner','water','scrap'];",
+    "  const active=e=>!['complete','cancelled'].includes(e.status);",
+    "  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;",
+    "  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;",
+    "  const claim=(n,id)=>({residentId:id,from:n.view.serverTime,until:n.book.windowEnd});",
+    "  function conflicts(n,intentId) {",
+    "    const blocked=[];",
+    "    if(n.existing?.materialPurpose&&!['complete','cancelled'].includes(n.existing.material?.status))",
+    "      blocked.push({kind:'existing-material-purpose-active'});",
+    "    if(n.book.entries.some(e=>active(e)&&e.id!==intentId&&e.purpose.startsWith('new upgrade materials for ')))",
+    "      blocked.push({kind:'material-purpose-already-active'});",
+    "    return blocked;",
+    "  }",
+    "  function refresh(n,intentId,spec) {",
+    "    const blocked=conflicts(n,intentId),at=n.view.serverTime,s=n.view.state;",
+    "    const e=n.book.entries.find(e=>e.id===intentId&&active(e)),r=s.rooms.find(r=>r.id===spec.project.roomId);",
+    "    if(!e||e.status!=='held')return {node:n,accepted:false,blocked:[{kind:'material-reservation-unavailable'}]};",
+    "    if(!usable(r,at)||r.level!==spec.project.fromLevel||r.width!==spec.width||r.type!==spec.type)",
+    "      blocked.push({kind:'material-target-changed'});",
+    "    const owned=new Set(e.people.filter(c=>c.from<=at&&at<c.until).map(c=>c.residentId));",
+    "    for(const p of s.residents)if(present(p,at)&&s.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&usable(r,at))&&",
+    "      (!owned.has(p.id)||!spec.workers.some(w=>w.residentId===p.id&&w.workshopId===p.roomId)))",
+    "      blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});",
+    "    for(const id of spec.rooms)if(!s.rooms.some(r=>r.id===id&&r.type==='workshop'&&usable(r,at)))",
+    "      blocked.push({kind:'material-workshop-unavailable',roomId:id});",
+    "    if(blocked.length)return {node:n,accepted:false,blocked};",
+    "    const view=holds.inspect(n.view,n.book,{owner:intentId});",
+    "    const scrap=Math.max(0,view.ownSpendable.scrap+e.feedScrap),parts=Math.max(0,view.ownSpendable.parts);",
+    "    const allocation={scrap:Math.min(spec.cost.scrap,scrap),parts:Math.min(spec.cost.parts,parts)};",
+    "    let projected=n.view,collectable=0;",
+    "    for(const roomId of spec.rooms){const got=resources.collect(projected,roomId);projected=got.view;collectable+=got.ledger.collected.parts;}",
+    "    const missing=Math.max(0,spec.cost.parts-allocation.parts);",
+    "    const need=missing>collectable+1e-7?spec.rooms.reduce((sum,id)=>sum+resources.rate(n.view,s.rooms.find(r=>r.id===id),at),0):0;",
+    "    const feedScrap=Math.min(Math.max(0,scrap-allocation.scrap),need);",
+    "    const updated=routes.amend(n,intentId,{resources:allocation,feedScrap});",
+    "    return {...updated,material:{allocation,feedScrap,collectable,missing,",
+    "      partsReady:missing<1e-7,ready:missing<1e-7&&allocation.scrap>=spec.cost.scrap-1e-7}};",
+    "  }",
+    "  function enumerate(n,{proof,goal,cost,people,maxCandidates=2000}) {",
+    "    if(proof.action.kind!=='upgrade'||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>2000)",
+    "      throw Error('Bounded new upgrade material evidence required');",
+    "    const at=n.view.serverTime,s=n.view.state,target=s.rooms.find(r=>r.id===proof.action.roomId);",
+    "    const workshops=s.rooms.filter(r=>r.type==='workshop'&&usable(r,at)).sort((a,b)=>a.id-b.id);",
+    "    const jobs=s.rooms.filter(r=>basic.includes(r.type)&&usable(r,at)).sort((a,b)=>a.id-b.id);",
+    "    const occupants=s.residents.filter(p=>present(p,at)&&workshops.some(r=>r.id===p.roomId)).sort((a,b)=>a.id-b.id);",
+    "    const book=holds.inspect(n.view,n.book),blocked=conflicts(n,null);",
+    "    for(const p of occupants){",
+    "      const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));",
+    "      if(p.romance||!Number.isFinite(p.hp)||p.hp<.6*maxHp||book.people.some(c=>c.residentId===p.id)||",
+    "        n.existing?.roles.some(r=>r.residentId===p.id&&['active','return-due','preempted'].includes(r.status))||",
+    "        n.existing?.defense.some(d=>d.id===p.id))blocked.push({kind:'material-worker-unavailable',residentId:p.id});",
+    "    }",
+    "    const donors=people.filter(x=>x.eligible&&!x.intentId&&(!x.p.roomId||s.rooms.some(r=>r.id===x.p.roomId&&",
+    "      [...basic,'quarters'].includes(r.type)))).map(x=>x.p);",
+    "    const free=book.free,groups=[{workers:occupants.map(p=>({residentId:p.id,workshopId:p.roomId,fromRoomId:p.roomId})),arrival:null}];",
+    "    if(cost.parts>free.parts+1e-7)for(const donor of donors)for(const room of workshops){",
+    "      if(s.residents.filter(p=>p.roomId===room.id&&p.deadAt===null&&p.adultAt<=at).length>=room.width*2)continue;",
+    "      groups.push({workers:[...groups[0].workers,{residentId:donor.id,workshopId:room.id,fromRoomId:donor.roomId}],",
+    "        arrival:{kind:'assign',residentId:donor.id,fromRoomId:donor.roomId,roomId:room.id}});",
+    "    }",
+    "    const rows=[];let totalVariants=0;",
+    "    // Existing workers, optionally one new donor. Rotate a deterministic return allocation",
+    "    // across all basic jobs; report this limited family instead of claiming all permutations.",
+    "    for(let rotation=0;rotation<Math.max(1,jobs.length);rotation++)for(const group of groups){",
+    "      if(!group.workers.length&&rotation)continue;",
+    "      totalVariants++;if(rows.length>=maxCandidates)continue;",
+    "      const occupied=new Map(jobs.map(r=>[r.id,new Set(s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=at).map(p=>p.id))]));",
+    "      const workers=group.workers.map(w=>({...w})),reasons=[...blocked];",
+    "      for(const w of workers){",
+    "        const original=jobs.find(r=>r.id===w.fromRoomId),ordered=[...jobs.slice(rotation),...jobs.slice(0,rotation)];",
+    "        const room=original??ordered.find(r=>occupied.get(r.id).size<r.width*2);",
+    "        if(!room){reasons.push({kind:'material-return-seat-missing',residentId:w.residentId});continue;}",
+    "        w.returnRoomId=room.id;occupied.get(room.id).add(w.residentId);",
+    "      }",
+    "      let projected=n.view,collectable=0;",
+    "      for(const r of workshops){const got=resources.collect(projected,r.id);projected=got.view;collectable+=got.ledger.collected.parts;}",
+    "      if(cost.parts>free.parts+collectable+1e-7&&!workers.length)reasons.push({kind:'material-manufacturing-worker-needed'});",
+    "      if(cost.parts>free.parts+collectable+1e-7&&!workshops.length)reasons.push({kind:'material-workshop-needed'});",
+    "      const key='material:'+proof.id+':'+(group.arrival?group.arrival.residentId+':'+group.arrival.roomId:'existing')+':'+rotation;",
+    "      const project={...structuredClone(proof.action),source:proof.source};delete project.finishAt;",
+    "      const spec={project,durationMs:proof.durationMs,",
+    "        cost:{...cost},type:target.type,width:target.width,goalId:goal.id,source:proof.source,workers,rooms:workshops.map(r=>r.id)};",
+    "      rows.push({id:key,kind:'project',intentId:key,intent:{id:key,purpose:'new upgrade materials for '+goal.id,",
+    "        people:workers.map(w=>claim(n,w.residentId)),seats:workers.map(w=>({...claim(n,w.residentId),roomId:w.workshopId})),",
+    "        resources:{scrap:Math.min(cost.scrap,Math.max(0,free.scrap)),parts:Math.min(cost.parts,Math.max(0,free.parts))}},",
+    "        action:group.arrival,blocked:reasons,continuation:{kind:'material-upgrade',spec}});",
+    "    }",
+    "    return {rows,coverage:{totalVariants,emitted:rows.length,unemitted:totalVariants-rows.length,generationTruncated:totalVariants>rows.length,",
+    "      scope:'all existing unreserved workshop workers, optionally one basic/idle donor; rotated greedy return seats; existing upgrades only'}};",
+    "  }",
+    "  function prepare(n,row) {",
+    "    const result=refresh(n,row.intentId,row.continuation.spec);if(!result.accepted)return result;",
+    "    const blocked=Object.entries(routes.supply(result.node)).filter(([,v])=>v.deficit>1e-7||v.inventoryGap>1e-7)",
+    "      .map(([resource])=>({kind:'material-investment-supply-not-covered',resource}));",
+    "    return blocked.length?{node:n,accepted:false,blocked}:result;",
+    "  }",
+    "  return {enumerate,prepare,refresh};",
+    "}",
+    "",
+    "return {createShelterMaterialCandidates};",
+    "})();",
+    "const {createShelterDevelopmentCandidates}=(()=>{",
+    "",
+    "// D.14 common first-action input. This enumerates and checks proposals, not complete routes.",
+    "// A ready first action is never a seven-day winner or permission for a native request.",
+    "function createShelterDevelopmentCandidates() {",
+    "  const routes=createShelterRouteSimulation(),resource=createShelterResourceSimulation(),family=createShelterFamilySimulation(),exchanges=createShelterExchangeCandidates(),",
+    "    materials=createShelterMaterialCandidates();",
+    "  const tick=600000,keys=['power','food','water','scrap','parts','stimpak'];",
+    "  const production={power:['power','str',100],diner:['food','agi',100],water:['water','per',100],",
+    "    scrap:['scrap','end',80],workshop:['parts','int',500],medbay:['stimpak','int',300]};",
+    "  const base={...Object.fromEntries(Object.entries(production).map(([k,v])=>[k,v[2]])),quarters:120,storage:80,",
+    "    training:400,armory:600,tailor:600,radio:800};",
+    "  const active=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.unpowered&&!r.incident;",
+    "  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;",
+    "  const text=s=>typeof s==='string'&&s.trim().length>0;",
+    "  const status=blocked=>blocked.length?blocked.some(b=>/unknown|missing|needed|not-modeled|unmodeled/.test(b.kind+' '+(b.reason??'')))?'unknown':'blocked':'ready';",
+    "  const person=(n,residentId,from=n.view.serverTime)=>({residentId,from,until:n.book.windowEnd});",
+    "  const seat=(n,residentId,roomId,from=n.view.serverTime)=>({...person(n,residentId,from),roomId});",
+    "  const move=(p,r)=>({kind:'assign',residentId:p.id,fromRoomId:p.roomId,roomId:r.id});",
+    "  const signature=n=>JSON.stringify(n);",
+    "  const rates=view=>Object.fromEntries(keys.map(k=>[k,view.state.rooms.filter(r=>production[r.type]?.[0]===k)",
+    "    .reduce((sum,r)=>sum+resource.rate(view,r,view.serverTime),0)]));",
+    "  function eligible(n,p) {",
+    "    const why=[],at=n.view.serverTime,s=n.view.state;",
+    "    if(!present(p,at))why.push('not-present-adult');",
+    "    if(p.romance)why.push('active-romance');",
+    "    const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));",
+    "    if(!Number.isFinite(p.hp))why.push('unknown-health');else if(p.hp<.6*maxHp)why.push('low-health');",
+    "    const role=n.existing?.roles.find(r=>r.residentId===p.id&&['active','preempted','return-due'].includes(r.status));",
+    "    const owners=n.book.entries.filter(e=>!['complete','cancelled'].includes(e.status)&&",
+    "      e.people.some(c=>c.residentId===p.id&&c.until>at));",
+    "    if(owners.some(e=>e.id!==role?.intentId))why.push('resident-reserved');",
+    "    if(role&&role.record.role!=='training')why.push('special-role-value-not-modeled');",
+    "    if(n.existing?.defense.some(d=>d.id===p.id))why.push('defense-recovery-not-modeled');",
+    "    const room=s.rooms.find(r=>r.id===p.roomId);",
+    "    if(room&&['medbay','workshop','radio','armory','tailor','door'].includes(room.type)&&!role)",
+    "      why.push('special-role-value-not-modeled');",
+    "    return {residentId:p.id,roomId:p.roomId,reasons:why,eligible:!why.length,intentId:role?.intentId??null};",
+    "  }",
+    "  function goals(n) {",
+    "    routes.inspect(n);const s=n.view.state,at=n.view.serverTime,result=[];",
+    "    const supply=routes.supply(n);",
+    "    for(const [key,v] of Object.entries(supply))if(v.deficit>1e-7||v.inventoryGap>1e-7)",
+    "      result.push({id:'supply:'+key,kind:'supply',resource:key,rate:v.need*1.2,inventory:v.need*2,",
+    "        source:'current roster, paid construction and shared family commitments'});",
+    "    const residents=s.residents.filter(p=>present(p,at)&&(!p.roomId||s.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'))&&!p.romance).map(p=>p.id);",
+    "    if(residents.length)result.push({id:'employment:'+n.view.vaultNo+':'+at,kind:'employment',residentIds:residents,",
+    "      source:'observed unemployed adults; no projected children counted as employed'});",
+    "    return result;",
+    "  }",
+    "  function validateGoal(n,g) {",
+    "    if(!g||!text(g.id)||g.id.length>120||!text(g.source)||!['employment','supply','stock','unlock'].includes(g.kind))throw Error('Explicit common development goal required');",
+    "    if(g.kind==='employment'&&(!Array.isArray(g.residentIds)||!g.residentIds.length||",
+    "      new Set(g.residentIds).size!==g.residentIds.length||g.residentIds.some(x=>!n.view.state.residents.some(p=>p.id===x))))",
+    "      throw Error('Employment goal must bind observed residents');",
+    "    if(['supply','stock'].includes(g.kind)&&(!keys.includes(g.resource)||g.kind==='stock'&&(!Number.isFinite(g.amount)||g.amount<0)||",
+    "      g.kind==='supply'&&(!['power','food','water'].includes(g.resource)||![g.rate,g.inventory].every(x=>Number.isFinite(x)&&x>=0))))",
+    "      throw Error('Invalid resource goal');",
+    "    if(g.kind==='unlock'&&(!Number.isInteger(g.score)||g.score<0||!text(g.benefit)))throw Error('Unlock requires verified score and productive use');",
+    "  }",
+    "  function prepare(n,p) {",
+    "    if(p.blocked?.length)return {node:n,accepted:false,blocked:p.blocked};",
+    "    if(n.view.serverTime>=n.book.windowEnd)return {node:n,accepted:false,blocked:[{kind:'planning-window-ended'}]};",
+    "    if(n.pending)return {node:n,accepted:false,blocked:[{kind:'pending-action-timing-unknown'}]};",
+    "    if(n.existing?.native.length)return {node:n,accepted:false,blocked:[{kind:'inherited-native-pending',reason:'unknown original outcome'}]};",
+    "    if(p.kind==='wait')return {node:n,accepted:true,blocked:[],action:null};",
+    "    let next=n;",
+    "    if(p.intent){const held=routes.reserve(next,p.intent);if(!held.accepted)return held;next=held.node;}",
+    "    if(p.continuation?.kind==='material-upgrade'){",
+    "      const prepared=materials.prepare(next,p);if(!prepared.accepted)return prepared;next=prepared.node;",
+    "    }",
+    "    let sequenceCheck=null;",
+    "    if(p.continuation?.kind==='exchange-sequence'){",
+    "      sequenceCheck=exchanges.check(next,p);",
+    "      if(!sequenceCheck.accepted)return {node:n,accepted:false,blocked:sequenceCheck.blocked,sequenceCheck};",
+    "    }",
+    "    if(p.familyPlan){const linked=routes.registerFamily(next,p.intentId,p.familyPlan);if(!linked.accepted)return linked;next=linked.node;}",
+    "    if(p.familyPlan){",
+    "      const view=structuredClone(next.view),blocked=[];",
+    "      for(const e of next.book.entries.filter(e=>!['cancelled','complete'].includes(e.status)))for(const f of e.families)",
+    "        if(f.dueAt===null&&f.childId===null)for(const id of f.parents){const person=view.state.residents.find(p=>p.id===id);if(person)person.roomId=null;}",
+    "      for(const [key,value] of Object.entries(routes.supply({...next,view})))if(value.deficit>1e-7||value.inventoryGap>1e-7)",
+    "        blocked.push({kind:'family-supply-not-covered',resource:key,...value});",
+    "      if(blocked.length)return {node:n,accepted:false,blocked};",
+    "    }",
+    "    if(!p.action)return {node:next,accepted:true,blocked:[],action:null};",
+    "    const checked=routes.preview(next,p.intentId,p.action);",
+    "    const before=rates(n.view),after=checked.blocked.length?null:rates(checked.node.view);",
+    "    return {node:next,accepted:!checked.blocked.length,blocked:checked.blocked,action:p.action,sequenceCheck,",
+    "      cost:checked.cost,supplyAfter:checked.blocked.length?null:routes.supply(checked.node),",
+    "      productionDelta:after?Object.fromEntries(keys.map(k=>[k,after[k]-before[k]])):null};",
+    "  }",
+    "  function enumerate(n,{goal=goals(n)[0],familyOutcomes=[],constructionEvidence=[],maxChecks=2000}={}) {",
+    "    const inputSignature=signature(n),report=routes.inspect(n),at=n.view.serverTime,s=n.view.state;",
+    "    validateGoal(n,goal);",
+    "    if(!Number.isInteger(maxChecks)||maxChecks<1||maxChecks>2000||!Array.isArray(familyOutcomes)||!Array.isArray(constructionEvidence))",
+    "      throw Error('Invalid candidate evidence or bounded check budget');",
+    "    if(new Set(constructionEvidence.map(p=>p?.id)).size!==constructionEvidence.length||",
+    "      new Set(familyOutcomes.map(p=>[...(p?.parents??[])].sort((a,b)=>a-b).join('/'))).size!==familyOutcomes.length)",
+    "      throw Error('Duplicate candidate evidence identity');",
+    "    const groups=Object.fromEntries(['wait','assign','family','train','project'].map(k=>[k,[]]));",
+    "    const people=[...s.residents].sort((a,b)=>a.id-b.id).map(p=>({...eligible(n,p),p}));",
+    "    const workers=people.filter(x=>x.eligible),rooms=s.rooms.filter(r=>active(r,at)),jobs=rooms.filter(r=>production[r.type]);",
+    "    let checks=0,familyPairsWithoutOutcome=0;const identities=new Set();",
+    "    function add(p) {",
+    "      if(identities.has(p.id))throw Error('Duplicate candidate identity');identities.add(p.id);",
+    "      // A candidate label is reusable after a completed action; its reservation identity",
+    "      // is not. Keep old payments/receipts and give this occurrence a fresh bound intent.",
+    "      if(p.intent&&n.book.entries.some(e=>e.id===p.intent.id)){",
+    "        const stem=p.intent.id+'@'+at;let next=stem,index=1;",
+    "        while(n.book.entries.some(e=>e.id===next))next=stem+':'+index++;",
+    "        p.intent.id=next;p.intentId=next;",
+    "        if(p.familyPlan){p.familyPlan.key=next;if(p.action)p.action.familyKey=next;}",
+    "      }",
+    "      const row={...p,goalId:goal.id,routeComplete:false,blocked:p.blocked??[]};",
+    "      row.status=row.blocked.length?status(row.blocked):'unchecked';",
+    "      groups[row.kind].push(row);return row;",
+    "    }",
+    "    function intent(key,ids,seats=[],extra={}) {return {id:key,purpose:'common development goal '+goal.id,",
+    "      people:ids.map(x=>person(n,x)),seats,...extra};}",
+    "    const future=[...s.residents.map(p=>({kind:'adulthood',id:p.id,at:p.adultAt})),...s.births.map(b=>({kind:'birth',id:b.roomId,at:b.dueAt})),",
+    "      ...s.rooms.flatMap(r=>[{kind:'construction',id:r.id,at:r.builtAt},{kind:'upgrade',id:r.id,at:r.upgradeAt}]),",
+    "      ...(n.existing?.roles??[]).map(r=>({kind:'training-deadline',id:r.residentId,at:r.record.until}))]",
+    "      .filter(e=>Number.isSafeInteger(e.at)&&e.at>at).sort((a,b)=>a.at-b.at||a.id-b.id);",
+    "    add({id:'wait',kind:'wait',action:null,nextAt:Math.min(at+tick,future[0]?.at??Infinity,n.book.windowEnd),",
+    "      nextEvent:future[0]??{kind:'next-settlement',at:at+tick},blocked:[...report.blocked,...report.inherited],",
+    "      continuation:{kind:'observe-and-regenerate',originalWindowEnd:n.book.windowEnd}});",
+    "    if(n.existing?.swap&&!['complete','cancelled'].includes(n.existing.swap.status)){",
+    "      const next=routes.nextExistingSwap(n);",
+    "      add({id:'existing-swap:'+n.existing.swap.step,kind:'assign',intentId:next.intentId,intent:null,action:next.action,",
+    "        blocked:next.blocked,continuation:{kind:'inherited-swap',step:n.existing.swap.step,total:n.existing.swap.moves.length}});",
+    "    }",
+    "    // Interleave destinations across the entire roster so a check limit is never a hidden",
+    "    // prefix-of-16 resident pool. Unchecked proposals remain explicit, not zero-benefit losers.",
+    "    for(const r of jobs)for(const x of workers){const p=x.p;if(p.roomId===r.id)continue;",
+    "      const key='assign:'+p.id+':'+r.id;",
+    "      add({id:key,kind:'assign',intentId:x.intentId??key,intent:x.intentId?null:intent(key,[p.id],[seat(n,p.id,r.id)]),",
+    "        action:move(p,r),continuation:{kind:'recompute-after-confirmed-employment'}});",
+    "    }",
+    "    const exchange=exchanges.enumerate(n,{people,goal,maxCandidates:maxChecks});",
+    "    for(const row of exchange.rows)add(row);",
+    "    // Family evidence supplies uncertain offspring outcomes; the enumerator supplies pairs,",
+    "    // location and first move. It never invents child IDs, attributes or native confirmations.",
+    "    for(const r of rooms.filter(r=>r.type==='quarters'))for(let i=0;i<workers.length;i++)for(let j=i+1;j<workers.length;j++){",
+    "      const pair=[workers[i].p,workers[j].p],ids=pair.map(p=>p.id),key='family:'+ids.join('/')+':'+r.id;",
+    "      const proof=familyOutcomes.find(o=>Array.isArray(o.parents)&&o.parents.length===2&&ids.every(x=>o.parents.includes(x)));",
+    "      if(!proof){familyPairsWithoutOutcome++;continue;}",
+    "      const plan={key,parents:ids,roomId:r.id,stage:'planned',child:structuredClone(proof.child),source:proof.source};",
+    "      if(plan.child?.roomId!==null&&plan.child?.roomId!==r.id){",
+    "        add({id:key,kind:'family',blocked:[{kind:'child-room-outcome-mismatch',roomId:r.id}]});continue;}",
+    "      try{family.validate([plan],n.familyRules);}catch(error){add({id:key,kind:'family',blocked:[{kind:'unknown-family-outcome',reason:error.message}]});continue;}",
+    "      const blocked=family.eligibility(n.view,plan,{ignoreLocation:true});",
+    "      const first=pair.find(p=>p.roomId!==r.id);",
+    "      add({id:key,kind:'family',intentId:key,intent:intent(key,ids,ids.map(x=>seat(n,x,r.id)),",
+    "        {families:[{parents:ids,dueAt:null,childId:null}]}),familyPlan:plan,",
+    "        action:first?{...move(first,r),familyKey:key}:null,blocked,",
+    "        continuation:{kind:'family-through-employed-child',parents:ids,originalRooms:pair.map(p=>p.roomId),childId:plan.child.id}});",
+    "    }",
+    "    if(familyPairsWithoutOutcome||!groups.family.length)add({id:'family:evidence',kind:'family',",
+    "      blocked:[{kind:'missing-child-outcome-evidence',pairLocationsWithoutOutcome:familyPairsWithoutOutcome}]});",
+    "    const perk=s.legacy?.perks?.training??0;",
+    "    for(const r of rooms.filter(r=>r.type==='training'))for(const x of workers){const p=x.p;",
+    "      if(!['str','per','end','cha','int','agi','lck'].includes(r.trainStat)||!Number.isInteger(p.stats[r.trainStat])||!Number.isInteger(perk)||perk<0||perk>10){",
+    "        add({id:'train:'+p.id+':'+r.id,kind:'train',blocked:[{kind:'unknown-training-state'}]});continue;}",
+    "      if(p.stats[r.trainStat]>=10)continue;",
+    "      const progress=p.roomId===r.id?p.training:0;",
+    "      if(!Number.isFinite(progress)||progress<0||progress>=1){add({id:'train:'+p.id+':'+r.id,kind:'train',blocked:[{kind:'unknown-training-progress'}]});continue;}",
+    "      const duration=Math.max(1,Math.ceil((1-progress)/(r.level*(1+.05*perk)/(p.stats[r.trainStat]+1)/6)-1e-9))*tick;",
+    "      const readyAt=at+duration,role=n.existing?.roles.find(q=>q.intentId===x.intentId),deadline=Math.min(n.book.windowEnd,role?.record.until??Infinity,role?.record.windowEnd??Infinity);",
+    "      for(const dest of jobs.filter(q=>production[q.type][1]===r.trainStat)){",
+    "        const key='train:'+p.id+':'+r.id+':'+dest.id,blocked=[];",
+    "        if(readyAt>=deadline)blocked.push({kind:'training-cannot-return-before-deadline',readyAt,deadline});",
+    "        const claims=readyAt<n.book.windowEnd?[{...seat(n,p.id,r.id),until:readyAt},seat(n,p.id,dest.id,readyAt)]:[];",
+    "        if(x.intentId&&(!role||role.roomId!==r.id||role.record.destination!==dest.id))blocked.push({kind:'inherited-training-destination-mismatch'});",
+    "        if(role&&(p.stats[role.record.stat]>role.record.base||at>=deadline))blocked.push({kind:'inherited-training-return-due'});",
+    "        add({id:key,kind:'train',intentId:x.intentId??key,intent:x.intentId?null:intent(key,[p.id],claims),",
+    "          action:p.roomId===r.id?null:move(p,r),blocked,",
+    "          continuation:{kind:'one-stat-then-return',residentId:p.id,stat:r.trainStat,base:p.stats[r.trainStat],",
+    "            roomId:dest.id,readyAt,deadline,source:n.assumptions.source,needsFullPaybackComparison:true}});",
+    "      }",
+    "    }",
+    "    const materialCoverage=[];",
+    "    for(const proof of constructionEvidence){",
+    "      if(!proof||proof.goalId!==goal.id)continue;",
+    "      const a=structuredClone(proof.action),r=s.rooms.find(r=>r.id===a?.roomId),key='project:'+String(proof.id),blocked=[];",
+    "      if(!text(proof.id)||!a||!['build','upgrade','dig'].includes(a.kind)||!text(proof.source)||",
+    "        !Number.isSafeInteger(proof.durationMs)||proof.durationMs<=0)throw Error('Explicit bound construction outcome and duration required');",
+    "      a.source=proof.source;a.finishAt=at+proof.durationMs;",
+    "      const type=a.kind==='build'?a.type:r?.type;",
+    "      let useful=['stock','supply'].includes(goal.kind)&&production[type]?.[0]===goal.resource;",
+    "      if(goal.kind==='stock'&&type==='storage')useful=resource.capacities(n.view)[goal.resource]<goal.amount;",
+    "      if(goal.kind==='employment')useful=!!production[type]&&Array.isArray(proof.residentIds)&&proof.residentIds.length>0&&",
+    "        proof.residentIds.every(id=>goal.residentIds.includes(id));",
+    "      if(goal.kind==='unlock')useful=proof.benefit===goal.benefit;",
+    "      if(!useful)blocked.push({kind:'project-not-linked-to-goal'});",
+    "      let cost={scrap:0,parts:0};",
+    "      if(a.kind==='upgrade'&&r&&base[r.type])cost={scrap:Math.ceil(base[r.type]*r.width*(r.level===1?2.5:6)),parts:r.level===1?0:15*r.width};",
+    "      else if(a.kind==='build'&&base[a.type])cost.scrap=Math.ceil(base[a.type]*(1+.2*s.rooms.filter(q=>q.type===a.type).reduce((v,q)=>v+q.width,0)));",
+    "      else if(a.kind==='dig')cost.scrap=Math.ceil(120*(s.depth+1)**1.4);",
+    "      else blocked.push({kind:'invalid-project-target'});",
+    "      const shortage=Object.fromEntries(['scrap','parts'].map(k=>[k,Math.max(0,cost[k]-report.free[k])]));",
+    "      if(shortage.scrap>1e-7||shortage.parts>1e-7)blocked.push({kind:'project-needs-material-route',shortage});",
+    "      add({id:key,kind:'project',intentId:key,intent:intent(key,[],[],{resources:cost}),action:a,blocked,",
+    "        continuation:{kind:'completion-power-staff-then-use',goalId:goal.id,finishAt:a.finishAt,requiredCost:cost}});",
+    "      if(a.kind==='upgrade'&&r&&blocked.length===1&&blocked[0].kind==='project-needs-material-route'){",
+    "        const generated=materials.enumerate(n,{proof,goal,cost,people,maxCandidates:maxChecks});",
+    "        materialCoverage.push({proofId:proof.id,...generated.coverage});for(const row of generated.rows)add(row);",
+    "      }",
+    "    }",
+    "    if(!constructionEvidence.some(p=>p?.goalId===goal.id))add({id:'project:evidence',kind:'project',blocked:[{kind:'missing-goal-construction-evidence'}]});",
+    "    if(!groups.train.length)add({id:'train:none',kind:'train',blocked:[{kind:rooms.some(r=>r.type==='training')?",
+    "      'training-purpose-not-modeled':'no-existing-training-destination'}]});",
+    "    // Share checking capacity across first-action types before allocating extra checks to a",
+    "    // large assignment matrix. This is admission coverage, not beam-search ranking.",
+    "    const assignments=groups.assign.filter(p=>p.status==='unchecked'),moves=assignments.filter(p=>p.continuation?.kind!=='exchange-sequence'),",
+    "      swaps=assignments.filter(p=>p.continuation?.kind==='exchange-sequence'),interleaved=[];",
+    "    for(let i=0;i<Math.max(moves.length,swaps.length);i++){if(moves[i])interleaved.push(moves[i]);if(swaps[i])interleaved.push(swaps[i]);}",
+    "    const queues=Object.entries(groups).map(([kind,rows])=>kind==='assign'?interleaved:rows.filter(p=>p.status==='unchecked'));",
+    "    for(let index=0;queues.some(q=>q[index]);index++)for(const queue of queues){const row=queue[index];if(!row)continue;",
+    "      if(checks>=maxChecks){row.status='truncated';row.blocked=[{kind:'candidate-check-budget'}];continue;}",
+    "      checks++;const trial=prepare(n,row);row.blocked=trial.blocked;row.status=status(row.blocked);",
+    "      if(trial.sequenceCheck)row.sequenceCheck=trial.sequenceCheck;",
+    "      row.cost=trial.cost??null;row.supplyAfter=trial.supplyAfter??null;row.productionDelta=trial.productionDelta??null;",
+    "    }",
+    "    return {version:1,goal:structuredClone(goal),basis:inputSignature,from:at,windowEnd:n.book.windowEnd,",
+    "      people:people.map(({p,...x})=>x),groups,checks,maxChecks,selected:null,",
+    "      summary:Object.entries(groups).map(([kind,rows])=>({kind,counts:Object.fromEntries(['ready','blocked','unknown','truncated']",
+    "        .map(state=>[state,rows.filter(p=>p.status===state).length])),firstReady:rows.find(p=>p.status==='ready')?.id??null,",
+    "        completeRoutes:0})),",
+    "      coverage:{familyPairsWithoutOutcome,checkedByKind:Object.fromEntries(Object.entries(groups)",
+    "        .map(([k,rows])=>[k,rows.filter(p=>p.cost!==undefined).length])),",
+    "        completeRoutes:0,fullRoomExchangeGenerated:exchange.rows.length>0,exchange:exchange.coverage,materials:materialCoverage,",
+    "        exchangeCheckedMoves:groups.assign.reduce((sum,p)=>sum+(p.sequenceCheck?.checkedMoves??0),0)},",
+    "      limitations:['First-action admissibility only; no complete 168-hour comparison or optimal selection.',",
+    "        'Two-person exchanges and new upgrade material candidates are bounded; larger cycles, other special roles and full route selection remain incomplete.',",
+    "        'Family and construction outcomes are explicit conditional evidence, not invented server results.']};",
+    "  }",
+    "  function prepareFirst(n,report,candidateId) {",
+    "    if(report?.version!==1||report.basis!==signature(n))throw Error('Candidate snapshot changed; regenerate before preparation');",
+    "    const row=Object.values(report.groups).flat().find(p=>p.id===candidateId);",
+    "    if(!row)throw Error('Unknown development candidate');",
+    "    if(row.status==='truncated')return {node:n,accepted:false,blocked:row.blocked};",
+    "    return prepare(n,row);",
+    "  }",
+    "  return {goals,enumerate,prepareFirst};",
+    "}",
+    "",
+    "return {createShelterDevelopmentCandidates};",
+    "})();",
+    "const {createShelterDevelopmentContinuation}=(()=>{",
+    "",
+    "// Conditional continuation interpreter, not the D.14 bounded-search selector or a live executor.",
+    "// Only its own modeled submissions receive simulated receipts. Native pending requests remain",
+    "// unresolved. Subsequent investments can be appended at any observed state, across action types.",
+    "function createShelterDevelopmentContinuation() {",
+    "  const routes=createShelterRouteSimulation(),candidates=createShelterDevelopmentCandidates(),resources=createShelterResourceSimulation(),holds=createShelterReservations(),",
+    "    exchanges=createShelterExchangeCandidates(),materials=createShelterMaterialCandidates();",
+    "  const tick=600000,hour=3600000,keys=['power','food','water','scrap','parts','stimpak'];",
+    "  const production={power:'power',diner:'food',water:'water',scrap:'scrap',workshop:'parts',medbay:'stimpak'};",
+    "  const active=e=>!['complete','cancelled'].includes(e.status),id=n=>Number.isSafeInteger(n)&&n>0;",
+    "  const text=s=>typeof s==='string'&&s.trim().length>0;",
+    "  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.unpowered&&!r.incident;",
+    "  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));",
+    "  const signature=x=>JSON.stringify(x);",
+    "  const owner=(n,intentId)=>n.book.entries.find(e=>e.id===intentId&&active(e));",
+    "  const person=(n,residentId,from=n.view.serverTime)=>({residentId,from,until:n.book.windowEnd});",
+    "  const seat=(n,residentId,roomId,from=n.view.serverTime)=>({...person(n,residentId,from),roomId});",
+    "  const assignment=(n,residentId,roomId)=>({kind:'assign',residentId,fromRoomId:n.view.state.residents.find(p=>p.id===residentId)?.roomId,roomId});",
+    "  const contract=w=>JSON.stringify({key:w.key,candidateId:w.candidateId,kind:w.kind,intentId:w.intentId,",
+    "    createdAt:w.createdAt,deadline:w.deadline,residentId:w.residentId,stat:w.stat,base:w.base,",
+    "    parents:w.parents,childId:w.childId,staff:w.staff,project:w.project,material:w.material,binding:w.binding});",
+    "  const projectAction=w=>w.constructionAction??w.project;",
+    "  function materialSpec(state,w) {",
+    "    return {...w.material,project:{...w.material.project,roomId:w.projectRoomId},",
+    "      rooms:[...new Set(w.material.rooms.map(id=>remappedRoom(state,id)))],",
+    "      workers:w.material.workers.map(p=>({...p,workshopId:remappedRoom(state,p.workshopId),returnRoomId:remappedRoom(state,p.returnRoomId)}))};",
+    "  }",
+    "  const overlap=(a,b)=>a.from<b.until&&b.from<a.until;",
+    "  // These are capacity guarantees, not invented future residents or usable construction.",
+    "  // Family return seats are held conservatively until confirmed; child seats start no",
+    "  // earlier than the known pregnancy + childhood durations. They never produce income.",
+    "  function guarantees(state,node=state.node) {",
+    "    const claims=[],n=node,at=n.view.serverTime;",
+    "    for(const w of state.workflows)if(w.stage!=='done'){",
+    "      if(w.kind==='family')for(const d of w.destinations){",
+    "        if(w.returned.includes(d.residentId))continue;",
+    "        const child=d.residentId===w.childId,p=n.view.state.residents.find(p=>p.id===d.residentId);",
+    "        const from=child?Math.max(at,p?.adultAt??w.createdAt+n.familyRules.pregnancyMs+n.familyRules.childhoodMs):at;",
+    "        if(from<n.book.windowEnd)claims.push({...d,intentId:w.intentId,from,until:n.book.windowEnd,child});",
+    "      }",
+    "      if(w.material&&w.paidAt===null)for(const p of materialSpec(state,w).workers)if(!w.materialReturned.includes(p.residentId))",
+    "        claims.push({residentId:p.residentId,roomId:p.returnRoomId,intentId:w.intentId,from:at,until:n.book.windowEnd,child:false});",
+    "      if(w.kind==='project')for(const residentId of w.staff)if(!w.staffed.includes(residentId)){",
+    "        const from=Math.max(at,projectAction(w).finishAt??n.view.state.rooms.find(r=>r.id===w.projectRoomId)?.upgradeAt??at);",
+    "        if(from<n.book.windowEnd)claims.push({residentId,roomId:w.projectRoomId,intentId:w.intentId,from,until:n.book.windowEnd,child:false});",
+    "      }",
+    "    }",
+    "    return claims;",
+    "  }",
+    "  function futureIssues(state,node=state.node) {",
+    "    // A preview has proposed positions but intentionally has not reconciled imported",
+    "    // swap/role state yet. Check its capacity book here; validate actual nodes separately.",
+    "    const claims=guarantees(state,node),view=node.view,blocked=[],book=holds.inspect(view,node.book);",
+    "    for(const c of claims){",
+    "      const w=state.workflows.find(w=>w.intentId===c.intentId),p=view.state.residents.find(p=>p.id===c.residentId);",
+    "      let r=view.state.rooms.find(r=>r.id===c.roomId);",
+    "      if(!r&&w.kind==='project'&&w.stage==='first'&&w.project.kind==='build')",
+    "        r={...w.project,id:c.roomId,width:1,builtAt:w.project.finishAt,upgradeAt:null};",
+    "      if(!r||!production[r.type]||r.builtAt>c.from||r.upgradeAt!==null&&r.upgradeAt>c.from||r.unpowered||r.incident)",
+    "        blocked.push({kind:'future-seat-unavailable',...c});",
+    "      const maxHp=p?Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end)):Infinity;",
+    "      if(!c.child&&(!p||p.deadAt!==null||p.away!==null||p.adultAt>c.from||!Number.isFinite(p.hp)||p.hp<.6*maxHp))",
+    "        blocked.push({kind:'future-worker-unavailable',...c});",
+    "      if(book.people.some(q=>q.residentId===c.residentId&&q.intentId!==c.intentId&&overlap(c,q))||",
+    "        claims.some(q=>q!==c&&q.residentId===c.residentId&&q.intentId!==c.intentId&&overlap(c,q)))",
+    "        blocked.push({kind:'future-worker-conflict',...c});",
+    "      if(!r)continue;",
+    "      const others=[...claims,...book.seats].filter(q=>q.roomId===c.roomId&&overlap(c,q));",
+    "      const boundaries=new Set([c.from,...others.map(q=>Math.max(c.from,q.from)),",
+    "        ...view.state.residents.filter(p=>p.roomId===c.roomId&&p.adultAt>=c.from&&p.adultAt<c.until).map(p=>p.adultAt)]);",
+    "      for(const at of boundaries){",
+    "        const occupants=new Set(view.state.residents.filter(p=>p.roomId===c.roomId&&p.deadAt===null&&p.adultAt<=at).map(p=>p.id));",
+    "        for(const q of others)if(q.from<=at&&at<q.until)occupants.add(q.residentId);",
+    "        if(occupants.size>r.width*2){blocked.push({kind:'future-seat-capacity',roomId:r.id,at,used:occupants.size,capacity:r.width*2});break;}",
+    "      }",
+    "    }",
+    "    return blocked;",
+    "  }",
+    "  function projectStaffIssues(node,w) {",
+    "    if(w.kind!=='project'||!w.staff.length)return [];",
+    "    // A static admission check only: actual event, staffing and collection times are",
+    "    // still advanced below. No output from this hypothetical end state is booked.",
+    "    const projected=structuredClone(node),s=projected.view.state,r=s.rooms.find(r=>r.id===w.projectRoomId);",
+    "    if(!r)return [{kind:'future-project-room-missing'}];",
+    "    projected.view.serverTime=projectAction(w).finishAt??node.view.serverTime+w.material.durationMs;r.upgradeAt=null;",
+    "    if(w.project.kind==='upgrade')r.level=w.project.fromLevel+1;",
+    "    if(w.material&&w.paidAt===null)for(const p of w.material.workers){",
+    "      const worker=s.residents.find(q=>q.id===p.residentId);",
+    "      if(worker)worker.roomId=remappedRoom({node},p.returnRoomId);",
+    "    }",
+    "    for(const id of w.staff)s.residents.find(p=>p.id===id).roomId=r.id;",
+    "    return Object.entries(routes.supply(projected)).filter(([,v])=>v.deficit>1e-7)",
+    "      .map(([resource,value])=>({kind:'future-project-supply',resource,...value}));",
+    "  }",
+    "  function remappedRoom(state,roomId) {",
+    "    for(const e of state.node.events)if(e.kind==='merge'&&e.roomId===roomId)roomId=e.into;",
+    "    return roomId;",
+    "  }",
+    "  function employed(view,p) {",
+    "    const r=view.state.rooms.find(r=>r.id===p.roomId),at=view.serverTime;",
+    "    return p.deadAt===null&&p.away===null&&p.adultAt<=at&&!!production[r?.type]&&usable(r,at)&&",
+    "      view.state.residents.filter(q=>q.roomId===r.id&&q.deadAt===null&&q.away===null&&q.adultAt<=at)",
+    "        .slice(0,r.width*2).some(q=>q.id===p.id)&&resources.rate(view,r,at)>0;",
+    "  }",
+    "  function snapshot(state) {",
+    "    const n=state.node,v=n.view,s=v.state,supply=routes.supply(n),book=routes.inspect(n);",
+    "    const employedIds=s.residents.filter(p=>employed(v,p)).map(p=>p.id);",
+    "    const score=2*s.residents.filter(p=>p.deadAt===null).length+3*s.depth+s.rooms",
+    "      .filter(r=>r.builtAt<=v.serverTime&&!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);",
+    "    const rates=zero();for(const r of s.rooms)if(production[r.type])rates[production[r.type]]+=resources.rate(v,r,v.serverTime);",
+    "    const g=state.goal,supplied=Object.values(supply).every(v=>v.deficit<1e-7&&v.inventoryGap<1e-7);",
+    "    const achieved=supplied&&(g.kind==='employment'?g.residentIds.every(id=>employedIds.includes(id)):",
+    "      g.kind==='stock'?book.free[g.resource]>=g.amount:g.kind==='supply'?rates[g.resource]>=g.rate&&s.resources[g.resource]>=g.inventory:null);",
+    "    return {at:v.serverTime,score,employedIds,rates,supply,inventory:{...s.resources},stored:resources.storedTotals(v),",
+    "      free:{...book.free},accounting:structuredClone(n.accounting),goalAchieved:g.kind==='unlock'?null:achieved,",
+    "      goalUnknown:g.kind==='unlock'?'score alone does not verify the promised functional unlock':null};",
+    "  }",
+    "  function mark(state) {",
+    "    for(const k of keys)state.metrics.minimumInventory[k]=Math.min(state.metrics.minimumInventory[k],state.node.view.state.resources[k]);",
+    "    const value=snapshot(state);if(value.goalAchieved)state.goalFirstAt??=value.at;",
+    "    for(const h of [24,72,168])if(value.at===state.origin.windowStart+h*hour)state.checkpoints[String(h)]=value;",
+    "    state.latest=value;",
+    "  }",
+    "  function validate(state) {",
+    "    if(state?.version!==1||!state.node||!state.origin||!Array.isArray(state.workflows)||!Array.isArray(state.history)||!Array.isArray(state.admissions)||",
+    "      state.node.book.windowEnd!==state.origin.windowEnd||state.node.book.startedAt!==state.origin.windowStart||",
+    "      !Number.isSafeInteger(state.sequence)||state.sequence<0||state.execution?.receipts!=='immediate-simulated'||",
+    "      state.execution?.collection!=='each-tick'||!text(state.execution.source)||",
+    "      new Set(state.workflows.map(w=>w.key)).size!==state.workflows.length||state.admissions.length!==state.workflows.length||",
+    "      state.admissions.some((a,i)=>a!==contract(state.workflows[i]))||state.sequence!==state.history.length||",
+    "      state.metrics?.ticks*tick!==state.node.view.serverTime-state.origin.from||",
+    "      !keys.every(k=>Number.isFinite(state.metrics?.minimumInventory?.[k])&&state.metrics.minimumInventory[k]>=0))",
+    "      throw Error('Invalid or reset continuation state');",
+    "    routes.inspect(state.node);",
+    "    if(state.origin.goal!==signature(state.goal))throw Error('Continuation changed its original goal');",
+    "    for(const h of state.history)if(!state.workflows.some(w=>w.key===h.workflow)||!state.node.book.receipts.some(r=>",
+    "      r.requestId===h.requestId&&r.result==='confirmed'&&r.at===h.at&&r.fingerprint===signature(h.action)))",
+    "      throw Error('Continuation action lost its receipt');",
+    "    for(const k of keys){const a=state.node.accounting;",
+    "      if(Math.abs(a.initial[k]+a.collected[k]-a.consumed[k]-a.feed[k]-a.paid[k]-state.node.view.state.resources[k])>1e-6)",
+    "        throw Error('Continuation inventory conservation failed');}",
+    "    for(const w of state.workflows){",
+    "      if(w.stage==='first'&&signature(w.first)!==signature(w.binding.firstAction)||",
+    "        w.stage!=='first'&&w.binding.firstAction&&!state.history.some(h=>h.workflow===w.key&&signature(h.action)===signature(w.binding.firstAction)))",
+    "        throw Error('Continuation first action was not confirmed');",
+    "      for(const field of ['returnRoomId','trainingRoomId','projectRoomId'])if(w.binding[field]!==undefined&&",
+    "        w[field]!==remappedRoom(state,w.binding[field]))throw Error('Continuation destination changed');",
+    "      if(w.binding.destinations&&signature(w.destinations)!==signature(w.binding.destinations.map(d=>({...d,roomId:remappedRoom(state,d.roomId)}))))",
+    "        throw Error('Continuation family destinations changed');",
+    "      if(w.moves){",
+    "        if(signature(w.moves)!==signature(w.binding.moves)||!Number.isInteger(w.exchangeStep)||w.exchangeStep<0||w.exchangeStep>w.moves.length)",
+    "          throw Error('Continuation exchange lost its original moves');",
+    "        const confirmed=state.history.filter(h=>h.workflow===w.key);",
+    "        if(confirmed.length!==w.exchangeStep||confirmed.some((h,i)=>signature(h.action)!==signature(w.moves[i])))",
+    "          throw Error('Continuation exchange progress disagrees with receipts');",
+    "        if(w.stage==='done'&&w.exchangeStep!==w.moves.length)throw Error('Continuation exchange finished too early');",
+    "      }",
+    "      if(w.material){",
+    "        const payments=state.history.filter(h=>h.workflow===w.key&&h.action.kind==='upgrade');",
+    "        if(payments.length>1||payments.length!==(w.paidAt===null?0:1)||payments.length&&",
+    "          (w.paidAt!==payments[0].at||signature(w.constructionAction)!==signature(payments[0].action)||",
+    "            w.constructionAction.finishAt!==w.paidAt+w.material.durationMs))throw Error('Material construction clock lost its payment');",
+    "        if(w.stage==='done'&&w.paidAt===null)throw Error('Material purpose finished without construction');",
+    "        const spec=materialSpec(state,w),returned=spec.workers.filter(p=>state.history.some(h=>h.workflow===w.key&&",
+    "          h.action.kind==='assign'&&h.action.residentId===p.residentId&&remappedRoom(state,h.action.fromRoomId)===p.workshopId&&",
+    "          remappedRoom(state,h.action.roomId)===p.returnRoomId)).map(p=>p.residentId).sort((a,b)=>a-b);",
+    "        if(signature([...w.materialReturned].sort((a,b)=>a-b))!==signature(returned))throw Error('Material return lost its receipt');",
+    "      }",
+    "      if(!text(w.key)||!['wait','assign','train','family','project'].includes(w.kind)||!text(w.stage)||",
+    "        w.deadline>state.origin.windowEnd||w.kind!=='wait'&&!state.node.book.entries.some(e=>e.id===w.intentId))",
+    "        throw Error('Continuation lost its commitment');",
+    "      if(w.kind==='train'&&(!id(w.residentId)||!id(w.returnRoomId)||!Number.isSafeInteger(w.deadline)||",
+    "        !state.node.view.state.residents.some(p=>p.id===w.residentId)||w.base<0||w.base>=10))",
+    "        throw Error('Invalid training continuation');",
+    "      if(w.stage==='done'&&(!Number.isSafeInteger(w.completedAt)||w.completedAt>w.deadline||w.ownsIntent&&owner(state.node,w.intentId)))",
+    "        throw Error('Continuation was not fulfilled');",
+    "      if(w.stage!=='done'&&w.kind!=='wait'&&!owner(state.node,w.intentId)&&",
+    "        !(w.kind==='assign'&&state.node.existing?.swap?.status==='complete')&&",
+    "        !(w.kind==='train'&&state.node.existing?.roles.some(r=>r.intentId===w.intentId&&r.status==='completed')))",
+    "        throw Error('Unfinished continuation lost its active reservation');",
+    "    }",
+    "  }",
+    "  function workflow(n,row,completion,key) {",
+    "    const w={key,candidateId:row.id,kind:row.kind,intentId:row.intentId??null,stage:'first',",
+    "      first:structuredClone(row.action??null),ownsIntent:!!row.intent,continuation:structuredClone(row.continuation),",
+    "      createdAt:n.view.serverTime,deadline:n.book.windowEnd};",
+    "    if(row.continuation?.kind==='exchange-sequence')Object.assign(w,{moves:structuredClone(row.continuation.moves),exchangeStep:0});",
+    "    if(row.kind==='train')Object.assign(w,{residentId:row.continuation.residentId,stat:row.continuation.stat,base:row.continuation.base,",
+    "      returnRoomId:row.continuation.roomId,trainingRoomId:row.action?.roomId??n.view.state.residents.find(p=>p.id===row.continuation.residentId).roomId,",
+    "      deadline:row.continuation.deadline,expectedReadyAt:row.continuation.readyAt});",
+    "    if(row.kind==='family'){",
+    "      w.familyKey=row.familyPlan.key;w.parents=[...row.continuation.parents];w.childId=row.continuation.childId;",
+    "      w.destinations=structuredClone(completion?.destinations??[]);w.returned=[];w.childReserved=false;",
+    "      const ids=[...w.parents,w.childId];",
+    "      if(w.destinations.length!==ids.length||new Set(w.destinations.map(x=>x.residentId)).size!==ids.length||",
+    "        w.destinations.some(x=>!ids.includes(x.residentId)||!id(x.roomId)||!n.view.state.rooms.some(r=>r.id===x.roomId&&production[r.type])))",
+    "        return {blocked:[{kind:'missing-family-employment-plan',residents:ids}]};",
+    "    }",
+    "    if(row.kind==='project'){",
+    "      if(row.continuation?.kind==='material-upgrade'){",
+    "        w.material=structuredClone(row.continuation.spec);w.materialReturned=[];w.materialChecks=[];w.paidAt=null;",
+    "      }",
+    "      w.project=structuredClone(w.material?.project??row.action);w.projectRoomId=w.project.roomId??w.project.elevatorId;",
+    "      const r=n.view.state.rooms.find(r=>r.id===w.projectRoomId);",
+    "      w.staff=structuredClone(completion?.staff??(w.project.kind==='upgrade'?n.view.state.residents",
+    "        .filter(p=>p.roomId===r?.id&&p.deadAt===null&&p.away===null&&p.adultAt<=n.view.serverTime).map(p=>p.id):[]));",
+    "      w.staffReserved=false;w.staffed=[];",
+    "      if(!Array.isArray(w.staff)||new Set(w.staff).size!==w.staff.length||w.staff.some(id=>!n.view.state.residents.some(p=>p.id===id)))",
+    "        throw Error('Project staff must bind observed residents');",
+    "      if(production[w.project.type??r?.type]&&!w.staff.length)return {blocked:[{kind:'missing-project-staff-plan'}]};",
+    "    }",
+    "    w.binding=Object.fromEntries(Object.entries({firstAction:structuredClone(w.first),returnRoomId:w.returnRoomId,trainingRoomId:w.trainingRoomId,projectRoomId:w.projectRoomId,",
+    "      destinations:w.destinations?structuredClone(w.destinations):undefined,moves:w.moves?structuredClone(w.moves):undefined}).filter(([,value])=>value!==undefined));",
+    "    return {workflow:w,blocked:[]};",
+    "  }",
+    "  function append(input,report,candidateId,{completion={}}={}) {",
+    "    validate(input);const state=structuredClone(input),n=state.node;",
+    "    if(signature(report.goal)!==signature(state.goal))throw Error('Continuation cannot silently change the common goal');",
+    "    if(state.workflows.some(w=>w.material&&w.stage!=='done'))return {state:input,accepted:false,blocked:[{kind:'material-purpose-in-progress'}]};",
+    "    if(state.workflows.some(w=>w.moves&&w.stage!=='done'))return {state:input,accepted:false,blocked:[{kind:'exchange-sequence-in-progress'}]};",
+    "    if(state.workflows.some(w=>w.stage==='first'&&w.first))return {state:input,accepted:false,blocked:[{kind:'unsubmitted-first-action'}]};",
+    "    if(state.workflows.some(w=>w.stage!=='done'&&w.candidateId===candidateId))throw Error('Candidate continuation already active');",
+    "    const row=Object.values(report.groups).flat().find(p=>p.id===candidateId);",
+    "    if(!row)throw Error('Unknown first action');",
+    "    const ready=candidates.prepareFirst(n,report,candidateId);",
+    "    if(!ready.accepted)return {state:input,accepted:false,blocked:ready.blocked};",
+    "    const compiled=workflow(n,row,completion,'workflow:'+state.workflows.length);",
+    "    if(compiled.blocked.length)return {state:input,accepted:false,blocked:compiled.blocked};",
+    "    state.node=ready.node;state.workflows.push(compiled.workflow);state.admissions.push(contract(compiled.workflow));state.blocked=[];",
+    "    const proposal=row.action?routes.preview(state.node,row.intentId,row.action):{node:state.node,blocked:[]};",
+    "    const blocked=[...proposal.blocked,...futureIssues(state,proposal.node??state.node),",
+    "      ...projectStaffIssues(proposal.node??state.node,compiled.workflow)];",
+    "    if(compiled.workflow.moves){",
+    "      // Protect already admitted family/project guarantees throughout the exchange,",
+    "      // rather than finding a future-seat collision after its first displacement.",
+    "      const full=exchanges.check(state.node,row,{inspectNode:node=>futureIssues({...state,node})});",
+    "      blocked.push(...full.blocked);",
+    "    }",
+    "    if(compiled.workflow.kind==='project'&&compiled.workflow.staff.length&&compiled.workflow.project.finishAt>=n.book.windowEnd)",
+    "      blocked.push({kind:'project-staff-outside-window'});",
+    "    if(blocked.length)return {state:input,accepted:false,blocked};",
+    "    validate(state);mark(state);return {state,accepted:true,blocked:[]};",
+    "  }",
+    "  function start(n,report,candidateId,{execution,completion={}}={}) {",
+    "    if(execution?.receipts!=='immediate-simulated'||execution?.collection!=='each-tick'||!text(execution.source))",
+    "      throw Error('Explicit conditional receipt and collection assumptions required');",
+    "    const state={version:1,node:structuredClone(n),goal:structuredClone(report.goal),execution:structuredClone(execution),",
+    "      origin:{basis:signature(n),goal:signature(report.goal),from:n.view.serverTime,windowStart:n.book.startedAt,windowEnd:n.book.windowEnd},",
+    "      workflows:[],admissions:[],history:[],sequence:0,blocked:[],goalFirstAt:null,checkpoints:{},",
+    "      metrics:{ticks:0,minimumInventory:{...n.view.state.resources},unserved:zero(),roomOverflow:zero()}};",
+    "    const result=append(state,report,candidateId,{completion});if(result.accepted)result.state.firstCandidate={id:candidateId,kind:result.state.workflows[0].kind};",
+    "    return result;",
+    "  }",
+    "  function updateClaims(state,w,residentId,roomId,{from=state.node.view.serverTime,remove=false}={}) {",
+    "    const n=state.node,e=owner(n,w.intentId);if(!e)return [{kind:'continuation-reservation-ended'}];",
+    "    const people=e.people.filter(c=>c.residentId!==residentId),seats=e.seats.filter(c=>c.residentId!==residentId);",
+    "    if(!remove){people.push(person(n,residentId,from));seats.push(seat(n,residentId,roomId,from));}",
+    "    const amended=routes.amend(n,w.intentId,{people,seats});if(!amended.accepted)return amended.blocked;",
+    "    state.node=amended.node;return [];",
+    "  }",
+    "  function finish(state,w) {",
+    "    if(w.ownsIntent&&owner(state.node,w.intentId))state.node=routes.release(state.node,w.intentId,{complete:true,reason:'conditional continuation fulfilled'});",
+    "    w.stage='done';w.completedAt=state.node.view.serverTime;",
+    "  }",
+    "  function next(state,w) {",
+    "    const n=state.node,at=n.view.serverTime,s=n.view.state;",
+    "    if(w.stage==='done')return {};",
+    "    if(w.stage==='first'){",
+    "      if(w.first)return {action:w.first,after:'first'};",
+    "      if(w.kind==='wait'){finish(state,w);return {};}",
+    "      w.stage=w.material?'materials':w.kind==='train'?'training':w.kind==='family'?'parents':w.kind==='project'?'construction':'running';",
+    "    }",
+    "    if(w.material&&w.paidAt===null){",
+    "      const spec=materialSpec(state,w),updated=materials.refresh(state.node,w.intentId,spec);",
+    "      if(!updated.accepted)return {blocked:updated.blocked};state.node=updated.node;w.materialStatus=updated.material;",
+    "      const check={at,...structuredClone(updated.material),feedSpent:owner(state.node,w.intentId).feedSpent,",
+    "        returned:[...w.materialReturned]};",
+    "      if(signature(w.materialChecks.at(-1))!==signature(check))w.materialChecks.push(check);",
+    "      if(!updated.material.partsReady)return {};",
+    "      w.stage='material-return';",
+    "      for(const p of spec.workers)if(!w.materialReturned.includes(p.residentId)){",
+    "        const actual=state.node.view.state.residents.find(r=>r.id===p.residentId);",
+    "        if(actual?.roomId!==p.workshopId)return {blocked:[{kind:'material-worker-position-changed',residentId:p.residentId}]};",
+    "        const blocked=updateClaims(state,w,p.residentId,p.returnRoomId);if(blocked.length)return {blocked};",
+    "        return {action:assignment(state.node,p.residentId,p.returnRoomId),after:'material-return'};",
+    "      }",
+    "      if(!updated.material.ready){w.stage='material-capital';return {};}",
+    "      const action={...w.project,roomId:w.projectRoomId,finishAt:at+w.material.durationMs};",
+    "      if(action.finishAt>=state.origin.windowEnd)return {blocked:[{kind:'material-construction-outside-window',finishAt:action.finishAt}]};",
+    "      return {action,after:'material-payment'};",
+    "    }",
+    "    if(w.kind==='assign'){",
+    "      if(w.moves){",
+    "        if(w.exchangeStep===w.moves.length){finish(state,w);return {};}",
+    "        const action=w.moves[w.exchangeStep],ready=exchanges.stage(n,w.intentId,action);",
+    "        if(!ready.accepted)return {blocked:ready.blocked};state.node=ready.node;",
+    "        return {action,after:'exchange-move'};",
+    "      }",
+    "      if(w.continuation.kind==='inherited-swap'){",
+    "        if(n.existing.swap.status==='complete'){finish(state,w);return {};}",
+    "        const r=routes.nextExistingSwap(n);return {action:r.action,blocked:r.blocked.filter(b=>b.kind!=='action-cadence'),after:'swap'};",
+    "      }",
+    "      finish(state,w);return {};",
+    "    }",
+    "    if(w.kind==='train'){",
+    "      const p=s.residents.find(p=>p.id===w.residentId);",
+    "      if(p.roomId!==w.trainingRoomId&&p.roomId!==w.returnRoomId)return {blocked:[{kind:'training-position-changed',residentId:p.id}]};",
+    "      if(p.roomId===w.returnRoomId&&employed(n.view,p)){finish(state,w);return {};}",
+    "      if(p.stats[w.stat]>w.base||at>=w.deadline){",
+    "        w.returnReason=p.stats[w.stat]>w.base?'stat-complete':'deadline';",
+    "        if(w.ownsIntent){const blocked=updateClaims(state,w,p.id,w.returnRoomId);if(blocked.length)return {blocked};}",
+    "        return {action:assignment(state.node,p.id,w.returnRoomId),after:'training-return'};",
+    "      }",
+    "      return {};",
+    "    }",
+    "    if(w.kind==='family'){",
+    "      const plan=n.familyPlans.find(p=>p.key===w.familyKey);",
+    "      if(!plan)return {blocked:[{kind:'missing-family-continuation'}]};",
+    "      if(['planned','romance'].includes(plan.stage)){",
+    "        const p=w.parents.map(id=>s.residents.find(p=>p.id===id)).find(p=>p.roomId!==plan.roomId);",
+    "        return p?{action:{...assignment(n,p.id,plan.roomId),familyKey:plan.key},after:'parent-arrive'}:{};",
+    "      }",
+    "      if(!['pregnant','born'].includes(plan.stage))return {blocked:[{kind:'family-continuation-state-changed'}]};",
+    "      for(const id of w.parents)if(!w.returned.includes(id)){",
+    "        const dest=w.destinations.find(d=>d.residentId===id).roomId,p=s.residents.find(p=>p.id===id);",
+    "        if(p.roomId===dest){w.returned.push(id);const blocked=updateClaims(state,w,id,dest,{remove:true});if(blocked.length)return {blocked};continue;}",
+    "        const blocked=updateClaims(state,w,id,dest);if(blocked.length)return {blocked};",
+    "        return {action:assignment(state.node,id,dest),after:'parent-return'};",
+    "      }",
+    "      const child=s.residents.find(p=>p.id===w.childId);if(!child)return {};",
+    "      if(child.adultAt>=state.origin.windowEnd){w.outsideWindow='child-employment';return {};}",
+    "      const dest=w.destinations.find(d=>d.residentId===child.id).roomId;",
+    "      if(!w.childReserved){const blocked=updateClaims(state,w,child.id,dest,{from:Math.max(at,child.adultAt)});",
+    "        if(blocked.length)return {blocked};w.childReserved=true;}",
+    "      if(at<child.adultAt)return {};",
+    "      if(child.roomId===dest&&employed(n.view,child)){finish(state,w);return {};}",
+    "      return {action:assignment(state.node,child.id,dest),after:'child-job'};",
+    "    }",
+    "    if(w.kind==='project'){",
+    "      const r=s.rooms.find(r=>r.id===w.projectRoomId);",
+    "      if(w.project.kind==='dig'&&s.depth<w.project.floor)return {};",
+    "      if(w.project.kind!=='dig'&&(!r||r.builtAt>at||r.upgradeAt!==null))return {};",
+    "      if(r&&(!usable(r,at)||w.project.kind==='upgrade'&&r.level<w.project.fromLevel+1))return {blocked:[{kind:'project-not-operational'}]};",
+    "      for(const id of w.staff)if(!w.staffed.includes(id)){",
+    "        const p=s.residents.find(p=>p.id===id);",
+    "        if(p.roomId===w.projectRoomId&&employed(n.view,p)){w.staffed.push(id);continue;}",
+    "        const blocked=updateClaims(state,w,id,w.projectRoomId);if(blocked.length)return {blocked};",
+    "        return {action:assignment(state.node,id,w.projectRoomId),after:'project-staff'};",
+    "      }",
+    "      finish(state,w);return {};",
+    "    }",
+    "    return {};",
+    "  }",
+    "  function afterAction(state,w,task) {",
+    "    const at=state.node.view.serverTime;",
+    "    if(task.after==='first'){",
+    "      w.first=null;w.stage=w.material?'materials':w.kind==='train'?'training':w.kind==='family'?'parents':w.kind==='project'?'construction':'running';",
+    "      if(w.moves)w.exchangeStep=1;",
+    "      if(w.kind==='assign'&&w.continuation.kind!=='inherited-swap'&&!w.moves)finish(state,w);",
+    "      if(w.kind==='project'&&!w.material&&w.staff.length){",
+    "        const e=owner(state.node,w.intentId),from=w.project.finishAt;",
+    "        if(from>=state.origin.windowEnd)return [{kind:'project-staff-outside-window'}];",
+    "        const result=routes.amend(state.node,w.intentId,{people:[...e.people,...w.staff.map(id=>person(state.node,id,from))],",
+    "          seats:[...e.seats,...w.staff.map(id=>seat(state.node,id,w.projectRoomId,from))]});",
+    "        if(!result.accepted)return result.blocked;state.node=result.node;w.staffReserved=true;",
+    "      }",
+    "    }",
+    "    if(task.after==='material-return'){",
+    "      w.materialReturned.push(task.action.residentId);",
+    "      if(!w.staff.includes(task.action.residentId)){",
+    "        const blocked=updateClaims(state,w,task.action.residentId,task.action.roomId,{remove:true});if(blocked.length)return blocked;",
+    "      }",
+    "    }",
+    "    if(task.after==='material-payment'){",
+    "      w.paidAt=at;w.constructionAction=structuredClone(task.action);w.stage='construction';",
+    "      const from=task.action.finishAt;",
+    "      const result=routes.amend(state.node,w.intentId,{resources:{},feedScrap:0,",
+    "        people:w.staff.map(id=>person(state.node,id,from)),seats:w.staff.map(id=>seat(state.node,id,w.projectRoomId,from))});",
+    "      if(!result.accepted)return result.blocked;state.node=result.node;w.staffReserved=true;",
+    "    }",
+    "    if(task.after==='training-return'){w.returnedAt=at;finish(state,w);}",
+    "    if(task.after==='parent-return'){",
+    "      w.returned.push(task.action.residentId);",
+    "      const blocked=updateClaims(state,w,task.action.residentId,task.action.roomId,{remove:true});if(blocked.length)return blocked;",
+    "    }",
+    "    if(task.after==='child-job'){w.childEmployedAt=at;finish(state,w);}",
+    "    if(task.after==='project-staff')w.staffed.push(task.action.residentId);",
+    "    if(task.after==='exchange-move'){w.exchangeStep++;if(w.exchangeStep===w.moves.length)finish(state,w);}",
+    "    return [];",
+    "  }",
+    "  function remap(state,events) {",
+    "    for(const e of events)if(e.kind==='merge')for(const w of state.workflows){",
+    "      for(const field of ['returnRoomId','trainingRoomId','projectRoomId'])if(w[field]===e.roomId)w[field]=e.into;",
+    "      for(const d of w.destinations??[])if(d.roomId===e.roomId)d.roomId=e.into;",
+    "    }",
+    "  }",
+    "  function advance(input,to,{maxTicks=1008,stopAtDecision=false,collectTrajectory=false}={}) {",
+    "    validate(input);",
+    "    if(!Number.isSafeInteger(to)||to<input.node.view.serverTime||to>input.origin.windowEnd||",
+    "      (to-input.node.view.serverTime)%tick!==0||!Number.isInteger(maxTicks)||maxTicks<1||maxTicks>1008||typeof stopAtDecision!=='boolean'||typeof collectTrajectory!=='boolean')",
+    "      throw Error('Invalid continuation horizon or tick budget');",
+    "    const state=structuredClone(input);state.blocked=[];let ticks=0,decision=false;",
+    "    const trajectory=[];",
+    "    const record=(minimum=null)=>{if(collectTrajectory){const value=structuredClone(state.latest);",
+    "      value.minimumInventory=minimum?structuredClone(minimum):{...value.inventory};",
+    "      value.recoveringSupply=state.node.view.state.rooms.filter(r=>r.upgradeAt!==null)",
+    "        .map(r=>({power:'power',diner:'food',water:'water'})[r.type]).filter(Boolean);",
+    "      if(trajectory.at(-1)?.at===value.at)for(const k of keys)",
+    "        value.minimumInventory[k]=Math.min(value.minimumInventory[k],trajectory.at(-1).minimumInventory[k]);",
+    "      if(trajectory.at(-1)?.at===value.at)trajectory[trajectory.length-1]=value;else trajectory.push(value);}};",
+    "    record();",
+    "    while(true){",
+    "      const n=state.node,at=n.view.serverTime;",
+    "      if(n.pending||n.existing?.native.length){state.blocked=[{kind:'original-request-outcome-unknown'}];break;}",
+    "      state.blocked=futureIssues(state);if(state.blocked.length)break;",
+    "      if(at<state.origin.windowEnd){",
+    "        let acted=false;",
+    "        for(const w of state.workflows){",
+    "          const exchange=state.workflows.find(w=>w.moves&&w.stage!=='done');",
+    "          if(exchange&&w!==exchange)continue;",
+    "          const task=next(state,w);",
+    "          if(task.blocked?.length){state.blocked=task.blocked;break;}",
+    "          if(!task.action)continue;",
+    "          // Pure completion may run at the same timestamp; a second action may not.",
+    "          if(state.node.lastActionAt!==null&&at<state.node.lastActionAt+tick)continue;",
+    "          const proposal=routes.preview(state.node,w.intentId,task.action);",
+    "          state.blocked=[...proposal.blocked,...futureIssues(state,proposal.node??state.node),",
+    "            ...(task.after==='material-payment'?projectStaffIssues(proposal.node??state.node,w):[])];",
+    "          if(state.blocked.length)break;",
+    "          const requestId='continuation:'+state.sequence+':'+at;",
+    "          const submitted=routes.submit(state.node,w.intentId,task.action,requestId);",
+    "          if(!submitted.accepted){state.blocked=submitted.blocked;break;}",
+    "          const p=submitted.node.pending,confirmation=routes.resolve(submitted.node,",
+    "            {requestId,intentId:w.intentId,fingerprint:p.fingerprint,at,result:'confirmed'});",
+    "          if(confirmation.blocked.length){state.node=submitted.node;state.blocked=confirmation.blocked;break;}",
+    "          state.node=confirmation.node;state.sequence++;state.history.push({at,workflow:w.key,action:task.action,requestId});",
+    "          state.blocked=afterAction(state,w,task);acted=true;mark(state);record();break;",
+    "        }",
+    "        if(state.blocked.length)break;",
+    "        if(acted)continue;",
+    "      }",
+    "      mark(state);record();",
+    "      if(at===to)break;",
+    "      if(ticks>=maxTicks){state.blocked=[{kind:'continuation-tick-budget'}];break;}",
+    "      for(const w of state.workflows)if(w.kind==='train'&&w.stage!=='done'&&w.deadline>at&&w.deadline<at+tick)",
+    "        state.blocked.push({kind:'training-deadline-boundary',deadline:w.deadline,nextAt:at+tick});",
+    "      if(state.blocked.length)break;",
+    "      const material=state.workflows.find(w=>w.material&&w.stage!=='done');",
+    "      const eventCount=state.node.events.length,step=routes.advanceOwned(state.node,at+tick,{collect:true,feedOwner:material?.intentId??null});",
+    "      state.node=step.node;ticks+=step.metrics.ticks;state.metrics.ticks+=step.metrics.ticks;",
+    "      for(const k of keys){state.metrics.minimumInventory[k]=Math.min(state.metrics.minimumInventory[k],step.metrics.minimumInventory[k]);",
+    "        state.metrics.unserved[k]+=step.metrics.unserved[k];state.metrics.roomOverflow[k]+=step.metrics.roomOverflow[k];}",
+    "      const events=state.node.events.slice(eventCount);remap(state,events);mark(state);record(step.metrics.minimumInventory);",
+    "      if(!step.complete){state.blocked=step.blocked;break;}",
+    "      if(stopAtDecision&&events.some(e=>['adult','birth','build','upgrade','training','production-modifier-end'].includes(e.kind))){decision=true;break;}",
+    "    }",
+    "    validate(state);",
+    "    return {state,complete:state.node.view.serverTime===to&&!state.blocked.length,decisionRequired:decision,",
+    "      blocked:state.blocked,requestedTo:to,ticks,...(collectTrajectory?{trajectory}:{})};",
+    "  }",
+    "  function report(state) {",
+    "    validate(state);const current=snapshot(state),finished=state.node.view.serverTime===state.origin.windowEnd&&!state.blocked.length;",
+    "    const workflowIntents=new Set(state.workflows.map(w=>w.intentId));",
+    "    const unfinished=state.workflows.filter(w=>w.stage!=='done').map(w=>",
+    "      ({kind:w.kind,intentId:w.intentId,stage:w.stage,deadline:w.deadline,outsideWindow:w.outsideWindow??null}));",
+    "    unfinished.push(...state.node.book.entries.filter(e=>active(e)&&!workflowIntents.has(e.id)).map(e=>",
+    "      ({kind:'existing-commitment',intentId:e.id,stage:e.status,deadline:e.deadline,purpose:e.purpose})));",
+    "    if(state.node.existing?.native.length)unfinished.push({kind:'original-native-request',stage:'unknown',count:state.node.existing.native.length});",
+    "    const obligationsFulfilled=unfinished.length===0&&!state.node.pending;",
+    "    return {kind:'conditional-development-continuation',firstCandidate:state.firstCandidate,goal:state.goal,",
+    "      from:state.origin.from,windowStart:state.origin.windowStart,windowEnd:state.origin.windowEnd,evaluatedUntil:current.at,",
+    "      complete:finished&&obligationsFulfilled&&current.goalAchieved===true,",
+    "      simulationComplete:finished,obligationsFulfilled,",
+    "      firstAdmitted:!!state.firstCandidate,blocked:structuredClone(state.blocked),goalFirstAt:state.goalFirstAt,goalAtEnd:current.goalAchieved,",
+    "      checkpoints:structuredClone(state.checkpoints),ending:current,metrics:structuredClone(state.metrics),",
+    "      futureSeats:guarantees(state),actions:structuredClone(state.history),unfinished,",
+    "      materials:state.workflows.filter(w=>w.material).map(w=>({intentId:w.intentId,purpose:structuredClone(w.material),",
+    "        stage:w.stage,paidAt:w.paidAt,finishAt:w.constructionAction?.finishAt??null,returned:[...w.materialReturned],",
+    "        checks:structuredClone(w.materialChecks)})),",
+    "      selected:null,limitations:['Explicit chosen continuations, not bounded search or a winning complete strategy.',",
+    "        'Immediate simulated receipts and one action per ten-minute tick; no native account evidence.',",
+    "        'Future family seats are conservatively protected until confirmed; admission staffing is rechecked at execution.',",
+    "        'Subsequent investment choices are explicit appends; an unmodeled event stops the actual prefix.']};",
+    "  }",
+    "  return {start,append,advance,report};",
+    "}",
+    "",
+    "return {createShelterDevelopmentContinuation};",
+    "})();",
+    "const {createShelterDevelopmentSelection}=(()=>{",
+    "",
+    "const tick=600000,hour=3600000,keys=['power','food','water','scrap','parts','stimpak'];",
+    "const kinds=['wait','assign','family','train','project'],copy=structuredClone,eps=1e-6;",
+    "const hash=createShelterSelectionDigest();",
+    "const text=x=>typeof x==='string'&&x.trim().length>0;",
+    "const merge=(a,b)=>{const values=new Map(a.map(x=>[x.at,x]));for(const x of b){const old=values.get(x.at);",
+    "  values.set(x.at,old?{...x,minimumInventory:Object.fromEntries(keys.map(k=>[k,Math.min(old.minimumInventory[k],x.minimumInventory[k])]))}:x);",
+    "}return [...values.values()].sort((a,b)=>a.at-b.at);};",
+    "",
+    "// Reuses actual conditional continuations. No invented offspring, construction times,",
+    "// simultaneous swaps, market conversion, or native receipts are introduced here.",
+    "function createShelterDevelopmentSelection(){",
+    "  const candidates=createShelterDevelopmentCandidates(),continuation=createShelterDevelopmentContinuation(),routes=createShelterRouteSimulation();",
+    "  function options(n,o,local=false){",
+    "    if(!o||!o.goal||!o.execution)throw Error('A common goal and explicit execution assumptions are required');",
+    "    if(n.book.windowEnd-n.book.startedAt!==168*hour||n.view.serverTime<n.book.startedAt||",
+    "      n.view.serverTime>=n.book.windowEnd||!local&&(n.book.windowEnd-n.view.serverTime)%tick!==0)",
+    "      throw Error('Selection requires a remaining tick-aligned horizon in the original fixed 168-hour window');",
+    "    const p={familyOutcomes:[],constructionEvidence:[],completions:{},surplus:[],goalDeadline:null,",
+    "      beamWidth:8,maxProjects:8,maxExpansions:2000,maxChecks:2000,checksPerNode:64,...copy(o)};",
+    "    for(const [key,limit] of Object.entries({beamWidth:8,maxProjects:8,maxExpansions:2000,maxChecks:2000,checksPerNode:2000}))",
+    "      if(!Number.isInteger(p[key])||p[key]<1||p[key]>limit)throw Error('Invalid bounded selection budget: '+key);",
+    "    if(p.beamWidth<kinds.length)throw Error('Beam width must preserve all five first-action classes');",
+    "    if(!Array.isArray(p.surplus)||new Set(p.surplus.map(x=>x.resource)).size!==p.surplus.length||",
+    "      p.surplus.some(x=>!['power','food','water'].includes(x.resource)||x.resource===p.goal.resource||!text(x.source)||",
+    "        !Number.isSafeInteger(x.through)||x.through<n.book.windowEnd||x.knownLaterCommitmentsCovered!==true))",
+    "      throw Error('Surplus needs explicit purpose evidence through the window and known later commitments');",
+    "    if(p.goalDeadline!==null&&(!Number.isSafeInteger(p.goalDeadline)||p.goalDeadline<n.view.serverTime||p.goalDeadline>n.book.windowEnd))",
+    "      throw Error('Invalid common goal deadline');",
+    "    if(!p.completions||typeof p.completions!=='object'||Array.isArray(p.completions))throw Error('Completion plans must be bound by candidate ID');",
+    "    return p;",
+    "  }",
+    "  function compact(s){return {at:s.at,employed:s.employedIds.length,free:s.free,stored:s.stored,rates:s.rates,",
+    "    supply:s.supply,minimumInventory:s.minimumInventory,recoveringSupply:s.recoveringSupply,goal:s.goalAchieved};}",
+    "  function evaluate(branch,p){",
+    "    const run=continuation.advance(branch.state,branch.state.origin.windowEnd,{collectTrajectory:true});",
+    "    const report=continuation.report(run.state),trajectory=merge(branch.trace,run.trajectory.map(compact));",
+    "    const supplySafe=Object.fromEntries(['power','food','water'].map(k=>[k,trajectory.every(t=>",
+    "      t.supply[k].deficit<=eps&&t.supply[k].inventoryGap<=eps)]));",
+    "    const unserved=Object.values(report.metrics.unserved).some(x=>x>eps);",
+    "    const supplyViolation=trajectory.some(t=>Object.entries(t.supply).some(([k,v])=>",
+    "      t.minimumInventory[k]+eps<2*v.need||v.deficit>eps&&!t.recoveringSupply.includes(k)));",
+    "    const complete=report.simulationComplete&&report.obligationsFulfilled&&report.goalAtEnd!==null&&!unserved&&!supplyViolation;",
+    "    const deadlineOk=p.goalDeadline===null||report.goalFirstAt!==null&&report.goalFirstAt<=p.goalDeadline;",
+    "    return {report,trajectory,supplySafe,status:!report.simulationComplete?",
+    "      report.blocked.some(b=>/unknown|missing|not.modeled|boundary/.test(b.kind))?'unknown':'blocked':",
+    "      !report.obligationsFulfilled?'unfinished':unserved||supplyViolation||!deadlineOk?'blocked':report.goalAtEnd===null?'unknown':'comparable',",
+    "      comparable:complete&&deadlineOk,deadlineOk,supplyViolation,",
+    "      trajectoryMinimum:Object.fromEntries(keys.map(k=>[k,Math.min(...trajectory.map(t=>t.minimumInventory[k]))]))};",
+    "  }",
+    "  function relevant(a,b,p){return keys.filter(k=>!p.surplus.some(x=>x.resource===k&&a.supplySafe[k]&&b.supplySafe[k]));}",
+    "  function vector(s,resources){return [s.employed,s.goal===true?1:0,...resources.flatMap(k=>[s.free[k],s.stored[k],s.rates[k]])];}",
+    "  function relation(av,bv){return {ge:av.every((x,i)=>x+eps>=bv[i]),strict:av.some((x,i)=>x>bv[i]+eps),equal:av.every((x,i)=>Math.abs(x-bv[i])<=eps)};}",
+    "  function compare(a,b,p){",
+    "    if(!a.comparable||!b.comparable)return {better:false,reason:'incomplete-or-unknown'};",
+    "    const resources=relevant(a,b,p),end=relation(vector(a.trajectory.at(-1),resources),vector(b.trajectory.at(-1),resources));",
+    "    if(!end.ge)return {better:false,reason:'useful-resource-or-production-tradeoff'};",
+    "    const ta=a.report.goalFirstAt??Infinity,tb=b.report.goalFirstAt??Infinity;",
+    "    if(end.equal){",
+    "      if(ta<tb)return {better:true,reason:'same-effective-end-earlier-goal',advanceMs:tb-ta};",
+    "      if(ta!==tb)return {better:false,reason:'later-goal-without-end-benefit'};",
+    "      const cost=r=>keys.map(k=>r.report.ending.accounting.paid[k]+r.report.ending.accounting.feed[k]);",
+    "      const costs=relation(cost(b),cost(a));",
+    "      if(!costs.equal)return {better:costs.ge&&costs.strict,reason:'equivalent-outcome-resource-cost-tie'};",
+    "      return {better:a.report.actions.length<b.report.actions.length,reason:'equivalent-outcome-action-tie',equivalent:a.report.actions.length===b.report.actions.length};",
+    "    }",
+    "    if(ta<=tb)return {better:true,reason:'earlier-or-equal-goal-and-better-effective-end',advanceMs:tb-ta};",
+    "    const other=new Map(b.trajectory.map(t=>[t.at,t]));let catchup=null;",
+    "    for(let i=a.trajectory.length-1;i>=0;i--){const x=a.trajectory[i],y=other.get(x.at);",
+    "      if(!y||!relation(vector(x,resources),vector(y,resources)).ge)break;catchup=x.at;}",
+    "    return {better:catchup!==null,reason:catchup===null?'unproved-payback':'later-goal-with-realized-window-payback',catchupAt:catchup};",
+    "  }",
+    "  function ordered(report){",
+    "    const queues=kinds.map(k=>report.groups[k]),result=[];",
+    "    for(let i=0;queues.some(q=>q[i]);i++)for(const q of queues)if(q[i])result.push(q[i]);",
+    "    return result;",
+    "  }",
+    "  function frontier(rows,p){return rows.filter(a=>!rows.some(b=>a!==b&&compare(b.evaluation,a.evaluation,p).better));}",
+    "  function choose(rows,p){",
+    "    const valid=rows.filter(x=>x.evaluation.comparable);if(!valid.length)return null;",
+    "    const best=frontier(valid,p).sort((a,b)=>a.id.localeCompare(b.id,'en'));",
+    "    if(best.length===1)return best[0];",
+    "    const first=best[0];return best.every(x=>x===first||compare(first.evaluation,x.evaluation,p).equivalent)?first:null;",
+    "  }",
+    "  function independentAssignment(n,report,p){",
+    "    const before=routes.supply(n),local=report.groups.assign.filter(row=>row.status==='ready'&&row.action?.kind==='assign'&&",
+    "      row.continuation?.kind==='recompute-after-confirmed-employment'&&row.productionDelta&&",
+    "      keys.every(k=>row.productionDelta[k]>=-eps)&&keys.some(k=>row.productionDelta[k]>eps)&&",
+    "      Object.entries(row.supplyAfter).every(([k,v])=>v.deficit<=before[k].deficit+eps&&v.inventoryGap<=before[k].inventoryGap+eps));",
+    "    local.sort((a,b)=>(b.productionDelta[p.goal.resource]??0)-(a.productionDelta[p.goal.resource]??0)||a.id.localeCompare(b.id,'en'));",
+    "    const row=local[0];return row?{routeId:null,firstCandidate:{at:n.view.serverTime,id:row.id,kind:row.kind},",
+    "      firstAction:{at:n.view.serverTime,action:copy(row.action)},report:null,choices:[]}:null;",
+    "  }",
+    "  function selectLocal(n,o){",
+    "    routes.inspect(n);const p=options(n,o,true),report=candidates.enumerate(n,{goal:p.goal,familyOutcomes:p.familyOutcomes,",
+    "      constructionEvidence:p.constructionEvidence,maxChecks:Math.min(p.checksPerNode,p.maxChecks)});",
+    "    const selected=independentAssignment(n,report,p);",
+    "    const body={kind:'bounded-development-selection',basis:hash(n),options:p,from:n.view.serverTime,",
+    "      windowStart:n.book.startedAt,windowEnd:n.book.windowEnd,selected,",
+    "      outcome:selected?'independent-local-improvement':'no-independent-local-improvement',",
+    "      budget:{checks:report.checks,expansions:0,terminalEvaluations:0},coverage:report.coverage,",
+    "      comparisons:[],qualifiedForNativeExecution:false,",
+    "      limitations:['Current non-worsening assignment only; no future simulation, seven-day winner or native receipt.']};",
+    "    return {body,integrity:hash(body)};",
+    "  }",
+    "  function select(input,o,resume=null){",
+    "    if(resume){",
+    "      continuation.report(resume);",
+    "      if(JSON.stringify(resume.node)!==JSON.stringify(input)||JSON.stringify(resume.goal)!==JSON.stringify(o?.goal)||",
+    "        JSON.stringify(resume.execution)!==JSON.stringify(o?.execution))throw Error('Replanning must preserve its continuation, goal and execution assumptions');",
+    "    }",
+    "    routes.inspect(input);const n=copy(input),p=options(n,o),basis=hash(n),all=[],rejected=[],coverage=[];",
+    "    const budget={expansions:0,checks:0,admissions:0,terminalEvaluations:0,beamPruned:0,projectPruned:0,unexpanded:0};",
+    "    let queue=[{id:'root',state:resume?copy(resume):null,node:n,trace:[],choices:[],projects:0,firstKind:null}],rootReport=null,depth=0;",
+    "    const makeReport=node=>{",
+    "      const allowed=Math.min(p.checksPerNode,p.maxChecks-budget.checks);",
+    "      if(allowed<1)return null;",
+    "      const report=candidates.enumerate(node,{goal:p.goal,familyOutcomes:p.familyOutcomes,",
+    "        constructionEvidence:p.constructionEvidence,maxChecks:allowed});budget.checks+=report.checks;",
+    "      coverage.push({at:node.view.serverTime,checks:report.checks,summary:report.summary,coverage:report.coverage});return report;",
+    "    };",
+    "    while(queue.length&&budget.expansions<p.maxExpansions&&budget.checks<p.maxChecks){",
+    "      const next=[];",
+    "      for(const parent of queue){",
+    "        if(budget.expansions>=p.maxExpansions||budget.checks>=p.maxChecks){budget.unexpanded++;continue;}",
+    "        const report=makeReport(parent.node);if(!report){budget.unexpanded++;continue;}",
+    "        rootReport??=report;",
+    "        for(const row of ordered(report)){",
+    "          if(budget.expansions>=p.maxExpansions){budget.unexpanded++;break;}",
+    "          budget.expansions++;",
+    "          const id=parent.id+'/'+row.id,firstKind=parent.firstKind??row.kind;",
+    "          if(row.status!=='ready') {rejected.push({id,firstKind,kind:row.kind,status:row.status,blocked:row.blocked});continue;}",
+    "          if(row.kind==='project'&&parent.projects>=p.maxProjects){budget.projectPruned++;rejected.push({id,firstKind,status:'truncated',blocked:[{kind:'route-project-budget'}]});continue;}",
+    "          if(parent.state?.workflows.some(w=>w.stage!=='done'&&w.candidateId===row.id))continue;",
+    "          const opt={execution:p.execution,completion:p.completions[row.id]??{}};",
+    "          budget.admissions++;",
+    "          const admitted=parent.state?continuation.append(parent.state,report,row.id,opt):continuation.start(n,report,row.id,opt);",
+    "          if(!admitted.accepted){rejected.push({id,firstKind,status:admitted.blocked.some(b=>/unknown|missing/.test(b.kind))?'unknown':'blocked',blocked:admitted.blocked});continue;}",
+    "          const immediate=continuation.advance(admitted.state,parent.node.view.serverTime,{collectTrajectory:true});",
+    "          const branch={id,state:immediate.state,node:immediate.state.node,firstKind,",
+    "            projects:parent.projects+(row.kind==='project'?1:0),choices:[...parent.choices,{at:parent.node.view.serverTime,id:row.id,kind:row.kind}],",
+    "            trace:merge(parent.trace,immediate.trajectory.map(compact))};",
+    "          branch.evaluation=evaluate(branch,p);budget.terminalEvaluations++;all.push(branch);",
+    "          if(branch.node.view.serverTime<n.book.windowEnd&&!immediate.blocked.length){",
+    "            const step=continuation.advance(branch.state,Math.min(n.book.windowEnd,branch.node.view.serverTime+tick),{collectTrajectory:true});",
+    "            if(!step.blocked.length&&step.state.node.view.serverTime<n.book.windowEnd)",
+    "              next.push({...branch,state:step.state,node:step.state.node,trace:merge(branch.trace,step.trajectory.map(compact))});",
+    "          }",
+    "        }",
+    "      }",
+    "      // Keep a representative of every first-action class before filling the remaining beam.",
+    "      // Unknown and short-prefix branches are retained as search candidates, never scored as zero.",
+    "      const kept=[];",
+    "      for(const kind of kinds){const group=next.filter(x=>x.firstKind===kind);if(!group.length)continue;",
+    "        kept.push(choose(group,p)??frontier(group,p).sort((a,b)=>a.id.localeCompare(b.id,'en'))[0]);}",
+    "      for(const row of frontier(next,p).sort((a,b)=>a.id.localeCompare(b.id,'en')))",
+    "        if(kept.length<p.beamWidth&&!kept.includes(row))kept.push(row);",
+    "      budget.beamPruned+=Math.max(0,next.length-Math.min(kept.length,p.beamWidth));",
+    "      queue=kept.slice(0,p.beamWidth);depth++;",
+    "    }",
+    "    budget.unexpanded+=queue.length;",
+    "    const baseline=all.find(x=>x.id==='root/wait'),winner=choose(all,p);",
+    "    let selected=winner?{routeId:winner.id,firstCandidate:winner.choices[0],",
+    "      firstAction:null,comparisonToWait:baseline?compare(winner.evaluation,baseline.evaluation,p):null,",
+    "      report:winner.evaluation.report,choices:winner.choices}:null;",
+    "    let outcome=selected?(selected.firstCandidate.kind==='wait'?'wait':'complete-route-selected'):'no-comparable-winner';",
+    "    if(!selected&&baseline?.evaluation.comparable){selected={routeId:baseline.id,firstCandidate:baseline.choices[0],firstAction:null,",
+    "      report:baseline.evaluation.report,choices:baseline.choices};outcome='retain-feasible-wait';}",
+    "    if(!selected&&rootReport){",
+    "      selected=independentAssignment(n,rootReport,p);if(selected)outcome='independent-local-improvement';",
+    "    }",
+    "    // Earlier confirmations and a future move after a wait are not the current first action.",
+    "    if(selected){const first=Object.values(rootReport.groups).flat().find(r=>r.id===selected.firstCandidate.id);",
+    "      selected.firstAction=first?.action?{at:n.view.serverTime,action:copy(first.action)}:null;}",
+    "    const body={kind:'bounded-development-selection',basis,options:p,from:n.view.serverTime,windowStart:n.book.startedAt,windowEnd:n.book.windowEnd,",
+    "      outcome,selected,budget,depth,coverage,rejected,comparisons:kinds.map(kind=>{",
+    "        const group=all.filter(x=>x.firstKind===kind),best=choose(group,p);",
+    "        return {kind,completeRoutes:group.filter(x=>x.evaluation.comparable).length,",
+    "          routes:group.map(x=>({id:x.id,status:x.evaluation.status,choices:x.choices,report:x.evaluation.report,trajectoryMinimum:x.evaluation.trajectoryMinimum,",
+    "            selectedOverThisRoute:winner?compare(winner.evaluation,x.evaluation,p):null})),",
+    "          representative:best?.id??null,rejections:rejected.filter(x=>x.firstKind===kind)};",
+    "      }),nextCheckAt:rootReport?.groups.wait[0]?.nextAt??null,",
+    "      qualifiedForNativeExecution:false,limitations:['Bounded conditional search; not a global optimum or real seven-day efficiency proof.',",
+    "        'Surplus is excluded only with explicit purpose evidence and safe supply throughout both compared trajectories.',",
+    "        'Unknown, unfinished and truncated routes remain visible; a selected route is best only among comparable evaluated routes.',",
+    "        'Original snapshot, requests and receipts must be checked by the native executor; simulated confirmations are not native receipts.']};",
+    "    return {body,integrity:hash(body)};",
+    "  }",
+    "  function prepareSelected(n,result){",
+    "    if(result?.integrity!==hash(result.body)||result.body.kind!=='bounded-development-selection')throw Error('Selection integrity changed');",
+    "    if(hash(n)!==result.body.basis)throw Error('Selection snapshot changed; replan before execution');",
+    "    const chosen=result.body.selected;if(!chosen)return {node:n,accepted:false,blocked:[{kind:'no-selected-development-action'}]};",
+    "    const p=result.body.options,report=candidates.enumerate(n,{goal:p.goal,familyOutcomes:p.familyOutcomes,",
+    "      constructionEvidence:p.constructionEvidence,maxChecks:Math.min(p.checksPerNode,p.maxChecks)});",
+    "    return candidates.prepareFirst(n,report,chosen.firstCandidate.id);",
+    "  }",
+    "  return {select,selectLocal,prepareSelected,continueSelection:(state,o)=>select(state.node,o,state)};",
+    "}",
+    "",
+    "return {createShelterDevelopmentSelection};",
+    "})();",
+    "const {installShelterPlanningWorker}=(()=>{",
+    "",
+    "// This endpoint only proposes. It cannot access storage, DOM controls or native requests.",
+    "function installShelterPlanningWorker(endpoint) {",
+    "  const selection=createShelterDevelopmentSelection();",
+    "  endpoint.onmessage=({data})=>{",
+    "    const {id,options,resume}=data;",
+    "    try {",
+    "      const node=data.runtime?createShelterRouteSimulation().fromRuntime(data.runtime.view,data.runtime.options).node:data.node;",
+    "      const result=data.mode==='local'?selection.selectLocal(node,options):",
+    "        resume?selection.continueSelection(resume,options):selection.select(node,options);",
+    "      const prepared=selection.prepareSelected(resume?.node??node,result);",
+    "      endpoint.postMessage({id,result,prepared:{accepted:prepared.accepted,action:prepared.action??null,blocked:prepared.blocked}});",
+    "    } catch(error) {endpoint.postMessage({id,error:String(error?.message??error)});}",
+    "  };",
+    "}",
+    "",
+    "return {installShelterPlanningWorker};",
+    "})();",
+    "installShelterPlanningWorker(self);",
+    ""
+  ].join("\n");
+  const createShelterPlanningClient=function createShelterPlanningClient({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{}}) {
+  if(typeof source!=='string'||!source||!Number.isFinite(timeoutMs)||timeoutMs<=0)throw Error('Invalid planning worker configuration');
+  const factory=makeWorker??(()=>{
+    const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
+  });
+  let sequence=0,job=null;
+  const close=j=>{clearTimeout(j.timer);j.worker?.terminate();j.worker=null;};
+  const finish=(j,status,extra={})=>{
+    if(job!==j||j.status!=='running')return;
+    close(j);Object.assign(j,{status,finishedAt:now()},extra);onUpdate(read(j.key));
+  };
+  function read(key){if(!job||job.key!==key)return null;
+    return {id:job.id,key:job.key,status:job.status,startedAt:job.startedAt,finishedAt:job.finishedAt,
+      result:job.result??null,prepared:job.prepared??null,error:job.error??null};}
+  function invalidate(){if(job)close(job);job=null;sequence++;}
+  function request(key,payload){
+    if(typeof key!=='string'||!key)throw Error('A planning snapshot identity is required');
+    if(job?.key===key)return read(key);
+    invalidate();const j=job={id:++sequence,key,status:'running',startedAt:now(),finishedAt:null,worker:null,timer:null};
+    try{
+      j.worker=factory();
+      j.worker.onmessage=({data})=>{
+        if(job!==j||j.status!=='running'||data?.id!==j.id)return;
+        if(data.error)finish(j,'failed',{error:data.error});
+        else if(data.result?.body?.kind!=='bounded-development-selection'||typeof data.prepared?.accepted!=='boolean')
+          finish(j,'failed',{error:'Invalid planning response'});
+        else finish(j,'ready',{result:data.result,prepared:data.prepared});
+      };
+      j.worker.onerror=event=>finish(j,'failed',{error:String(event?.message??'Planning worker failed')});
+      j.worker.onmessageerror=()=>finish(j,'failed',{error:'Planning response could not be decoded'});
+      j.timer=setTimeout(()=>finish(j,'timeout',{error:'Planning time budget exhausted'}),timeoutMs);
+      j.worker.postMessage({...payload,id:j.id});
+    }catch(error){finish(j,'failed',{error:String(error?.message??error)});}
+    return read(key);
+  }
+  return {request,read,invalidate};
+};
+  const createShelterNativePlanning=function createShelterNativePlanning({client,now=Date.now}) {
+  let latest=null;
+  function update(view,context){
+    if(!context.enabled||context.pending||!context.window||context.window.end<=view.serverTime){
+      client.invalidate();latest=null;return null;
+    }
+    const {serverTime,...facts}=view;
+    const key=JSON.stringify([facts,context.schedule,context.construction,context.safety,context.window,context.settings]);
+    if(latest?.key!==key)latest={key,at:now(),vaultNo:view.vaultNo};
+    const payload={mode:'local',runtime:{view,options:{firstActionOnly:true,
+      windowStart:context.window.start,windowEnd:context.window.end,safety:context.safety,construction:context.construction,
+      runtime:{schedule:context.schedule,pending:context.pending,source:'observed native read and persisted original obligations',
+        clock:{localAt:context.readAt,serverAt:serverTime,uncertaintyMs:Math.max(0,context.readAt-context.readStartedAt),source:'native request/response clock interval'}}}},
+      options:{goal:{id:'current-scrap-production',kind:'stock',resource:'scrap',amount:view.state.resources.scrap+1,
+        source:'current non-worsening scrap production; not a future stock forecast'},
+        execution:{receipts:'immediate-simulated',collection:'each-tick',source:'unused in local-only selection; never native evidence'},
+        maxChecks:2000,checksPerNode:2000,maxExpansions:1}};
+    const status=client.request(key,payload);return status;
+  }
+  function choose(view,context,allowed){
+    const status=update(view,context);
+    if(!status||status.status!=='ready'||now()-latest.at>60000||latest.vaultNo!==view.vaultNo)return null;
+    const body=status.result?.body,prepared=status.prepared,first=body?.selected?.firstCandidate,action=prepared?.action;
+    if(body?.outcome!=='independent-local-improvement'||!prepared?.accepted||first?.kind!=='assign'||action?.kind!=='assign'||
+      body.windowStart!==context.window.start||body.windowEnd!==context.window.end||
+      JSON.stringify(body.selected.firstAction?.action)!==JSON.stringify(action))return null;
+    const current=allowed.find(c=>c.id===action.residentId&&c.room===action.roomId&&c.from===action.fromRoomId);
+    if(!current)return null;
+    return {...current,reason:'后台已比较独立增产调岗，本轮重新核对供应、用途和空位后执行',
+      developmentProposal:{jobId:status.id,from:body.from,windowStart:body.windowStart,windowEnd:body.windowEnd,
+        candidateId:first.id,kind:body.outcome}};
+  }
+  return {update,choose,status:()=>latest?client.read(latest.key):null,invalidate(){client.invalidate();latest=null;}};
+};
+  const createShelterLevelPlanning=function createShelterLevelPlanning({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{}}) {
+  const factory=makeWorker??(()=>{
+    const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
+  });
+  let epoch=null,sequence=0,active=null;
+  const jobs=new Map();
+  const close=j=>{clearTimeout(j.timer);j.worker?.terminate();j.worker=null;if(active===j)active=null;};
+  const read=j=>({id:j.id,status:j.status,routes:j.routes??[],supply:j.supply??null,snapshotAt:j.payload.view.serverTime,error:j.error??null});
+  function invalidate(){for(const j of jobs.values())close(j);jobs.clear();epoch=null;}
+  function finish(j,status,extra={}){
+    if(jobs.get(j.key)!==j||!['running','queued'].includes(j.status))return;
+    close(j);Object.assign(j,{status,finishedAt:now()},extra);onUpdate(read(j));pump();
+  }
+  function pump(){
+    if(active)return;
+    const j=[...jobs.values()].find(j=>j.status==='queued');if(!j)return;
+    if(now()-j.queuedAt>=timeoutMs){finish(j,'timeout',{error:'Planning request time budget exhausted'});return;}
+    active=j;j.status='running';
+    try{
+      j.worker=factory();
+      j.worker.onmessage=({data})=>{
+        if(active!==j||data?.id!==j.id)return;
+        if(now()-j.queuedAt>=timeoutMs){finish(j,'timeout',{error:'Planning request time budget exhausted'});return;}
+        if(data.error)finish(j,'failed',{error:String(data.error)});
+        else if(j.payload.kind==='native-family-supply'){
+          if(data.kind!=='native-family-supply'||!(data.supply===null||data.supply&&
+              Array.isArray(data.supply.family)&&data.supply.family.length===3&&
+              data.supply.family.every(Number.isSafeInteger)&&data.supply.resources&&typeof data.supply.resources==='object'))
+            finish(j,'failed',{error:'Invalid native family-supply response'});
+          else finish(j,'ready',{supply:data.supply});
+        }
+        else if(data.kind!=='native-level-routes'||!Array.isArray(data.routes)||
+          !data.routes.every(r=>r.kind==='projects'&&Array.isArray(r.steps)&&Number.isFinite(r.hours)))
+          finish(j,'failed',{error:'Invalid native level-route response'});
+        else finish(j,'ready',{routes:data.routes});
+      };
+      j.worker.onerror=e=>finish(j,'failed',{error:String(e?.message??'Level worker failed')});
+      j.worker.onmessageerror=()=>finish(j,'failed',{error:'Level response could not be decoded'});
+      j.worker.postMessage({id:j.id,...j.payload});
+    }catch(e){finish(j,'failed',{error:String(e?.message??e)});}
+  }
+  function request(payload,context){
+    // A changed clock alone may retain the search, but its route must be replayed
+    // against the new clock by the native caller before any proposal is consumed.
+    const {serverTime,...facts}=payload.view;
+    // Family previews depend on clock predicates, not elapsed stock projections.
+    // Preserve a completed search across the mandatory fresh pre-submit read, but
+    // invalidate at adulthood, cooldown, room completion or production-event boundaries.
+    // All non-clock facts (including actual stock/settlement) still belong to the epoch.
+    const familyClock=payload.kind==='native-family-supply'?[
+      facts.state.residents.map(p=>[p.adultAt<=serverTime,p.familyCooldownUntil>serverTime]),
+      facts.state.rooms.map(r=>[r.builtAt<=serverTime,r.upgradeAt!==null&&r.upgradeAt<=serverTime]),
+      (facts.env?.events||[]).map(e=>[e.startsAt<=serverTime,e.endsAt<=serverTime])]:null;
+    const newEpoch=JSON.stringify([facts,context,familyClock]);
+    if(epoch!==newEpoch){invalidate();epoch=newEpoch;}
+    const key=JSON.stringify([payload.kind,payload.options,payload.targetScore,payload.first,payload.planning,payload.campaign]);
+    let j=jobs.get(key);
+    if(j?.status==='ready'&&now()-j.finishedAt>60000){close(j);jobs.delete(key);j=null;}
+    if(!j){
+      if(jobs.size>=4){const oldest=jobs.values().next().value;close(oldest);jobs.delete(oldest.key);}
+      j={id:++sequence,key,payload:structuredClone(payload),status:'queued',queuedAt:now(),worker:null,timer:null};jobs.set(key,j);
+      // The deadline includes time in the queue; expired work must not acquire a Worker.
+      j.timer=setTimeout(()=>finish(j,'timeout',{error:'Planning request time budget exhausted'}),timeoutMs);pump();
+    }
+    return read(j);
+  }
+  return {request,invalidate};
+};
+  const shelterLevelWorkerSource=new TextDecoder().decode(Uint8Array.from(atob("J3VzZSBzdHJpY3QnOwpjb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7CiAgY29uc3Qgc2hlbHRlclJvb21zID0geyBwb3dlcjogWydzdHInLCdwb3dlcicsMTIsMzBdLCBkaW5lcjogWydhZ2knLCdmb29kJyw4LDI1XSwgd2F0ZXI6IFsncGVyJywnd2F0ZXInLDgsMjVdLA0KICAgIHNjcmFwOiBbJ2VuZCcsJ3NjcmFwJyw4LDMwXSwgbWVkYmF5OiBbJ2ludCcsJ3N0aW1wYWsnLC41LDJdLCB3b3Jrc2hvcDogWydpbnQnLCdwYXJ0cycsLjYsM10sDQogICAgZG9vcjogW10sIGVsZXZhdG9yOiBbXSwgcXVhcnRlcnM6IFtdLCBzdG9yYWdlOiBbXSwgdHJhaW5pbmc6IFtdLCBhcm1vcnk6IFtdLCB0YWlsb3I6IFtdLCByYWRpbzogW10gfTsKICBjb25zdCBzaGVsdGVyQnVpbGRSdWxlcyA9IHtwb3dlcjpbJ+WPkeeUteermScsMTAwLDFdLGRpbmVyOlsn6aSQ5Y6FJywxMDAsMV0sd2F0ZXI6Wyflh4DmsLTnq5knLDEwMCwxXSxzY3JhcDpbJ+W6n+aWmeWbnuaUtuermScsODAsMV0sDQogICAgcXVhcnRlcnM6Wyflrr/oiI0nLDEyMCwxXSxzdG9yYWdlOlsn5LuT5bqTJyw4MCwyXSxtZWRiYXk6WyfljLvliqHlrqQnLDMwMCwzXSx0cmFpbmluZzpbJ+iuree7g+WupCcsNDAwLDRdLA0KICAgIHdvcmtzaG9wOlsn5bel5Z2KJyw1MDAsNV0sYXJtb3J5Olsn5q2m5Zmo5bel5Z2KJyw2MDAsNl0sdGFpbG9yOlsn5pyN6KOF5bel5Z2KJyw2MDAsNl0scmFkaW86WyfnlLXlj7AnLDgwMCw4XX07CiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLA0KICAgIHRpZXI6MCxob3Vyczo2LHN0aW1wYWtzOjIscmVzZXJ2ZToyLGNoYW5jZTo3MCxhdHRlbXB0czoxLHRyYWluVGFyZ2V0OjYsZ3VhcmRSZXNpZGVudHM6MixndWFyZFBvd2VyUGVyY2VudDo1MH07CiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTsKICBmdW5jdGlvbiBzaGVsdGVyV29ya2VyUmF0ZShzLCBub3csIGVudiwgcCwgcikgew0KICAgIGNvbnN0IFtzdGF0LHJlc291cmNlLGJhc2VdID0gc2hlbHRlclJvb21zW3IudHlwZV0gfHwgW107DQogICAgaWYgKCFyZXNvdXJjZSB8fCByLmJ1aWx0QXQgPiBub3cgfHwgci5pbmNpZGVudCB8fCByLnVucG93ZXJlZCB8fCByLnVwZ3JhZGVBdCAhPT0gbnVsbCkgcmV0dXJuIDA7DQogICAgY29uc3QgYm9udXMgPSBzLml0ZW1zLmZpbmQoaXRlbSA9PiBpdGVtLmlkID09PSBwLm91dGZpdElkKT8uYm9udXM/LltzdGF0XSA/PyAwOw0KICAgIGlmICghTnVtYmVyLmlzRmluaXRlKGJvbnVzKSB8fCBib251cyA8IDApIHRocm93IG5ldyBFcnJvcign6YG/6Zq+5omA6KOF5aSH6KeE5YiZ5Y+Y5YyWJyk7DQogICAgY29uc3QgZXZlbnRzID0gKGVudj8uZXZlbnRzIHx8IFtdKS5maWx0ZXIoZSA9PiBlLmtpbmQgPT09ICdwcm9kdWN0aW9uJyAmJiBlLnN0YXJ0c0F0IDw9IG5vdyAmJiBub3cgPCBlLmVuZHNBdCk7DQogICAgcmV0dXJuIGJhc2UqWzAsMSwxLjUsMi4xXVtyLmxldmVsXSooLjUrTWF0aC5taW4oMTcscC5zdGF0c1tzdGF0XStib251cykvMTApKiguNisuNCpNYXRoLm1pbigxMDAscC5oYXBwaW5lc3MpLzEwMCkqDQogICAgICAoMSsoTWF0aC5taW4oNTAsMStNYXRoLmZsb29yKE1hdGguc3FydChwLnhwLzMpKSktMSkqLjAxKSooMSsuMDMqKHMubGVnYWN5Py5wZXJrcz8ucHJvZHVjdGlvbiB8fCAwKSkqDQogICAgICBNYXRoLm1pbigxNTAsTWF0aC5tYXgoMTAwLC4uLmV2ZW50cy5tYXAoZSA9PiBlLnBlcmNlbnQpKSkvMTAwOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJSZXNpZGVudElkZW50aXR5KHMscCxuYW1lcz1udWxsKSB7DQogICAgY29uc3Qgbm9ybWFsaXplPXZhbHVlPT50eXBlb2YgdmFsdWU9PT0nc3RyaW5nJz92YWx1ZS5ub3JtYWxpemUoJ05GS0MnKS5yZXBsYWNlKC9ccysvZywnICcpLnRyaW0oKTonJzsNCiAgICBjb25zdCBuYW1lPXE9Pm5hbWVzPy5nZXQocSk/P25vcm1hbGl6ZShxPy5uYW1lKTsNCiAgICBjb25zdCBsZXZlbD1xPT5OdW1iZXIuaXNGaW5pdGUocT8ueHApJiZxLnhwPj0wP01hdGgubWluKDUwLDErTWF0aC5mbG9vcihNYXRoLnNxcnQocS54cC8zKSkpOm51bGw7DQogICAgY29uc3Qga2V5cz1bJ3N0cicsJ3BlcicsJ2VuZCcsJ2NoYScsJ2ludCcsJ2FnaScsJ2xjayddLGxhYmVscz1bJ+WKm+mHjycsJ+aEn+efpScsJ+iAkOWKmycsJ+mtheWKmycsJ+aZuuWKmycsJ+aVj+aNtycsJ+W5uOi/kCddOw0KICAgIGNvbnN0IHN0YXRzPXE9PmtleXMuZXZlcnkoaz0+TnVtYmVyLmlzSW50ZWdlcihxPy5zdGF0cz8uW2tdKSYmcS5zdGF0c1trXT49MCk/a2V5cy5tYXAoaz0+cS5zdGF0c1trXSk6bnVsbDsNCiAgICBjb25zdCBsb2NhdGlvbj1xPT57DQogICAgICBpZihxLmF3YXkhPT1udWxsfHxxLmRlYWRBdCE9PW51bGwpcmV0dXJuIG51bGw7DQogICAgICBpZihxLnJvb21JZD09PW51bGwpcmV0dXJuIHtyb3c6J+mXsuedgCcsZGV0YWlsOiflnKjkvJHmga8nfTsNCiAgICAgIGNvbnN0IHI9cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1xLnJvb21JZCksbmFtZXM9e3Bvd2VyOiflj5HnlLXnq5knLGRpbmVyOifppJDljoUnLHdhdGVyOiflh4DmsLTnq5knLHNjcmFwOiflup/mlpnlm57mlLbnq5knLA0KICAgICAgICBxdWFydGVyczon5a6/6IiNJyxzdG9yYWdlOifku5PlupMnLG1lZGJheTon5Yy75Yqh5a6kJyx3b3Jrc2hvcDon5bel5Z2KJyx0cmFpbmluZzon6K6t57uD5a6kJyxyYWRpbzon55S15Y+wJyxhcm1vcnk6J+atpuWZqOW3peWdiicsdGFpbG9yOifmnI3oo4Xlt6XlnYonLGRvb3I6J+Wkp+mXqCd9Ow0KICAgICAgaWYoIXJ8fCFuYW1lc1tyLnR5cGVdfHwhTnVtYmVyLmlzSW50ZWdlcihyLmZsb29yKXx8IU51bWJlci5pc0ludGVnZXIoci53aWR0aCkpcmV0dXJuIG51bGw7DQogICAgICBpZihyLnR5cGU9PT0ndHJhaW5pbmcnJiYha2V5cy5pbmNsdWRlcyhyLnRyYWluU3RhdCkpcmV0dXJuIG51bGw7DQogICAgICBjb25zdCBuYW1lPW5hbWVzW3IudHlwZV0rKHIudHlwZT09PSd0cmFpbmluZyc/YMK3JHtsYWJlbHNba2V5cy5pbmRleE9mKHIudHJhaW5TdGF0KV19YDonJykrKHIud2lkdGg+MT9gIMOXJHtyLndpZHRofWA6JycpOw0KICAgICAgcmV0dXJuIHtyb3c6bm9ybWFsaXplKGAke3IuZmxvb3J9IOWxgiAke25hbWV9YCksZGV0YWlsOm5vcm1hbGl6ZShg5ZyoJHtuYW1lfe+8iCR7ci5mbG9vcn0g5bGC77yJYCl9Ow0KICAgIH07DQogICAgaWYoIXB8fCFuYW1lKHApfHxsZXZlbChwKT09PW51bGx8fHMucmVzaWRlbnRzLmZpbHRlcihxPT5xLmlkPT09cC5pZCkubGVuZ3RoIT09MSlyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBwcm9vZj17aWQ6cC5pZCxuYW1lOm5hbWUocCksbGV2ZWw6bGV2ZWwocCksc3RhdHM6c3RhdHMocCksbG9jYXRpb246bG9jYXRpb24ocCksZmllbGRzOltdfTsNCiAgICBsZXQgbWF0Y2hlcz1zLnJlc2lkZW50cy5maWx0ZXIocT0+bmFtZShxKT09PXByb29mLm5hbWUpOw0KICAgIGlmKG1hdGNoZXMubGVuZ3RoPT09MSlyZXR1cm4gcHJvb2Y7DQogICAgcHJvb2YuZmllbGRzLnB1c2goJ2xldmVsJyk7bWF0Y2hlcz1tYXRjaGVzLmZpbHRlcihxPT5sZXZlbChxKT09PXByb29mLmxldmVsKTsNCiAgICBpZihtYXRjaGVzLmxlbmd0aD09PTEpcmV0dXJuIHByb29mOw0KICAgIGlmKHByb29mLnN0YXRzKXtwcm9vZi5maWVsZHMucHVzaCgnc3RhdHMnKTttYXRjaGVzPW1hdGNoZXMuZmlsdGVyKHE9PkpTT04uc3RyaW5naWZ5KHN0YXRzKHEpKT09PUpTT04uc3RyaW5naWZ5KHByb29mLnN0YXRzKSk7fQ0KICAgIGlmKG1hdGNoZXMubGVuZ3RoPT09MSlyZXR1cm4gcHJvb2Y7DQogICAgaWYocHJvb2YubG9jYXRpb24pe3Byb29mLmZpZWxkcy5wdXNoKCdsb2NhdGlvbicpO21hdGNoZXM9bWF0Y2hlcy5maWx0ZXIocT0+bG9jYXRpb24ocSk/LnJvdz09PXByb29mLmxvY2F0aW9uLnJvdyk7fQ0KICAgIHJldHVybiBtYXRjaGVzLmxlbmd0aD09PTE/cHJvb2Y6bnVsbDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyU3RvcmVkUHJvamVjdGlvbihzLHIsbm93LGVudixjYXAsYm91bmRzPXt9KSB7DQogICAgY29uc3QgWyxyZXNvdXJjZSwsYmF0Y2hCYXNlXT1zaGVsdGVyUm9vbXNbci50eXBlXSxiYXRjaD0oYmF0Y2hCYXNlIHx8IDApKnIud2lkdGgqWzAsMSwxLjUsMi4xXVtyLmxldmVsXTsNCiAgICBjb25zdCBlbGFwc2VkPU1hdGgubWF4KDAsbm93LXMubGFzdFNldHRsZWRBdCksc3RlcHM9TWF0aC5mbG9vcihNYXRoLm1pbig4NjQwMDAwMCxlbGFwc2VkKS82MDAwMDApOw0KICAgIGNvbnN0IG5leHRUaWNrQXQ9cy5sYXN0U2V0dGxlZEF0KyhNYXRoLmZsb29yKGVsYXBzZWQvNjAwMDAwKSsxKSo2MDAwMDA7DQogICAgY29uc3QgcmVzdWx0PXtzdG9yZWQ6cmVzb3VyY2U/ci5zdG9yZWQ6MCxhdXRvQ29sbGVjdGVkOjAsc2NyYXBDb25zdW1lZDowLG5leHRUaWNrQXR9Ow0KICAgIGlmKCFyZXNvdXJjZSB8fCAhc3RlcHMpcmV0dXJuIHJlc3VsdDsNCiAgICAvLyBQdWJsaWMgcGFnZSdzIHR3KCk6IDEwLW1pbnV0ZSB0aWNrcywgYXQgbW9zdCAyNCBob3VycywgcmF0ZSBzYW1wbGVkIGF0IHRoZSBzdGFydCBvZiB0aGF0IHdpbmRvdy4NCiAgICBjb25zdCBmcm9tPU1hdGgubWF4KHMubGFzdFNldHRsZWRBdCxub3ctODY0MDAwMDApOw0KICAgIGNvbnN0IHdvcmtlcnM9cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAucm9vbUlkPT09ci5pZCAmJiBwLmF3YXk9PT1udWxsICYmIHAuZGVhZEF0PT09bnVsbCAmJiBwLmFkdWx0QXQ8PWZyb20pLnNsaWNlKDAsci53aWR0aCoyKTsNCiAgICBjb25zdCBpbmNyZW1lbnQ9d29ya2Vycy5yZWR1Y2UoKHN1bSxwKT0+c3VtK3NoZWx0ZXJXb3JrZXJSYXRlKHMsZnJvbSxlbnYscCxyKSwwKS82Ow0KICAgIGNvbnN0IGF1dG9tYXRpYz0ocy5oYW5kaWVzIHx8IFtdKS5zb21lKGg9PmguZmxvb3I9PT1yLmZsb29yKSxtYXhTdG9yZWQ9NCpiYXRjaDsNCiAgICBsZXQgc2NyYXA9Ym91bmRzLnNjcmFwQnVkZ2V0Pz9zLnJlc291cmNlcy5zY3JhcCxjYXBhY2l0eT1ib3VuZHMuY2FwYWNpdHlCdWRnZXQ/PyhjYXAtcy5yZXNvdXJjZXNbcmVzb3VyY2VdKTsNCiAgICBmb3IobGV0IGk9MDtpPHN0ZXBzO2krKykgew0KICAgICAgY29uc3QgYmVmb3JlU3RvcmVkPXJlc3VsdC5zdG9yZWQsYmVmb3JlQ29sbGVjdGVkPXJlc3VsdC5hdXRvQ29sbGVjdGVkLGJlZm9yZVNjcmFwPXJlc3VsdC5zY3JhcENvbnN1bWVkLGJlZm9yZUZlZWQ9c2NyYXAsYmVmb3JlQ2FwYWNpdHk9Y2FwYWNpdHk7DQogICAgICBpZihpbmNyZW1lbnQ+MCkgew0KICAgICAgICBsZXQgbWFkZT1NYXRoLm1pbihpbmNyZW1lbnQsTWF0aC5tYXgoMCxtYXhTdG9yZWQtcmVzdWx0LnN0b3JlZCkpOw0KICAgICAgICBpZihyLnR5cGU9PT0nd29ya3Nob3AnKSB7bWFkZT1NYXRoLm1pbihtYWRlLHNjcmFwLzYpO3NjcmFwLT02Km1hZGU7cmVzdWx0LnNjcmFwQ29uc3VtZWQrPTYqbWFkZTt9DQogICAgICAgIHJlc3VsdC5zdG9yZWQrPU1hdGgubWF4KDAsbWFkZSk7DQogICAgICB9DQogICAgICBpZihhdXRvbWF0aWMpIHsNCiAgICAgICAgY29uc3QgY29sbGVjdGVkPU1hdGgubWluKE1hdGguZmxvb3IocmVzdWx0LnN0b3JlZC9iYXRjaCsxZS05KSpiYXRjaCxNYXRoLm1heCgwLE1hdGguZmxvb3IoY2FwYWNpdHkpKSk7DQogICAgICAgIGlmKGNvbGxlY3RlZD4wKXtyZXN1bHQuc3RvcmVkPU1hdGgubWF4KDAscmVzdWx0LnN0b3JlZC1jb2xsZWN0ZWQpO2NhcGFjaXR5LT1jb2xsZWN0ZWQ7cmVzdWx0LmF1dG9Db2xsZWN0ZWQrPWNvbGxlY3RlZDt9DQogICAgICB9DQogICAgICBpZihpbmNyZW1lbnQ8PTAgJiYgIWF1dG9tYXRpYylicmVhazsNCiAgICAgIC8vIOacrOasoeaKleW9seeahOS6p+mAn+OAgeS+m+aWmeWSjOWPr+aUtuWuuemHj+Wdh+WbuuWumu+8m+S4gOaVtOWIu+ayoeacieWPmOWMluWQju+8jOWQjue7reWIu+S5n+S4jeS8muiHquihjOino+mUgeOAgg0KICAgICAgaWYocmVzdWx0LnN0b3JlZD09PWJlZm9yZVN0b3JlZCYmcmVzdWx0LmF1dG9Db2xsZWN0ZWQ9PT1iZWZvcmVDb2xsZWN0ZWQmJnJlc3VsdC5zY3JhcENvbnN1bWVkPT09YmVmb3JlU2NyYXAmJnNjcmFwPT09YmVmb3JlRmVlZCYmY2FwYWNpdHk9PT1iZWZvcmVDYXBhY2l0eSlicmVhazsNCiAgICB9DQogICAgcmV0dXJuIHJlc3VsdDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyU2hhcmVkUHJvamVjdGlvbihzLG5vdyxlbnYsY2Fwcykgew0KICAgIGNvbnN0IHJvb21zPW5ldyBNYXAoKSxhbW91bnRzPXt9LGF1dG9tYXRpYz17fSx0b3RhbHM9e30sdW5jZXJ0YWluUm9vbXM9W107DQogICAgY29uc3QgYnVpbHQ9cy5yb29tcy5maWx0ZXIocj0+ci5idWlsdEF0PD1ub3cpLGVsYXBzZWQ9TWF0aC5tYXgoMCxub3ctcy5sYXN0U2V0dGxlZEF0KTsNCiAgICBjb25zdCBhY3RpdmU9TWF0aC5mbG9vcihNYXRoLm1pbig4NjQwMDAwMCxlbGFwc2VkKS82MDAwMDApPjA7DQogICAgY29uc3Qgcm93cz1idWlsdC5tYXAocm9vbT0+ew0KICAgICAgY29uc3QgWyxyZXNvdXJjZSwsYmFzZV09c2hlbHRlclJvb21zW3Jvb20udHlwZV0sYmF0Y2g9KGJhc2V8fDApKnJvb20ud2lkdGgqWzAsMSwxLjUsMi4xXVtyb29tLmxldmVsXTsNCiAgICAgIGNvbnN0IG5hdGl2ZT1zaGVsdGVyU3RvcmVkUHJvamVjdGlvbihzLHJvb20sbm93LGVudixjYXBzW3Jlc291cmNlXSk7DQogICAgICBjb25zdCBtYXhpbXVtPXJlc291cmNlJiZhY3RpdmU/c2hlbHRlclN0b3JlZFByb2plY3Rpb24ocyxyb29tLG5vdyxlbnYsY2Fwc1tyZXNvdXJjZV0sDQogICAgICAgIHtzY3JhcEJ1ZGdldDpOdW1iZXIuTUFYX1NBRkVfSU5URUdFUixjYXBhY2l0eUJ1ZGdldDpOdW1iZXIuTUFYX1NBRkVfSU5URUdFUn0pOm5hdGl2ZTsNCiAgICAgIHJldHVybiB7cm9vbSxyZXNvdXJjZSxiYXRjaCxuYXRpdmUsbWF4aW11bSxyb2JvdDoocy5oYW5kaWVzfHxbXSkuc29tZShoPT5oLmZsb29yPT09cm9vbS5mbG9vcil9Ow0KICAgIH0pOw0KICAgIGNvbnN0IGZlZWREZW1hbmQ9cm93cy5yZWR1Y2UoKG4scik9Pm4rci5tYXhpbXVtLnNjcmFwQ29uc3VtZWQsMCk7DQogICAgY29uc3QgaW5jb21pbmdTY3JhcD1yb3dzLmZpbHRlcihyPT5yLnJlc291cmNlPT09J3NjcmFwJykucmVkdWNlKChuLHIpPT5uK3IubWF4aW11bS5hdXRvQ29sbGVjdGVkLDApOw0KICAgIGNvbnN0IGZlZWRVcHBlcj1NYXRoLm1pbihmZWVkRGVtYW5kLHMucmVzb3VyY2VzLnNjcmFwK2luY29taW5nU2NyYXApOw0KICAgIGNvbnN0IGF1dG9Qb3RlbnRpYWw9e307DQogICAgZm9yKGNvbnN0IHIgb2Ygcm93cylpZihyLnJlc291cmNlKWF1dG9Qb3RlbnRpYWxbci5yZXNvdXJjZV09KGF1dG9Qb3RlbnRpYWxbci5yZXNvdXJjZV18fDApK3IubWF4aW11bS5hdXRvQ29sbGVjdGVkOw0KICAgIGZvcihjb25zdCByb3cgb2Ygcm93cyl7DQogICAgICBjb25zdCB7cm9vbSxyZXNvdXJjZSxiYXRjaCxuYXRpdmUsbWF4aW11bSxyb2JvdH09cm93Ow0KICAgICAgaWYoIXJlc291cmNlKXtyb29tcy5zZXQocm9vbS5pZCx7Li4ubmF0aXZlLHN0b3JlZFVwcGVyOm5hdGl2ZS5zdG9yZWQscHJvamVjdGlvblVuY2VydGFpbjpmYWxzZX0pO2NvbnRpbnVlO30NCiAgICAgIC8vIFRoZSBwYWdlIGVzdGltYXRlcyBlYWNoIHJvb20gaW5kZXBlbmRlbnRseTsgaXQgZG9lcyBub3QgZXN0YWJsaXNoIHNlcnZlciBwcm9jZXNzaW5nIG9yZGVyLg0KICAgICAgLy8gTG93ZXIgYm91bmRzIGxlYXZlIG90aGVyIHJvb21zIHRoZWlyIG1heGltdW0gZGVtYW5kLiBVcHBlciBib3VuZHMgYXJlIGZvciBjYXBhY2l0eSBjaGVja3MsDQogICAgICAvLyBuZXZlciBpbnZlbnRvcnkgY3JlZGl0cy4gVGhleSBuZWVkIG5vdCBhbGwgYmUgYXR0YWluYWJsZSBpbiB0aGUgc2FtZSBwcm9jZXNzaW5nIG9yZGVyLg0KICAgICAgY29uc3QgZmVlZExvdz1yb29tLnR5cGU9PT0nd29ya3Nob3AnP01hdGgubWF4KDAscy5yZXNvdXJjZXMuc2NyYXAtKGZlZWREZW1hbmQtbWF4aW11bS5zY3JhcENvbnN1bWVkKSk6MDsNCiAgICAgIGNvbnN0IG93bkZlZWRVcHBlcj1yb29tLnR5cGU9PT0nd29ya3Nob3AnP01hdGgubWluKG1heGltdW0uc2NyYXBDb25zdW1lZCxzLnJlc291cmNlcy5zY3JhcCtpbmNvbWluZ1NjcmFwKTowOw0KICAgICAgY29uc3QgZnJlZT1NYXRoLm1heCgwLGNhcHNbcmVzb3VyY2VdLXMucmVzb3VyY2VzW3Jlc291cmNlXSk7DQogICAgICBjb25zdCBhdXRvSGlnaD1yb2JvdD9NYXRoLm1pbihtYXhpbXVtLmF1dG9Db2xsZWN0ZWQsTWF0aC5mbG9vcihmcmVlKyhyZXNvdXJjZT09PSdzY3JhcCc/ZmVlZFVwcGVyOjApKSk6MDsNCiAgICAgIGNvbnN0IGNhcGFjaXR5TG93PU1hdGgubWF4KDAsZnJlZS0oKGF1dG9Qb3RlbnRpYWxbcmVzb3VyY2VdfHwwKS1tYXhpbXVtLmF1dG9Db2xsZWN0ZWQpKTsNCiAgICAgIGNvbnN0IGxvd2VyPXJvb20udHlwZT09PSd3b3Jrc2hvcCd8fHJvYm90P3NoZWx0ZXJTdG9yZWRQcm9qZWN0aW9uKHMscm9vbSxub3csZW52LGNhcHNbcmVzb3VyY2VdLA0KICAgICAgICB7c2NyYXBCdWRnZXQ6ZmVlZExvdyxjYXBhY2l0eUJ1ZGdldDpjYXBhY2l0eUxvd30pOm5hdGl2ZTsNCiAgICAgIGNvbnN0IGZlZWRVbmNlcnRhaW49cm9vbS50eXBlPT09J3dvcmtzaG9wJyYmb3duRmVlZFVwcGVyPmxvd2VyLnNjcmFwQ29uc3VtZWQrMWUtOTsNCiAgICAgIGNvbnN0IGF1dG9VbmNlcnRhaW49cm9ib3QmJihhdXRvSGlnaD5sb3dlci5hdXRvQ29sbGVjdGVkKzFlLTl8fGluY29taW5nU2NyYXA+MCYmZmVlZFVuY2VydGFpbik7DQogICAgICBsZXQgc3RvcmVkPWxvd2VyLnN0b3JlZCxzdG9yZWRVcHBlcj1uYXRpdmUuc3RvcmVkOw0KICAgICAgaWYoZmVlZFVuY2VydGFpbiYmIXJvYm90KXsNCiAgICAgICAgc3RvcmVkVXBwZXI9c2hlbHRlclN0b3JlZFByb2plY3Rpb24ocyxyb29tLG5vdyxlbnYsY2Fwc1tyZXNvdXJjZV0se3NjcmFwQnVkZ2V0Om93bkZlZWRVcHBlcn0pLnN0b3JlZDsNCiAgICAgIH1lbHNlIGlmKHJvYm90JiYoZmVlZFVuY2VydGFpbnx8YXV0b1VuY2VydGFpbikpew0KICAgICAgICBjb25zdCBwcm9kdWNlZExvdz1yb29tLnR5cGU9PT0nd29ya3Nob3AnP2xvd2VyLnNjcmFwQ29uc3VtZWQvNjoNCiAgICAgICAgICBNYXRoLm1heCgwLGxvd2VyLnN0b3JlZCtsb3dlci5hdXRvQ29sbGVjdGVkLXJvb20uc3RvcmVkKTsNCiAgICAgICAgY29uc3QgcHJvZHVjZWRIaWdoPXJvb20udHlwZT09PSd3b3Jrc2hvcCc/b3duRmVlZFVwcGVyLzY6DQogICAgICAgICAgTWF0aC5tYXgoMCxtYXhpbXVtLnN0b3JlZCttYXhpbXVtLmF1dG9Db2xsZWN0ZWQtcm9vbS5zdG9yZWQpOw0KICAgICAgICBzdG9yZWQ9TWF0aC5tYXgoMCxyb29tLnN0b3JlZCtwcm9kdWNlZExvdy1hdXRvSGlnaCk7DQogICAgICAgIHN0b3JlZFVwcGVyPU1hdGgubWluKE1hdGgubWF4KHJvb20uc3RvcmVkLDQqYmF0Y2gpLHJvb20uc3RvcmVkK3Byb2R1Y2VkSGlnaCk7DQogICAgICB9DQogICAgICBjb25zdCB1bmNlcnRhaW49c3RvcmVkVXBwZXI+c3RvcmVkKzFlLTk7DQogICAgICBjb25zdCByZXN1bHQ9ey4uLmxvd2VyLHN0b3JlZCxzdG9yZWRVcHBlcixhdXRvQ29sbGVjdGVkOmF1dG9IaWdoLHNjcmFwQ29uc3VtZWRVcHBlcjpvd25GZWVkVXBwZXIsDQogICAgICAgIHByb2plY3Rpb25VbmNlcnRhaW46dW5jZXJ0YWluLHByb2plY3Rpb25SZWFzb246dW5jZXJ0YWluPyhmZWVkVW5jZXJ0YWluPydzaGFyZWQtZmVlZCc6J3NoYXJlZC1jYXBhY2l0eScpOm51bGx9Ow0KICAgICAgcm9vbXMuc2V0KHJvb20uaWQscmVzdWx0KTtpZih1bmNlcnRhaW4pdW5jZXJ0YWluUm9vbXMucHVzaChyb29tLmlkKTsNCiAgICAgIGFtb3VudHNbcm9vbS5pZF09TWF0aC5mbG9vcihzdG9yZWRVcHBlci9iYXRjaCsxZS05KSpiYXRjaDsNCiAgICAgIHRvdGFsc1tyZXNvdXJjZV09KHRvdGFsc1tyZXNvdXJjZV18fDApK2Ftb3VudHNbcm9vbS5pZF07DQogICAgICBhdXRvbWF0aWNbcmVzb3VyY2VdPShhdXRvbWF0aWNbcmVzb3VyY2VdfHwwKSthdXRvSGlnaDsNCiAgICB9DQogICAgZm9yKGNvbnN0IHJlc291cmNlIG9mIE9iamVjdC5rZXlzKGF1dG9tYXRpYykpYXV0b21hdGljW3Jlc291cmNlXT1NYXRoLm1pbihhdXRvbWF0aWNbcmVzb3VyY2VdLA0KICAgICAgTWF0aC5tYXgoMCxNYXRoLmZsb29yKGNhcHNbcmVzb3VyY2VdLXMucmVzb3VyY2VzW3Jlc291cmNlXSsocmVzb3VyY2U9PT0nc2NyYXAnP2ZlZWRVcHBlcjowKSkpKTsNCiAgICBpZih0b3RhbHMucGFydHMhPT11bmRlZmluZWQpew0KICAgICAgY29uc3Qgc3RvcmVkPXJvd3MuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT0ncGFydHMnKS5yZWR1Y2UoKG4scik9Pm4rci5yb29tLnN0b3JlZCwwKTsNCiAgICAgIHRvdGFscy5wYXJ0cz1NYXRoLm1pbih0b3RhbHMucGFydHMsc3RvcmVkK2ZlZWRVcHBlci82KTsNCiAgICB9DQogICAgcmV0dXJuIHtyb29tcyxhbW91bnRzLGF1dG9tYXRpYyx0b3RhbHMsc2NyYXBDb25zdW1lZFVwcGVyOmZlZWRVcHBlcix1bmNlcnRhaW5Sb29tc307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckZ1dHVyZUNvbGxlY3Rpb24obSxhZnRlck1zPTApIHsNCiAgICBjb25zdCB7YW1vdW50cyxhdXRvbWF0aWMsdG90YWxzLHNjcmFwQ29uc3VtZWRVcHBlcix1bmNlcnRhaW5Sb29tc309DQogICAgICBzaGVsdGVyU2hhcmVkUHJvamVjdGlvbihtLnN0YXRlLG0ubm93K2FmdGVyTXMsbS52aWV3LmVudixtLmNhcHMpOw0KICAgIHJldHVybiB7YW1vdW50cyxhdXRvbWF0aWMsdG90YWxzLHNjcmFwQ29uc3VtZWRVcHBlcix1bmNlcnRhaW5Sb29tc307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNhcGFjaXR5KHJvb21zLHN0b3JhZ2VQZXJrLGV4dHJhU3RvcmFnZT0wKSB7DQogICAgY29uc3Qgc3RvcmFnZT1yb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3N0b3JhZ2UnKS5yZWR1Y2UoKG4scik9Pm4rci53aWR0aCpyLmxldmVsLGV4dHJhU3RvcmFnZSk7DQogICAgY29uc3QgY2Fwcz1PYmplY3QuZnJvbUVudHJpZXMoT2JqZWN0LmtleXMoc2hlbHRlclJlc291cmNlcykubWFwKGtleT0+ew0KICAgICAgY29uc3QgW2Jhc2Usd2FyZWhvdXNlLHJvb21dPWtleT09PSdzY3JhcCc/WzE1MDAsMTIwMCw2MDBdOmtleT09PSdwYXJ0cyc/WzEwMCw2MCw0MF06DQogICAgICAgIGtleT09PSdzdGltcGFrJz9bMTAsNSw1XTpbNjAwLDQwMCwyNTBdOw0KICAgICAgY29uc3QgY2VsbHM9cm9vbXMuZmlsdGVyKHI9PnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdPT09a2V5KS5yZWR1Y2UoKG4scik9Pm4rci53aWR0aCpbMCwxLDEuNSwyLjFdW3IubGV2ZWxdLDApOw0KICAgICAgcmV0dXJuIFtrZXksTWF0aC5mbG9vcigoYmFzZSt3YXJlaG91c2Uqc3RvcmFnZStyb29tKmNlbGxzKSooMSsuMDUqc3RvcmFnZVBlcmspKV07DQogICAgfSkpOw0KICAgIHJldHVybiB7Y2FwcyxpdGVtQ2FwOjIwKzEwKnN0b3JhZ2UscG9wdWxhdGlvbkNhcDpNYXRoLm1pbigyMDAsDQogICAgICByb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3F1YXJ0ZXJzJykucmVkdWNlKChuLHIpPT5uK3Iud2lkdGgqKDIrMipyLmxldmVsKSwwKSl9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJNb2RlbCh2aWV3KSB7DQogICAgY29uc3QgcyA9IHZpZXc/LnN0YXRlLCBub3cgPSB2aWV3Py5zZXJ2ZXJUaW1lOw0KICAgIGNvbnN0IGZpbml0ZSA9IHggPT4gTnVtYmVyLmlzRmluaXRlKHgpICYmIHggPj0gMDsNCiAgICBpZiAoIU51bWJlci5pc1NhZmVJbnRlZ2VyKHZpZXc/LnZhdWx0Tm8pIHx8IHZpZXcudmF1bHRObyA8PSAwIHx8ICFmaW5pdGUobm93KSB8fCAhcyB8fA0KICAgICAgICAhZmluaXRlKHMubGFzdFNldHRsZWRBdCkgfHwgIWZpbml0ZShzLnN0YXRzPy5jb2xsZWN0ZWQpIHx8ICFOdW1iZXIuaXNTYWZlSW50ZWdlcih2aWV3LnByb2dyZXNzPy5sZXZlbCkgfHwNCiAgICAgICAgIUFycmF5LmlzQXJyYXkocy5yb29tcykgfHwgIUFycmF5LmlzQXJyYXkocy5yZXNpZGVudHMpIHx8ICFBcnJheS5pc0FycmF5KHMuaXRlbXMpIHx8ICFBcnJheS5pc0FycmF5KHMuYmlydGhzKSB8fA0KICAgICAgICAhQXJyYXkuaXNBcnJheShzLmFjaGlldmVtZW50cykgfHwgIUFycmF5LmlzQXJyYXkocy5kYWlseT8uY2xhaW1lZCkgfHwgdHlwZW9mIHMuZGFpbHkuZGF5ICE9PSAnc3RyaW5nJyB8fA0KICAgICAgICAhQXJyYXkuaXNBcnJheShzLnNlYXNvbj8uY2xhaW1lZEZyZWUpIHx8ICFmaW5pdGUocy5zZWFzb24ucG9pbnRzKSB8fCB0eXBlb2Ygcy5zZWFzb24ubW9udGggIT09ICdzdHJpbmcnIHx8DQogICAgICAgIChzLnR1dG9yaWFsICE9IG51bGwgJiYgIUFycmF5LmlzQXJyYXkocy50dXRvcmlhbC5jbGFpbWVkKSkgfHwgdHlwZW9mIHZpZXcuc3dpdGNoZXM/LmZyb3plbiAhPT0gJ2Jvb2xlYW4nIHx8DQogICAgICAgICFPYmplY3Qua2V5cyhzaGVsdGVyUmVzb3VyY2VzKS5ldmVyeShrZXkgPT4gZmluaXRlKHMucmVzb3VyY2VzPy5ba2V5XSkpKSB0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOeKtuaAgee7k+aehOWPmOWMlicpOw0KICAgIGlmIChuZXcgU2V0KHMucm9vbXMubWFwKHIgPT4gci5pZCkpLnNpemUgIT09IHMucm9vbXMubGVuZ3RoIHx8IHMucm9vbXMuc29tZShyID0+ICFOdW1iZXIuaXNTYWZlSW50ZWdlcihyLmlkKSB8fA0KICAgICAgICAhT2JqZWN0Lmhhc093bihzaGVsdGVyUm9vbXMsIHIudHlwZSkgfHwgIVsxLDIsM10uaW5jbHVkZXMoci5sZXZlbCkgfHwgIVsxLDIsM10uaW5jbHVkZXMoci53aWR0aCkgfHwNCiAgICAgICAgIWZpbml0ZShyLmJ1aWx0QXQpIHx8ICFmaW5pdGUoci5zdG9yZWQpIHx8ICEoci51cGdyYWRlQXQgPT09IG51bGwgfHwgZmluaXRlKHIudXBncmFkZUF0KSkpKSB0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOaIv+mXtOinhOWImeWPmOWMlicpOw0KICAgIGlmIChzLnJlc2lkZW50cy5zb21lKHAgPT4gIU51bWJlci5pc1NhZmVJbnRlZ2VyKHAuaWQpIHx8ICEocC5kZWFkQXQgPT09IG51bGwgfHwgZmluaXRlKHAuZGVhZEF0KSkgfHwNCiAgICAgICAgIShwLmF3YXkgPT09IG51bGwgfHwgdHlwZW9mIHAuYXdheSA9PT0gJ29iamVjdCcpIHx8ICFmaW5pdGUocC5hZHVsdEF0KSkgfHwNCiAgICAgICAgcy5iaXJ0aHMuc29tZShiID0+ICFmaW5pdGUoYi5kdWVBdCkpKSB0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOWxheawkeaVsOaNruS4jeWujOaVtCcpOw0KICAgIGlmKHMuaGFuZGllcyE9PXVuZGVmaW5lZCAmJiAoIUFycmF5LmlzQXJyYXkocy5oYW5kaWVzKSB8fCBzLmhhbmRpZXMuc29tZShoPT4hTnVtYmVyLmlzU2FmZUludGVnZXIoaD8uZmxvb3IpIHx8IGguZmxvb3I8MCkpIHx8DQogICAgICAgIHMuaGFuZGllcz8ubGVuZ3RoICYmIHMucm9vbXMuc29tZShyPT4hTnVtYmVyLmlzU2FmZUludGVnZXIoci5mbG9vcikgfHwgci5mbG9vcjwwKSl0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOacuuWZqOS6uualvOWxguaXoOazleaguOWvuScpOw0KICAgIGNvbnN0IG11bHRpcGxpZXIgPSByID0+IFswLDEsMS41LDIuMV1bci5sZXZlbF07DQogICAgY29uc3QgYnVpbHQgPSBzLnJvb21zLmZpbHRlcihyID0+IHIuYnVpbHRBdCA8PSBub3cpOw0KICAgIGNvbnN0IHBlcmsgPSBrZXkgPT4gew0KICAgICAgY29uc3QgbiA9IHMubGVnYWN5Py5wZXJrcz8uW2tleV0gPz8gMDsNCiAgICAgIGlmICghTnVtYmVyLmlzSW50ZWdlcihuKSB8fCBuIDwgMCB8fCBuID4gMTApIHRocm93IG5ldyBFcnJvcign6YG/6Zq+5omA5Lyg5om/6KeE5YiZ5Y+Y5YyWJyk7DQogICAgICByZXR1cm4gbjsNCiAgICB9Ow0KICAgIGNvbnN0IGNhcGFjaXR5PXNoZWx0ZXJDYXBhY2l0eShidWlsdCxwZXJrKCdzdG9yYWdlJykpLCB7Y2Fwc309Y2FwYWNpdHk7DQogICAgY29uc3QgYXRIb21lID0gcy5yZXNpZGVudHMuZmlsdGVyKHAgPT4gcC5hd2F5ID09PSBudWxsICYmIHAuZGVhZEF0ID09PSBudWxsKTsNCiAgICBpZiAoYXRIb21lLnNvbWUocCA9PiAhZmluaXRlKHAuYWR1bHRBdCkgfHwgIWZpbml0ZShwLnhwKSB8fCAhZmluaXRlKHAuaGFwcGluZXNzKSB8fA0KICAgICAgICAhWydzdHInLCdwZXInLCdlbmQnLCdjaGEnLCdpbnQnLCdhZ2knLCdsY2snXS5ldmVyeShrZXkgPT4gZmluaXRlKHAuc3RhdHM/LltrZXldKSkpKSB0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOWxheawkeaVsOaNruS4jeWujOaVtCcpOw0KICAgIGNvbnN0IHByb2R1Y3Rpb24gPSBPYmplY3QuZnJvbUVudHJpZXMoT2JqZWN0LmtleXMoc2hlbHRlclJlc291cmNlcykubWFwKGsgPT4gW2ssMF0pKTsNCiAgICBjb25zdCBzaGFyZWQ9c2hlbHRlclNoYXJlZFByb2plY3Rpb24ocyxub3csdmlldy5lbnYsY2Fwcyk7DQogICAgY29uc3Qgcm9vbXMgPSBidWlsdC5tYXAociA9PiB7DQogICAgICBjb25zdCBbc3RhdCxyZXNvdXJjZSxiYXNlLGJhdGNoQmFzZV0gPSBzaGVsdGVyUm9vbXNbci50eXBlXTsNCiAgICAgIGNvbnN0IHdvcmtlcnMgPSBhdEhvbWUuZmlsdGVyKHAgPT4gcC5yb29tSWQgPT09IHIuaWQgJiYgcC5hZHVsdEF0IDw9IG5vdykuc2xpY2UoMCxyLndpZHRoKjIpOw0KICAgICAgbGV0IHJhdGUgPSAwOw0KICAgICAgaWYgKHJlc291cmNlICYmICFyLmluY2lkZW50ICYmICFyLnVucG93ZXJlZCAmJiByLnVwZ3JhZGVBdCA9PT0gbnVsbCkgew0KICAgICAgICBwZXJrKCdwcm9kdWN0aW9uJyk7DQogICAgICAgIHJhdGUgPSB3b3JrZXJzLnJlZHVjZSgobixwKSA9PiBuK3NoZWx0ZXJXb3JrZXJSYXRlKHMsbm93LHZpZXcuZW52LHAsciksMCk7DQogICAgICAgIGlmICghZmluaXRlKHJhdGUpKSB0aHJvdyBuZXcgRXJyb3IoJ+mBv+mavuaJgOa0u+WKqOinhOWImeWPmOWMlicpOw0KICAgICAgICBwcm9kdWN0aW9uW3Jlc291cmNlXSArPSByYXRlOw0KICAgICAgfQ0KICAgICAgY29uc3QgYmF0Y2ggPSByZXNvdXJjZSA/IGJhdGNoQmFzZSpyLndpZHRoKm11bHRpcGxpZXIocikgOiAwOw0KICAgICAgY29uc3QgcHJvamVjdGVkPXNoYXJlZC5yb29tcy5nZXQoci5pZCk7DQogICAgICByZXR1cm4geyBpZDpyLmlkLCByZXNvdXJjZSwgcmF0ZSwgYmF0Y2gsIC4uLnByb2plY3RlZCwgYXV0b21hdGljOihzLmhhbmRpZXMgfHwgW10pLnNvbWUoaD0+aC5mbG9vcj09PXIuZmxvb3IpLCB3b3JrZXJzOndvcmtlcnMubGVuZ3RoIH07DQogICAgfSk7DQogICAgY29uc3QgbW91dGhzID0gYXRIb21lLnJlZHVjZSgobixwKSA9PiBuKyhwLmFkdWx0QXQgPD0gbm93ID8gMSA6IC41KSwwKTsNCiAgICBjb25zdCBwb3dlciA9IGJ1aWx0LnJlZHVjZSgobixyKSA9PiBuKyhbJ2Rvb3InLCdlbGV2YXRvcicsJ3Bvd2VyJ10uaW5jbHVkZXMoci50eXBlKSA/IDAgOg0KICAgICAgKHNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdID8gMSA6IC41KSpyLndpZHRoKnIubGV2ZWwpLDApOw0KICAgIHJldHVybiB7IHZpZXcsIHN0YXRlOnMsIG5vdywgLi4uY2FwYWNpdHksIHJvb21zLCBwcm9kdWN0aW9uLCBkZW1hbmQ6e3Bvd2VyLGZvb2Q6bW91dGhzLHdhdGVyOm1vdXRoc30sDQogICAgICBwcm9qZWN0aW9uOnt1bmNlcnRhaW5Sb29tczpzaGFyZWQudW5jZXJ0YWluUm9vbXMsc2NyYXBDb25zdW1lZFVwcGVyOnNoYXJlZC5zY3JhcENvbnN1bWVkVXBwZXJ9IH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclByb2R1Y3Rpb25XaXRob3V0KG0saWRzKSB7DQogICAgY29uc3QgYWJzZW50PW5ldyBTZXQoaWRzKSxyZXNlcnZlZD1uZXcgU2V0KG0ucmVzZXJ2ZWRSZXNpZGVudHMgfHwgW10pLHM9bS5zdGF0ZSxwcm9qZWN0ZWQ9ey4uLm0ucHJvZHVjdGlvbn07DQogICAgY29uc3Qgd29ya2Vycz1zLnJlc2lkZW50cy5maWx0ZXIocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiYhcmVzZXJ2ZWQuaGFzKHAuaWQpKTsNCiAgICAvLyDmjInljp/nlJ/pobrluo/lkozmiL/pl7Tlrrnph4/ph43nrpfvvJvlpJrlkI3lrrbkurrkuIDotbfnprvlspfml7bvvIzmm7/ooaXlj6rog73orqHlhaXkuIDmrKHjgIINCiAgICBmb3IoY29uc3QgaWQgb2YgbmV3IFNldCh3b3JrZXJzLmZpbHRlcihwPT5hYnNlbnQuaGFzKHAuaWQpKS5tYXAocD0+cC5yb29tSWQpKSkgew0KICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocj0+ci5pZD09PWlkKSxyZXNvdXJjZT1yb29tJiZzaGVsdGVyUm9vbXNbcm9vbS50eXBlXVsxXTsNCiAgICAgIGlmKCFyZXNvdXJjZSljb250aW51ZTsNCiAgICAgIGNvbnN0IG9jY3VwYW50cz13b3JrZXJzLmZpbHRlcihwPT5wLnJvb21JZD09PWlkKTsNCiAgICAgIGNvbnN0IG91dHB1dD1wZW9wbGU9PnBlb3BsZS5zbGljZSgwLHJvb20ud2lkdGgqMikucmVkdWNlKChuLHApPT5uK3NoZWx0ZXJXb3JrZXJSYXRlKHMsbS5ub3csbS52aWV3LmVudixwLHJvb20pLDApOw0KICAgICAgcHJvamVjdGVkW3Jlc291cmNlXSs9b3V0cHV0KG9jY3VwYW50cy5maWx0ZXIocD0+IWFic2VudC5oYXMocC5pZCkpKS1vdXRwdXQob2NjdXBhbnRzKTsNCiAgICB9DQogICAgcmV0dXJuIHByb2plY3RlZDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRGVwYXJ0dXJlU2FmZShtLGlkcykgew0KICAgIGNvbnN0IHByb2plY3RlZD1zaGVsdGVyUHJvZHVjdGlvbldpdGhvdXQobSxpZHMpOw0KICAgIHJldHVybiBPYmplY3Qua2V5cyhtLmRlbWFuZCkuZXZlcnkoaz0+cHJvamVjdGVkW2tdPj1NYXRoLm1pbihtLnByb2R1Y3Rpb25ba10sbS5kZW1hbmRba10qMS4yKS0xZS05KTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQ29uc3RydWN0aW9uU3VwcGx5KG0saWRzLGRlbWFuZCxwcm9qZWN0ZWQ9c2hlbHRlclByb2R1Y3Rpb25XaXRob3V0KG0saWRzKSkgew0KICAgIGNvbnN0IHM9bS5zdGF0ZSxhYnNlbnQ9bmV3IFNldChbLi4uaWRzLC4uLihtLnJlc2VydmVkUmVzaWRlbnRzfHxbXSldKSx3YWl0aW5nPVtdOw0KICAgIGZvcihjb25zdCBbcmVzb3VyY2UsbmVlZF0gb2YgT2JqZWN0LmVudHJpZXMoZGVtYW5kKSl7DQogICAgICBsZXQgcmF0ZT1wcm9qZWN0ZWRbcmVzb3VyY2VdLHN0b2NrPXMucmVzb3VyY2VzW3Jlc291cmNlXSxsYXN0PTA7DQogICAgICBpZihzdG9jazwyKm5lZWQpcmV0dXJuIHtzYWZlOmZhbHNlLHdhaXRpbmd9Ow0KICAgICAgaWYocmF0ZT49bmVlZCoxLjItMWUtOSljb250aW51ZTsNCiAgICAgIGNvbnN0IGV2ZW50cz1bXTsNCiAgICAgIGZvcihjb25zdCByIG9mIHMucm9vbXMuZmlsdGVyKHI9PnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdPT09cmVzb3VyY2UmJiFyLmluY2lkZW50JiYhci51bnBvd2VyZWQpKXsNCiAgICAgICAgY29uc3QgYXQ9ci5idWlsdEF0Pm0ubm93P3IuYnVpbHRBdDpyLnVwZ3JhZGVBdDsNCiAgICAgICAgaWYoIU51bWJlci5pc0Zpbml0ZShhdCl8fGF0PD1tLm5vd3x8YXQtbS5ub3c+ODY0MDAwMDApY29udGludWU7DQogICAgICAgIGNvbnN0IHJvb209ey4uLnIsYnVpbHRBdDptLm5vdyx1cGdyYWRlQXQ6bnVsbCxsZXZlbDpyLmJ1aWx0QXQ+bS5ub3c/ci5sZXZlbDpNYXRoLm1pbigzLHIubGV2ZWwrMSl9Ow0KICAgICAgICBjb25zdCBwZW9wbGU9cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAucm9vbUlkPT09ci5pZCYmcC5hd2F5PT09bnVsbCYmcC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiYhYWJzZW50LmhhcyhwLmlkKSkuc2xpY2UoMCxyLndpZHRoKjIpOw0KICAgICAgICAvLyDkuI3kvp3otZbliLDmnJ/mtLvliqjliqDmiJDjgIHmnKrmnaXlh7rnlJ8v5b2S5p2l5oiW5bCa5pyq5omn6KGM55qE6LCD5bKX77yb5Y+q55So5b2T5YmN56Gu5a6e5Zyo5bKX55qE5Lq644CCDQogICAgICAgIGNvbnN0IG91dHB1dD1wZW9wbGUucmVkdWNlKChuLHApPT5uK3NoZWx0ZXJXb3JrZXJSYXRlKHMsYXQse2V2ZW50czpbXX0scCxyb29tKSwwKTsNCiAgICAgICAgaWYoIShvdXRwdXQ+MCkpY29udGludWU7DQogICAgICAgIGNvbnN0IGJhdGNoPXNoZWx0ZXJSb29tc1tyLnR5cGVdWzNdKnIud2lkdGgqWzAsMSwxLjUsMi4xXVtyb29tLmxldmVsXTsNCiAgICAgICAgLy8g6aaW5om55YWl5bqT5YmN6YO96Z2g546w5pyJ5bqT5a2Y77yM5Y+m55WZ5LiA5qyh5Y2B5YiG6ZKf57uT566X562J5b6F77yb5LiN5oqK5a6M5bel556s6Ze05b2T5L2c6LWE5rqQ5bey5Yiw6LSm44CCDQogICAgICAgIGV2ZW50cy5wdXNoKHtob3VyczooYXQtbS5ub3cpLzM2MDAwMDArYmF0Y2gvb3V0cHV0KzEvNixyYXRlOm91dHB1dH0pOw0KICAgICAgfQ0KICAgICAgZm9yKGNvbnN0IGUgb2YgZXZlbnRzLnNvcnQoKGEsYik9PmEuaG91cnMtYi5ob3Vycykpew0KICAgICAgICBzdG9jay09TWF0aC5tYXgoMCxuZWVkLXJhdGUpKihlLmhvdXJzLWxhc3QpO2xhc3Q9ZS5ob3VyczsNCiAgICAgICAgaWYoc3RvY2s8MipuZWVkKXJldHVybiB7c2FmZTpmYWxzZSx3YWl0aW5nfTsNCiAgICAgICAgcmF0ZSs9ZS5yYXRlO2lmKHJhdGU+PW5lZWQqMS4yLTFlLTkpYnJlYWs7DQogICAgICB9DQogICAgICBpZihyYXRlPG5lZWQqMS4yLTFlLTkpcmV0dXJuIHtzYWZlOmZhbHNlLHdhaXRpbmd9Ow0KICAgICAgd2FpdGluZy5wdXNoKHtyZXNvdXJjZSxob3VyczpsYXN0fSk7DQogICAgfQ0KICAgIHJldHVybiB7c2FmZTp0cnVlLHdhaXRpbmd9Ow0KICB9DQogIC8vIOWAkuS4i+iusOW9leS7jeWcqOaXtuS/neeVmeaBouWkjeWQjemine+8m+S4jeWHreacrOWcsOacn+mZkOaOqOaWreW3sue7j+WuieiRrO+8jOS5n+S4jeiuoeWFpeW9k+WJjeS6p+WHui/mtojogJfjgIINCiAgZnVuY3Rpb24gc2hlbHRlclJlY292ZXJpbmdQb3B1bGF0aW9uKHMpIHsNCiAgICByZXR1cm4gcy5yZXNpZGVudHMuZmlsdGVyKHAgPT4gcC5kZWFkQXQgIT09IG51bGwpLmxlbmd0aDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRmFtaWx5RXhwZWN0aW5nKHMsYSxiKSB7DQogICAgLy8g5aSa5a+55a625bqt5Y+v5ZCM5L2P5a6/6IiN77yb5Y+q5pyJ54i25q+N5Yy56YWN55qE5b6F5Lqn6K6w5b2V5omN6IO95oq15raI6K+l5a625bqt55qE5oSf5oOF6aKE55WZ44CCDQogICAgcmV0dXJuIGEhPT1iJiZbYSxiXS5ldmVyeShpZD0+TnVtYmVyLmlzU2FmZUludGVnZXIoaWQpJiZpZD4wKSYmcy5iaXJ0aHMuc29tZShiaXJ0aD0+DQogICAgICBBcnJheS5pc0FycmF5KGJpcnRoLnBhcmVudHMpJiZiaXJ0aC5wYXJlbnRzLmxlbmd0aD09PTImJmJpcnRoLnBhcmVudHMuaW5jbHVkZXMoYSkmJmJpcnRoLnBhcmVudHMuaW5jbHVkZXMoYikpOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJCaXJ0aFBhcmVudHMocyxiaXJ0aCkgew0KICAgIGNvbnN0IGlkcz1iaXJ0aC5wYXJlbnRzOw0KICAgIHJldHVybiBBcnJheS5pc0FycmF5KGlkcykmJmlkcy5sZW5ndGg9PT0yJiZpZHNbMF0hPT1pZHNbMV0mJmlkcy5ldmVyeShpZD0+TnVtYmVyLmlzU2FmZUludGVnZXIoaWQpJiZpZD4wJiYNCiAgICAgIHMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PWlkKSk/aWRzOm51bGw7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckdyb3d0aE5lZWRzKG0scHJlcGFyYXRpb249bnVsbCx0YXJnZXQ9bnVsbCxvcGVyYXRpb25hbD1mYWxzZSkgew0KICAgIGNvbnN0IHM9bS5zdGF0ZSxub3c9bS5ub3csbGl2aW5nPXMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwpOw0KICAgIGNvbnN0IHBvcHVsYXRpb249bGl2aW5nLmxlbmd0aCtzLmJpcnRocy5sZW5ndGgsIHJlY292ZXJpbmc9c2hlbHRlclJlY292ZXJpbmdQb3B1bGF0aW9uKHMpOw0KICAgIGNvbnN0IGNvbnN0cnVjdGlvbj1zLnJvb21zLmZpbHRlcihyPT5yLnR5cGUhPT0nZWxldmF0b3InJiYoci5idWlsdEF0Pm5vd3x8ci51cGdyYWRlQXQhPT1udWxsKSk7DQogICAgY29uc3QgcGFpcnM9bmV3IFNldChsaXZpbmcuZmlsdGVyKHA9PnAucm9tYW5jZSYmTnVtYmVyLmlzU2FmZUludGVnZXIocC5yb21hbmNlLnBhcnRuZXJJZCkmJg0KICAgICAgIXNoZWx0ZXJGYW1pbHlFeHBlY3RpbmcocyxwLmlkLHAucm9tYW5jZS5wYXJ0bmVySWQpKS5tYXAocD0+W3AuaWQscC5yb21hbmNlLnBhcnRuZXJJZF0uc29ydCgoYSxiKT0+YS1iKS5qb2luKCc6JykpKTsNCiAgICBjb25zdCBmdXR1cmVNb3V0aHM9cG9wdWxhdGlvbityZWNvdmVyaW5nK3BhaXJzLnNpemU7DQogICAgLy8g5Y+q6aKE55WZ5bey5pyJ5Lq65Y+jL+WutuW6reWSjOW3suW8gOW3peW3peeoi++8jOS4jeaPkOWJjea2iOiAl+WwmuacquWuieaOkueahOWPkeWxleebruagh+aJgOmcgOeahOS6uuaJi+OAgg0KICAgIGNvbnN0IGNvbW1pdHRlZFBvd2VyPWNvbnN0cnVjdGlvbi5yZWR1Y2UoKG4scik9Pm4rKFsnZG9vcicsJ2VsZXZhdG9yJywncG93ZXInXS5pbmNsdWRlcyhyLnR5cGUpPzA6DQogICAgICAoc2hlbHRlclJvb21zW3IudHlwZV1bMV0/MTouNSkqci53aWR0aCooci5idWlsdEF0Pm5vdz9yLmxldmVsOnIubGV2ZWw8Mz8xOjApKSwwKTsNCiAgICBjb25zdCBkZW1hbmQ9e3Bvd2VyOm0uZGVtYW5kLnBvd2VyK2NvbW1pdHRlZFBvd2VyLGZvb2Q6TWF0aC5tYXgobS5kZW1hbmQuZm9vZCxmdXR1cmVNb3V0aHMpLHdhdGVyOk1hdGgubWF4KG0uZGVtYW5kLndhdGVyLGZ1dHVyZU1vdXRocyl9Ow0KICAgIC8vIOWPquaOpee6s+WunumZhemYtuauteWSjOW3suW7uuW6iuS9jeWGheeahOS4gOaJueWHhuWkh+WPo+eyru+8m+S6uuWRmOOAgeWkh+aWmeWSjOW3peeoi+WFseS6q+i/meS7vemcgOaxguOAgg0KICAgIGlmKE51bWJlci5pc1NhZmVJbnRlZ2VyKHByZXBhcmF0aW9uKSYmcHJlcGFyYXRpb24+ZnV0dXJlTW91dGhzJiYNCiAgICAgICAgcHJlcGFyYXRpb248PU1hdGgubWluKE51bWJlci5pc0ludGVnZXIodGFyZ2V0KSYmdGFyZ2V0Pj0yJiZ0YXJnZXQ8PTIwMD90YXJnZXQ6MCxtLnBvcHVsYXRpb25DYXApKXsNCiAgICAgIC8vIOWkh+aWmeaYr+i+vuWIsOWHhuWkh+ebruagh+eahOWJjee9ru+8muacqui+vuWIsOeahOWHhuWkh+mHj+S4jeiDveWPjei/h+adpeemgeatouWItumAoOihpeawtOWNh+e6p+aJgOmcgOeahOmbtuS7tuOAgg0KICAgICAgLy8g5bey5Y+W5b6X55qE5YeG5aSH5L2Z6YeP5LuN6aG75L+d5oqk77yb5bey5om/6K+65Lq65Y+j5LiO5Zyo5bu65bel56iL55qE56Gs6ZyA5rGC5aeL57uI5LiN6ZmN5L2O44CCDQogICAgICBmb3IoY29uc3QgayBvZiBbJ2Zvb2QnLCd3YXRlciddKWRlbWFuZFtrXT1NYXRoLm1heChkZW1hbmRba10sb3BlcmF0aW9uYWw/TWF0aC5taW4ocHJlcGFyYXRpb24sbS5wcm9kdWN0aW9uW2tdLzEuMik6cHJlcGFyYXRpb24pOw0KICAgIH0NCiAgICByZXR1cm4ge3BvcHVsYXRpb24scmVjb3ZlcmluZyxjb25zdHJ1Y3Rpb24scGFpcnMsZnV0dXJlTW91dGhzLGNvbW1pdHRlZFBvd2VyLGRlbWFuZH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclBvcHVsYXRpb25TdGFnZShtLHRhcmdldCxjb250aW51b3VzLHN0YXRlPXt9LHBlbmRpbmc9bnVsbCkgew0KICAgIGNvbnN0IHM9bS5zdGF0ZSxsaXZpbmc9cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCksZ3Jvd3RoPXNoZWx0ZXJHcm93dGhOZWVkcyhtKTsNCiAgICBjb25zdCB2YWxpZD1OdW1iZXIuaXNJbnRlZ2VyKHRhcmdldCkmJnRhcmdldD49MiYmdGFyZ2V0PD0yMDA7DQogICAgY29uc3QgbmV4dD12YWxpZD9NYXRoLm1pbigyMDAsdGFyZ2V0PDMwPzMwOihNYXRoLmZsb29yKE1hdGgubWF4KHRhcmdldCxsaXZpbmcubGVuZ3RoKS8xMCkrMSkqMTApOm51bGw7DQogICAgY29uc3QgcmVzdWx0PXtjb250aW51b3VzLHRhcmdldCxuZXh0VGFyZ2V0Om5leHQscG9wdWxhdGlvbjpsaXZpbmcubGVuZ3RoLGZ1dHVyZTpncm93dGguZnV0dXJlTW91dGhzLA0KICAgICAgY2hpbGRyZW46bGl2aW5nLmZpbHRlcihwPT5wLmFkdWx0QXQ+bS5ub3cpLm1hcChwPT5wLmlkKSx1bmVtcGxveWVkOltdLGJsb2NrczpbXSxyZWFkeTpmYWxzZSxzdGF0dXM6J2ZpeGVkJ307DQogICAgY29uc3QgZmFtaWx5SWRzPW5ldyBTZXQoKHN0YXRlLmZhbWlsaWVzfHxbXSkuZmxhdE1hcChmPT5bZi5hLGYuYl0pKTsNCiAgICByZXN1bHQudW5lbXBsb3llZD1saXZpbmcuZmlsdGVyKHA9PnAuYWR1bHRBdDw9bS5ub3cmJnAuYXdheT09PW51bGwmJnAucGFyZW50cz8ubGVuZ3RoPT09MiYmDQogICAgICAhZmFtaWx5SWRzLmhhcyhwLmlkKSYmIXMucmVzaWRlbnRzLnNvbWUoY2hpbGQ9PmNoaWxkLnBhcmVudHM/LmluY2x1ZGVzKHAuaWQpKSYmDQogICAgICAocC5yb29tSWQ9PT1udWxsfHxzLnJvb21zLnNvbWUocj0+ci5pZD09PXAucm9vbUlkJiYoci50eXBlPT09J3F1YXJ0ZXJzJ3x8DQogICAgICAgIHNoZWx0ZXJSb29tc1tyLnR5cGVdPy5bMV0mJihyLmJ1aWx0QXQ+bS5ub3d8fHIudXBncmFkZUF0IT09bnVsbHx8ci5pbmNpZGVudHx8ci51bnBvd2VyZWR8fA0KICAgICAgICAgICEoc2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAscik+MCkpKSkpKS5tYXAocD0+cC5pZCk7DQogICAgaWYoIWNvbnRpbnVvdXMpcmV0dXJuIHsuLi5yZXN1bHQsbWVzc2FnZTpg5Zu65a6a5Lq65Y+j5LiK6ZmQICR7dGFyZ2V0Pz8n5pyq6K6+572uJ30g5Lq677yM5LiN6Ieq5Yqo5o+Q6auY44CCYH07DQogICAgaWYoIXZhbGlkKXJldHVybiB7Li4ucmVzdWx0LHN0YXR1czonaW52YWxpZCcsbWVzc2FnZTon5oyB57ut5Lq65Y+j5aKe6ZW/562J5b6F5pyJ5pWI55qE6Zi25q6155uu5qCH77yIMu+9njIwMO+8ieOAgid9Ow0KICAgIGlmKHRhcmdldD09PTIwMClyZXR1cm4gey4uLnJlc3VsdCxzdGF0dXM6J2xpbWl0JyxtZXNzYWdlOifkurrlj6PpmLbmrrXnm67moIflt7LliLAyMDDkurrnmoTnjrDmnInmlK/mjIHkuIrpmZDvvIznu6fnu63okL3lrp7miJDlubTlsLHkuJrkuI7kvpvlupTjgIInfTsNCiAgICBpZihsaXZpbmcubGVuZ3RoPHRhcmdldClyZXR1cm4gey4uLnJlc3VsdCxzdGF0dXM6J2dyb3dpbmcnLG1lc3NhZ2U6YOaMgee7reS6uuWPo+WinumVv++8muW9k+WJjemYtuautSAke2xpdmluZy5sZW5ndGh9LyR7dGFyZ2V0fSDkurrvvJvmnKzpmLbmrrXmiJDlubTjgIHlsLHkuJrlkozkvpvlupTokL3lrp7lkI7op4TliJIgJHtuZXh0fSDkurrjgIJgfTsNCiAgICBpZihwZW5kaW5nKXJlc3VsdC5ibG9ja3MucHVzaCgn5Y6f5pON5L2c57uT5p6c5bCa5pyq56Gu6K6kJyk7DQogICAgaWYoc3RhdGUucGFpcnx8c3RhdGUuc3dhcClyZXN1bHQuYmxvY2tzLnB1c2goJ+S6uuWRmOmFjeWvueaIluaNouS9jeWwmuacque7k+adnycpOw0KICAgIGlmKGdyb3d0aC5yZWNvdmVyaW5nKXJlc3VsdC5ibG9ja3MucHVzaChgJHtncm93dGgucmVjb3ZlcmluZ33lkI3lgJLkuIvlsYXmsJHlsJrlvoXmgaLlpI1gKTsNCiAgICBpZihzLmJpcnRocy5sZW5ndGh8fGdyb3d0aC5wYWlycy5zaXplfHxsaXZpbmcuc29tZShwPT5wLnJvbWFuY2UpKXJlc3VsdC5ibG9ja3MucHVzaCgn5pys6Zi25q615LuN5pyJ5b6F5Lqn5oiW5Z+55YW75oSf5oOF5Lit55qE5a625bqtJyk7DQogICAgaWYocmVzdWx0LmNoaWxkcmVuLmxlbmd0aClyZXN1bHQuYmxvY2tzLnB1c2goYCR7cmVzdWx0LmNoaWxkcmVuLmxlbmd0aH3lkI3lhL/nq6XlsJrmnKrmiJDlubRgKTsNCiAgICBpZihyZXN1bHQudW5lbXBsb3llZC5sZW5ndGgpcmVzdWx0LmJsb2Nrcy5wdXNoKGAke3Jlc3VsdC51bmVtcGxveWVkLmxlbmd0aH3lkI3miJDlubTlrZDlpbPlsJrmnKrokL3lrp7mnInmlYjnlJ/kuqflspfkvY1gKTsNCiAgICBpZihzLnJvb21zLnNvbWUocj0+ci5pbmNpZGVudCkpcmVzdWx0LmJsb2Nrcy5wdXNoKCfpgb/pmr7miYDkuovku7blsJrmnKrnu5PmnZ8nKTsNCiAgICBmb3IoY29uc3QgW3Jlc291cmNlLG5lZWRdIG9mIE9iamVjdC5lbnRyaWVzKGdyb3d0aC5kZW1hbmQpKXsNCiAgICAgIGlmKCEobS5wcm9kdWN0aW9uW3Jlc291cmNlXT49bmVlZCoxLjItMWUtOSkpcmVzdWx0LmJsb2Nrcy5wdXNoKGAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfeaXtuS6p+acqui+vuWIsOW9k+WJjemcgOaxguWPijIwJeS9memHj2ApOw0KICAgICAgaWYoIShzLnJlc291cmNlc1tyZXNvdXJjZV0+PW5lZWQqMikpcmVzdWx0LmJsb2Nrcy5wdXNoKGAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfeW6k+WtmOS4jei2s+W9k+WJjemcgOaxgueahOS4pOWwj+aXtuWCqOWkh2ApOw0KICAgIH0NCiAgICByZXN1bHQucmVhZHk9cmVzdWx0LmJsb2Nrcy5sZW5ndGg9PT0wO3Jlc3VsdC5zdGF0dXM9cmVzdWx0LnJlYWR5PydyZWFkeSc6J3NldHRsaW5nJzsNCiAgICByZXN1bHQubWVzc2FnZT1yZXN1bHQucmVhZHk/YOaMgee7reS6uuWPo+WinumVv++8miR7dGFyZ2V0feS6uumYtuauteW3suiQveWunu+8jOS4i+S4gOmYtuautSAke25leHR9IOS6uu+8m+WFiOaMieWunumZheW6iuS9jeOAgeWPo+eyruWSjOWyl+S9jemAkOaJueWHhuWkh++8jOWGjeWuieaOkuaWsOWinueUn+iCsuOAgmA6DQogICAgICBg5oyB57ut5Lq65Y+j5aKe6ZW/77yaJHt0YXJnZXR9IOKGkiAke25leHR9IOS6uuetieW+he+8miR7cmVzdWx0LmJsb2Nrcy5qb2luKCfvvJsnKX3jgIJgOw0KICAgIHJldHVybiByZXN1bHQ7DQogIH0NCiAgZnVuY3Rpb24gYWR2YW5jZVNoZWx0ZXJQb3B1bGF0aW9uKG0pIHsNCiAgICBpZighc2hlbHRlclBvcHVsYXRpb25Db250aW51b3VzfHxzaGVsdGVyU3RhZmZNb2RlIT09J3BvcHVsYXRpb24nfHxzaGVsdGVyU3RhZmZIb2xkKXJldHVybiBmYWxzZTsNCiAgICBjb25zdCBzdGFnZT1zaGVsdGVyUG9wdWxhdGlvblN0YWdlKG0sc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsdHJ1ZSxzaGVsdGVyU3RhdGUsc2hlbHRlclBlbmRpbmcpOw0KICAgIGlmKCFzdGFnZS5yZWFkeXx8cG9wdWxhdGlvblRhcmdldCgpIT09c2hlbHRlclBvcHVsYXRpb25UYXJnZXR8fCFwb3B1bGF0aW9uQ29udGludW91cygpKXJldHVybiBmYWxzZTsNCiAgICBsb2NhbFN0b3JhZ2Uuc2V0SXRlbShTSEVMVEVSX1BPUFVMQVRJT05fQ09OVElOVU9VUywndHJ1ZScpOw0KICAgIGxvY2FsU3RvcmFnZS5zZXRJdGVtKFNIRUxURVJfUE9QVUxBVElPTixTdHJpbmcoc3RhZ2UubmV4dFRhcmdldCkpOw0KICAgIGlmKHBvcHVsYXRpb25UYXJnZXQoKSE9PXN0YWdlLm5leHRUYXJnZXQpdGhyb3cgRXJyb3IoJ+S4i+S4gOS6uuWPo+mYtuauteacquaIkOWKn+S/neWtmO+8jOWBnOatouaOqOi/mycpOw0KICAgIHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0PXN0YWdlLm5leHRUYXJnZXQ7c2hlbHRlclBvcHVsYXRpb25Ob3RlPXN0YWdlLm1lc3NhZ2U7Y2FuY2VsUXVldWVkKCk7DQogICAgc2F2ZVNoZWx0ZXIoey4uLnNoZWx0ZXJTdGF0ZSxuZXh0QXQ6MCxub3RlOmDkurrlj6PpmLbmrrUgJHtzdGFnZS50YXJnZXR9IOKGkiAke3N0YWdlLm5leHRUYXJnZXR977yM5oyJ5a6e6ZmF5om/6L295p2h5Lu257un57ut5aKe6ZW/YH0pOw0KICAgIGxvZy5hZGQoJ3NoZWx0ZXItcG9wdWxhdGlvbi1zdGFnZScsJ+acrOmYtuauteaIkOW5tOOAgeWwseS4muWSjOS+m+W6lOW3suiQveWunu+8jOi/m+WFpeS4i+S4gOS6uuWPo+mYtuautScsc3RhZ2UpOw0KICAgIHNjaGVkdWxlKCk7cmV0dXJuIHRydWU7DQogIH0NCiAgLy8g5YWs5byA5oiY5Yqb5YWs5byP77yb5o6J6JC95ZKM6YeO5aSW5Lyk5a6z55qE5ZCO5Y+w5YWs5byP5pyq55+l77yM5LiN55So5bm46L+Q5o6o5pat5rG95rC05pS255uK44CCDQogIGZ1bmN0aW9uIHNoZWx0ZXJDb21iYXQocyxwKSB7DQogICAgaWYoIXB8fCFOdW1iZXIuaXNGaW5pdGUocC54cCl8fHAueHA8MClyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBvdXRmaXQ9cy5pdGVtcy5maW5kKGk9PmkuaWQ9PT1wLm91dGZpdElkKSx3ZWFwb249cy5pdGVtcy5maW5kKGk9PmkuaWQ9PT1wLndlYXBvbklkKTsNCiAgICBpZihwLm91dGZpdElkIT1udWxsJiYhb3V0Zml0fHxwLndlYXBvbklkIT1udWxsJiYhd2VhcG9uKXJldHVybiBudWxsOw0KICAgIGxldCByZXN1bHQ9MipNYXRoLm1pbig1MCwxK01hdGguZmxvb3IoTWF0aC5zcXJ0KHAueHAvMykpKTsNCiAgICBmb3IoY29uc3QgayBvZiBbJ3N0cicsJ2VuZCcsJ2FnaSddKXsNCiAgICAgIGNvbnN0IGJhc2U9cC5zdGF0cz8uW2tdLGJvbnVzPW91dGZpdD8uYm9udXM/LltrXT8/MDsNCiAgICAgIGlmKCFOdW1iZXIuaXNGaW5pdGUoYmFzZSl8fGJhc2U8MHx8YmFzZT4xMHx8IU51bWJlci5pc0Zpbml0ZShib251cyl8fGJvbnVzPDApcmV0dXJuIG51bGw7DQogICAgICByZXN1bHQrPU1hdGgubWluKDE3LGJhc2UrYm9udXMpOw0KICAgIH0NCiAgICBpZih3ZWFwb24pe2lmKHdlYXBvbi5zbG90IT09J3dlYXBvbid8fCFBcnJheS5pc0FycmF5KHdlYXBvbi5kYW1hZ2UpfHx3ZWFwb24uZGFtYWdlLmxlbmd0aCE9PTJ8fA0KICAgICAgIXdlYXBvbi5kYW1hZ2UuZXZlcnkobj0+TnVtYmVyLmlzRmluaXRlKG4pJiZuPj0wKSlyZXR1cm4gbnVsbDtyZXN1bHQrPXdlYXBvbi5kYW1hZ2VbMF0rd2VhcG9uLmRhbWFnZVsxXTt9DQogICAgcmV0dXJuIHJlc3VsdDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUXVlc3RDaGFuY2UoY29tYmF0LHEpIHsNCiAgICBpZighTnVtYmVyLmlzRmluaXRlKGNvbWJhdCl8fCEoY29tYmF0PjApfHwhTnVtYmVyLmlzRmluaXRlKHE/LmRpZmZpY3VsdHkpfHxxLmRpZmZpY3VsdHk8PTB8fCFOdW1iZXIuaXNJbnRlZ2VyKHEuc3RhZ2VzKXx8cS5zdGFnZXM8MXx8cS5zdGFnZXM+NTApcmV0dXJuIG51bGw7DQogICAgbGV0IGNoYW5jZT0xO2ZvcihsZXQgaT0wO2k8cS5zdGFnZXM7aSsrKWNoYW5jZSo9Y29tYmF0Lyhjb21iYXQrNDQqcS5kaWZmaWN1bHR5LyhxLmRpZmZpY3VsdHkrNCkqKDErLjA1KmkpKTsNCiAgICByZXR1cm4gY2hhbmNlOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJRdWVzdEdyb3d0aChjb21iYXQscSx0ZWFtKSB7DQogICAgaWYoc2hlbHRlclF1ZXN0Q2hhbmNlKGNvbWJhdCxxKT09PW51bGx8fCFBcnJheS5pc0FycmF5KHRlYW0pfHwhdGVhbS5sZW5ndGh8fA0KICAgICAgdGVhbS5zb21lKHA9PiFOdW1iZXIuaXNGaW5pdGUocC54cCl8fHAueHA8MCkpcmV0dXJuIG51bGw7DQogICAgY29uc3QgcGVyc29uSG91cnM9cS5zdGFnZXMqcS5zdGFnZU1pbnV0ZXMvNjAqdGVhbS5sZW5ndGg7DQogICAgaWYoIShwZXJzb25Ib3Vycz4wKXx8IU51bWJlci5pc0Zpbml0ZShwZXJzb25Ib3VycykpcmV0dXJuIG51bGw7DQogICAgLy8g5a2Y5rS76Zif5ZGY5q+P6L+H5LiA5YWz6I635b6XM8OX6Zq+5bqm57uP6aqM44CC5aSx6LSl5YmN5bey6L+H5YWz55qE57uP6aqM5LuN6K6h5YWl77ybNTDnuqflkI7nmoTlop7plb/ml6DnrYnnuqfmlLbnm4rjgIINCiAgICAvLyDmjInlh7rlj5HmiJjlipvkuI3lj5jjgIHpmJ/lkZjlrZjmtLvkvLDnrpfvvIzkuI3omZrmnoTpgJTkuK3ljYfnuqfjgIHmrbvkuqHkuI7ov5TnqIsv55aX5Lyk5qih5Z6L44CCDQogICAgY29uc3QgeHBQZXJTdGFnZT0zKnEuZGlmZmljdWx0eSxoZWFkcm9vbT10ZWFtLm1hcChwPT5NYXRoLm1heCgwLDcyMDMtcC54cCkpOw0KICAgIGxldCBwcm9iYWJpbGl0eT0xLGV4cGVjdGVkVXNlZnVsWHA9MCx1c2VmdWxYcE9uU3VjY2Vzcz0wOw0KICAgIGZvcihsZXQgaT0wO2k8cS5zdGFnZXM7aSsrKXsNCiAgICAgIHByb2JhYmlsaXR5Kj1jb21iYXQvKGNvbWJhdCs0NCpxLmRpZmZpY3VsdHkvKHEuZGlmZmljdWx0eSs0KSooMSsuMDUqaSkpOw0KICAgICAgY29uc3QgdXNlZnVsPWhlYWRyb29tLnJlZHVjZSgobixsZWZ0KT0+bitNYXRoLm1pbih4cFBlclN0YWdlLE1hdGgubWF4KDAsbGVmdC1pKnhwUGVyU3RhZ2UpKSwwKTsNCiAgICAgIGV4cGVjdGVkVXNlZnVsWHArPXByb2JhYmlsaXR5KnVzZWZ1bDt1c2VmdWxYcE9uU3VjY2Vzcys9dXNlZnVsOw0KICAgIH0NCiAgICByZXR1cm4ge3hwUGVyU3RhZ2UsZXhwZWN0ZWRVc2VmdWxYcCx1c2VmdWxYcE9uU3VjY2Vzcyx4cFJhdGU6ZXhwZWN0ZWRVc2VmdWxYcC9wZXJzb25Ib3Vyc307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclF1ZXN0VmFsdWUocSxjaGFuY2UsY291bnQsc2Vhc29uUG9pbnRzLHNjcmFwTG9zcyxncm93dGg9bnVsbCkgew0KICAgIGNvbnN0IHI9cS5yZXdhcmRzLGhvdXJzPXEuc3RhZ2VzKnEuc3RhZ2VNaW51dGVzLzYwLHBlcnNvbkhvdXJzPWhvdXJzKmNvdW50Ow0KICAgIGlmKCFyfHwhWydzY3JhcCcsJ3BhcnRzJywnc2Vhc29uUG9pbnRzJ10uZXZlcnkoaz0+TnVtYmVyLmlzRmluaXRlKHJba10pJiZyW2tdPj0wKXx8DQogICAgICAgICEoci5pdGVtVGllcj09PW51bGx8fE51bWJlci5pc0ludGVnZXIoci5pdGVtVGllcikmJnIuaXRlbVRpZXI+PTAmJnIuaXRlbVRpZXI8PTYpfHwNCiAgICAgICAgIShwZXJzb25Ib3Vycz4wKXx8IU51bWJlci5pc0Zpbml0ZShwZXJzb25Ib3VycykpcmV0dXJuIG51bGw7DQogICAgLy8gMTUw56ev5YiG5LiA5qGj77yM5YWN6LS55qGj5LiK6ZmQMzDjgILmr5TovoPkuI3lkIzph4/nurLml7bph4fnlKjmmI7noa7kvJjlhYjluo/vvIzkuI3omZrmnoToo4XlpIfkuI7msb3msLTnmoTlhZHmjaLku7fmoLzjgIINCiAgICBjb25zdCBwb2ludHM9TWF0aC5taW4oci5zZWFzb25Qb2ludHMsTWF0aC5tYXgoMCw0NTAwLXNlYXNvblBvaW50cykpOw0KICAgIGNvbnN0IHNlYXNvblJhdGU9Y2hhbmNlKnBvaW50cy9wZXJzb25Ib3VycyxnZWFyUmF0ZT1yLml0ZW1UaWVyPT09bnVsbD8wOmNoYW5jZS9wZXJzb25Ib3VyczsNCiAgICBjb25zdCBzY3JhcFJhdGU9KGNoYW5jZSpyLnNjcmFwLXNjcmFwTG9zcypob3VycykvcGVyc29uSG91cnMscGFydHNSYXRlPWNoYW5jZSpyLnBhcnRzL3BlcnNvbkhvdXJzOw0KICAgIHJldHVybiB7aG91cnMscGVyc29uSG91cnMsc2Vhc29uUmF0ZSxnZWFyUmF0ZSxzY3JhcFJhdGUscGFydHNSYXRlLGdyb3d0aCxzY3JhcE5ldE9uU3VjY2VzczpyLnNjcmFwLXNjcmFwTG9zcypob3VycywNCiAgICAgIHJhbms6W3NlYXNvblJhdGUsci5pdGVtVGllcj09PW51bGw/LTE6ci5pdGVtVGllcixnZWFyUmF0ZSxwYXJ0c1JhdGUsc2NyYXBSYXRlLGdyb3d0aD8ueHBSYXRlPz8wXSwNCiAgICAgIHJld2FyZHM6ey4uLnJ9LG5leHRTb2RhUG9pbnRzOlsxNTAwLDMwMDAsNDUwMF0uZmluZChuPT5uPnNlYXNvblBvaW50cyk/P251bGx9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJRdWVzdEJldHRlcihhLGIpIHsNCiAgICBpZighYilyZXR1cm4gdHJ1ZTsNCiAgICBmb3IobGV0IGk9MDtpPGEudmFsdWUucmFuay5sZW5ndGg7aSsrKXsNCiAgICAgIGNvbnN0IGRpZmZlcmVuY2U9YS52YWx1ZS5yYW5rW2ldLWIudmFsdWUucmFua1tpXTtpZihNYXRoLmFicyhkaWZmZXJlbmNlKT4xZS05KXJldHVybiBkaWZmZXJlbmNlPjA7DQogICAgfQ0KICAgIGlmKE1hdGguYWJzKGEuY29zdC1iLmNvc3QpPjFlLTkpcmV0dXJuIGEuY29zdDxiLmNvc3Q7DQogICAgaWYoYS50ZWFtLmxlbmd0aCE9PWIudGVhbS5sZW5ndGgpcmV0dXJuIGEudGVhbS5sZW5ndGg8Yi50ZWFtLmxlbmd0aDsNCiAgICBpZihNYXRoLmFicyhhLmNoYW5jZS1iLmNoYW5jZSk+MWUtOSlyZXR1cm4gYS5jaGFuY2U+Yi5jaGFuY2U7DQogICAgcmV0dXJuIGEucS5pZDxiLnEuaWQ7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNvbWJhdExvYWRvdXQocyx0ZWFtLGVuYWJsZWQsYmxvY2tlZD1bXSxvcHRpb25zPW5ldyBNYXAoKSkgew0KICAgIC8vIOavj+S7tumXsue9ruijheWkh+WPquWIhue7meS4gOS6uuOAgumYn+S8jeiHs+WkmjPkurrvvIzmjInkurrlkZjlrZDpm4bmr5TovoPliIbphY3vvIzkuI3miorlkIzkuIDku7bmrablmajnmoTmlLbnm4rph43lpI3nm7jliqDjgIINCiAgICBjb25zdCBiYXNlPXRlYW0ubWFwKHA9PnNoZWx0ZXJDb21iYXQocyxwKSk7DQogICAgaWYoYmFzZS5zb21lKG49Pm49PT1udWxsKSlyZXR1cm4gbnVsbDsNCiAgICBjb25zdCByZXN1bHQ9e2NvbWJhdDpiYXNlLnJlZHVjZSgobix2KT0+bit2LDApLGNoYW5nZXM6W119Ow0KICAgIGlmKCFlbmFibGVkKXJldHVybiByZXN1bHQ7DQogICAgY29uc3QgdXNlZD1uZXcgU2V0KFsuLi5ibG9ja2VkLC4uLnMucmVzaWRlbnRzLmZsYXRNYXAocD0+W3Aud2VhcG9uSWQscC5vdXRmaXRJZF0pXSk7DQogICAgZm9yKGNvbnN0IHNsb3Qgb2YgWyd3ZWFwb24nLCdvdXRmaXQnXSl7DQogICAgICBjb25zdCByYW5rZWQ9dGVhbS5tYXAoKHAsaW5kZXgpPT57DQogICAgICAgIGNvbnN0IGtleT1wLmlkKyc6JytzbG90Ow0KICAgICAgICBpZighb3B0aW9ucy5oYXMoa2V5KSlvcHRpb25zLnNldChrZXkscy5pdGVtcy5maWx0ZXIoaT0+aS5zbG90PT09c2xvdCkubWFwKGl0ZW09PnsNCiAgICAgICAgICBjb25zdCB2YWx1ZT1zaGVsdGVyQ29tYmF0KHMsey4uLnAsW2Ake3Nsb3R9SWRgXTppdGVtLmlkfSk7cmV0dXJuIHtpdGVtLGdhaW46dmFsdWU9PT1udWxsPzA6dmFsdWUtYmFzZVtpbmRleF19Ow0KICAgICAgICB9KS5maWx0ZXIoeD0+eC5nYWluPjApLnNvcnQoKGEsYik9PmIuZ2Fpbi1hLmdhaW58fGEuaXRlbS5pZC1iLml0ZW0uaWQpKTsNCiAgICAgICAgLy8gTuS6uumYn+S8jeiHs+WkmuS6ieeUqE4tMeS7tuijheWkh++8m+avj+S6uuS/neeVmeWJjU7ku7bljbPlj6/kv53nlZnmnIDkvJjliIbphY3vvIzkuI3miKrmlq3mlbTkuKrlupPlrZjjgIINCiAgICAgICAgcmV0dXJuIG9wdGlvbnMuZ2V0KGtleSkuZmlsdGVyKHg9PiF1c2VkLmhhcyh4Lml0ZW0uaWQpKS5zbGljZSgwLHRlYW0ubGVuZ3RoKTsNCiAgICAgIH0pOw0KICAgICAgY29uc3QgaXRlbXM9Wy4uLm5ldyBNYXAocmFua2VkLmZsYXQoKS5tYXAoeD0+W3guaXRlbS5pZCx4Lml0ZW1dKSkudmFsdWVzKCldOw0KICAgICAgbGV0IHN0YXRlcz1uZXcgTWFwKFtbMCx7Z2FpbjowLGNoYW5nZXM6W119XV0pOw0KICAgICAgZm9yKGNvbnN0IGl0ZW0gb2YgaXRlbXMpew0KICAgICAgICBjb25zdCBnYWlucz1yYW5rZWQubWFwKGxpc3Q9Pmxpc3QuZmluZCh4PT54Lml0ZW0uaWQ9PT1pdGVtLmlkKT8uZ2Fpbnx8MCk7DQogICAgICAgIGNvbnN0IG5leHQ9bmV3IE1hcChzdGF0ZXMpOw0KICAgICAgICBmb3IoY29uc3QgW21hc2sscGxhbl0gb2Ygc3RhdGVzKWZvcihsZXQgaT0wO2k8dGVhbS5sZW5ndGg7aSsrKXsNCiAgICAgICAgICBpZihtYXNrJigxPDxpKSljb250aW51ZTsNCiAgICAgICAgICBjb25zdCBnYWluPWdhaW5zW2ldOw0KICAgICAgICAgIGlmKGdhaW48PTApY29udGludWU7DQogICAgICAgICAgY29uc3Qga2V5PW1hc2t8KDE8PGkpLHRvdGFsPXBsYW4uZ2FpbitnYWluOw0KICAgICAgICAgIGlmKCFuZXh0LmhhcyhrZXkpfHx0b3RhbD5uZXh0LmdldChrZXkpLmdhaW4pbmV4dC5zZXQoa2V5LHtnYWluOnRvdGFsLGNoYW5nZXM6Wy4uLnBsYW4uY2hhbmdlcywNCiAgICAgICAgICAgIHtpZDp0ZWFtW2ldLmlkLHNsb3QsaXRlbTppdGVtLmlkLGZyb21JdGVtOnRlYW1baV1bYCR7c2xvdH1JZGBdfV19KTsNCiAgICAgICAgfQ0KICAgICAgICBzdGF0ZXM9bmV4dDsNCiAgICAgIH0NCiAgICAgIGNvbnN0IGJlc3Q9Wy4uLnN0YXRlcy52YWx1ZXMoKV0uc29ydCgoYSxiKT0+Yi5nYWluLWEuZ2Fpbnx8YS5jaGFuZ2VzLmxlbmd0aC1iLmNoYW5nZXMubGVuZ3RoKVswXTsNCiAgICAgIHJlc3VsdC5jb21iYXQrPWJlc3QuZ2FpbjtyZXN1bHQuY2hhbmdlcy5wdXNoKC4uLmJlc3QuY2hhbmdlcyk7DQogICAgfQ0KICAgIHJldHVybiByZXN1bHQ7DQogIH0NCiAgZnVuY3Rpb24gdmFsaWRTaGVsdGVyU29kYVJlY2VpcHRzKGVudHJpZXMpIHsNCiAgICByZXR1cm4gQXJyYXkuaXNBcnJheShlbnRyaWVzKSYmZW50cmllcy5sZW5ndGg8PTIwMDAmJmVudHJpZXMuZXZlcnkocj0+b2JqZWN0U3RhdGUocikmJg0KICAgICAgdHlwZW9mIHIub3BlcmF0aW9uPT09J3N0cmluZycmJnIub3BlcmF0aW9uLmxlbmd0aD4wJiZyLm9wZXJhdGlvbi5sZW5ndGg8PTEwMCYmDQogICAgICBbJ3ZhdWx0Tm8nLCdleHBsb3JlcklkJywncmVzaWRlbnRJZCcsJ2Ftb3VudCddLmV2ZXJ5KGs9Pk51bWJlci5pc1NhZmVJbnRlZ2VyKHJba10pJiZyW2tdPjApJiYNCiAgICAgIE51bWJlci5pc0Zpbml0ZShyLmF0KSYmci5hdD49MCkmJm5ldyBTZXQoZW50cmllcy5tYXAocj0+ci5vcGVyYXRpb24pKS5zaXplPT09ZW50cmllcy5sZW5ndGg7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclNvZGFRdW90YShtLGVudHJpZXM9W10pIHsNCiAgICBjb25zdCBsaW1pdD1tLnZpZXcuZHJvcHM/LnBlclVzZXJEYWlseSx2YWxpZExpbWl0PU51bWJlci5pc1NhZmVJbnRlZ2VyKGxpbWl0KSYmbGltaXQ+PTA7DQogICAgY29uc3QgcmVzdWx0PXttb2RlOidjb25maXJtZWQtcm9sbGluZy0yNGgtYWR2aXNvcnknLGxpbWl0OnZhbGlkTGltaXQ/bGltaXQ6bnVsbCxvYnNlcnZlZDowLGhpc3RvcnlDb21wbGV0ZTpmYWxzZSwNCiAgICAgIGJsb2NrZWQ6ZmFsc2UscmVhc29uOidiZWxvdy1vYnNlcnZlZC1saW1pdCcscmVzdW1lQXQ6bnVsbH07DQogICAgaWYoIXZhbGlkU2hlbHRlclNvZGFSZWNlaXB0cyhlbnRyaWVzKSlyZXR1cm4gey4uLnJlc3VsdCxibG9ja2VkOnRydWUscmVhc29uOidpbnZhbGlkLXJlY2VpcHRzJ307DQogICAgY29uc3Qgb3duPWVudHJpZXMuZmlsdGVyKHI9PnIudmF1bHRObz09PW0udmlldy52YXVsdE5vKTsNCiAgICBpZihvd24uc29tZShyPT5yLmF0Pm0ubm93KSlyZXR1cm4gey4uLnJlc3VsdCxibG9ja2VkOnRydWUscmVhc29uOidzbmFwc2hvdC1iZWZvcmUtcmVjZWlwdCd9Ow0KICAgIGNvbnN0IHJlY2VudD1vd24uZmlsdGVyKHI9Pm0ubm93LXIuYXQ8ODY0MDAwMDApLnNvcnQoKGEsYik9PmEuYXQtYi5hdCk7DQogICAgcmVzdWx0Lm9ic2VydmVkPXJlY2VudC5yZWR1Y2UoKG4scik9Pm4rci5hbW91bnQsMCk7DQogICAgaWYoIXZhbGlkTGltaXQpcmV0dXJuIHsuLi5yZXN1bHQsYmxvY2tlZDp0cnVlLHJlYXNvbjonbGltaXQtdW5hdmFpbGFibGUnfTsNCiAgICBpZihsaW1pdD09PTApcmV0dXJuIHsuLi5yZXN1bHQsYmxvY2tlZDp0cnVlLHJlYXNvbjonemVyby1saW1pdCd9Ow0KICAgIC8vIOa7muWKqOmihuWPlue7n+iuoeS4jeiDveivgeaYjua4uOaIj+W9k+WkqeW3sui+vumine+8jOS5n+S4jeiDveaNruatpOeUn+aIkDI05bCP5pe25YGc5rS+56qX5Y+j44CCDQogICAgaWYocmVzdWx0Lm9ic2VydmVkPj1saW1pdClyZXN1bHQucmVhc29uPSdvYnNlcnZlZC1saW1pdC1hZHZpc29yeSc7DQogICAgcmV0dXJuIHJlc3VsdDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyU29kYVF1b3RhVGV4dChxKSB7DQogICAgY29uc3QgcmVhc29ucz17J2ludmFsaWQtcmVjZWlwdHMnOifpooblj5borrDlvZXkuI3lj6/moLjlr7knLCdzbmFwc2hvdC1iZWZvcmUtcmVjZWlwdCc6J+acjeWKoeWZqOW/q+eFp+aXqeS6juW3suehruiupOmihuWPlicsDQogICAgICAnbGltaXQtdW5hdmFpbGFibGUnOifnvZHpobXmr4/ml6Xmsb3msLTnk7bmlbDkuI3lj6/moLjlr7knLCd6ZXJvLWxpbWl0Jzon572R6aG15q+P5pel5rG95rC05LiK6ZmQ5Li6MCcsDQogICAgICAnb2JzZXJ2ZWQtbGltaXQtYWR2aXNvcnknOiforrDlvZXmlbDovr7liLDnvZHpobXmr4/ml6XkuIrpmZDvvIzku4XkvZzmj5DnpLrvvIzkuI3og73or4HmmI7lvZPlpKnlt7Lpoobmu6EnLA0KICAgICAgJ2JlbG93LW9ic2VydmVkLWxpbWl0Jzon5bey55+l6K6w5b2V5pWw5L2O5LqO572R6aG15q+P5pel5LiK6ZmQJ307DQogICAgcmV0dXJuIGDmsb3msLTvvJrnvZHpobXmr4/ml6XkuIrpmZAgJHtxLmxpbWl0Pz8n5pyq55+lJ30g55O277yb6L+RMjTlsI/ml7blt7Lnoa7orqQgJHtxLm9ic2VydmVkfSDnk7bvvIwke3JlYXNvbnNbcS5yZWFzb25dfeOAgmArDQogICAgICAocS5ibG9ja2VkPyfmlYjnjofmqKHlvI/mmoLlgZzmlrDlop7mjqLpmanvvJvljp/lj6zlm57jgIHpooblj5bkuI7lhbbku5blj5HlsZXnu6fnu63jgIInOifpop3luqbpmZDliLbnk7bmlbDvvIzkuI3pmZDliLbmtL7pgaPmrKHmlbDjgIInKSsNCiAgICAgICflj6rnu5/orqHohJrmnKznoa7orqTlm57miafvvIzmnKropobnm5bmiYvliqgv5pen54mIL+S4ouWkseWbnuaJp++8m+a7muWKqDI05bCP5pe25LiN5piv5ri45oiP5pel6aKd5bqm77yM5LiN5o2u5q2k5YGc5rS+44CCJzsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRXhwbG9yZUVmZmljaWVuY3kobSxjZmcpIHsNCiAgICBjb25zdCBkcm9wcz1tLnZpZXcuZHJvcHM7DQogICAgaWYoZHJvcHM/LmVuYWJsZWQhPT10cnVlfHwhTnVtYmVyLmlzRmluaXRlKGRyb3BzLm1pbk1pbnV0ZXMpfHxkcm9wcy5taW5NaW51dGVzPDB8fA0KICAgICAgIUFycmF5LmlzQXJyYXkoZHJvcHMudGllclBlcm1pbGxlKXx8IWRyb3BzLnRpZXJQZXJtaWxsZS5sZW5ndGh8fA0KICAgICAgIWRyb3BzLnRpZXJQZXJtaWxsZS5ldmVyeShuPT5OdW1iZXIuaXNGaW5pdGUobikmJm4+PTAmJm48PTEwMDApfHwhTnVtYmVyLmlzSW50ZWdlcihtLnN0YXRlLmRlcHRoKXx8bS5zdGF0ZS5kZXB0aDwxKXJldHVybiBudWxsOw0KICAgIC8vIOWOn+eUn+ivtOaYju+8muavjzMw5YiG6ZKf5LiA5qyh5LqL5Lu277yM6L+U56iL5Li65aSW5Ye65pe26ZW/55qE5LiA5Y2K44CC5LuF5LyY5YyW5rG95rC06LWE5qC85Y2g55So77yM5LiN5Lyw566X5pyq55+l5Lyk5a6z44CCDQogICAgY29uc3QgaG91cnM9Y2ZnLnNvZGFFZmZpY2llbmN5P01hdGgubWF4KC41LGRyb3BzLm1pbk1pbnV0ZXMvNjApOk1hdGgubWF4KGNmZy5ob3Vycyxkcm9wcy5taW5NaW51dGVzLzYwKTsNCiAgICBpZighTnVtYmVyLmlzRmluaXRlKGhvdXJzKXx8aG91cnM+MjQpcmV0dXJuIG51bGw7DQogICAgY29uc3QgbWF4VGllcj1NYXRoLm1pbihjZmcudGllcixNYXRoLmZsb29yKG0uc3RhdGUuZGVwdGgvMTApLGRyb3BzLnRpZXJQZXJtaWxsZS5sZW5ndGgtMSk7DQogICAgbGV0IHRpZXI9bWF4VGllcjsNCiAgICBpZihjZmcuc29kYUVmZmljaWVuY3kpew0KICAgICAgdGllcj0wOw0KICAgICAgZm9yKGxldCBpPTE7aTw9bWF4VGllcjtpKyspaWYoZHJvcHMudGllclBlcm1pbGxlW2ldPmRyb3BzLnRpZXJQZXJtaWxsZVt0aWVyXSl0aWVyPWk7DQogICAgfQ0KICAgIHJldHVybiB7aG91cnMsdGllcixwcm9iYWJpbGl0eTpkcm9wcy50aWVyUGVybWlsbGVbdGllcl0vMTAwMCxjeWNsZUhvdXJzOmhvdXJzKjEuNX07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclRyaXBFdmlkZW5jZShtLGUsZXZlbnRzKSB7DQogICAgaWYoZS5hYnlzcyE9PWZhbHNlfHwhTnVtYmVyLmlzRmluaXRlKGUuc3RhcnRlZEF0KXx8ZS5zdGFydGVkQXQ+bS5ub3d8fG0ubm93LWUuc3RhcnRlZEF0PjcqODY0MDAwMDApcmV0dXJuIG51bGw7DQogICAgY29uc3QgY29uZmlybWF0aW9ucz1ldmVudHMuZmlsdGVyKHg9PngudHlwZT09PSdzaGVsdGVyLWNhbXBhaWduLWNvbmZpcm1lZCcmJnguZGF0YT8ua2luZD09PSdleHBsb3JlLXN0YXJ0JyYmDQogICAgICB4LmRhdGEubWlzc2lvbj09PWUuaWQmJnguZGF0YS50YXJnZXRzPy5bMF09PT1lLnJlc2lkZW50SWQmJnguZGF0YS50YXJnZXRzWzFdPT09ZS50aWVyJiYNCiAgICAgIE51bWJlci5pc0Zpbml0ZSh4LmRhdGEuYXQpJiZ4LmRhdGEuYXQ+PWUuc3RhcnRlZEF0JiZ4LmRhdGEuYXQtZS5zdGFydGVkQXQ8PTYwMDAwKTsNCiAgICBpZihjb25maXJtYXRpb25zLmxlbmd0aCE9PTEpcmV0dXJuIG51bGw7DQogICAgY29uc3QgZXZlbnQ9Y29uZmlybWF0aW9uc1swXSxkPWV2ZW50LmRhdGE7DQogICAgaWYoZC52YXVsdE5vIT09dW5kZWZpbmVkJiZkLnZhdWx0Tm8hPT1tLnZpZXcudmF1bHRObylyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBtYXRjaD1ldmVudC5kZXRhaWw/Lm1hdGNoKC9e5pmu6YCa5o6i6Zmp5Yy65Z+fKFxkKynvvIzorqHliJIoXGQrKD86XC5cZCspPynlsI/ml7YvKTsNCiAgICBjb25zdCBob3Vycz1kLnRyaXA/LmhvdXJzPz8obWF0Y2gmJittYXRjaFsyXSk7DQogICAgaWYoIU51bWJlci5pc0Zpbml0ZShob3Vycyl8fGhvdXJzPC41fHxob3Vycz4yNHx8IWV2ZW50LnBhZ2VJZClyZXR1cm4gbnVsbDsNCiAgICBpZihkLnRyaXAmJihkLnRyaXAuc3RhcnRlZEF0IT09ZS5zdGFydGVkQXR8fGQudHJpcC5pZCE9PWUuaWR8fGQudHJpcC5yZXNpZGVudCE9PWUucmVzaWRlbnRJZCkpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgc2FtZT14PT54LnBhZ2VJZD09PWV2ZW50LnBhZ2VJZCYmeC5kYXRhPy5raW5kPT09J2V4cGxvcmUtc3RhcnQnJiZKU09OLnN0cmluZ2lmeSh4LmRhdGEudGFyZ2V0cyk9PT1KU09OLnN0cmluZ2lmeShkLnRhcmdldHMpOw0KICAgIC8vIOaXp+aXpeW/l+ayoeaciei0puWPt+Wtl+aute+8muWQjOaXtuimgeaxguWQjOmhteeCueWHu+OAgee9kee7nOi/lOWbnuOAgeaIkOWKn+aguOWvueWPiueyvuehruihjOeoi+aXtueCue+8jOS4jeiDveS7heWHreWQjOWQjeWxheawkeaOpeeuoeOAgg0KICAgIGNvbnN0IHN1Ym1pdHRlZD1ldmVudHMuZmlsdGVyKHg9PngudHlwZT09PSdzaGVsdGVyLXN1Ym1pdHRlZCcmJnNhbWUoeCkmJnguYXQ8PWUuc3RhcnRlZEF0JiZlLnN0YXJ0ZWRBdC14LmF0PD01MDAwKTsNCiAgICBjb25zdCBjb21wbGV0ZWQ9ZXZlbnRzLmZpbHRlcih4PT54LnR5cGU9PT0nc2hlbHRlci1jb25maXJtZWQnJiZzYW1lKHgpJiZ4LmF0Pj1ldmVudC5hdCYmeC5hdC1ldmVudC5hdDw9MTAwMCk7DQogICAgaWYoc3VibWl0dGVkLmxlbmd0aCE9PTF8fGNvbXBsZXRlZC5sZW5ndGghPT0xKXJldHVybiBudWxsOw0KICAgIGNvbnN0IG5ldHdvcms9ZXZlbnRzLmZpbHRlcih4PT54LnR5cGU9PT0ncmVxdWVzdC1yZXN1bHQnJiZ4LnBhZ2VJZD09PWV2ZW50LnBhZ2VJZCYmeC5kYXRhPy5wYXRoPT09Jy9hcGkvc2hlbHRlci9hY3Rpb24nJiYNCiAgICAgIE1hdGguYWJzKHguZGF0YS5zdGFydGVkQXQtc3VibWl0dGVkWzBdLmF0KTw9MTAwJiZ4LmRhdGEuc3RhdHVzPj0yMDAmJnguZGF0YS5zdGF0dXM8MzAwJiZ4LmRhdGEub3V0Y29tZT09PSdvaycmJiF4LmRhdGEucmVkaXJlY3RlZCk7DQogICAgaWYobmV0d29yay5sZW5ndGghPT0xKXJldHVybiBudWxsOw0KICAgIHJldHVybiB7aWQ6ZS5pZCxyZXNpZGVudDplLnJlc2lkZW50SWQsYXQ6ZC5hdCxob3VycyxzdGFydGVkQXQ6ZS5zdGFydGVkQXQsdmF1bHRObzptLnZpZXcudmF1bHROb307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckRlZmVuc2VFbmFibGVkKGNmZykgeyByZXR1cm4gY2ZnLmRlZmVuc2U/P1snZXhwbG9yZScsJ3F1ZXN0cycsJ3RyYWluaW5nJywnbWVkaWNhbCcsJ3JhZGlvJywnY29tYmF0R2VhciddLnNvbWUoaz0+Y2ZnW2tdKTsgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRGVmZW5zZVBvd2VyKHMscCkgew0KICAgIGlmKHNoZWx0ZXJDb21iYXQocyxwKT09PW51bGwpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgb3V0Zml0PXMuaXRlbXMuZmluZChpPT5pLmlkPT09cC5vdXRmaXRJZCksd2VhcG9uPXMuaXRlbXMuZmluZChpPT5pLmlkPT09cC53ZWFwb25JZCk7DQogICAgcmV0dXJuIE1hdGgubWluKDE3LHAuc3RhdHMuc3RyKyhvdXRmaXQ/LmJvbnVzPy5zdHJ8fDApKSsod2VhcG9uPy5kYW1hZ2U/LnJlZHVjZSgoYSxiKT0+YStiLDApfHwwKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyR3VhcmRQbGFuKG0sY2ZnLGRlcGFydHVyZXM9W10sY2hhbmdlcz1bXSxyZWNvcmQ9e30sY2hlY2tGdXR1cmVQb3B1bGF0aW9uPWZhbHNlKSB7DQogICAgY29uc3Qgcz1tLnN0YXRlLHBvcHVsYXRpb249cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCkubGVuZ3RoK3MuYmlydGhzLmxlbmd0aDsNCiAgICBjb25zdCBtaW5pbXVtPWNmZy5ndWFyZFJlc2lkZW50cz8/MixwZXJjZW50PWNmZy5ndWFyZFBvd2VyUGVyY2VudD8/NTA7DQogICAgaWYoIXNoZWx0ZXJEZWZlbnNlRW5hYmxlZChjZmcpfHxwb3B1bGF0aW9uPDE1JiYhY2hlY2tGdXR1cmVQb3B1bGF0aW9uKXJldHVybiB7YWN0aXZlOmZhbHNlLGFsbG93ZWQ6dHJ1ZX07DQogICAgY29uc3QgYWR1bHRzPXMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwmJnAuYWR1bHRBdDw9bS5ub3cpLG91dD1uZXcgU2V0KGRlcGFydHVyZXMpOw0KICAgIGxldCB0b3RhbD0wLGtlcHQ9MCxjb3VudD0wLHVua25vd249ZmFsc2U7DQogICAgY29uc3QgcmVzaWRlbnRzPVtdOw0KICAgIGZvcihjb25zdCBvcmlnaW5hbCBvZiBhZHVsdHMpew0KICAgICAgY29uc3QgcD17Li4ub3JpZ2luYWx9Ow0KICAgICAgZm9yKGNvbnN0IGMgb2YgY2hhbmdlcylpZihjLmlkPT09cC5pZCYmWydvdXRmaXQnLCd3ZWFwb24nXS5pbmNsdWRlcyhjLnNsb3QpKXBbYCR7Yy5zbG90fUlkYF09Yy5pdGVtOw0KICAgICAgY29uc3QgcG93ZXI9c2hlbHRlckRlZmVuc2VQb3dlcihzLHApO2lmKHBvd2VyPT09bnVsbCl1bmtub3duPXRydWU7ZWxzZSB0b3RhbCs9cG93ZXI7DQogICAgICBjb25zdCBocD1zaGVsdGVySGVhbHRoKHApLHJvb209cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCk7DQogICAgICBjb25zdCBhdmFpbGFibGU9cC5hd2F5PT09bnVsbCYmIW91dC5oYXMocC5pZCkmJmhwJiZocC5ocD49LjcqaHAubWF4JiYNCiAgICAgICAgIXJlY29yZC5kZWZlbnNlTWFudWFsPy5pbmNsdWRlcyhwLmlkKSYmQm9vbGVhbihzaGVsdGVyUmVzaWRlbnRJZGVudGl0eShzLHApKSYmDQogICAgICAgIChwLnJvb21JZD09PW51bGx8fHJvb20mJnJvb20uYnVpbHRBdDw9bS5ub3cmJiFyb29tLmluY2lkZW50KTsNCiAgICAgIGlmKGF2YWlsYWJsZSYmcG93ZXIhPT1udWxsKXtjb3VudCsrO2tlcHQrPXBvd2VyO3Jlc2lkZW50cy5wdXNoKHAuaWQpO30NCiAgICB9DQogICAgY29uc3QgcmVxdWlyZWQ9dG90YWwqcGVyY2VudC8xMDA7DQogICAgY29uc3QgYWxsb3dlZD1jb3VudD49bWluaW11bSYmKCFwZXJjZW50fHwhdW5rbm93biYma2VwdCsxZS05Pj1yZXF1aXJlZCk7DQogICAgcmV0dXJuIHthY3RpdmU6dHJ1ZSxhbGxvd2VkLHBvcHVsYXRpb24sY291bnQsbWluaW11bSxwb3dlcjprZXB0LHRvdGFsUG93ZXI6dG90YWwscmVxdWlyZWRQb3dlcjpyZXF1aXJlZCxwZXJjZW50LHVua25vd24scmVzaWRlbnRzLA0KICAgICAgbm90ZTpg55WZ5a6I5qOA5p+l77yaJHtjb3VudH0vJHttaW5pbXVtfSDlkI3lgaXlurflnKjlrrbmiJDkurrvvIzlipvph4/kuI7mrablmajmjIfmoIcgJHtrZXB0LnRvRml4ZWQoMSl9LyR7cmVxdWlyZWQudG9GaXhlZCgxKX3vvIjlhajkvZPmiJDkurrlkKvlpJblh7rogIXnmoQke3BlcmNlbnR9Je+8iWArDQogICAgICAgIGAke3Vua25vd24/J++8m+mDqOWIhuijheWkh+aXoOazleaguOWvuSc6Jyd944CCJHthbGxvd2VkPyfmu6HotrPlvZPliY3nlZnlrojorr7nva7vvIzlubPml7blj6/mraPluLjnlJ/kuqcnOifkuI3otrPml7bmmoLnvJPmlrDlh7rlj5HvvIznu6fnu63lj6/ooYznmoTmsrvnlpfjgIHnlJ/kuqfkuI7lu7rorr4nfe+8m+aMh+agh+S4jeaYr+WunumZheavj+i9ruS8pOWus+aIluW/heiDnOS/neivgeOAgmB9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJEZWZlbnNlUmV0dXJuKG0sY2ZnLHJlY29yZCxlbnRyeSkgew0KICAgIC8vIE9yZGluYXJ5IHJlY292ZXJ5IG1heSByZXBsYW47IGluZGVwZW5kZW50IGVtZXJnZW5jeSBhY3Rpb25zIGtlZXAgdGhlIGV4aXN0aW5nDQogICAgLy8gdW5yZXNvbHZlZC1yZXF1ZXN0IGlzb2xhdGlvbiBjb250cmFjdC4gTmV2ZXIgdHVybiBhIHJlY2VpcHQgZ2FwIGludG8gYSBmcmVlIG1vdmUuDQogICAgaWYoIWNmZy5kZXZlbG9wbWVudHx8cmVjb3JkLnBlbmRpbmcpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgcz1tLnN0YXRlLG5vdz1tLm5vdyxwPXMucmVzaWRlbnRzLmZpbmQocD0+cC5pZD09PWVudHJ5LmlkKSxocD1wJiZzaGVsdGVySGVhbHRoKHApOw0KICAgIGlmKCFwfHwhaHB8fGhwLmhwPC42KmhwLm1heClyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBvcmlnaW5hbD1zLnJvb21zLmZpbmQocj0+ci5pZD09PWVudHJ5LmZyb20pLHJvbGU9KHJlY29yZC5yb2xlc3x8W10pLmZpbmQocj0+ci5pZD09PXAuaWQmJnIucm9vbT09PWVudHJ5LmZyb20pOw0KICAgIGNvbnN0IGZhbWlseUhlbGQ9KHJlY29yZC5mYW1pbHlSZXNlcnZlZHx8W10pLmluY2x1ZGVzKHAuaWQpfHxwLnJvbWFuY2UmJiFzaGVsdGVyRmFtaWx5RXhwZWN0aW5nKHMscC5pZCxwLnJvbWFuY2UucGFydG5lcklkKXx8DQogICAgICBzLmJpcnRocy5zb21lKGI9PiFzaGVsdGVyQmlydGhQYXJlbnRzKHMsYikmJihiLnJvb21JZD09PWVudHJ5LmZyb218fA0KICAgICAgICAocmVjb3JkLmZhbWlsaWVzfHxbXSkuc29tZShmPT5mLnJvb209PT1iLnJvb21JZCYmW2YuYSxmLmJdLmluY2x1ZGVzKHAuaWQpKSkpOw0KICAgIC8vIFByZXNlcnZlIGFuIGFjdHVhbCBmYW1pbHksIHVzZWZ1bCBzcGVjaWFsIGR1dHkgb3IgYW4gdW5maW5pc2hlZCB0cmFpbmluZyBwcm9taXNlLg0KICAgIC8vIE1pc3NpbmcgdHJhaW5pbmcgcHJvZ3Jlc3MvcHVycG9zZSBpcyBoYW5kbGVkIGJ5IHRoZSBub3JtYWwgaGlzdG9yaWNhbC1yb2xlIHJldmlldy4NCiAgICBjb25zdCB0cmFpbmluZ0ZpbmlzaGVkPXJvbGU/LnJvbGU9PT0ndHJhaW5pbmcnJiYocC5zdGF0c1tyb2xlLnN0YXRdPnJvbGUuYmFzZXx8DQogICAgICBOdW1iZXIuaXNGaW5pdGUocm9sZS51bnRpbCkmJm5vdz49cm9sZS51bnRpbHx8TnVtYmVyLmlzRmluaXRlKHJvbGUud2luZG93RW5kKSYmbm93Pj1yb2xlLndpbmRvd0VuZHx8IWNmZy50cmFpbmluZyk7DQogICAgY29uc3Qgc3BlY2lhbEhlbGQ9b3JpZ2luYWw/LnR5cGU9PT0ndHJhaW5pbmcnJiYhdHJhaW5pbmdGaW5pc2hlZHx8DQogICAgICBvcmlnaW5hbD8udHlwZT09PSd3b3Jrc2hvcCcmJmNmZy53b3Jrc2hvcCYmKGNmZy5wYXJ0c1RhcmdldD09PXVuZGVmaW5lZHx8cy5yZXNvdXJjZXMucGFydHM8Y2ZnLnBhcnRzVGFyZ2V0KXx8DQogICAgICBvcmlnaW5hbD8udHlwZT09PSdtZWRiYXknJiYocy5yZXNvdXJjZXMuc3RpbXBhazwoY2ZnLnJlc2VydmU/PzApKzF8fHMucmVzaWRlbnRzLnNvbWUocT0+ew0KICAgICAgICBjb25zdCBoPXNoZWx0ZXJIZWFsdGgocSk7cmV0dXJuIHEuZGVhZEF0PT09bnVsbCYmcS5hd2F5PT09bnVsbCYmaCYmaC5ocDwuOSpoLm1heDt9KSl8fA0KICAgICAgb3JpZ2luYWw/LnR5cGU9PT0ncmFkaW8nJiZjZmcucmFkaW87DQogICAgaWYoZmFtaWx5SGVsZHx8c3BlY2lhbEhlbGQpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgc3VwcGx5S2V5cz1bJ3Bvd2VyJywnZm9vZCcsJ3dhdGVyJ10sZGVtYW5kPXNoZWx0ZXJHcm93dGhOZWVkcyhtKS5kZW1hbmQ7DQogICAgY29uc3QgYWN0aXZlPXI9PnImJnIuYnVpbHRBdDw9bm93JiZyLnVwZ3JhZGVBdD09PW51bGwmJiFyLmluY2lkZW50JiYhci51bnBvd2VyZWQ7DQogICAgY29uc3QgYmFzaWM9cj0+Wydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddLmluY2x1ZGVzKHI/LnR5cGUpOw0KICAgIGNvbnN0IHJlc2VydmVkPShyb29tLGlkKT0+bmV3IFNldChbDQogICAgICAuLi4ocmVjb3JkLmRlZmVuc2V8fFtdKS5maWx0ZXIoZD0+ZC5pZCE9PWlkJiZkLmZyb209PT1yb29tLmlkJiZzLnJlc2lkZW50cy5zb21lKHE9PnEuaWQ9PT1kLmlkJiZxLmRlYWRBdD09PW51bGwmJnEuYXdheT09PW51bGwmJg0KICAgICAgICBbZC5yb29tLG51bGxdLmluY2x1ZGVzKHEucm9vbUlkKSkpLm1hcChkPT5kLmlkKSwNCiAgICAgIC4uLihyZWNvcmQucm9sZXN8fFtdKS5maWx0ZXIocj0+ci5pZCE9PWlkJiZyLnB1cnBvc2U9PT0ncHJvZHVjdGlvbicmJnIuZGVzdGluYXRpb249PT1yb29tLmlkJiYNCiAgICAgICAgcy5yZXNpZGVudHMuc29tZShxPT5xLmlkPT09ci5pZCYmcS5kZWFkQXQ9PT1udWxsJiYocS5yb29tSWQ9PT1yLnJvb218fA0KICAgICAgICAgIChyZWNvcmQuZGVmZW5zZXx8W10pLnNvbWUoZD0+ZC5pZD09PXEuaWQmJmQuZnJvbT09PXIucm9vbSkpKSkubWFwKHI9PnIuaWQpDQogICAgXSk7DQogICAgY29uc3QgYXZhaWxhYmxlPXI9PnsNCiAgICAgIGlmKCFhY3RpdmUocil8fCFiYXNpYyhyKSlyZXR1cm4gZmFsc2U7DQogICAgICBjb25zdCBvY2N1cGFudHM9bmV3IFNldChzLnJlc2lkZW50cy5maWx0ZXIocT0+cS5pZCE9PXAuaWQmJnEuZGVhZEF0PT09bnVsbCYmcS5hZHVsdEF0PD1ub3cmJnEucm9vbUlkPT09ci5pZCkubWFwKHE9PnEuaWQpKTsNCiAgICAgIGZvcihjb25zdCBpZCBvZiByZXNlcnZlZChyLHAuaWQpKW9jY3VwYW50cy5hZGQoaWQpOw0KICAgICAgcmV0dXJuIG9jY3VwYW50cy5zaXplPHIud2lkdGgqMjsNCiAgICB9Ow0KICAgIGNvbnN0IHdpdGhvdXQ9c2hlbHRlclByb2R1Y3Rpb25XaXRob3V0KG0sW3AuaWRdKTsNCiAgICBjb25zdCBjYW5kaWRhdGVzPXMucm9vbXMuZmlsdGVyKGF2YWlsYWJsZSkubWFwKHJvb209PnsNCiAgICAgIGNvbnN0IHByb2R1Y3Rpb249ey4uLndpdGhvdXR9LHJlc291cmNlPXNoZWx0ZXJSb29tc1tyb29tLnR5cGVdWzFdOw0KICAgICAgcHJvZHVjdGlvbltyZXNvdXJjZV0rPXNoZWx0ZXJXb3JrZXJSYXRlKHMsbm93LG0udmlldy5lbnYscCxyb29tKTsNCiAgICAgIGNvbnN0IHNob3J0YWdlcz1zdXBwbHlLZXlzLm1hcChrPT5NYXRoLm1heCgwLDEtcHJvZHVjdGlvbltrXS9NYXRoLm1heCgxZS05LGRlbWFuZFtrXSoxLjIpKSkuc29ydCgoYSxiKT0+Yi1hKTsNCiAgICAgIHJldHVybiB7cm9vbTpyb29tLmlkLHByb2R1Y3Rpb24sc2hvcnRhZ2VzfTsNCiAgICB9KS5maWx0ZXIoYz0+c3VwcGx5S2V5cy5ldmVyeShrPT5jLnByb2R1Y3Rpb25ba10rMWUtOT49TWF0aC5taW4obS5wcm9kdWN0aW9uW2tdLGRlbWFuZFtrXSoxLjIpKSk7DQogICAgY29uc3QgZGVzdGluYXRpb249dHJhaW5pbmdGaW5pc2hlZCYmcm9sZS5wdXJwb3NlPT09J3Byb2R1Y3Rpb24nP3JvbGUuZGVzdGluYXRpb246bnVsbDsNCiAgICBjb25zdCBjb21wYXJlPShhLGIpPT57DQogICAgICBmb3IobGV0IGk9MDtpPDM7aSsrKWlmKE1hdGguYWJzKGEuc2hvcnRhZ2VzW2ldLWIuc2hvcnRhZ2VzW2ldKT4xZS05KXJldHVybiBhLnNob3J0YWdlc1tpXS1iLnNob3J0YWdlc1tpXTsNCiAgICAgIC8vIEtlZXAgYSB2YWxpZCByZXR1cm4gcHJvbWlzZSB3aGVuIHN1cHBsaWVzIHRpZTsgYXZvaWQgZnJlZSBjcm9zcy1yZXNvdXJjZSB3ZWlnaHRzLg0KICAgICAgY29uc3QgcmFuaz1jPT5jLnJvb209PT1kZXN0aW5hdGlvbj8wOmMucm9vbT09PWVudHJ5LmZyb20/MTpjLnJvb209PT1wLnJvb21JZD8yOg0KICAgICAgICBzLnJvb21zLmZpbmQocj0+ci5pZD09PWMucm9vbSk/LnR5cGU9PT0nc2NyYXAnPzM6NDsNCiAgICAgIHJldHVybiByYW5rKGEpLXJhbmsoYil8fGEucm9vbS1iLnJvb207DQogICAgfTsNCiAgICBjYW5kaWRhdGVzLnNvcnQoY29tcGFyZSk7Y29uc3QgYmVzdD1jYW5kaWRhdGVzWzBdOw0KICAgIGlmKCFiZXN0KXJldHVybiB7d2FpdDp0cnVlLHJlYXNvbjon5oiY5ZCO5Y6f55So6YCU5aSx5pWI77yM5b2T5YmN5peg5LiN5oG25YyW5Z+656GA5L6b5bqU55qE5Y+v55So55Sf5Lqn5bKX77yM5L+d55WZ5oGi5aSN6K6w5b2VJ307DQogICAgcmV0dXJuIHtyb29tOmJlc3Qucm9vbSxzZXR0bGVkOmJlc3Qucm9vbT09PXAucm9vbUlkLA0KICAgICAgcmVhc29uOmJlc3Qucm9vbT09PWVudHJ5LmZyb20/J+aImOWQjumHjeaWsOaguOWvueS+m+W6lOS4juW4reS9je+8jOWOn+eUn+S6p+Wyl+S7jeWQiOmAgic6DQogICAgICAgIGJlc3Qucm9vbT09PWRlc3RpbmF0aW9uPyfmiJjlkI7orq3nu4Plt7LlrozmiJDmiJbliLDmnJ/vvIznm7TmjqXlhZHnjrDljp/nlJ/kuqfov5Tlspfnm67moIcnOg0KICAgICAgICAn5oiY5ZCO5oyJ5b2T5YmN5Z+656GA5L6b5bqU5ZKM5bey6aKE55WZ5bit5L2N6YeN5paw5bCx5Lia77yM5LiN562J5b6F5aSx5pWI5Y6f5bKX5L2NJywNCiAgICAgIHJlY292ZXJ5OntvcmlnaW5hbDplbnRyeS5mcm9tLGRlc3RpbmF0aW9uOmJlc3Qucm9vbSx0cmFpbmluZ0ZpbmlzaGVkOkJvb2xlYW4odHJhaW5pbmdGaW5pc2hlZCksDQogICAgICAgIGRlbWFuZCxwcm9kdWN0aW9uQmVmb3JlOnsuLi5tLnByb2R1Y3Rpb259LHByb2R1Y3Rpb25BZnRlcjpiZXN0LnByb2R1Y3Rpb259fTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRGVmZW5zZVBsYW4obSxjZmcscmVjb3JkPXt9KSB7DQogICAgY29uc3Qgcz1tLnN0YXRlLG5vdz1tLm5vdyxhY3Rpb25zPVtdLG5vdGVzPVtdLHNldHRsZWQ9W10scmVzZXJ2ZWQ9bmV3IFNldCgpLGpvdXJuYWw9cmVjb3JkLmRlZmVuc2V8fFtdOw0KICAgIGNvbnN0IHJhaWRzPXMucm9vbXMuZmlsdGVyKHI9PnIuaW5jaWRlbnQ/LmtpbmQ9PT0ncmFpZGVycycpLGFjdGl2ZT1yYWlkcy5sZW5ndGg+MDsNCiAgICBjb25zdCBlbmFibGVkPXNoZWx0ZXJEZWZlbnNlRW5hYmxlZChjZmcpLG5hbWU9cD0+U3RyaW5nKHAubmFtZSkubm9ybWFsaXplKCdORktDJykucmVwbGFjZSgvXHMrL2csJyAnKS50cmltKCk7DQogICAgaWYoIWVuYWJsZWQpcmV0dXJuIHthY3RpdmUsYnVzeTpmYWxzZSxhY3Rpb25zLG5vdGVzLHNldHRsZWQscmVzZXJ2ZWQ6am91cm5hbC5tYXAocj0+ci5pZCl9Ow0KICAgIGNvbnN0IGhvbWU9cD0+cC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW5vdyYmQm9vbGVhbihzaGVsdGVyUmVzaWRlbnRJZGVudGl0eShzLHApKTsNCiAgICBjb25zdCBoZWFsdGh5PXA9PnNoZWx0ZXJIZWFsdGgocCk/LmhwPj0uNypzaGVsdGVySGVhbHRoKHApPy5tYXg7DQogICAgY29uc3QgYXNzaWduPShwLHJvb20scm9sZSxmcm9tKT0+KHtraW5kOidhc3NpZ24nLGlkOnAuaWQsbmFtZTpuYW1lKHApLHJvb20sZnJvbTpwLnJvb21JZCx0YXJnZXRzOltwLmlkLHJvb21dLHJvbGUsb3JpZ2luYWw6ZnJvbSwNCiAgICAgIHJlYXNvbjpyb2xlPT09J2RlZmVuc2UnPyfkuLTml7blop7mj7TmjqDlpLrogIXkuovku7bvvIzorrDlvZXljp/lspfkvY3vvIznu5PmnZ/lkI7mgaLlpI0nOifmjqDlpLrogIXlt7LnprvlvIDljp/miL/pl7TvvIzmgaLlpI3mnKzohJrmnKzlronmjpLnmoTljp/lspfkvY0nfSk7DQogICAgZm9yKGNvbnN0IGVudHJ5IG9mIGpvdXJuYWwpew0KICAgICAgY29uc3QgcD1zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1lbnRyeS5pZCk7aWYoIXB8fCFob21lKHApfHwhW2VudHJ5LnJvb20sbnVsbF0uaW5jbHVkZXMocC5yb29tSWQpKWNvbnRpbnVlOw0KICAgICAgcmVzZXJ2ZWQuYWRkKHAuaWQpOw0KICAgICAgaWYocy5yb29tcy5zb21lKHI9PnIuaWQ9PT1lbnRyeS5yb29tJiZyLmluY2lkZW50Py5raW5kPT09J3JhaWRlcnMnKSljb250aW51ZTsNCiAgICAgIGlmKGFjdGl2ZSl7DQogICAgICAgIGlmKGhlYWx0aHkocCkpYWN0aW9ucy5wdXNoKGFzc2lnbihwLHJhaWRzWzBdLmlkLCdkZWZlbnNlJyxlbnRyeS5mcm9tKSk7DQogICAgICAgIGVsc2Ugbm90ZXMucHVzaChgJHtuYW1lKHApfeihgOmHj+S4jei2szcwJe+8jOS/neeVmeWOn+Wyl+iusOW9le+8jOaaguS4jei/veWHu+OAgmApOw0KICAgICAgICBjb250aW51ZTsNCiAgICAgIH0NCiAgICAgIGNvbnN0IHJlY292ZXJ5PXNoZWx0ZXJEZWZlbnNlUmV0dXJuKG0sY2ZnLHJlY29yZCxlbnRyeSk7DQogICAgICBpZihyZWNvdmVyeSl7DQogICAgICAgIGlmKHJlY292ZXJ5LndhaXQpe25vdGVzLnB1c2goYCR7bmFtZShwKX3vvJoke3JlY292ZXJ5LnJlYXNvbn3jgIJgKTtjb250aW51ZTt9DQogICAgICAgIGlmKHJlY292ZXJ5LnNldHRsZWQpe3NldHRsZWQucHVzaChwLmlkKTtyZXNlcnZlZC5kZWxldGUocC5pZCk7Y29udGludWU7fQ0KICAgICAgICBhY3Rpb25zLnB1c2goey4uLmFzc2lnbihwLHJlY292ZXJ5LnJvb20sJ2RlZmVuc2UtcmVsZWFzZScsZW50cnkuZnJvbSkscmVhc29uOnJlY292ZXJ5LnJlYXNvbixyZWNvdmVyeTpyZWNvdmVyeS5yZWNvdmVyeX0pO2NvbnRpbnVlOw0KICAgICAgfQ0KICAgICAgY29uc3Qgb3JpZ2luPXMucm9vbXMuZmluZChyPT5yLmlkPT09ZW50cnkuZnJvbSk7DQogICAgICBpZihlbnRyeS5mcm9tIT09bnVsbCYmKCFvcmlnaW58fG9yaWdpbi5idWlsdEF0Pm5vd3x8b3JpZ2luLnVwZ3JhZGVBdCE9PW51bGx8fG9yaWdpbi5pbmNpZGVudHx8b3JpZ2luLnVucG93ZXJlZHx8DQogICAgICAgIHMucmVzaWRlbnRzLmZpbHRlcihvPT5vLmlkIT09cC5pZCYmby5kZWFkQXQ9PT1udWxsJiZvLmFkdWx0QXQ8PW5vdyYmby5yb29tSWQ9PT1vcmlnaW4uaWQpLmxlbmd0aD49b3JpZ2luLndpZHRoKjIpKXsNCiAgICAgICAgbm90ZXMucHVzaChgJHtuYW1lKHApfeWOn+Wyl+S9jeaaguS4jeWPr+eUqO+8jOS/neeVmeWkjeWyl+iusOW9le+8jOeojeWQjuWGjeivleOAgmApO2NvbnRpbnVlOw0KICAgICAgfQ0KICAgICAgaWYocC5yb29tSWQhPT1lbnRyeS5mcm9tKWFjdGlvbnMucHVzaChhc3NpZ24ocCxlbnRyeS5mcm9tLCdkZWZlbnNlLXJlbGVhc2UnLGVudHJ5LmZyb20pKTsNCiAgICB9DQogICAgaWYoYWN0aXZlKXsNCiAgICAgIG5vdGVzLnB1c2goJ+aOoOWkuuiAheS6i+S7tu+8mumAgOaVjOS8mOWFiO+8jOWPl+iireaIv+mXtOWFgeiuuOi2heWRmO+8m+aMieWKm+mHj+WSjOatpuWZqOmbhuS4reWBpeW6t+aIkOS6uu+8jOS4jeWboOW6k+WtmOaIluS4tOaXtuWBnOS6p+mYu+atouWinuaPtO+8jOaImOWQjuaMieWOn+Wyl+S9jeaBouWkjeOAgicpOw0KICAgICAgY29uc3QgcG93ZXI9cD0+c2hlbHRlckRlZmVuc2VQb3dlcihzLHApPz8wOw0KICAgICAgZm9yKGNvbnN0IHJvb20gb2YgcmFpZHMpew0KICAgICAgICBjb25zdCBkZWZlbmRlcnM9cy5yZXNpZGVudHMuZmlsdGVyKHA9PmhvbWUocCkmJnAucm9vbUlkPT09cm9vbS5pZCk7DQogICAgICAgIGZvcihjb25zdCBwIG9mIGRlZmVuZGVycylyZXNlcnZlZC5hZGQocC5pZCk7DQogICAgICAgIGlmKCFlbmFibGVkKWNvbnRpbnVlOw0KICAgICAgICBjb25zdCBwb29sPXMucmVzaWRlbnRzLmZpbHRlcihwPT5ob21lKHApJiZoZWFsdGh5KHApJiYhcmVzZXJ2ZWQuaGFzKHAuaWQpJiYhKHJlY29yZC5kZWZlbnNlTWFudWFsfHxbXSkuaW5jbHVkZXMocC5pZCkmJg0KICAgICAgICAgICFqb3VybmFsLnNvbWUoaj0+ai5pZD09PXAuaWQpJiYNCiAgICAgICAgICAocC5yb29tSWQ9PT1udWxsfHxzLnJvb21zLnNvbWUocj0+ci5pZD09PXAucm9vbUlkJiZyLmJ1aWx0QXQ8PW5vdyYmIXIuaW5jaWRlbnQpKSkNCiAgICAgICAgICAuc29ydCgoYSxiKT0+cG93ZXIoYiktcG93ZXIoYSl8fGIuc3RhdHMuZW5kLWEuc3RhdHMuZW5kfHxhLmlkLWIuaWQpOw0KICAgICAgICBmb3IoY29uc3QgcCBvZiBwb29sKXsNCiAgICAgICAgICByZXNlcnZlZC5hZGQocC5pZCk7YWN0aW9ucy5wdXNoKGFzc2lnbihwLHJvb20uaWQsJ2RlZmVuc2UnLHAucm9vbUlkKSk7DQogICAgICAgIH0NCiAgICAgICAgaWYoIWRlZmVuZGVycy5sZW5ndGgmJiFhY3Rpb25zLnNvbWUoYT0+YS5yb29tPT09cm9vbS5pZCkpbm90ZXMucHVzaCgn5pqC5peg5Y+v6LCD5Yqo55qE5YGl5bq35oiQ5bm06Ziy5a6I5Lq66YCJ77yM6K+35omL5Yqo5aSE55CG5b2T5YmN5o6g5aS66ICF44CCJyk7DQogICAgICB9DQogICAgfQ0KICAgIHJldHVybiB7YWN0aXZlLGJ1c3k6YWN0aXZlfHxhY3Rpb25zLmxlbmd0aD4wLGFjdGlvbnMsbm90ZXMsc2V0dGxlZCxyZXNlcnZlZDpbLi4ucmVzZXJ2ZWRdfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUGFyZW50QXNzZXNzbWVudChtLHBhaXIpIHsNCiAgICBjb25zdCBrZXlzPVsnc3RyJywncGVyJywnZW5kJywnY2hhJywnaW50JywnYWdpJywnbGNrJ107DQogICAgaWYocGFpci5sZW5ndGghPT0yfHxwYWlyLnNvbWUocD0+IXB8fGtleXMuc29tZShrPT4hTnVtYmVyLmlzRmluaXRlKHAuc3RhdHM/LltrXSl8fHAuc3RhdHNba108MCkpKXJldHVybiBudWxsOw0KICAgIC8vIOi/memHjOWPqueUqOWfuuehgOWxnuaAp+S4reeCueavlOi+g++8jOS4jeWBh+WumuacjeWKoeerr+WPluaVtOOAgemaj+acuuamgueOh+aIlumBl+S8oOe7k+eul+aXtueCueOAgg0KICAgIGNvbnN0IG1pZHBvaW50PU9iamVjdC5mcm9tRW50cmllcyhrZXlzLm1hcChrPT5baywocGFpclswXS5zdGF0c1trXStwYWlyWzFdLnN0YXRzW2tdKS8yXSkpOw0KICAgIGNvbnN0IGJhc2VUb3RhbD1rZXlzLnJlZHVjZSgobixrKT0+bittaWRwb2ludFtrXSwwKSxjaGFybT1wYWlyWzBdLnN0YXRzLmNoYStwYWlyWzFdLnN0YXRzLmNoYTsNCiAgICBpZihjaGFybTw9MClyZXR1cm4gbnVsbDsNCiAgICBjb25zdCByb21hbmNlSG91cnM9MjAvY2hhcm0sYWZ0ZXI9c2hlbHRlclByb2R1Y3Rpb25XaXRob3V0KG0scGFpci5tYXAocD0+cC5pZCkpOw0KICAgIGNvbnN0IHJlc291cmNlcz1bJ3Bvd2VyJywnZm9vZCcsJ3dhdGVyJywnc2NyYXAnXTsNCiAgICBjb25zdCBsb3NzRnJhY3Rpb249cmVzb3VyY2VzLnJlZHVjZSgobixrKT0+bisobS5wcm9kdWN0aW9uW2tdPjA/TWF0aC5tYXgoMCxtLnByb2R1Y3Rpb25ba10tYWZ0ZXJba10pL20ucHJvZHVjdGlvbltrXTowKSwwKS9yZXNvdXJjZXMubGVuZ3RoOw0KICAgIC8vIOWFreWwj+aXtueUn+iCsuWGt+WNtOS4juaEn+aDheaXtumXtOe7hOaIkOWRqOacn++8m+S6p+WHuuaNn+WkseS4uuW9kuS4gOWMluaDqee9mu+8jOS4jea3t+WKoOS4jeWQjOi1hOa6kOWNleS9jeOAgg0KICAgIHJldHVybiB7bWlkcG9pbnQsYmFzZVRvdGFsLGNoYXJtLHJvbWFuY2VIb3Vycyxsb3NzRnJhY3Rpb24sc2NvcmU6YmFzZVRvdGFsLygoNityb21hbmNlSG91cnMpKigxK2xvc3NGcmFjdGlvbikpfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUGFyZW50VHJhaW5pbmdFc3RpbWF0ZShtLHAscm9vbSkgew0KICAgIGNvbnN0IHN0YXQ9cm9vbS50cmFpblN0YXQsYmFzZT1wLnN0YXRzPy5bc3RhdF0scGVyaz1tLnN0YXRlLmxlZ2FjeT8ucGVya3M/LnRyYWluaW5nPz8wOw0KICAgIGlmKCFbJ3N0cicsJ3BlcicsJ2VuZCcsJ2NoYScsJ2ludCcsJ2FnaScsJ2xjayddLmluY2x1ZGVzKHN0YXQpfHwhTnVtYmVyLmlzRmluaXRlKGJhc2UpfHxiYXNlPDB8fGJhc2U+PTEwfHwNCiAgICAgICAgIU51bWJlci5pc0ludGVnZXIocGVyayl8fHBlcms8MHx8cGVyaz4xMHx8IU51bWJlci5pc0ludGVnZXIocm9vbS5sZXZlbCl8fHJvb20ubGV2ZWw8MXx8cm9vbS5sZXZlbD4zKXJldHVybiBudWxsOw0KICAgIC8vIOaWsOWFpeWupOS4jeWBh+Wumue7p+aJv+aXp+i/m+W6pu+8m+mineWklueVmeS4gOS4quWNgeWIhumSn+e7k+eul+i9ruWPiuiwg+Wyl+S9memHj+OAgg0KICAgIGNvbnN0IGhvdXJzPU1hdGguY2VpbCgoKGJhc2UrMSkvKHJvb20ubGV2ZWwqKDErLjA1KnBlcmspKSkqNi0xZS05KS82KzEvNjsNCiAgICBjb25zdCByZXNvdXJjZT17c3RyOidwb3dlcicscGVyOid3YXRlcicsZW5kOidzY3JhcCcsaW50OidwYXJ0cycsYWdpOidmb29kJ31bc3RhdF07DQogICAgY29uc3QgZGVtYW5kPXNoZWx0ZXJHcm93dGhOZWVkcyhtKS5kZW1hbmQ7DQogICAgY29uc3QgcHJlc3N1cmU9cmVzb3VyY2UmJmRlbWFuZFtyZXNvdXJjZV0+MD9NYXRoLm1pbigyLGRlbWFuZFtyZXNvdXJjZV0qMS4yL01hdGgubWF4KDEsbS5wcm9kdWN0aW9uW3Jlc291cmNlXSkpOjA7DQogICAgY29uc3Qgd2VpZ2h0PXN0YXQ9PT0nY2hhJz8yOnN0YXQ9PT0nZW5kJz8xLjU6c3RhdD09PSdpbnQnPzEuMjoxK3ByZXNzdXJlOw0KICAgIHJldHVybiB7c3RhdCxiYXNlLGhvdXJzLHZhbHVlOndlaWdodC9ob3Vyc307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclN0YWZmQ2FwYWNpdHkobSxyb29tLGlkPW51bGwpIHsNCiAgICBjb25zdCBoZWxkPW5ldyBTZXQoKG0udHJhaW5pbmdEZXN0aW5hdGlvbnN8fFtdKS5maWx0ZXIoZD0+ZC5yb29tPT09cm9vbS5pZCYmZC5pZCE9PWlkJiYNCiAgICAgIG0uc3RhdGUucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PWQuaWQmJnAuZGVhZEF0PT09bnVsbCYmcC5yb29tSWQhPT1yb29tLmlkKSkubWFwKGQ9PmQuaWQpKTsNCiAgICByZXR1cm4gTWF0aC5tYXgoMCxyb29tLndpZHRoKjItaGVsZC5zaXplKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyVHJhaW5pbmdSZXR1cm4obSxwLHJvb20saG9yaXpvbkhvdXJzPTE2OCxjb21taXRtZW50cz17fSkgew0KICAgIGNvbnN0IHM9bS5zdGF0ZSxub3c9bS5ub3csc3RhdD1yb29tPy50cmFpblN0YXQsYmFzZT1wPy5zdGF0cz8uW3N0YXRdOw0KICAgIGNvbnN0IHJlc3VsdD17aWQ6cD8uaWQsdHJhaW5pbmdSb29tOnJvb20/LmlkLHN0YXQsYmFzZSx0YXJnZXQ6YmFzZSsxLGhvcml6b25Ib3VycyxlbGlnaWJsZTpmYWxzZSxyZWFzb246J3Vua25vd24tdHJhaW5pbmcnLG9wdGlvbnM6W119Ow0KICAgIGNvbnN0IHJlc291cmNlPXtzdHI6J3Bvd2VyJyxwZXI6J3dhdGVyJyxlbmQ6J3NjcmFwJyxhZ2k6J2Zvb2QnLGludDoncGFydHMnfVtzdGF0XTsNCiAgICBjb25zdCBhY3RpdmU9cj0+ciYmci5idWlsdEF0PD1ub3cmJnIudXBncmFkZUF0PT09bnVsbCYmIXIuaW5jaWRlbnQmJiFyLnVucG93ZXJlZDsNCiAgICBpZihyb29tPy50eXBlIT09J3RyYWluaW5nJ3x8IWFjdGl2ZShyb29tKXx8IU51bWJlci5pc0ludGVnZXIoYmFzZSl8fGJhc2U8MHx8YmFzZT4xMHx8DQogICAgICAgICFOdW1iZXIuaXNGaW5pdGUoaG9yaXpvbkhvdXJzKXx8aG9yaXpvbkhvdXJzPD0wfHxob3Jpem9uSG91cnM+MTY4KXJldHVybiByZXN1bHQ7DQogICAgaWYoYmFzZT09PTEwKXJldHVybiB7Li4ucmVzdWx0LHJlYXNvbjonYXR0cmlidXRlLW1heGVkJ307DQogICAgY29uc3QgaW5jdW1iZW50PXAucm9vbUlkPT09cm9vbS5pZCxwcm9ncmVzcz1pbmN1bWJlbnQ/cC50cmFpbmluZzowLHBlcms9cy5sZWdhY3k/LnBlcmtzPy50cmFpbmluZz8/MDsNCiAgICBpZighTnVtYmVyLmlzRmluaXRlKHByb2dyZXNzKXx8cHJvZ3Jlc3M8MHx8cHJvZ3Jlc3M+MXx8IU51bWJlci5pc0ludGVnZXIocGVyayl8fHBlcms8MHx8cGVyaz4xMHx8DQogICAgICAgICFOdW1iZXIuaXNJbnRlZ2VyKHJvb20ubGV2ZWwpfHxyb29tLmxldmVsPDF8fHJvb20ubGV2ZWw+MylyZXR1cm4gcmVzdWx0Ow0KICAgIGlmKHAuZGVhZEF0IT09bnVsbHx8cC5hd2F5IT09bnVsbHx8cC5hZHVsdEF0Pm5vdylyZXR1cm4gey4uLnJlc3VsdCxyZWFzb246J3Jlc2lkZW50LXVuYXZhaWxhYmxlJ307DQogICAgY29uc3Qgb2NjdXBhbnRzPXMucmVzaWRlbnRzLmZpbHRlcihxPT5xLmRlYWRBdD09PW51bGwmJnEuYWR1bHRBdDw9bm93JiZxLnJvb21JZD09PXJvb20uaWQpOw0KICAgIGlmKGluY3VtYmVudD8hb2NjdXBhbnRzLnNsaWNlKDAscm9vbS53aWR0aCoyKS5zb21lKHE9PnEuaWQ9PT1wLmlkKTpvY2N1cGFudHMubGVuZ3RoPj1yb29tLndpZHRoKjIpDQogICAgICByZXR1cm4gey4uLnJlc3VsdCxyZWFzb246J3RyYWluaW5nLWNhcGFjaXR5J307DQogICAgLy8g5Y6f55Sf6L+b5bqm5q+P5Y2B5YiG6ZKf57uT566X77yb5paw5YWl5a6k5aSa55WZ5LiA6L2u6LCD5bKXL+e7k+eul+S9memHj++8jOaXouaciei/m+W6puaMieacgOi/kee7k+eul+aXtueCueaOqOi/m+OAgg0KICAgIGNvbnN0IHRpY2tzPU1hdGguY2VpbChNYXRoLm1heCgwLDEtcHJvZ3Jlc3MpKihiYXNlKzEpLyhyb29tLmxldmVsKigxKy4wNSpwZXJrKSkqNi0xZS05KTsNCiAgICBpZihpbmN1bWJlbnQmJighTnVtYmVyLmlzRmluaXRlKHMubGFzdFNldHRsZWRBdCl8fHMubGFzdFNldHRsZWRBdD5ub3cpKXJldHVybiByZXN1bHQ7DQogICAgY29uc3Qgc2V0dGxlZD1pbmN1bWJlbnQ/cy5sYXN0U2V0dGxlZEF0Om5vdzsNCiAgICBjb25zdCBhbmNob3I9aW5jdW1iZW50P3NldHRsZWQrTWF0aC5jZWlsKChNYXRoLm1heChzZXR0bGVkLHJvb20uYnVpbHRBdCxwLmFkdWx0QXQpLXNldHRsZWQpLzYwMDAwMCkqNjAwMDAwOm5vdzsNCiAgICBjb25zdCBmaW5pc2hBdD1hbmNob3IrKHRpY2tzKyhpbmN1bWJlbnQ/MDoxKSkqNjAwMDAwOw0KICAgIGlmKGZpbmlzaEF0PD1ub3cpcmV0dXJuIHsuLi5yZXN1bHQscmVhc29uOidhd2FpdGluZy10cmFpbmluZy1zZXR0bGVtZW50JyxmaW5pc2hBdH07DQogICAgY29uc3QgaG91cnM9KGZpbmlzaEF0LW5vdykvMzYwMDAwMDsNCiAgICBpZighcmVzb3VyY2UpcmV0dXJuIHsuLi5yZXN1bHQscmVhc29uOidyZXF1aXJlcy1mYW1pbHktb3ItY29tYmF0LWJlbmVmaXQnLGhvdXJzLGZpbmlzaEF0LHByb2dyZXNzfTsNCiAgICBjb25zdCBvcmlnaW5hbD1zLnJvb21zLmZpbmQocj0+ci5pZD09PXAucm9vbUlkKSxvbGRSZXNvdXJjZT1zaGVsdGVyUm9vbXNbb3JpZ2luYWw/LnR5cGVdPy5bMV07DQogICAgaWYob2xkUmVzb3VyY2UmJm9sZFJlc291cmNlIT09cmVzb3VyY2UpcmV0dXJuIHsuLi5yZXN1bHQscmVhc29uOidjcm9zcy1yZXNvdXJjZS1vcHBvcnR1bml0eScsaG91cnMsZmluaXNoQXQsb2xkUmVzb3VyY2UscmVzb3VyY2V9Ow0KICAgIGNvbnN0IHBhcnRzU3RvY2s9cy5yZXNvdXJjZXMucGFydHMrbS5yb29tcy5maWx0ZXIocj0+ci5yZXNvdXJjZT09PSdwYXJ0cycmJnIuYmF0Y2g+MCkNCiAgICAgIC5yZWR1Y2UoKG4scik9Pm4rTWF0aC5mbG9vcihyLnN0b3JlZC9yLmJhdGNoKzFlLTkpKnIuYmF0Y2gsMCk7DQogICAgY29uc3QgcGFydHNOZWVkPXJlc291cmNlPT09J3BhcnRzJz9NYXRoLm1heCgwLChjb21taXRtZW50cy5wYXJ0c1RhcmdldD8/MCktcGFydHNTdG9jay0oY29tbWl0bWVudHMucGFydHNSZXNlcnZlZHx8MCkpOkluZmluaXR5Ow0KICAgIGlmKHJlc291cmNlPT09J3BhcnRzJyYmKCFOdW1iZXIuaXNGaW5pdGUoY29tbWl0bWVudHMucGFydHNUYXJnZXQpfHxwYXJ0c05lZWQ8PTApKQ0KICAgICAgcmV0dXJuIHsuLi5yZXN1bHQscmVhc29uOiduby1wYXJ0cy1wdXJwb3NlJyxob3VycyxmaW5pc2hBdCxyZXNvdXJjZX07DQogICAgaWYocmVzb3VyY2U9PT0ncGFydHMnJiZjb21taXRtZW50cy5wYXJ0c1RhcmdldD5tLmNhcHMucGFydHMpDQogICAgICByZXR1cm4gey4uLnJlc3VsdCxyZWFzb246J3BhcnRzLXRhcmdldC1jYXBhY2l0eScsaG91cnMsZmluaXNoQXQscmVzb3VyY2V9Ow0KICAgIGNvbnN0IHNjcmFwQXZhaWxhYmxlPU1hdGgubWF4KDAscy5yZXNvdXJjZXMuc2NyYXAtKGNvbW1pdG1lbnRzLnNjcmFwUmVzZXJ2ZXx8MCktKGNvbW1pdG1lbnRzLnNjcmFwUmVzZXJ2ZWR8fDApKTsNCiAgICBjb25zdCBkZW1hbmQ9c2hlbHRlckdyb3d0aE5lZWRzKG0pLmRlbWFuZCxhZnRlcj1zaGVsdGVyUHJvZHVjdGlvbldpdGhvdXQobSxbcC5pZF0pOw0KICAgIGNvbnN0IHN1cHBseT1zaGVsdGVyQ29uc3RydWN0aW9uU3VwcGx5KG0sW3AuaWRdLGRlbWFuZCxhZnRlcik7DQogICAgaWYoIXN1cHBseS5zYWZlKXJldHVybiB7Li4ucmVzdWx0LHJlYXNvbjonc3VwcGx5LXVuY292ZXJlZCcsaG91cnMsZmluaXNoQXQscmVzb3VyY2V9Ow0KICAgIGNvbnN0IGVuZD1ub3craG9yaXpvbkhvdXJzKjM2MDAwMDAsZXZlbnRzPW0udmlldy5lbnY/LmV2ZW50c3x8W107DQogICAgY29uc3QgaW50ZWdyYXRlPShwZXJzb24sdGFyZ2V0LGZyb20sdG8pPT57DQogICAgICBpZih0bzw9ZnJvbSlyZXR1cm4gMDsNCiAgICAgIGNvbnN0IGN1dHM9W2Zyb20sLi4uZXZlbnRzLmZpbHRlcihlPT5lLmtpbmQ9PT0ncHJvZHVjdGlvbicpLmZsYXRNYXAoZT0+W2Uuc3RhcnRzQXQsZS5lbmRzQXRdKS5maWx0ZXIodD0+dD5mcm9tJiZ0PHRvKSx0b10uc29ydCgoYSxiKT0+YS1iKTsNCiAgICAgIHJldHVybiBjdXRzLnNsaWNlKDAsLTEpLnJlZHVjZSgoc3VtLHQsaSk9PnN1bStzaGVsdGVyV29ya2VyUmF0ZShzLHQsbS52aWV3LmVudixwZXJzb24sdGFyZ2V0KSooY3V0c1tpKzFdLXQpLzM2MDAwMDAsMCk7DQogICAgfTsNCiAgICBjb25zdCB1cGdyYWRlZD17Li4ucCxzdGF0czp7Li4ucC5zdGF0cyxbc3RhdF06YmFzZSsxfX07DQogICAgY29uc3QgcGFydHNSb29tcz1yZXNvdXJjZT09PSdwYXJ0cyc/cy5yb29tcy5maWx0ZXIocj0+YWN0aXZlKHIpJiZyLnR5cGU9PT0nd29ya3Nob3AnKS5tYXAocj0+ew0KICAgICAgY29uc3QgYmF0Y2g9bS5yb29tcy5maW5kKHJvdz0+cm93LmlkPT09ci5pZCk/LmJhdGNofHwwOw0KICAgICAgY29uc3Qgd29ya2Vycz1zLnJlc2lkZW50cy5maWx0ZXIocT0+cS5kZWFkQXQ9PT1udWxsJiZxLmF3YXk9PT1udWxsJiZxLmFkdWx0QXQ8PW5vdyYmcS5yb29tSWQ9PT1yLmlkKS5zbGljZSgwLHIud2lkdGgqMikNCiAgICAgICAgLmZpbHRlcihxPT5xLmlkIT09cC5pZCYmIShjb21taXRtZW50cy5kZXBhcnR1cmVzfHxbXSkuaW5jbHVkZXMocS5pZCkpOw0KICAgICAgcmV0dXJuIHtyb29tOnIsYmF0Y2gscmVtYWluZGVyOmJhdGNoPjA/ci5zdG9yZWQtTWF0aC5mbG9vcihyLnN0b3JlZC9iYXRjaCsxZS05KSpiYXRjaDowLA0KICAgICAgICBiYWNrZ3JvdW5kOndvcmtlcnMucmVkdWNlKChuLHEpPT5uK2ludGVncmF0ZShxLHIsbm93LGVuZCksMCl9Ow0KICAgIH0pOltdOw0KICAgIGZvcihjb25zdCB0YXJnZXQgb2Ygcy5yb29tcy5maWx0ZXIocj0+YWN0aXZlKHIpJiZzaGVsdGVyUm9vbXNbci50eXBlXT8uWzFdPT09cmVzb3VyY2UmJg0KICAgICAgKGNvbW1pdG1lbnRzLmRlc3RpbmF0aW9uPT09dW5kZWZpbmVkfHxyLmlkPT09Y29tbWl0bWVudHMuZGVzdGluYXRpb24pJiYNCiAgICAgIHMucmVzaWRlbnRzLmZpbHRlcihxPT5xLmlkIT09cC5pZCYmcS5kZWFkQXQ9PT1udWxsJiZxLmFkdWx0QXQ8PW5vdyYmcS5yb29tSWQ9PT1yLmlkKS5sZW5ndGgrDQogICAgICAgIChjb21taXRtZW50cy5kZXN0aW5hdGlvbnN8fFtdKS5maWx0ZXIoZD0+ZC5pZCE9PXAuaWQmJmQucm9vbT09PXIuaWQpLmxlbmd0aDxyLndpZHRoKjIpKXsNCiAgICAgIGNvbnN0IHJhd0JlZm9yZT1pbnRlZ3JhdGUocCx0YXJnZXQsbm93LGVuZCkscmF3VHJhaW5lZD1pbnRlZ3JhdGUodXBncmFkZWQsdGFyZ2V0LE1hdGgubWluKGZpbmlzaEF0LGVuZCksZW5kKTsNCiAgICAgIC8vIOmbtuS7tuWPquiuoeW9k+WJjeWunumZhee8uuWPo++8m+S+m+aWmeayv+eUqOW3peWdiueahOeOsOacieW6k+WtmOinhOWIme+8jOacquadpeaAu+S6p+mHj+S4jeiDveimhuebluW3suaJv+ivuuW3peeoi+OAgg0KICAgICAgY29uc3QgYmF0Y2g9bS5yb29tcy5maW5kKHI9PnIuaWQ9PT10YXJnZXQuaWQpPy5iYXRjaHx8MDsNCiAgICAgIGNvbnN0IHJlbWFpbmRlcj1yZXNvdXJjZT09PSdwYXJ0cycmJmJhdGNoPjA/KHRhcmdldC5zdG9yZWQtTWF0aC5mbG9vcih0YXJnZXQuc3RvcmVkL2JhdGNoKzFlLTkpKmJhdGNoKTowOw0KICAgICAgY29uc3QgbWFkZT1hbW91bnQ9PnJlc291cmNlPT09J3BhcnRzJz9NYXRoLm1pbihwYXJ0c05lZWQscGFydHNSb29tcy5yZWR1Y2UoKG4scm93KT0+bisocm93LmJhdGNoPjA/DQogICAgICAgIE1hdGguZmxvb3IoKHJvdy5yZW1haW5kZXIrcm93LmJhY2tncm91bmQrKHJvdy5yb29tLmlkPT09dGFyZ2V0LmlkP2Ftb3VudDowKSsxZS05KS9yb3cuYmF0Y2gpKnJvdy5iYXRjaDowKSwwKSk6YW1vdW50Ow0KICAgICAgY29uc3QgYmVmb3JlPW1hZGUocmF3QmVmb3JlKSx0cmFpbmVkPW1hZGUocmF3VHJhaW5lZCk7DQogICAgICBjb25zdCBsb3N0PWludGVncmF0ZShwLHRhcmdldCxub3csTWF0aC5taW4oZmluaXNoQXQsZW5kKSksZGVsdGE9dHJhaW5lZC1iZWZvcmU7DQogICAgICBjb25zdCBiZWZvcmVSYXRlPXNoZWx0ZXJXb3JrZXJSYXRlKHMsbm93LG0udmlldy5lbnYscCx0YXJnZXQpLGFmdGVyUmF0ZT1zaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LHVwZ3JhZGVkLHRhcmdldCk7DQogICAgICBsZXQgcGF5YmFja0hvdXJzPW51bGw7DQogICAgICBpZihkZWx0YT4wKXsNCiAgICAgICAgbGV0IGxvPU1hdGgubWluKGZpbmlzaEF0LGVuZCksaGk9ZW5kOw0KICAgICAgICBmb3IobGV0IGk9MDtpPDMyO2krKyl7DQogICAgICAgICAgY29uc3QgbWlkPShsbytoaSkvMjsNCiAgICAgICAgICBpZihpbnRlZ3JhdGUodXBncmFkZWQsdGFyZ2V0LGZpbmlzaEF0LG1pZCk+PWludGVncmF0ZShwLHRhcmdldCxub3csbWlkKSloaT1taWQ7ZWxzZSBsbz1taWQ7DQogICAgICAgIH0NCiAgICAgICAgcGF5YmFja0hvdXJzPShoaS1ub3cpLzM2MDAwMDA7DQogICAgICB9DQogICAgICBjb25zdCBmZWVkPXJlc291cmNlPT09J3BhcnRzJz9NYXRoLm1heCgwLE1hdGguY2VpbCh0cmFpbmVkL2JhdGNoKSpiYXRjaC1yZW1haW5kZXIpKjY6MDsNCiAgICAgIGNvbnN0IGZlZWRLbm93bj1yZXNvdXJjZSE9PSdwYXJ0cyd8fGJhdGNoPjAmJnNjcmFwQXZhaWxhYmxlKzFlLTk+PWZlZWQ7DQogICAgICByZXN1bHQub3B0aW9ucy5wdXNoKHtyb29tOnRhcmdldC5pZCxyZXNvdXJjZSxiZWZvcmVSYXRlLGFmdGVyUmF0ZSxnYWluUmF0ZTphZnRlclJhdGUtYmVmb3JlUmF0ZSwNCiAgICAgICAgbG9zdFByb2R1Y3Rpb246bG9zdCxkaXJlY3RQcm9kdWN0aW9uOmJlZm9yZSx0cmFpbmVkUHJvZHVjdGlvbjp0cmFpbmVkLGRlbHRhLHBheWJhY2tIb3VycywNCiAgICAgICAgc2NyYXBGZWVkOmZlZWQsZmVlZEtub3duLHBhcnRzQ29tbWl0bWVudDpyZXNvdXJjZT09PSdwYXJ0cyc/dHJhaW5lZDowfSk7DQogICAgfQ0KICAgIHJlc3VsdC5vcHRpb25zLnNvcnQoKGEsYik9PmIuZGVsdGEtYS5kZWx0YXx8YS5yb29tLWIucm9vbSk7DQogICAgY29uc3QgYmVzdD1yZXN1bHQub3B0aW9ucy5maW5kKG89Pm8uZmVlZEtub3duKXx8cmVzdWx0Lm9wdGlvbnNbMF07DQogICAgcmV0dXJuIHsuLi5yZXN1bHQscmVzb3VyY2UsaG91cnMscHJvZ3Jlc3MsZmluaXNoQXQsYmVzdDpiZXN0fHxudWxsLA0KICAgICAgZWxpZ2libGU6Qm9vbGVhbihiZXN0JiZiZXN0LmRlbHRhPjFlLTYmJmJlc3QuZmVlZEtub3duKSwNCiAgICAgIHJlYXNvbjohYmVzdD8nbm8tcHJvZHVjdGl2ZS1kZXN0aW5hdGlvbic6IWJlc3QuZmVlZEtub3duPydwYXJ0cy1mZWVkLXVuZnVuZGVkJzpiZXN0LmRlbHRhPD0xZS02Pyduby1wYXliYWNrLWluLXdpbmRvdyc6J3Byb2R1Y3RpdmUtcGF5YmFjaycsDQogICAgICBhc3N1bXB0aW9uczpbJ+aMieW9k+WJjeWxnuaAp+OAgeetiee6p+WSjOW/g+aDheavlOi+g+WNleagvO+8m+W3suefpeeUn+S6p+a0u+WKqOaMiei1t+atouWIhuaute+8jOS4jeWBh+WumuWFtuaMgee7reS4g+WkqScsDQogICAgICAgICfnm67moIflspfkvY3pnIDkuIDnm7Tlj6/nlKjvvJvmnKrorqHmnKrmnaXoh6rnhLbnrYnnuqcv5b+D5oOF5Y+Y5YyW77yM5LiN5bCG5LiN5ZCM6LWE5rqQ55u05o6l55u45YqgJ119Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJXb3Jrc2hvcEZlZWRpbmcobSx0YXJnZXQpIHsNCiAgICBjb25zdCBzPW0uc3RhdGUsbm93PW0ubm93LHJvb21zPW0ucm9vbXMuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT0ncGFydHMnJiZyLmJhdGNoPjApOw0KICAgIGNvbnN0IHN0b2NrZWQ9cy5yZXNvdXJjZXMucGFydHMrcm9vbXMucmVkdWNlKChuLHIpPT5uK01hdGguZmxvb3Ioci5zdG9yZWQvci5iYXRjaCsxZS05KSpyLmJhdGNoLDApOw0KICAgIGNvbnN0IHNob3J0YWdlPU1hdGgubWF4KDAsKHRhcmdldHx8MCktc3RvY2tlZCk7DQogICAgY29uc3Qgd29ya2luZz1yb29tcy5maWx0ZXIocj0+cy5yb29tcy5zb21lKHJvb209PnJvb20uaWQ9PT1yLmlkJiZyb29tLmJ1aWx0QXQ8PW5vdyYmDQogICAgICByb29tLnVwZ3JhZGVBdD09PW51bGwmJiFyb29tLmluY2lkZW50JiYhcm9vbS51bnBvd2VyZWQpKSxzdGFmZmVkPXdvcmtpbmcuZmlsdGVyKHI9PnIud29ya2Vycz4wKTsNCiAgICBjb25zdCBmZWVkaW5nPXN0YWZmZWQubGVuZ3RoP3N0YWZmZWQ6d29ya2luZy5maWx0ZXIocj0+ew0KICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocm9vbT0+cm9vbS5pZD09PXIuaWQpOw0KICAgICAgcmV0dXJuIHMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwmJnAuYWR1bHRBdDw9bm93JiZwLnJvb21JZD09PXIuaWQpLmxlbmd0aDxyb29tLndpZHRoKjI7DQogICAgfSkuc2xpY2UoMCwxKTsNCiAgICBjb25zdCByb29tRmVlZD1yPT5NYXRoLm1heCgwLE1hdGguY2VpbChzaG9ydGFnZS9yLmJhdGNoKSpyLmJhdGNoLShyLnN0b3JlZC1NYXRoLmZsb29yKHIuc3RvcmVkL3IuYmF0Y2grMWUtOSkqci5iYXRjaCkpOw0KICAgIGNvbnN0IGZlZWQ9c2hvcnRhZ2U+MD82KihmZWVkaW5nLmxlbmd0aD9mZWVkaW5nLnJlZHVjZSgobixyKT0+bityb29tRmVlZChyKSwwKTpNYXRoLmNlaWwoc2hvcnRhZ2UvMykqMyk6MDsNCiAgICBjb25zdCBuZXh0VGlja1N0b2NrPXMucmVzb3VyY2VzLnBhcnRzK3dvcmtpbmcucmVkdWNlKChuLHIpPT5uK01hdGguZmxvb3IoKHIuc3RvcmVkK3IucmF0ZS82KS9yLmJhdGNoKzFlLTkpKnIuYmF0Y2gsMCk7DQogICAgcmV0dXJuIHtzaG9ydGFnZSx3b3JraW5nLGZlZWRpbmcscm9vbUZlZWQsZmVlZCxuZXh0VGlja1N0b2NrfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQ2FtcGFpZ25QbGFuKG0sY2ZnPXt9LHJlY29yZD17fSx0YXJnZXQ9MTQpIHsNCiAgICBjb25zdCBzPW0uc3RhdGUsbm93PW0ubm93LG5vdGVzPVtdLHJlc2VydmVkPW5ldyBTZXQoKSxhY3Rpb25zPVtdLHByb2plY3RzPVtdLHJvbGVzPVsuLi4ocmVjb3JkLnJvbGVzfHxbXSldOw0KICAgIGNvbnN0IGVuYWJsZWQ9Y2ZnLmRldmVsb3BtZW50fHxbJ2V4cGxvcmUnLCdxdWVzdHMnLCd0cmFpbmluZycsJ21lZGljYWwnLCdyYWRpbycsJ2NvbWJhdEdlYXInLCdkZWZlbnNlJywnd29ya3Nob3AnLCdkYWlseUdvYWxzJywnaGVscCddLnNvbWUoaz0+Y2ZnW2tdKXx8cm9sZXMuc29tZShyPT5bJ3BhcmVudCcsJ3Byb2R1Y3Rpb24nXS5pbmNsdWRlcyhyLnB1cnBvc2UpKTsNCiAgICBjb25zdCB3b3Jrc2hvcFdvcmtlcnM9cm9sZXMuZmlsdGVyKHI9PnIucm9sZT09PSd3b3Jrc2hvcCcmJnMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PXIuaWQmJnAucm9vbUlkPT09ci5yb29tKSkubWFwKHI9PnIuaWQpOw0KICAgIGNvbnN0IHJlc3VsdD17ZW5hYmxlZCxub3RlcyxyZXNlcnZlZDpbXSxkYWlseVJlc2VydmVkOltdLGRhaWx5UHJvZHVjdGlvbjpbXSxhY3Rpb25zLHByb2plY3RzLGV2ZW50czpbXSxwYXJ0c1Jlc2VydmU6Y2ZnLnBhcnRzUmVzZXJ2ZXx8MCx3b3Jrc2hvcFdvcmtlcnMsDQogICAgICBtYXRlcmlhbHM6cmVjb3JkLm1hdGVyaWFscyxwb3B1bGF0aW9uUHJlcGFyYXRpb246cmVjb3JkLnBvcHVsYXRpb25QcmVwYXJhdGlvbj8/bnVsbCxjb25zdHJ1Y3Rpb25Qb2xpY3k6cmVjb3JkLmNvbnN0cnVjdGlvblBvbGljeSx0cmFpbmluZ0Rlc3RpbmF0aW9uczpbXSxhZG9wdGlvbnM6W10sDQogICAgICBwb3B1bGF0aW9uRGVmZW5zZTp7ZW5hYmxlZDpzaGVsdGVyRGVmZW5zZUVuYWJsZWQoY2ZnKSxndWFyZDpudWxsLHN1cHBseTp7Li4ubS5wcm9kdWN0aW9ufX19Ow0KICAgIGNvbnN0IGRhaWx5PWNmZy5kYWlseUdvYWxzP3NoZWx0ZXJEYWlseUdvYWxzKG0pOm51bGw7cmVzdWx0LmRhaWx5R29hbHM9ZGFpbHk7DQogICAgaWYoZGFpbHkpbm90ZXMucHVzaCguLi5kYWlseS5ub3Rlcyk7DQogICAgaWYoIWVuYWJsZWQpe25vdGVzLnB1c2goJ+W8gOWQr+aZrumAmuaOoumZqeOAgeWRqOS7u+WKoeaIluWFu+aIkOWQju+8jOaMieaxveawtOaOoumZqeOAgeihpee7meOAgeaImOWKm+WSjOS6uuWPo+WFseWQjOWuieaOkuOAgicpO3JldHVybiByZXN1bHQ7fQ0KICAgIGNvbnN0IHVuaXF1ZT0obGlzdCxrZXkpPT5BcnJheS5pc0FycmF5KGxpc3QpJiZsaXN0LmV2ZXJ5KHg9PngmJk51bWJlci5pc1NhZmVJbnRlZ2VyKHhba2V5XSkmJnhba2V5XT4wKSYmbmV3IFNldChsaXN0Lm1hcCh4PT54W2tleV0pKS5zaXplPT09bGlzdC5sZW5ndGg7DQogICAgaWYoIXVuaXF1ZShzLnJlc2lkZW50cywnaWQnKXx8IXVuaXF1ZShzLml0ZW1zLCdpZCcpfHwhdW5pcXVlKHMuZXhwbG9yZXJzLCdpZCcpfHwhdW5pcXVlKHMucXVlc3RzLCdpZCcpKXsNCiAgICAgIG5vdGVzLnB1c2goJ+WxheawkeOAgeijheWkh+aIluWkluWHuuWIl+ihqOS4jeWPr+WUr+S4gOaguOWvue+8jOaague8k+aWsOeahOWkluWHuuS4juWFu+aIkOOAgicpO3JldHVybiByZXN1bHQ7DQogICAgfQ0KICAgIGNvbnN0IG5vcm1hbGl6ZWQ9eD0+U3RyaW5nKHg/PycnKS5ub3JtYWxpemUoJ05GS0MnKS5yZXBsYWNlKC9ccysvZywnICcpLnRyaW0oKTsNCiAgICBjb25zdCBuYW1lT0s9cD0+dHlwZW9mIHAubmFtZT09PSdzdHJpbmcnJiZub3JtYWxpemVkKHAubmFtZSkmJnMucmVzaWRlbnRzLmZpbHRlcihvPT5ub3JtYWxpemVkKG8ubmFtZSk9PT1ub3JtYWxpemVkKHAubmFtZSkpLmxlbmd0aD09PTE7DQogICAgY29uc3QgYWN0aXZlPXI9PnImJnIuYnVpbHRBdDw9bm93JiZyLnVwZ3JhZGVBdD09PW51bGwmJiFyLmluY2lkZW50JiYhci51bnBvd2VyZWQ7DQogICAgLy8g5Y2V5qyh57qv6KeE5YiS5LiN5pS55bGF5rCR44CB5oi/6Ze05oiW6Lqr5Lu977yb5aSa5qyh562b6YCJ5aSN55So5ZCM5LiA5qC45a+557uT5p6c77yM5LiL5LiA5qyh6KeE5YiS6YeN5paw5qC45a+544CCDQogICAgY29uc3QgaG9tZUNoZWNrcz1uZXcgTWFwKCksaWRlbnRpdHlOYW1lcz1uZXcgTWFwKHMucmVzaWRlbnRzLm1hcChwPT5bcCx0eXBlb2YgcC5uYW1lPT09J3N0cmluZyc/bm9ybWFsaXplZChwLm5hbWUpOicnXSkpOw0KICAgIGNvbnN0IGhvbWU9cD0+ew0KICAgICAgaWYoIWhvbWVDaGVja3MuaGFzKHApKWhvbWVDaGVja3Muc2V0KHAscC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW5vdyYmc2hlbHRlclJlc2lkZW50SWRlbnRpdHkocyxwLGlkZW50aXR5TmFtZXMpJiZzaGVsdGVySGVhbHRoKHApKTsNCiAgICAgIHJldHVybiBob21lQ2hlY2tzLmdldChwKTsNCiAgICB9Ow0KICAgIGNvbnN0IGV4cGVjdGluZz1uZXcgU2V0KHMuYmlydGhzLmZsYXRNYXAoYj0+c2hlbHRlckJpcnRoUGFyZW50cyhzLGIpfHxbXSkpOw0KICAgIGNvbnN0IHBhcmVudElkcz1uZXcgU2V0KChyZWNvcmQuZmFtaWxpZXN8fFtdKS5mbGF0TWFwKGY9PltmLmEsZi5iXSkpOw0KICAgIGNvbnN0IHByb3RlY3RlZElkcz1uZXcgU2V0KHMucmVzaWRlbnRzLmZpbHRlcihwPT5wLnJvbWFuY2UmJiFzaGVsdGVyRmFtaWx5RXhwZWN0aW5nKHMscC5pZCxwLnJvbWFuY2UucGFydG5lcklkKSkuZmxhdE1hcChwPT5bcC5pZCxwLnJvbWFuY2UucGFydG5lcklkXSkpOw0KICAgIGZvcihjb25zdCBiIG9mIHMuYmlydGhzKWlmKCFzaGVsdGVyQmlydGhQYXJlbnRzKHMsYikpew0KICAgICAgZm9yKGNvbnN0IHAgb2Ygcy5yZXNpZGVudHMpaWYocC5yb29tSWQ9PT1iLnJvb21JZClwcm90ZWN0ZWRJZHMuYWRkKHAuaWQpOw0KICAgICAgZm9yKGNvbnN0IGYgb2YgcmVjb3JkLmZhbWlsaWVzfHxbXSlpZihmLnJvb209PT1iLnJvb21JZCl7cHJvdGVjdGVkSWRzLmFkZChmLmEpO3Byb3RlY3RlZElkcy5hZGQoZi5iKTt9DQogICAgfQ0KICAgIGZvcihjb25zdCBpZCBvZiByZWNvcmQuZmFtaWx5UmVzZXJ2ZWR8fFtdKXByb3RlY3RlZElkcy5hZGQoaWQpOw0KICAgIGNvbnN0IHB1cnBvc2VQcm90ZWN0ZWRJZHM9bmV3IFNldChwcm90ZWN0ZWRJZHMpOw0KICAgIGZvcihjb25zdCBpZCBvZiBjZmcud29ya3Nob3BGYW1pbHlSZWFkeXx8W10paWYoIXJvbGVzLnNvbWUocj0+ci5pZD09PWlkJiZyLnB1cnBvc2U9PT0ncGFyZW50JykpcHJvdGVjdGVkSWRzLmFkZChpZCk7DQogICAgaWYoZGFpbHkpew0KICAgICAgY29uc3QgbWlkbmlnaHQ9RGF0ZS5wYXJzZShgJHtzLmRhaWx5LmRheX1UMDA6MDA6MDArMDg6MDBgKSs4NjQwMDAwMDsNCiAgICAgIGNvbnN0IGhvdXJzPU1hdGgubWF4KDAsKG1pZG5pZ2h0LW5vdykvMzYwMDAwMC0xLzYpOw0KICAgICAgZm9yKGNvbnN0IGdvYWwgb2YgZGFpbHkuZ29hbHMuZmlsdGVyKGc9PiFnLmNsYWltZWQmJmcucmVtYWluaW5nJiZbJ2NvbGxlY3Rfc2NyYXAnLCdjb2xsZWN0X2Zvb2QnXS5pbmNsdWRlcyhnLmtleSkpKXsNCiAgICAgICAgY29uc3QgdHlwZT1nb2FsLmtleT09PSdjb2xsZWN0X3NjcmFwJz8nc2NyYXAnOidkaW5lcicscmVzb3VyY2U9dHlwZT09PSdzY3JhcCc/J3NjcmFwJzonZm9vZCc7DQogICAgICAgIGNvbnN0IHJvb21zPW0ucm9vbXMuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT1yZXNvdXJjZSYmci5iYXRjaD4wKSxyZW1vdmVkPW5ldyBNYXAoKTsNCiAgICAgICAgY29uc3QgY29sbGVjdGFibGU9KCk9PnJvb21zLnJlZHVjZSgobixyKT0+bitNYXRoLmZsb29yKChyLnN0b3JlZCtob3VycypNYXRoLm1heCgwLHIucmF0ZS0ocmVtb3ZlZC5nZXQoci5pZCl8fDApKSkvci5iYXRjaCsxZS05KSpyLmJhdGNoLDApOw0KICAgICAgICBjb25zdCBhbHJlYWR5PXJvb21zLnJlZHVjZSgobixyKT0+bitNYXRoLmZsb29yKHIuc3RvcmVkL3IuYmF0Y2grMWUtOSkqci5iYXRjaCwwKTsNCiAgICAgICAgaWYoYWxyZWFkeT49Z29hbC5yZW1haW5pbmcpY29udGludWU7DQogICAgICAgIGNvbnN0IHdvcmtlcnM9cy5yZXNpZGVudHMuZmlsdGVyKHA9PmhvbWUocCkmJnMucm9vbXMuc29tZShyPT5yLmlkPT09cC5yb29tSWQmJnIudHlwZT09PXR5cGUmJmFjdGl2ZShyKSkpDQogICAgICAgICAgLm1hcChwPT4oe3AscmF0ZTpzaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LHAscy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCkpfSkpLnNvcnQoKGEsYik9PmEucmF0ZS1iLnJhdGV8fGEucC5pZC1iLnAuaWQpOw0KICAgICAgICBjb25zdCBmb3JlY2FzdD1jb2xsZWN0YWJsZSgpLGtlcHQ9W107DQogICAgICAgIHJlc3VsdC5kYWlseVByb2R1Y3Rpb24ucHVzaCh7cmVzb3VyY2UsaG91cnMscmVtYWluaW5nOmdvYWwucmVtYWluaW5nLGZvcmVjYXN0fSk7DQogICAgICAgIGZvcihjb25zdCB7cCxyYXRlfSBvZiB3b3JrZXJzKXsNCiAgICAgICAgICBjb25zdCBiZWZvcmU9cmVtb3ZlZC5nZXQocC5yb29tSWQpfHwwO3JlbW92ZWQuc2V0KHAucm9vbUlkLGJlZm9yZStyYXRlKTsNCiAgICAgICAgICBpZihjb2xsZWN0YWJsZSgpPj1nb2FsLnJlbWFpbmluZyljb250aW51ZTsNCiAgICAgICAgICByZW1vdmVkLnNldChwLnJvb21JZCxiZWZvcmUpO3Byb3RlY3RlZElkcy5hZGQocC5pZCk7a2VwdC5wdXNoKHAuaWQpOw0KICAgICAgICB9DQogICAgICAgIHJlc3VsdC5kYWlseVJlc2VydmVkLnB1c2goLi4ua2VwdCk7DQogICAgICAgIGlmKGtlcHQubGVuZ3RoKW5vdGVzLnB1c2goYOS7iuaXpSR7Z29hbC5sYWJlbH3lsJrlt64gJHtnb2FsLnJlbWFpbmluZ33vvIzmjInlkITmiL/pl7TmlbTmibnpooblj5bkv53nlZkgJHtrZXB0Lmxlbmd0aH0g5ZCN546w5pyJ5Lqn5Ye65Lq65ZGY77yb5ZCE5oi/6Zu25aS05LiN5ZCI5bm277yM6aKE55WZ5Y2B5YiG6ZKf6aKG5Y+W5pe26Ze044CCYCk7DQogICAgICAgIGlmKGZvcmVjYXN0PGdvYWwucmVtYWluaW5nKW5vdGVzLnB1c2goYOaMieW9k+WJjeS6p+mAn+WIsOmbtueCueWJjeWPr+aVtOaJuemihuWPliAke2ZvcmVjYXN0fSAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2Vdfe+8jOS7jeW3riAke2dvYWwucmVtYWluaW5nLWZvcmVjYXN0fe+8m+mcgOimgeWinuS6p+aIluWFtuS7luespuWQiOe9keermeiuoeaVsOeahOadpea6kO+8jOS4jeiDveaMiei/nue7reS6p+mHj+inhuS4uuWPr+WujOaIkOOAgmApOw0KICAgICAgfQ0KICAgIH0NCiAgICBjb25zdCBoaXN0b3JpY2FsVHJhaW5pbmc9W107DQogICAgaWYoY2ZnLmRldmVsb3BtZW50JiYhcmVjb3JkLnBlbmRpbmcpZm9yKGNvbnN0IHAgb2Ygcy5yZXNpZGVudHMpew0KICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocj0+ci5pZD09PXAucm9vbUlkKTsNCiAgICAgIGlmKCFob21lKHApfHxwdXJwb3NlUHJvdGVjdGVkSWRzLmhhcyhwLmlkKXx8IWFjdGl2ZShyb29tKSljb250aW51ZTsNCiAgICAgIGNvbnN0IHByZXZpb3VzPXJvbGVzLmZpbmQocj0+ci5pZD09PXAuaWQmJnIucm9vbT09PXAucm9vbUlkKTsNCiAgICAgIGlmKHByZXZpb3VzKXsNCiAgICAgICAgaWYocHJldmlvdXMucm9sZT09PSd0cmFpbmluZycmJnByZXZpb3VzLnB1cnBvc2U9PT11bmRlZmluZWQpcm9sZXMuc3BsaWNlKHJvbGVzLmluZGV4T2YocHJldmlvdXMpLDEpOw0KICAgICAgICBlbHNlIGNvbnRpbnVlOw0KICAgICAgfQ0KICAgICAgaWYocm9vbS50eXBlPT09J3RyYWluaW5nJyloaXN0b3JpY2FsVHJhaW5pbmcucHVzaChwKTsNCiAgICAgIGVsc2Ugew0KICAgICAgICBjb25zdCByb2xlPXttZWRiYXk6J21lZGljYWwnLHdvcmtzaG9wOid3b3Jrc2hvcCcscmFkaW86J3JhZGlvJ31bcm9vbS50eXBlXTsNCiAgICAgICAgaWYocm9sZSlyb2xlcy5wdXNoKHtpZDpwLmlkLHJvb206cC5yb29tSWQscm9sZSxhdDpub3csaGlzdG9yaWNhbDp0cnVlfSk7DQogICAgICB9DQogICAgfQ0KICAgIHJlc3VsdC53b3Jrc2hvcFdvcmtlcnM9cm9sZXMuZmlsdGVyKHI9PnIucm9sZT09PSd3b3Jrc2hvcCcmJnMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PXIuaWQmJnAucm9vbUlkPT09ci5yb29tKSkubWFwKHI9PnIuaWQpOw0KICAgIGNvbnN0IG93bmVkPXA9PnJvbGVzLmZpbmQocj0+ci5pZD09PXAuaWQmJnIucm9vbT09PXAucm9vbUlkKTsNCiAgICBjb25zdCBhdmFpbGFibGU9cD0+aG9tZShwKSYmIXByb3RlY3RlZElkcy5oYXMocC5pZCkmJnNoZWx0ZXJDb21iYXQocyxwKSE9PW51bGwmJg0KICAgICAgKHAucm9vbUlkPT09bnVsbHx8YWN0aXZlKHMucm9vbXMuZmluZChyPT5yLmlkPT09cC5yb29tSWQpKSYmDQogICAgICAgIChbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ10uaW5jbHVkZXMocy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCkudHlwZSl8fEJvb2xlYW4ob3duZWQocCkpfHwNCiAgICAgICAgICBzLnJvb21zLmZpbmQocj0+ci5pZD09PXAucm9vbUlkKS50eXBlPT09J3F1YXJ0ZXJzJyYmKGNmZy5kZXZlbG9wbWVudHx8ZXhwZWN0aW5nLmhhcyhwLmlkKXx8Y2ZnLnBhcmVudFRyYWluaW5nJiZwYXJlbnRJZHMuaGFzKHAuaWQpJiZwLmZhbWlseUNvb2xkb3duVW50aWw+bm93KSkpOw0KICAgIGNvbnN0IHBvb2w9cy5yZXNpZGVudHMuZmlsdGVyKGF2YWlsYWJsZSksZ3Jvd3RoPXNoZWx0ZXJHcm93dGhOZWVkcyhtLHJlY29yZC5wb3B1bGF0aW9uUHJlcGFyYXRpb24sdGFyZ2V0LHRydWUpLGRlbWFuZD1ncm93dGguZGVtYW5kOw0KICAgIGNvbnN0IGRlcGFydHVyZXM9bmV3IE1hcCgpLGNvbWJhdFZhbHVlcz1uZXcgTWFwKCksbG9hZG91dHM9bmV3IE1hcCgpLGdlYXJSZXNlcnZlZD1uZXcgU2V0KCksZ2Vhck9wdGlvbnM9bmV3IE1hcCgpOw0KICAgIGNvbnN0IGxvYWRvdXQ9dGVhbT0+ew0KICAgICAgY29uc3Qgb3JkZXJlZD1bLi4udGVhbV0uc29ydCgoYSxiKT0+YS5pZC1iLmlkKSxrZXk9b3JkZXJlZC5tYXAocD0+cC5pZCkuam9pbignLCcpKyd8JytbLi4uZ2VhclJlc2VydmVkXS5qb2luKCcsJyk7DQogICAgICBpZighbG9hZG91dHMuaGFzKGtleSkpbG9hZG91dHMuc2V0KGtleSxzaGVsdGVyQ29tYmF0TG9hZG91dChzLG9yZGVyZWQsY2ZnLmNvbWJhdEdlYXIsZ2VhclJlc2VydmVkLGdlYXJPcHRpb25zKSk7DQogICAgICByZXR1cm4gbG9hZG91dHMuZ2V0KGtleSk7DQogICAgfTsNCiAgICBjb25zdCBlcXVpcD1wbGFuPT57DQogICAgICBmb3IoY29uc3QgY2hhbmdlIG9mIHBsYW4uY2hhbmdlcyl7DQogICAgICAgIGNvbnN0IHA9cy5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09Y2hhbmdlLmlkKSx7aWQsaXRlbSxzbG90fT1jaGFuZ2U7Z2VhclJlc2VydmVkLmFkZChpdGVtKTsNCiAgICAgICAgYWN0aW9ucy5wdXNoKHsuLi5jaGFuZ2Usa2luZDonZXF1aXAnLHRhcmdldHM6c2xvdD09PSdvdXRmaXQnP1tpZCxpdGVtXTpbaWQsaXRlbSwnd2VhcG9uJ10sDQogICAgICAgICAgbmFtZTpub3JtYWxpemVkKHAubmFtZSkscm9sZTonY29tYmF0R2VhcicscmVhc29uOiflhYjnqb/miLTlt7LnurPlhaXpmJ/kvI3or4TkvLDnmoTpl7Lnva7oo4XlpIfvvIzlho3mjInlrp7pmYXmiJjlipvph43mlrDmoLjlr7nlh7rlj5EnfSk7DQogICAgICB9DQogICAgICBjb21iYXRWYWx1ZXMuY2xlYXIoKTsNCiAgICB9Ow0KICAgIGNvbnN0IHByb2plY3Rpb249aWRzPT57DQogICAgICBjb25zdCB1bmlxdWU9Wy4uLm5ldyBTZXQoaWRzKV0uc29ydCgoYSxiKT0+YS1iKSxrZXk9dW5pcXVlLmpvaW4oJywnKTsNCiAgICAgIGlmKCFkZXBhcnR1cmVzLmhhcyhrZXkpKWRlcGFydHVyZXMuc2V0KGtleSxzaGVsdGVyUHJvZHVjdGlvbldpdGhvdXQobSx1bmlxdWUpKTsNCiAgICAgIHJldHVybiBkZXBhcnR1cmVzLmdldChrZXkpOw0KICAgIH07DQogICAgY29uc3QgY29tYmF0PXA9PntpZighY29tYmF0VmFsdWVzLmhhcyhwLmlkKSljb21iYXRWYWx1ZXMuc2V0KHAuaWQsbG9hZG91dChbcF0pLmNvbWJhdCk7cmV0dXJuIGNvbWJhdFZhbHVlcy5nZXQocC5pZCk7fTsNCiAgICBjb25zdCBsb3NzPWlkcz0+e2NvbnN0IGFmdGVyPXByb2plY3Rpb24oaWRzKTtyZXR1cm4gTWF0aC5tYXgoMCxtLnByb2R1Y3Rpb24uc2NyYXAtYWZ0ZXIuc2NyYXApKw0KICAgICAgT2JqZWN0LmtleXMoZGVtYW5kKS5yZWR1Y2UoKG4sayk9Pm4rTWF0aC5tYXgoMCxtLnByb2R1Y3Rpb25ba10tYWZ0ZXJba10pLDApO307DQogICAgY29uc3Qgc3VwcGx5Q2FjaGU9bmV3IE1hcCgpOw0KICAgIGNvbnN0IHN1cHBseT1pZHM9Pntjb25zdCBrZXk9Wy4uLm5ldyBTZXQoaWRzKV0uc29ydCgoYSxiKT0+YS1iKS5qb2luKCcsJyk7DQogICAgICBpZighc3VwcGx5Q2FjaGUuaGFzKGtleSkpc3VwcGx5Q2FjaGUuc2V0KGtleSxzaGVsdGVyQ29uc3RydWN0aW9uU3VwcGx5KG0saWRzLGRlbWFuZCxwcm9qZWN0aW9uKGlkcykpKTsNCiAgICAgIHJldHVybiBzdXBwbHlDYWNoZS5nZXQoa2V5KTt9Ow0KICAgIGNvbnN0IHNhZmU9aWRzPT5zdXBwbHkoaWRzKS5zYWZlOw0KICAgIGNvbnN0IGNvbnN0cnVjdGlvblN1cHBseT1zdXBwbHkoW10pOw0KICAgIGlmKGNvbnN0cnVjdGlvblN1cHBseS5zYWZlJiZjb25zdHJ1Y3Rpb25TdXBwbHkud2FpdGluZy5sZW5ndGgpbm90ZXMucHVzaChg5pa95bel5pyf6Ze05bqT5a2Y5Y+v6KaG55uW5Yiw5oGi5aSN6aaW5om55Lqn5Ye677yM5bm25L+d55WZ5Lik5bCP5pe25L2Z6YeP77yb57un57ut6K+E5Lyw5LiN5oq96LWw5a6M5bel5b+F6KaB5Lq65ZGY55qE5YW75oiQ77yaJHtjb25zdHJ1Y3Rpb25TdXBwbHkud2FpdGluZy5tYXAoZT0+YCR7c2hlbHRlclJlc291cmNlc1tlLnJlc291cmNlXX3nuqYke2UuaG91cnMudG9GaXhlZCgxKX3lsI/ml7ZgKS5qb2luKCfjgIEnKX3jgIJgKTsNCiAgICBjb25zdCBkZXBhcnRpbmc9W10sZGVwYXJ0dXJlR2Vhcj1bXSxndWFyZENhY2hlPW5ldyBNYXAoKTsNCiAgICBjb25zdCBndWFyZD0odGVhbT1bXSxnZWFyPXtjaGFuZ2VzOltdfSk9PnsNCiAgICAgIGNvbnN0IGlkcz1bLi4uZGVwYXJ0aW5nLC4uLnRlYW0ubWFwKHA9PnAuaWQpXSxjaGFuZ2VzPVsuLi5kZXBhcnR1cmVHZWFyLC4uLmdlYXIuY2hhbmdlc107DQogICAgICBjb25zdCBrZXk9SlNPTi5zdHJpbmdpZnkoW2lkcy5zbGljZSgpLnNvcnQoKGEsYik9PmEtYiksY2hhbmdlc10pOw0KICAgICAgaWYoIWd1YXJkQ2FjaGUuaGFzKGtleSkpZ3VhcmRDYWNoZS5zZXQoa2V5LHNoZWx0ZXJHdWFyZFBsYW4obSxjZmcsaWRzLGNoYW5nZXMscmVjb3JkKSk7DQogICAgICByZXR1cm4gZ3VhcmRDYWNoZS5nZXQoa2V5KTsNCiAgICB9Ow0KICAgIHJlc3VsdC5ndWFyZD1ndWFyZCgpO2lmKHJlc3VsdC5ndWFyZC5hY3RpdmUpbm90ZXMucHVzaChyZXN1bHQuZ3VhcmQubm90ZSk7DQogICAgcmVzdWx0LnBvcHVsYXRpb25EZWZlbnNlLmd1YXJkPXNoZWx0ZXJHdWFyZFBsYW4obSxjZmcsW10sW10scmVjb3JkLHRydWUpOw0KICAgIGxldCBndWFyZFJlamVjdGVkPWZhbHNlOw0KICAgIGNvbnN0IGd1YXJkZWQ9KHRlYW0sZ2Vhcik9Pntjb25zdCBjaGVjaz1ndWFyZCh0ZWFtLGdlYXIpO2lmKCFjaGVjay5hbGxvd2VkKWd1YXJkUmVqZWN0ZWQ9dHJ1ZTtyZXR1cm4gY2hlY2suYWxsb3dlZDt9Ow0KICAgIGNvbnN0IHByb2plY3RlZElkcz0oKT0+Wy4uLnJlc2VydmVkXTsNCiAgICBjb25zdCBoZWFsdGh5PXA9PnNoZWx0ZXJIZWFsdGgocCkuaHA+PS45KnNoZWx0ZXJIZWFsdGgocCkubWF4Ow0KICAgIGNvbnN0IGNvbWJhdE9yZGVyPShhLGIpPT5jb21iYXQoYiktY29tYmF0KGEpfHxsb3NzKFthLmlkXSktbG9zcyhbYi5pZF0pfHxhLmlkLWIuaWQ7DQogICAgY29uc3Qgb2NjdXBpZWQ9cj0+cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1ub3cmJnAucm9vbUlkPT09ci5pZCkubGVuZ3RoOw0KICAgIGNvbnN0IHJlc2VydmU9cD0+e3Jlc2VydmVkLmFkZChwLmlkKTtyZXR1cm4gcDt9Ow0KICAgIGNvbnN0IGFzc2lnbj0ocCxyLHJvbGUscmVhc29uKT0+KHtraW5kOidhc3NpZ24nLGlkOnAuaWQsdGFyZ2V0czpbcC5pZCxyPy5pZD8/bnVsbF0scm9vbTpyPy5pZD8/bnVsbCxmcm9tOnAucm9vbUlkLG5hbWU6bm9ybWFsaXplZChwLm5hbWUpLHJvbGUscmVhc29uLA0KICAgICAgLi4uKHI/LnR5cGU9PT0ndHJhaW5pbmcnP3tzdGF0OnIudHJhaW5TdGF0LGJhc2U6cC5zdGF0c1tyLnRyYWluU3RhdF19Ont9KX0pOw0KICAgIC8vIOWPquWPrOWbnuiEmuacrOW3suehruiupOa0vuWHuueahOaZrumAmuaOoumZqe+8m+aJi+WKqOWHuuWPkS/mt7HmuIrkv53mjIHljp/lronmjpLjgIINCiAgICByZXN1bHQudHJpcHM9W107DQogICAgaWYoY2ZnLmV4cGxvcmUpZm9yKGNvbnN0IGUgb2Ygcy5leHBsb3JlcnMpew0KICAgICAgY29uc3QgdHJpcD0ocmVjb3JkLnRyaXBzfHxbXSkuZmluZCh0PT50LmlkPT09ZS5pZCYmdC5yZXNpZGVudD09PWUucmVzaWRlbnRJZCkscD1zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1lLnJlc2lkZW50SWQpLGhwPXAmJnNoZWx0ZXJIZWFsdGgocCk7DQogICAgICBjb25zdCBtYW5hZ2VkPUJvb2xlYW4odHJpcCYmKHRyaXAuc3RhcnRlZEF0PT09dW5kZWZpbmVkfHx0cmlwLnN0YXJ0ZWRBdD09PWUuc3RhcnRlZEF0KSYmKHRyaXAudmF1bHRObz09PXVuZGVmaW5lZHx8dHJpcC52YXVsdE5vPT09bS52aWV3LnZhdWx0Tm8pKTsNCiAgICAgIGNvbnN0IGR1ZT1tYW5hZ2VkP2Uuc3RhcnRlZEF0K3RyaXAuaG91cnMqMzYwMDAwMDpudWxsOw0KICAgICAgcmVzdWx0LnRyaXBzLnB1c2goe2lkOmUuaWQscmVzaWRlbnQ6ZS5yZXNpZGVudElkLG1hbmFnZWQsc3RhcnRlZEF0OmUuc3RhcnRlZEF0LHJlY2FsbEF0OmR1ZSxyZWNhbGxlZEF0OmUucmVjYWxsZWRBdCxyZXR1cm5BdDplLnJldHVybkF0fSk7DQogICAgICBjb25zdCBzdGFtcD10PT5uZXcgRGF0ZSh0KS50b0xvY2FsZVN0cmluZygnemgtQ04nLHt0aW1lWm9uZTonQXNpYS9TaGFuZ2hhaScsaG91cjEyOmZhbHNlfSk7DQogICAgICBpZihlLnJlY2FsbGVkQXQhPT1udWxsKXtub3Rlcy5wdXNoKGAke25vcm1hbGl6ZWQocD8ubmFtZSl8fCfmjqLpmanogIUnfeato+WcqOi/lOeoiyR7TnVtYmVyLmlzRmluaXRlKGUucmV0dXJuQXQpP2DvvIzpooTorqEgJHtzdGFtcChlLnJldHVybkF0KX0g5Yiw5a62YDonJ33jgIJgKTtjb250aW51ZTt9DQogICAgICBpZighbWFuYWdlZCl7bm90ZXMucHVzaChgJHtub3JtYWxpemVkKHA/Lm5hbWUpfHwn5o6i6Zmp6ICFJ33nmoTlpJblh7rmsqHmnInlj6/moLjlr7nnmoTljp/ooYznqIvvvIzmnKroh6rliqjmjqXnrqHvvJvor7fmiYvliqjlj6zlm57miJbnrYnlvoXmnKzlnLDmiJDlip/ml6Xlv5fmgaLlpI3orrDlvZXjgIJgKTtjb250aW51ZTt9DQogICAgICBpZihlLmFieXNzIT09ZmFsc2V8fCFOdW1iZXIuaXNGaW5pdGUoZS5zdGFydGVkQXQpfHwhcHx8cC5kZWFkQXQhPT1udWxsfHwhaHB8fCFuYW1lT0socCkpY29udGludWU7DQogICAgICBub3Rlcy5wdXNoKGAke25vcm1hbGl6ZWQocC5uYW1lKX3ljp/orqHliJLlpJblh7ogJHt0cmlwLmhvdXJzfSDlsI/ml7bvvIwke25vdz49ZHVlPyflt7LliLDlj6zlm57ml7bpl7QnOiforqHliJLlj6zlm54nfSAke3N0YW1wKGR1ZSl977yb6L+U56iL5Y+m6ZyA5a6e6ZmF5aSW5Ye65pe26ZW/55qE5LiA5Y2K44CCYCk7DQogICAgICBpZihkdWU+bm93KXJlc3VsdC5ldmVudHMucHVzaChkdWUtbm93KTsNCiAgICAgIGlmKGhwLmhwPC42KmhwLm1heHx8bm93Pj1kdWUpYWN0aW9ucy5wdXNoKHtraW5kOidleHBsb3JlLXJlY2FsbCcsdGFyZ2V0czpbZS5pZF0saWQ6cC5pZCxuYW1lOm5vcm1hbGl6ZWQocC5uYW1lKSwNCiAgICAgICAgcmVhc29uOmhwLmhwPC42KmhwLm1heD8n5o6i6Zmp6ICF6KGA6YeP5L2O5LqONjAl77yM5o+Q5YmN5Y+s5ZueJzon5pmu6YCa5o6i6Zmp6L6+5Yiw6K6+5a6a5pe26ZW/77yM5Y+s5Zue5ZCO562J5b6F5b2S5p2l6aKG5Y+WJ30pOw0KICAgIH0NCiAgICBjb25zdCBkZWZlbnNlPXNoZWx0ZXJEZWZlbnNlUGxhbihtLGNmZyxyZWNvcmQpOw0KICAgIGNvbnN0IHdvdW5kZWQ9cy5yZXNpZGVudHMuZmlsdGVyKHA9PmhvbWUocCkmJnNoZWx0ZXJIZWFsdGgocCkuaHA8Ljkqc2hlbHRlckhlYWx0aChwKS5tYXgpLnNvcnQoKGEsYik9PmEuaHAvc2hlbHRlckhlYWx0aChhKS5tYXgtYi5ocC9zaGVsdGVySGVhbHRoKGIpLm1heHx8YS5pZC1iLmlkKTsNCiAgICBjb25zdCBjYW5IZWFsPXA9PmNmZy5tZWRpY2FsJiZzLnJlc291cmNlcy5zdGltcGFrPmNmZy5yZXNlcnZlJiYNCiAgICAgICEocmVjb3JkLmhlYWxzfHxbXSkuc29tZShoPT5oLmlkPT09cC5pZCYmbm93LWguYXQ8MTgwMDAwMCkmJg0KICAgICAgKCFyZWNvcmQucGVuZGluZ3x8c2hlbHRlckluZGVwZW5kZW50RGVmZW5zZShyZWNvcmQucGVuZGluZyx7a2luZDonc3RpbXBhaycscm9sZTonbWVkaWNhbCcsaWQ6cC5pZH0sbSxjZmcscmVjb3JkLnJlYWRTdGFydGVkQXQpKTsNCiAgICBjb25zdCBjb21iYXRIZWFsaW5nPWRlZmVuc2UuYWN0aXZlJiZkZWZlbnNlLmJ1c3k7DQogICAgY29uc3QgY3JpdGljYWw9Y29tYmF0SGVhbGluZz93b3VuZGVkLmZpbmQocD0+Y2FuSGVhbChwKSYmc2hlbHRlckhlYWx0aChwKS5jcml0aWNhbCYmDQogICAgICBzLnJvb21zLnNvbWUocj0+ci5pZD09PXAucm9vbUlkJiZyLmluY2lkZW50Py5raW5kPT09J3JhaWRlcnMnKSk6bnVsbDsNCiAgICBjb25zdCBwYXRpZW50PWNyaXRpY2FsfHx3b3VuZGVkLmZpbmQoY2FuSGVhbCk7DQogICAgY29uc3QgaGVhbGluZz1wYXRpZW50P3traW5kOidzdGltcGFrJyx0YXJnZXRzOltwYXRpZW50LmlkXSxpZDpwYXRpZW50LmlkLG5hbWU6bm9ybWFsaXplZChwYXRpZW50Lm5hbWUpLHJvbGU6J21lZGljYWwnLA0KICAgICAgcmVhc29uOmNyaXRpY2FsPyflhYjmlZHmsrvlj5fooq3miL/lhoXooYDph4/kuI3otrPkuIDljYrnmoTlsYXmsJHvvJvmr4/kurrljYrlsI/ml7bmnIDlpJroh6rliqjnlKjkuIDpkognOg0KICAgICAgICBjb21iYXRIZWFsaW5nPyfnjrDmnInlgaXlurfkurrmiYvlop7mj7TlkI7msrvnlpflnKjlrrbkvKTlkZjvvIzlho3or4TkvLDov73lh7vvvJvmr4/kurrljYrlsI/ml7bmnIDlpJroh6rliqjnlKjkuIDpkognOifmgaLlpI3lnKjlrrbkvKTlkZjvvJvmr4/kurrljYrlsI/ml7bmnIDlpJroh6rliqjnlKjkuIDpkognfTpudWxsOw0KICAgIGZvcihjb25zdCBpZCBvZiBkZWZlbnNlLnJlc2VydmVkKXJlc2VydmVkLmFkZChpZCk7DQogICAgbm90ZXMucHVzaCguLi5kZWZlbnNlLm5vdGVzKTthY3Rpb25zLnB1c2goLi4uZGVmZW5zZS5hY3Rpb25zKTtyZXN1bHQuZGVmZW5zZT1kZWZlbnNlOw0KICAgIGlmKGRlZmVuc2UuYnVzeSl7DQogICAgICAvLyDliLDmnJ/lj6zlm57ku43kv53nlZnljp/ooYznqIvvvIzkvYbkuI3og73mjpLlnKjlvZPliY3mnaXooq3nmoTlop7mj7Tlj4rlpI3lspfliY3pnaLjgIINCiAgICAgIGFjdGlvbnMuc3BsaWNlKDAsYWN0aW9ucy5sZW5ndGgsLi4uZGVmZW5zZS5hY3Rpb25zKTsNCiAgICAgIGlmKGRlZmVuc2UuYWN0aXZlJiZoZWFsaW5nKXtpZihjcml0aWNhbClhY3Rpb25zLnVuc2hpZnQoaGVhbGluZyk7ZWxzZSBhY3Rpb25zLnB1c2goaGVhbGluZyk7fQ0KICAgICAgcmVzdWx0LmV2ZW50cy5wdXNoKDUwMDApO3Jlc3VsdC5yZXNlcnZlZD1bLi4ucmVzZXJ2ZWRdO3Jlc3VsdC5jaG9pY2U9YWN0aW9uc1swXXx8bnVsbDtyZXR1cm4gcmVzdWx0Ow0KICAgIH0NCiAgICAvLyDlkajku7vliqHmjInlv6vnhafph4znmoTlpZblirHpooTnlZnlrrnph4/vvIzkuI3lh60gSFRUUCAyMDAg5o6o5pat5bey6aKG5Y+W44CCDQogICAgaWYoY2ZnLnF1ZXN0cylmb3IoY29uc3QgcSBvZiBzLnF1ZXN0cyl7DQogICAgICBpZighTnVtYmVyLmlzRmluaXRlKHEucmV0dXJuQXQpfHxxLnJldHVybkF0Pm5vd3x8IVsncmV0dXJuaW5nJywnZmFpbGVkJ10uaW5jbHVkZXMocS5zdGF0dXMpfHwhQXJyYXkuaXNBcnJheShxLnRlYW0pfHxxLnRlYW0ubGVuZ3RoPDF8fHEudGVhbS5sZW5ndGg+Myljb250aW51ZTsNCiAgICAgIGNvbnN0IHRlYW09cS50ZWFtLm1hcChpZD0+cy5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09aWQpKSxyZXdhcmQ9cS5zbmFwc2hvdD8ucmV3YXJkczsNCiAgICAgIGlmKG5ldyBTZXQocS50ZWFtKS5zaXplIT09cS50ZWFtLmxlbmd0aHx8dGVhbS5zb21lKHA9PiFwfHwhbmFtZU9LKHApfHxwLmRlYWRBdCE9PW51bGx8fHAuYXdheT8ua2luZCE9PSdxdWVzdCcpfHwNCiAgICAgICAgdHlwZW9mIHEuc25hcHNob3Q/LnRpdGxlIT09J3N0cmluZyd8fCFyZXdhcmR8fCFbJ3NjcmFwJywncGFydHMnXS5ldmVyeShrPT5OdW1iZXIuaXNGaW5pdGUocmV3YXJkW2tdKSYmcmV3YXJkW2tdPj0wKXx8DQogICAgICAgICEocmV3YXJkLml0ZW1UaWVyPT09bnVsbHx8TnVtYmVyLmlzSW50ZWdlcihyZXdhcmQuaXRlbVRpZXIpJiZyZXdhcmQuaXRlbVRpZXI+PTAmJnJld2FyZC5pdGVtVGllcjw9NikpY29udGludWU7DQogICAgICBjb25zdCBzdWNjZXNzPXEuc3RhdHVzIT09J2ZhaWxlZCcscmV3YXJkcz1zdWNjZXNzP3tzY3JhcDpNYXRoLmNlaWwocmV3YXJkLnNjcmFwKSxwYXJ0czpNYXRoLmNlaWwocmV3YXJkLnBhcnRzKX06e30saXRlbXM9c3VjY2VzcyYmcmV3YXJkLml0ZW1UaWVyIT09bnVsbD8xOjA7DQogICAgICBpZihPYmplY3QuZW50cmllcyhyZXdhcmRzKS5zb21lKChbayx2XSk9PnMucmVzb3VyY2VzW2tdK3Y+bS5jYXBzW2tdKXx8cy5pdGVtcy5sZW5ndGgraXRlbXM+bS5pdGVtQ2FwKXtub3Rlcy5wdXNoKCflvZLmnaXlsI/pmJ/lpZblirHlj6/og73muqLlh7rvvIzlhYjohb7lh7rlupPlrZjjgIInKTtjb250aW51ZTt9DQogICAgICBhY3Rpb25zLnB1c2goe2tpbmQ6J3F1ZXN0LWNsYWltJyx0YXJnZXRzOltxLmlkXSx0ZWFtOnEudGVhbSx0aXRsZTpub3JtYWxpemVkKGAke3Euc25hcHNob3QudGl0bGV9IMK3ICR7dGVhbS5tYXAocD0+cC5uYW1lKS5qb2luKCfjgIEnKX1gKSxyZWFzb246J+mihuWPluW9kuadpeW6n+Wcn+Wwj+mYn+W5tumHiuaUvuS6uuWRmCd9KTsNCiAgICB9DQogICAgaWYoaGVhbGluZylhY3Rpb25zLnB1c2goaGVhbGluZyk7DQogICAgbGV0IHRyYWluaW5nU2NyYXBSZXNlcnZlZD0wLHRyYWluaW5nUGFydHNSZXNlcnZlZD0wOw0KICAgIGNvbnN0IHRyYWluaW5nQ29tbWl0bWVudHM9KGV4dHJhPXt9KT0+KHtkZXN0aW5hdGlvbnM6cmVzdWx0LnRyYWluaW5nRGVzdGluYXRpb25zLGRlcGFydHVyZXM6cHJvamVjdGVkSWRzKCkscGFydHNUYXJnZXQ6Y2ZnLnBhcnRzVGFyZ2V0LA0KICAgICAgc2NyYXBSZXNlcnZlOk1hdGgubWF4KGNmZy53b3Jrc2hvcFNjcmFwUmVzZXJ2ZXx8MCxyZWNvcmQuY29uc3RydWN0aW9uUG9saWN5Py5zY3JhcFJlc2VydmV8fDApLA0KICAgICAgc2NyYXBSZXNlcnZlZDp0cmFpbmluZ1NjcmFwUmVzZXJ2ZWQscGFydHNSZXNlcnZlZDp0cmFpbmluZ1BhcnRzUmVzZXJ2ZWQsLi4uZXh0cmF9KTsNCiAgICBjb25zdCByZXNlcnZlVHJhaW5pbmc9KGlkLGRlc3RpbmF0aW9uLGFzc2Vzc21lbnQpPT57DQogICAgICByZXN1bHQudHJhaW5pbmdEZXN0aW5hdGlvbnMucHVzaCh7aWQscm9vbTpkZXN0aW5hdGlvbn0pOw0KICAgICAgdHJhaW5pbmdTY3JhcFJlc2VydmVkKz1hc3Nlc3NtZW50Py5iZXN0Py5zY3JhcEZlZWR8fDA7dHJhaW5pbmdQYXJ0c1Jlc2VydmVkKz1hc3Nlc3NtZW50Py5iZXN0Py5wYXJ0c0NvbW1pdG1lbnR8fDA7DQogICAgfTsNCiAgICAvLyDljoblj7LmiYvliqjorq3nu4PmjInnnJ/lrp7liankvZnov5vluqbpgInmi6nnlKjpgJTvvJvnuq/op4TliJLlj6rov5Tlm57mjqXnrqHmhI/lm77vvIzlpJblsYLmoLjlr7nlkI7mjIHkuYXljJblm7rlrprmnJ/pmZDjgIINCiAgICBjb25zdCBhZG9wdGVkRGVzdGluYXRpb25zPXJvbGVzLmZpbHRlcihyPT5yLnB1cnBvc2U9PT0ncHJvZHVjdGlvbicmJnIudW50aWw+bm93JiYNCiAgICAgIHMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PXIuaWQmJnAucm9vbUlkPT09ci5yb29tKSkubWFwKHI9Pih7aWQ6ci5pZCxyb29tOnIuZGVzdGluYXRpb259KSk7DQogICAgZm9yKGNvbnN0IHAgb2YgaGlzdG9yaWNhbFRyYWluaW5nKXsNCiAgICAgIGNvbnN0IHJvb209cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCksYXNzZXNzbWVudD1zaGVsdGVyVHJhaW5pbmdSZXR1cm4obSxwLHJvb20sMTY4LA0KICAgICAgICB0cmFpbmluZ0NvbW1pdG1lbnRzKHtkZXN0aW5hdGlvbnM6YWRvcHRlZERlc3RpbmF0aW9uc30pKTsNCiAgICAgIGlmKFsndW5rbm93bi10cmFpbmluZycsJ2F3YWl0aW5nLXRyYWluaW5nLXNldHRsZW1lbnQnXS5pbmNsdWRlcyhhc3Nlc3NtZW50LnJlYXNvbikpew0KICAgICAgICByZXNlcnZlKHApO25vdGVzLnB1c2goYCR7bm9ybWFsaXplZChwLm5hbWUpfeWOhuWPsuiuree7g+WxnuaAp+OAgei/m+W6puaIlue7k+eul+WwmuW+heaguOWvue+8jOS/neeVmeW9k+WJjeagvO+8jOS4jeWBh+iuvui/m+W6puS4uumbtuOAgmApO2NvbnRpbnVlOw0KICAgICAgfQ0KICAgICAgaWYoIWhlYWx0aHkocCkpe3Jlc2VydmUocCk7Y29udGludWU7fQ0KICAgICAgbGV0IGFkb3B0ZWQ9bnVsbDsNCiAgICAgIGlmKGNmZy50cmFpbmluZyYmY2ZnLnBhcmVudFRyYWluaW5nJiZwYXJlbnRJZHMuaGFzKHAuaWQpJiZwLmZhbWlseUNvb2xkb3duVW50aWw+bm93JiYNCiAgICAgICAgICBwLnN0YXRzW3Jvb20udHJhaW5TdGF0XTxjZmcudHJhaW5UYXJnZXQmJmFzc2Vzc21lbnQuZmluaXNoQXQ8PXAuZmFtaWx5Q29vbGRvd25VbnRpbCkNCiAgICAgICAgYWRvcHRlZD17aWQ6cC5pZCxyb29tOnJvb20uaWQscm9sZTondHJhaW5pbmcnLGF0Om5vdyxzdGF0OnJvb20udHJhaW5TdGF0LGJhc2U6cC5zdGF0c1tyb29tLnRyYWluU3RhdF0scHVycG9zZToncGFyZW50Jyx1bnRpbDpwLmZhbWlseUNvb2xkb3duVW50aWx9Ow0KICAgICAgZWxzZSBpZihjZmcudHJhaW5pbmcmJmFzc2Vzc21lbnQuZWxpZ2libGUmJnAuc3RhdHNbcm9vbS50cmFpblN0YXRdPGNmZy50cmFpblRhcmdldCkNCiAgICAgICAgYWRvcHRlZD17aWQ6cC5pZCxyb29tOnJvb20uaWQscm9sZTondHJhaW5pbmcnLGF0Om5vdyxzdGF0OnJvb20udHJhaW5TdGF0LGJhc2U6cC5zdGF0c1tyb29tLnRyYWluU3RhdF0scHVycG9zZToncHJvZHVjdGlvbicsDQogICAgICAgICAgdW50aWw6YXNzZXNzbWVudC5maW5pc2hBdCs2MDAwMDAsd2luZG93RW5kOm5vdysxNjgqMzYwMDAwMCxkZXN0aW5hdGlvbjphc3Nlc3NtZW50LmJlc3Qucm9vbX07DQogICAgICBpZihhZG9wdGVkKXtyb2xlcy5wdXNoKGFkb3B0ZWQpO3Jlc3VsdC5hZG9wdGlvbnMucHVzaChhZG9wdGVkKTsNCiAgICAgICAgaWYoYWRvcHRlZC5kZXN0aW5hdGlvbilhZG9wdGVkRGVzdGluYXRpb25zLnB1c2goe2lkOmFkb3B0ZWQuaWQscm9vbTphZG9wdGVkLmRlc3RpbmF0aW9ufSk7Y29udGludWU7fQ0KICAgICAgaWYoY2ZnLnRyYWluaW5nJiZjZmcud29ya3Nob3AmJnJvb20udHJhaW5TdGF0PT09J2ludCcmJmNmZy5wYXJ0c1RhcmdldD09PXVuZGVmaW5lZCl7cmVzZXJ2ZShwKTtjb250aW51ZTt9DQogICAgICBhY3Rpb25zLnB1c2goYXNzaWduKHAsYXNzZXNzbWVudC5iZXN0P3Mucm9vbXMuZmluZChyPT5yLmlkPT09YXNzZXNzbWVudC5iZXN0LnJvb20pOm51bGwsJ3RyYWluaW5nLXJlbGVhc2UnLA0KICAgICAgICBg5Y6G5Y+y6K6t57uD6YeN5paw6K+E5Lyw77yaJHthc3Nlc3NtZW50LnJlYXNvbn3vvIznu5PmnZ/lvZPliY3nlKjpgJTlubbkuqTlm57nlJ/kuqfkuI7kurrlj6PosIPluqZgKSk7DQogICAgfQ0KICAgIC8vIOe7g+aIkOS4gOagvOWGjei9ruaNou+8m+W3suaciei/m+W6puS4jeaMieWbuuWumuaXtumVv+S4reaWre+8jOmBv+WFjeacquefpeeahOaNouWyl+mHjee9ruinhOWImeaNn+Wkseiuree7g+OAgg0KICAgIGZvcihjb25zdCByb2xlIG9mIHJvbGVzKXsNCiAgICAgIGNvbnN0IHA9cy5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09cm9sZS5pZCkscj1wJiZzLnJvb21zLmZpbmQocj0+ci5pZD09PXAucm9vbUlkKTsNCiAgICAgIGlmKCFwfHwhaG9tZShwKXx8cHVycG9zZVByb3RlY3RlZElkcy5oYXMocC5pZCl8fHJvbGUucm9vbSE9PXAucm9vbUlkKWNvbnRpbnVlOw0KICAgICAgaWYocm9sZS5yb2xlPT09J3RyYWluaW5nJyYmKGNmZy50cmFpbmluZ3x8WydwYXJlbnQnLCdwcm9kdWN0aW9uJ10uaW5jbHVkZXMocm9sZS5wdXJwb3NlKSkpew0KICAgICAgICBpZihyb2xlLnB1cnBvc2U9PT0ncHJvZHVjdGlvbicpew0KICAgICAgICAgIGNvbnN0IGFzc2Vzc21lbnQ9c2hlbHRlclRyYWluaW5nUmV0dXJuKG0scCxyLE1hdGgubWluKDE2OCxNYXRoLm1heCgxLzYsKHJvbGUud2luZG93RW5kLW5vdykvMzYwMDAwMCkpLA0KICAgICAgICAgICAgdHJhaW5pbmdDb21taXRtZW50cyh7ZGVzdGluYXRpb246cm9sZS5kZXN0aW5hdGlvbn0pKTsNCiAgICAgICAgICBjb25zdCBjb21wbGV0ZWQ9cC5zdGF0c1tyb2xlLnN0YXRdPnJvbGUuYmFzZSxleHBpcmVkPW5vdz49cm9sZS51bnRpbDsNCiAgICAgICAgICBjb25zdCBkZXN0aW5hdGlvbj1zLnJvb21zLmZpbmQoZD0+ZC5pZD09PXJvbGUuZGVzdGluYXRpb24pOw0KICAgICAgICAgIGNvbnN0IGV4cGVjdGVkUmVzb3VyY2U9e3N0cjoncG93ZXInLHBlcjond2F0ZXInLGVuZDonc2NyYXAnLGFnaTonZm9vZCcsaW50OidwYXJ0cyd9W3JvbGUuc3RhdF07DQogICAgICAgICAgY29uc3Qgc2VhdD1hY3RpdmUoZGVzdGluYXRpb24pJiZzaGVsdGVyUm9vbXNbZGVzdGluYXRpb24udHlwZV0/LlsxXT09PWV4cGVjdGVkUmVzb3VyY2UmJg0KICAgICAgICAgICAgb2NjdXBpZWQoZGVzdGluYXRpb24pK3Jlc3VsdC50cmFpbmluZ0Rlc3RpbmF0aW9ucy5maWx0ZXIoZD0+ZC5yb29tPT09cm9sZS5kZXN0aW5hdGlvbikubGVuZ3RoPGRlc3RpbmF0aW9uLndpZHRoKjI7DQogICAgICAgICAgY29uc3QgYXdhaXRpbmdQYXJ0cz1yb2xlLnN0YXQ9PT0naW50JyYmY2ZnLndvcmtzaG9wJiZjZmcucGFydHNUYXJnZXQ9PT11bmRlZmluZWQ7DQogICAgICAgICAgaWYoIWNmZy50cmFpbmluZ3x8IWNmZy5kZXZlbG9wbWVudHx8Y29tcGxldGVkfHxleHBpcmVkfHxub3c+PXJvbGUud2luZG93RW5kfHxyPy50cmFpblN0YXQhPT1yb2xlLnN0YXR8fA0KICAgICAgICAgICAgICBwLnN0YXRzW3JvbGUuc3RhdF08cm9sZS5iYXNlfHwhYWN0aXZlKHIpfHwhc2VhdHx8IXNhZmUoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKXx8DQogICAgICAgICAgICAgICFhc3Nlc3NtZW50LmVsaWdpYmxlJiYhYXdhaXRpbmdQYXJ0cyYmYXNzZXNzbWVudC5yZWFzb24hPT0ndW5rbm93bi10cmFpbmluZycmJmFzc2Vzc21lbnQucmVhc29uIT09J2F3YWl0aW5nLXRyYWluaW5nLXNldHRsZW1lbnQnKXsNCiAgICAgICAgICAgIGFjdGlvbnMucHVzaChhc3NpZ24ocCxzZWF0P2Rlc3RpbmF0aW9uOm51bGwsJ3RyYWluaW5nLXJlbGVhc2UnLGNvbXBsZXRlZD8n55Sf5Lqn6K6t57uD5a6M5oiQ5LiA5qC877yM5oyJ5a6e6ZmF5L6b57uZ5LiO56m65bKX6L+U5bKXJzoNCiAgICAgICAgICAgICAgZXhwaXJlZD8n55Sf5Lqn6K6t57uD5Yiw6L6+5pyA5pma6L+U5bKX5pe26Ze077yM57uT5p2f5pys6L2u5oqV5YWl5bm26YeN6K+EJzon55Sf5Lqn6K6t57uD55So6YCU44CB5Zue5oql5oiW5L6b5bqU5Y+R55Sf5Y+Y5YyW77yM6YeK5pS+5Lq65ZGY6YeN5paw5YiG6YWNJykpOw0KICAgICAgICAgIH1lbHNle3Jlc2VydmUocCk7cmVzZXJ2ZVRyYWluaW5nKHAuaWQscm9sZS5kZXN0aW5hdGlvbixhc3Nlc3NtZW50KTtyZXN1bHQuZXZlbnRzLnB1c2goTWF0aC5tYXgoMSxyb2xlLnVudGlsLW5vdykpO30NCiAgICAgICAgICBjb250aW51ZTsNCiAgICAgICAgfQ0KICAgICAgICBjb25zdCBwYXJlbnQ9cm9sZS5wdXJwb3NlPT09J3BhcmVudCcsZHVlPXBhcmVudCYmKCFjZmcudHJhaW5pbmd8fCFjZmcucGFyZW50VHJhaW5pbmd8fCFwYXJlbnRJZHMuaGFzKHAuaWQpfHwNCiAgICAgICAgICBub3c+PXJvbGUudW50aWx8fCEocC5mYW1pbHlDb29sZG93blVudGlsPm5vdykpOw0KICAgICAgICBpZihkdWV8fHAuc3RhdHNbcm9sZS5zdGF0XT5yb2xlLmJhc2V8fHAuc3RhdHNbcm9sZS5zdGF0XT49KHBhcmVudD9jZmcudHJhaW5UYXJnZXQ6ZGFpbHk/LmdvYWxzLnNvbWUoZz0+Zy5rZXk9PT0ndHJhaW4nJiYhZy5jbGFpbWVkJiZnLnJlbWFpbmluZyk/MTA6Y2ZnLnRyYWluVGFyZ2V0KXx8IWFjdGl2ZShyKXx8IXNhZmUoW3AuaWRdKSkNCiAgICAgICAgICBhY3Rpb25zLnB1c2goYXNzaWduKHAsbnVsbCwndHJhaW5pbmctcmVsZWFzZScscGFyZW50PyfniLbmr43mnKzova7orq3nu4PlrozmiJDjgIHlhrfljbTliLDmnJ/miJbkvpvlupTlj5jljJbvvIzkuqTlm57kurrlj6PkuI7nlJ/kuqfosIPluqYnOiforq3nu4Pova7mrKHnu5PmnZ/vvIzph4rmlL7kurrpgInlm57liLDmjqLpmanlkoznlJ/kuqflgJnpgInmsaAnKSk7DQogICAgICAgIGVsc2Uge3Jlc2VydmUocCk7aWYocGFyZW50KXJlc3VsdC5ldmVudHMucHVzaChyb2xlLnVudGlsLW5vdyk7fQ0KICAgICAgfQ0KICAgICAgZWxzZSBpZihjZmcuZGV2ZWxvcG1lbnQmJiFjZmdbcm9sZS5yb2xlXSYmWydtZWRpY2FsJywnd29ya3Nob3AnLCdyYWRpbyddLmluY2x1ZGVzKHJvbGUucm9sZSkpew0KICAgICAgICBpZihyb2xlLnJvbGU9PT0nbWVkaWNhbCcmJih3b3VuZGVkLmxlbmd0aHx8cy5yZXNvdXJjZXMuc3RpbXBhazxjZmcucmVzZXJ2ZSsxKSlyZXNlcnZlKHApOw0KICAgICAgICBlbHNlIGFjdGlvbnMucHVzaChhc3NpZ24ocCxudWxsLGAke3JvbGUucm9sZX0tcmVsZWFzZWAsJ+W9k+WJjeacquWQr+eUqOatpOWyl+S9jeeUqOmAlO+8jOmHiuaUvuWOhuWPsuWAvOePreW5tumHjeaWsOWIhumFjScpKTsNCiAgICAgIH0NCiAgICAgIGVsc2UgaWYoY2ZnW3JvbGUucm9sZV0mJiFzYWZlKFtdKSlhY3Rpb25zLnB1c2goYXNzaWduKHAsbnVsbCxgJHtyb2xlLnJvbGV9LXJlbGVhc2VgLCfln7rnoYDkvpvlupTlpLHljrvkvZnph4/vvIzph4rmlL7oh6rliqjlgLznj63kurrpgInkvpvnlJ/kuqfmjqXmm78nKSk7DQogICAgfQ0KICAgIGNvbnN0IHNwZWNpYWxDYW5kaWRhdGU9KHN0YXQsZXh0cmFTYWZlLG1pbmltdW1IZWFsdGg9LjkpPT5wb29sLmZpbHRlcihwPT4hcmVzZXJ2ZWQuaGFzKHAuaWQpJiZzaGVsdGVySGVhbHRoKHApLmhwPj1taW5pbXVtSGVhbHRoKnNoZWx0ZXJIZWFsdGgocCkubWF4JiYoIW93bmVkKHApfHxvd25lZChwKS5yb2xlPT09J3JhZGlvJykmJnNhZmUoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKSYmKCFleHRyYVNhZmV8fGV4dHJhU2FmZShwKSkpDQogICAgICAuc29ydCgoYSxiKT0+Yi5zdGF0c1tzdGF0XS1hLnN0YXRzW3N0YXRdfHxsb3NzKFthLmlkXSktbG9zcyhbYi5pZF0pfHxhLmlkLWIuaWQpWzBdOw0KICAgIGNvbnN0IHN1cHBvcnRWYWNhbmN5PXI9PnImJnMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwmJnAuYWR1bHRBdDw9bm93JiZwLnJvb21JZD09PXIuaWQpLmxlbmd0aDxyLndpZHRoKjI7DQogICAgY29uc3Qgc3VwcG9ydD0odHlwZSxzdGF0LG5lZWQscm9sZSxwcmlvcml0eSxleHRyYVNhZmUsZmlsbD1mYWxzZSk9PnsNCiAgICAgIGNvbnN0IHJvb21zPXMucm9vbXMuZmlsdGVyKHI9PnIudHlwZT09PXR5cGUpLHdvcmtpbmc9cm9vbXMuZmlsdGVyKGFjdGl2ZSksbWFuYWdlZD1yb2xlcy5maWx0ZXIocj0+ci5yb2xlPT09cm9sZSk7DQogICAgICBpZighbmVlZCl7Zm9yKGNvbnN0IHJyIG9mIG1hbmFnZWQpe2NvbnN0IHA9cy5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09cnIuaWQmJnAucm9vbUlkPT09cnIucm9vbSYmaG9tZShwKSk7DQogICAgICAgIGNvbnN0IHJvb209cCYmcy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCk7DQogICAgICAgIGlmKHAmJiFwdXJwb3NlUHJvdGVjdGVkSWRzLmhhcyhwLmlkKSYmcm9vbT8uYnVpbHRBdDw9bm93JiZyb29tLnVwZ3JhZGVBdD09PW51bGwmJiFyb29tLmluY2lkZW50JiYNCiAgICAgICAgICAgICFhY3Rpb25zLnNvbWUoYT0+YS5pZD09PXAuaWQmJmEucm9sZT09PWAke3JvbGV9LXJlbGVhc2VgKSlhY3Rpb25zLnB1c2goYXNzaWduKHAsbnVsbCxgJHtyb2xlfS1yZWxlYXNlYCwn5b2T5YmN5YC854+t5p2h5Lu25LiN5YaN5ruh6Laz77yM6YeK5pS+5YC854+t5Lq65omL6YeN5paw5YiG6YWNJykpO31yZXR1cm47fQ0KICAgICAgY29uc3Qgc3RhZmZlZD13b3JraW5nLmZpbHRlcihyPT5zLnJlc2lkZW50cy5zb21lKHA9PmhvbWUocCkmJnAucm9vbUlkPT09ci5pZCkpOw0KICAgICAgY29uc3QgY2hvaWNlcz1maWxsP1suLi5zdGFmZmVkLC4uLndvcmtpbmcuZmlsdGVyKHI9PiFzdGFmZmVkLmluY2x1ZGVzKHIpKV06c3RhZmZlZC5sZW5ndGg/c3RhZmZlZDp3b3JraW5nOw0KICAgICAgLy8g5aSW5Ye65oiQ5Lq65LuN5Y2g5Y6f55Sf5bKX5L2N77yb5YWI5aGr5bey5pyJ5YC854+t5oi/77yM5YaN5L2/55So5YW25LuW5bey5a6M5bel55qE56m65oi/44CCDQogICAgICBpZihzdGFmZmVkLmxlbmd0aCl7DQogICAgICAgIGZvcihjb25zdCByIG9mIHN0YWZmZWQpZm9yKGNvbnN0IHAgb2YgcG9vbC5maWx0ZXIocD0+cC5yb29tSWQ9PT1yLmlkKSlyZXNlcnZlKHApOw0KICAgICAgICBpZighZmlsbHx8IWNob2ljZXMuc29tZShzdXBwb3J0VmFjYW5jeSkpcmV0dXJuOw0KICAgICAgfQ0KICAgICAgY29uc3Qgcm9vbT1jaG9pY2VzLmZpbmQoc3VwcG9ydFZhY2FuY3kpOw0KICAgICAgLy8gRGV2ZWxvcG1lbnQgbWFudWZhY3R1cmluZyB1c2VzIHRoZSBvcmRpbmFyeSBzdGFmZmluZyBoZWFsdGggdGhyZXNob2xkOyBsZWF2aW5nIGhvbWUgc3RpbGwgcmVxdWlyZXMgOTAlLg0KICAgICAgY29uc3QgcD1zcGVjaWFsQ2FuZGlkYXRlKHN0YXQscD0+IWV4dHJhU2FmZXx8ZXh0cmFTYWZlKHAscm9vbSksY2ZnLmRldmVsb3BtZW50JiZyb2xlPT09J3dvcmtzaG9wJz8uNjouOSk7aWYoIXApe25vdGVzLnB1c2goYCR7c2hlbHRlckJ1aWxkUnVsZXNbdHlwZV1bMF195pqC57y65Y+v5a6J5YWo56a75bKX55qE5YC854+t5Lq66YCJ44CCYCk7cmV0dXJuO30NCiAgICAgIHJlc2VydmUocCk7DQogICAgICBpZihyb29tKWFjdGlvbnMucHVzaChhc3NpZ24ocCxyb29tLHJvbGUsYOWuieaOkiR7c2hlbHRlckJ1aWxkUnVsZXNbdHlwZV1bMF195YC854+t77yM6KGl6Laz57u85ZCI5Y+R5bGV57y65Y+jYCkpOw0KICAgICAgZWxzZSBpZighcm9vbXMubGVuZ3RoKXByb2plY3RzLnB1c2goe3R5cGUscHJpb3JpdHkscGVyc29uOnAuaWQsc3RhdCxyb2xlLGJlbmVmaXQ6YOW3suS4uiR7c2hlbHRlckJ1aWxkUnVsZXNbdHlwZV1bMF196aKE55WZ5Y+v5a6J5YWo56a75bKX5Lq66YCJ77yM5bu65oiQ5ZCO6Ieq5Yqo5a6J5o6SYH0pOw0KICAgIH07DQogICAgLy8g5YWI5Li65rG95rC05pmu6YCa5o6i6Zmp55WZ5Lq677yM5YaN6K+E5Lyw5pW05pSv5ZGo5Lu75Yqh6Zif55qE56a75bKX5oiQ5pys44CCDQogICAgY29uc3Qgc2xvdHM9TnVtYmVyLmlzSW50ZWdlcihzLmRlcHRoKSYmcy5kZXB0aD49MT9NYXRoLm1pbig2LDErTWF0aC5mbG9vcihzLmRlcHRoLzgpKTowOw0KICAgIGNvbnN0IGRyb3BzPW0udmlldy5kcm9wcyxkcm9wc09LPWRyb3BzPy5lbmFibGVkPT09dHJ1ZSYmTnVtYmVyLmlzRmluaXRlKGRyb3BzLm1pbk1pbnV0ZXMpJiZkcm9wcy5taW5NaW51dGVzPj0wJiYNCiAgICAgIEFycmF5LmlzQXJyYXkoZHJvcHMudGllclBlcm1pbGxlKSYmZHJvcHMudGllclBlcm1pbGxlLmxlbmd0aD4wJiZkcm9wcy50aWVyUGVybWlsbGUuZXZlcnkobj0+TnVtYmVyLmlzRmluaXRlKG4pJiZuPj0wJiZuPD0xMDAwKTsNCiAgICBjb25zdCBleHBlZGl0aW9uPXNoZWx0ZXJFeHBsb3JlRWZmaWNpZW5jeShtLGNmZyksZnJlZT1NYXRoLm1heCgwLHNsb3RzLXMuZXhwbG9yZXJzLmxlbmd0aCksdHJpcEhvdXJzPWV4cGVkaXRpb24/LmhvdXJzPz9JbmZpbml0eTsNCiAgICBjb25zdCBzb2RhUXVvdGE9c2hlbHRlclNvZGFRdW90YShtLHJlY29yZC5zb2RhUmVjZWlwdHMpLHF1b3RhQmxvY2tlZD1Cb29sZWFuKGNmZy5zb2RhRWZmaWNpZW5jeSYmc29kYVF1b3RhLmJsb2NrZWQpOw0KICAgIHJlc3VsdC5zb2RhUXVvdGE9c29kYVF1b3RhOw0KICAgIGlmKGNmZy5leHBsb3JlJiZjZmcuc29kYUVmZmljaWVuY3kpbm90ZXMucHVzaChzaGVsdGVyU29kYVF1b3RhVGV4dChzb2RhUXVvdGEpKTsNCiAgICBjb25zdCBzdXBwbHlUcmlwcz1jZmcuZXhwbG9yZSYmZXhwZWRpdGlvbiYmIXF1b3RhQmxvY2tlZCYmKCFjZmcuc29kYUVmZmljaWVuY3l8fGV4cGVkaXRpb24ucHJvYmFiaWxpdHk+MCk7DQogICAgLy8g5L+d55WZ57q/5pys6Lqr5LiN6IO955So5LqO5rK755aX77yM6Iez5bCR6KGl5Yiw5L+d55WZ57q/5Lul5LiK5LiA6ZKI77yb5Y+q5pyJ5pyJ5pWI5aSW5Ye65omN5YeG5aSH5Lik5qyh5pC66ZKI44CCDQogICAgY29uc3QgcmVxdWVzdGVkTWVkaWNhbFRhcmdldD1jZmcucmVzZXJ2ZStNYXRoLm1heCgxLHN1cHBseVRyaXBzPzIqY2ZnLnN0aW1wYWtzOjApOw0KICAgIGNvbnN0IG1lZGljYWxUYXJnZXQ9TWF0aC5taW4obS5jYXBzLnN0aW1wYWsscmVxdWVzdGVkTWVkaWNhbFRhcmdldCk7DQogICAgcmVzdWx0LnN0aW1wYWtUYXJnZXQ9Y2ZnLm1lZGljYWx8fHN1cHBseVRyaXBzP3JlcXVlc3RlZE1lZGljYWxUYXJnZXQ6MDsNCiAgICBjb25zdCBtZWROZWVkPWNmZy5tZWRpY2FsJiYod291bmRlZC5sZW5ndGg+MHx8cy5yZXNvdXJjZXMuc3RpbXBhazxtZWRpY2FsVGFyZ2V0KTsNCiAgICBpZihjZmcubWVkaWNhbCl7DQogICAgICBzdXBwb3J0KCdtZWRiYXknLCdpbnQnLG1lZE5lZWQsJ21lZGljYWwnLDEyKTsNCiAgICAgIG5vdGVzLnB1c2goYOWMu+eWl+ihpee7meebruaghyAke21lZGljYWxUYXJnZXR9IOaUr++8iOS/neeVmSAke2NmZy5yZXNlcnZlfe+8ie+8myR7c3VwcGx5VHJpcHM/J+WQq+S4pOasoeaOoumZqeaQuumSiCc6J+W9k+WJjeS4jeS4uuaWsOaOoumZqemineWkluWbpOmSiCd9JHt3b3VuZGVkLmxlbmd0aD8n77yb5LuN5pyJ5Lyk5ZGY77yM5L+d55WZ5Yy755aX5YC854+tJzon44CCJ31gKTsNCiAgICB9DQogICAgaWYoY2ZnLndvcmtzaG9wKXsNCiAgICAgIC8vIOWPquW3ruS4gOS4qumbtuS7tuS5n+imgeaKiuaJgOWcqOaIv+mXtOWHkea7oeS4gOaJue+8m+WQjOS4gOi9ruS/neeVmeeahOW3peWdiuWdh+mcgOacieWujOaJueS+m+aWmeOAgg0KICAgICAgY29uc3Qge3Nob3J0YWdlLHdvcmtpbmcsZmVlZGluZyxyb29tRmVlZCxmZWVkLG5leHRUaWNrU3RvY2t9PXNoZWx0ZXJXb3Jrc2hvcEZlZWRpbmcobSxjZmcucGFydHNUYXJnZXQpOw0KICAgICAgY29uc3QgZnVuZGVkPXMucmVzb3VyY2VzLnNjcmFwKzFlLTk+PShjZmcud29ya3Nob3BTY3JhcFJlc2VydmV8fDApK2ZlZWQ7DQogICAgICAvLyDkuIvkuIDnlJ/kuqfliLvljbPlj6/lh5HpvZDmlbTmibnml7bkv53mjIHnjrDlspfvvJvlkKbliJnliKnnlKjnjrDmnInlt6XlnYrnmoTnqbrkvY3nvKnnn63lpIfmlpnnrYnlvoXjgIINCiAgICAgIC8vIOS4jeS4uuihpeWRmOWPpuW8gOW3peWdiu+8jOS7jeWFseS6q+aVtOaJueS+m+aWmeOAgeacrOmHkeS/neeVmeWPiuiBlOWQiOemu+Wyl+S+m+W6lOajgOafpeOAgg0KICAgICAgY29uc3QgcHJlc2VydmVzUHJvamVjdD0ocCx0YXJnZXRSb29tKT0+ew0KICAgICAgICBpZih0YXJnZXRSb29tJiYhZmVlZGluZy5zb21lKHI9PnIuaWQ9PT10YXJnZXRSb29tLmlkKSl7DQogICAgICAgICAgY29uc3Qgcm93PXdvcmtpbmcuZmluZChyPT5yLmlkPT09dGFyZ2V0Um9vbS5pZCk7DQogICAgICAgICAgLy8g5paw5byA5YC854+t5oi/55qE5a6M5pW05L6b5paZ5Y+m55WZ77yb5LiN6Laz5Y+q6Zi75q2i5paw5aKe77yM5LiN5pKk5o6J5bey5YW35aSH5L6b5paZ55qE5Y6f5oi/5Lq65ZGY44CCDQogICAgICAgICAgaWYoIXJvd3x8cy5yZXNvdXJjZXMuc2NyYXArMWUtOTwoY2ZnLndvcmtzaG9wU2NyYXBSZXNlcnZlfHwwKStmZWVkKzYqcm9vbUZlZWQocm93KSlyZXR1cm4gZmFsc2U7DQogICAgICAgIH0NCiAgICAgICAgaWYoY2ZnLndvcmtzaG9wRmFtaWx5UmVhZHk/LmluY2x1ZGVzKHAuaWQpKXJldHVybiBmYWxzZTsNCiAgICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocj0+ci5pZD09PWNmZy53b3Jrc2hvcFByb2plY3QpO2lmKCFyb29tfHxwLnJvb21JZCE9PXJvb20uaWQpcmV0dXJuIHRydWU7DQogICAgICAgIGNvbnN0IGFic2VudD1uZXcgU2V0KFsuLi5wcm9qZWN0ZWRJZHMoKSxwLmlkXSk7DQogICAgICAgIHJldHVybiBzLnJlc2lkZW50cy5maWx0ZXIob3RoZXI9PmhvbWUob3RoZXIpJiZvdGhlci5yb29tSWQ9PT1yb29tLmlkJiYhYWJzZW50LmhhcyhvdGhlci5pZCkpLnNsaWNlKDAscm9vbS53aWR0aCoyKQ0KICAgICAgICAgIC5zb21lKG90aGVyPT5zaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LG90aGVyLHJvb20pPjApOw0KICAgICAgfTsNCiAgICAgIHN1cHBvcnQoJ3dvcmtzaG9wJywnaW50JyxzaG9ydGFnZT4wJiZmdW5kZWQsJ3dvcmtzaG9wJywyNCxwcmVzZXJ2ZXNQcm9qZWN0LChjZmcucGFydHNUYXJnZXR8fDApPm5leHRUaWNrU3RvY2spOw0KICAgICAgbm90ZXMucHVzaChzaG9ydGFnZT4wP2Dov5HmnJ/lpIfmlpnnm67moIfov5jpnIAgJHtNYXRoLmNlaWwoc2hvcnRhZ2UpfSDlj6/pooblj5bpm7bku7bvvIzmjInmlbTmibnpooTnlZkgJHtNYXRoLmNlaWwoZmVlZCl9IOW6n+aWmeS+m+aWme+8myR7ZnVuZGVkPyfmjInpnIDlronmjpLlt6XlnYrvvIzmnZDmlpnlpIfpvZDlkI7ph4rmlL7oh6rliqjlgLznj60nOifkvpvmlpnkvJrop6blj4rlu7rorr7otYTph5HmiJblup/mlpnkv53nlZnph4/vvIzmmoLnvJPoh6rliqjliqDlt6UnfeOAgmA6DQogICAgICAgICflvZPliY3ljYfnuqfpm7bku7blt7LlpIfpvZDmiJbmmoLml6Dov5HmnJ/pnIDmsYLvvIzph4rmlL7oh6rliqjlt6XlnYrlgLznj63vvJvkurrlt6XlspfkvY3kv53mjIHjgIInKTsNCiAgICB9DQogICAgY29uc3QgZmlnaHRlcnM9KCk9PnBvb2wuZmlsdGVyKHA9PiFyZXNlcnZlZC5oYXMocC5pZCkmJmhlYWx0aHkocCkmJiFvd25lZChwKSYmIShjZmcucGFyZW50VHJhaW5pbmcmJnBhcmVudElkcy5oYXMocC5pZCkpKS5zb3J0KGNvbWJhdE9yZGVyKTsNCiAgICBjb25zdCBkYWlseVRyYWluPWRhaWx5Py5nb2Fscy5maW5kKGc9Pmcua2V5PT09J3RyYWluJyYmIWcuY2xhaW1lZCYmZy5yZW1haW5pbmc+MCk7DQogICAgY29uc3QgdHJhaW5pbmdUYXJnZXQ9ZGFpbHlUcmFpbj8xMDpjZmcudHJhaW5UYXJnZXQ7DQogICAgY29uc3QgdHJhaW5pbmdTZWF0cz1uZXcgTWFwKCksdHJhaW5pbmdBdD1wPT5NYXRoLm1heCgwLC4uLihyZWNvcmQudHJhaW5pbmdSZXN0fHxbXSkuZmlsdGVyKHI9PnIuaWQ9PT1wLmlkKS5tYXAocj0+ci5hdCkpOw0KICAgIGNvbnN0IHBhcmVudE9jY3VwaWVkPXI9PnMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwmJnAuYWR1bHRBdDw9bm93JiZwLnJvb21JZD09PXIuaWQpLmxlbmd0aDsNCiAgICBpZihjZmcudHJhaW5pbmcmJmNmZy5wYXJlbnRUcmFpbmluZyYmIXJvbGVzLnNvbWUocj0+ci5wdXJwb3NlPT09J3BhcmVudCcmJnMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PXIuaWQmJnAucm9vbUlkPT09ci5yb29tKSkpew0KICAgICAgY29uc3QgcGFyZW50cz1wb29sLmZpbHRlcihwPT5wYXJlbnRJZHMuaGFzKHAuaWQpJiYhcmVzZXJ2ZWQuaGFzKHAuaWQpJiYhb3duZWQocCkmJmhlYWx0aHkocCkmJnAuaGFwcGluZXNzPj01MCYmDQogICAgICAgIHAuZmFtaWx5Q29vbGRvd25VbnRpbD5ub3cmJnRyYWluaW5nQXQocCk8cC5mYW1pbHlDb29sZG93blVudGlsLTYqMzYwMDAwMCYmc2FmZShbLi4ucHJvamVjdGVkSWRzKCkscC5pZF0pKTsNCiAgICAgIGNvbnN0IG9wdGlvbnM9cGFyZW50cy5mbGF0TWFwKHA9PnMucm9vbXMuZmlsdGVyKHI9PnIudHlwZT09PSd0cmFpbmluZycmJmFjdGl2ZShyKSYmcGFyZW50T2NjdXBpZWQocik8ci53aWR0aCoyKS5mbGF0TWFwKHI9PnsNCiAgICAgICAgY29uc3QgZT1zaGVsdGVyUGFyZW50VHJhaW5pbmdFc3RpbWF0ZShtLHAscik7DQogICAgICAgIHJldHVybiBlJiZlLmJhc2U8Y2ZnLnRyYWluVGFyZ2V0JiZub3crZS5ob3VycyozNjAwMDAwPD1wLmZhbWlseUNvb2xkb3duVW50aWw/W3twLHIsLi4uZX1dOltdOw0KICAgICAgfSkpLnNvcnQoKGEsYik9PmIudmFsdWUtYS52YWx1ZXx8bG9zcyhbYS5wLmlkXSktbG9zcyhbYi5wLmlkXSl8fGEucC5pZC1iLnAuaWR8fGEuci5pZC1iLnIuaWQpOw0KICAgICAgaWYob3B0aW9ucy5sZW5ndGgpew0KICAgICAgICBjb25zdCB7cCxyLGhvdXJzfT1vcHRpb25zWzBdO3Jlc2VydmUocCk7dHJhaW5pbmdTZWF0cy5zZXQoci5pZCwxKTsNCiAgICAgICAgYWN0aW9ucy5wdXNoKHsuLi5hc3NpZ24ocCxyLCd0cmFpbmluZycsYOeItuavjeWGt+WNtOacn+iuree7g++8mumihOiuoSAke2hvdXJzLnRvRml4ZWQoMil9IOWwj+aXtuWGheaPkOWNh+S4gOagvO+8iOWQq+e7k+eul+S9memHj++8ie+8jOWIsOacn+S6pOWbnuS6uuWPo+iwg+W6pmApLA0KICAgICAgICAgIHB1cnBvc2U6J3BhcmVudCcsdW50aWw6cC5mYW1pbHlDb29sZG93blVudGlsfSk7DQogICAgICB9ZWxzZSBpZihwYXJlbnRzLmxlbmd0aCl7DQogICAgICAgIC8vIOS4jeS4uuW7uuaIv+mihOeVmeWxheawke+8m+aWveW3peacn+mXtOe7p+e7reeUn+S6p+OAguWPquaPkOWHuuS4gOmhueWPr+WcqOW9k+WJjeWGt+WNtOeql+WPo+WGheWujOaIkOeahOmcgOaxguOAgg0KICAgICAgICBjb25zdCByZXF1ZXN0cz1wYXJlbnRzLmZsYXRNYXAocD0+WydjaGEnLCdlbmQnLCdzdHInLCdwZXInLCdhZ2knLCdpbnQnLCdsY2snXS5mbGF0TWFwKHN0YXQ9PnsNCiAgICAgICAgICBpZihwLnN0YXRzW3N0YXRdPj1jZmcudHJhaW5UYXJnZXQpcmV0dXJuIFtdOw0KICAgICAgICAgIGNvbnN0IHNhbWU9cy5yb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3RyYWluaW5nJyYmci50cmFpblN0YXQ9PT1zdGF0KTsNCiAgICAgICAgICBpZihzYW1lLnNvbWUocj0+IWFjdGl2ZShyKXx8cGFyZW50T2NjdXBpZWQocik+MCkpcmV0dXJuIFtdOw0KICAgICAgICAgIGNvbnN0IHJvb209c2FtZS5maWx0ZXIocj0+ci5sZXZlbDwzKS5zb3J0KChhLGIpPT5iLmxldmVsLWEubGV2ZWx8fGEud2lkdGgtYi53aWR0aHx8YS5pZC1iLmlkKVswXTsNCiAgICAgICAgICBpZihzYW1lLmxlbmd0aCYmIXJvb20pcmV0dXJuIFtdOw0KICAgICAgICAgIGNvbnN0IHByb3Bvc2VkPXt0cmFpblN0YXQ6c3RhdCxsZXZlbDpyb29tP3Jvb20ubGV2ZWwrMToxfSxlPXNoZWx0ZXJQYXJlbnRUcmFpbmluZ0VzdGltYXRlKG0scCxwcm9wb3NlZCk7DQogICAgICAgICAgY29uc3QgYnVpbGRIb3Vycz1yb29tP3Jvb20ud2lkdGgqKHJvb20ubGV2ZWw9PT0xPzE6Myk6MS82Ow0KICAgICAgICAgIGlmKCFlfHxub3crKGUuaG91cnMrYnVpbGRIb3VycykqMzYwMDAwMD5wLmZhbWlseUNvb2xkb3duVW50aWwpcmV0dXJuIFtdOw0KICAgICAgICAgIGNvbnN0IGNvc3Q9cm9vbT9NYXRoLmNlaWwoNDAwKnJvb20ud2lkdGgqKHJvb20ubGV2ZWw9PT0xPzIuNTo2KSkrNioocm9vbS5sZXZlbD09PTI/MTUqcm9vbS53aWR0aDowKToNCiAgICAgICAgICAgIE1hdGguY2VpbCg0MDAqKDErLjIqcy5yb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3RyYWluaW5nJykucmVkdWNlKChuLHIpPT5uK3Iud2lkdGgsMCkpKTsNCiAgICAgICAgICByZXR1cm4gW3twLHN0YXQscm9vbSx2YWx1ZTplLnZhbHVlL2Nvc3R9XTsNCiAgICAgICAgfSkpLnNvcnQoKGEsYik9PmIudmFsdWUtYS52YWx1ZXx8YS5wLmlkLWIucC5pZCk7DQogICAgICAgIGlmKHJlcXVlc3RzLmxlbmd0aCl7DQogICAgICAgICAgY29uc3Qge3Asc3RhdCxyb29tfT1yZXF1ZXN0c1swXTsNCiAgICAgICAgICBwcm9qZWN0cy5wdXNoKHt0eXBlOid0cmFpbmluZycsdHJhaW5TdGF0OnN0YXQscGVyc29uOnAuaWQscm9sZTondHJhaW5pbmcnLHByaW9yaXR5OjI1LC4uLihyb29tP3t1cGdyYWRlSWQ6cm9vbS5pZH06e30pLA0KICAgICAgICAgICAgYmVuZWZpdDpg5Li65Ya35Y205Lit55qE54i25q+NJHtwLm5hbWV9JHtyb29tPyfljYfnuqfnjrDmnIknOifooaXlu7onfSR7e3N0cjon5Yqb6YePJyxwZXI6J+aEn+efpScsZW5kOifogJDlipsnLGNoYTon6a2F5YqbJyxpbnQ6J+aZuuWKmycsYWdpOifmlY/mjbcnLGxjazon5bm46L+QJ31bc3RhdF196K6t57uD5a6k77yb5LiN5o+Q5YmN5YGc5bel562J5oi/77yM5LiN5bu26L+f5LiL5LiA6L2u55Sf6IKyYH0pOw0KICAgICAgICB9ZWxzZSBub3Rlcy5wdXNoKCfniLbmr43orq3nu4PvvJrnjrDmnInnqbrkvY3jgIHliankvZnlhrfljbTmiJblu7rorr7ml7bplb/kuI3lkIjpgILvvIzmnKzova7nu6fnu63nlJ/kuqfkuI7nlJ/ogrLova7mjaLjgIInKTsNCiAgICAgIH0NCiAgICB9DQogICAgY29uc3QgdHJhaW49KGxpbWl0LGJ1aWxkKT0+ew0KICAgICAgaWYoIWNmZy50cmFpbmluZylyZXR1cm47DQogICAgICBpZihjZmcuZGV2ZWxvcG1lbnQpew0KICAgICAgICAvLyDlj5HlsZXmqKHlvI/ku6XkuIDmoLznlJ/kuqflm57miqXpgInorq3nu4PvvIzkuI3nu6fnu63lm7rlrprlgY/lkJHkuInpobnmiJjmlpflsZ7mgKfjgIINCiAgICAgICAgLy8g5Yid6L2u5Y+q55So5bey5pyJ5oi/6Ze077yb6ZyA6KaB5paw5bu6L+WNh+e6p+eahOaIkOacrOS6pOeUseWPkeWxlei3r+e6v+e7n+S4gOavlOi+g+OAgg0KICAgICAgICAvLyBBIGNvbmZpcm1lZCByZXR1cm4gbXVzdCByZWFjaCBhIG5ldyBzZXR0bGVtZW50IGJlZm9yZSBhbm90aGVyIGludmVzdG1lbnQuDQogICAgICAgIC8vIFJlYWRpbmcgdGhlIHNhbWUgcG9zaXRpb25zIGFnYWluIChvciByZWZyZXNoaW5nKSBpcyBub3QgcHJvZHVjdGl2ZSB3b3JrLg0KICAgICAgICBjb25zdCBjYW5kaWRhdGVzPWZpZ2h0ZXJzKCkuZmlsdGVyKHA9PiEocmVjb3JkLnRyYWluaW5nUmVzdHx8W10pLnNvbWUocj0+ci5pZD09PXAuaWQmJg0KICAgICAgICAgICghTnVtYmVyLmlzRmluaXRlKHMubGFzdFNldHRsZWRBdCl8fHMubGFzdFNldHRsZWRBdDw9ci5hdCkpJiZzYWZlKFsuLi5wcm9qZWN0ZWRJZHMoKSxwLmlkXSkpOw0KICAgICAgICBjb25zdCBvcHRpb25zPWNhbmRpZGF0ZXMuZmxhdE1hcChwPT5zLnJvb21zLmZpbHRlcihyPT5yLnR5cGU9PT0ndHJhaW5pbmcnJiZhY3RpdmUocikmJg0KICAgICAgICAgIG9jY3VwaWVkKHIpKyh0cmFpbmluZ1NlYXRzLmdldChyLmlkKXx8MCk8ci53aWR0aCoyJiZwLnN0YXRzW3IudHJhaW5TdGF0XTx0cmFpbmluZ1RhcmdldCkuZmxhdE1hcChyPT57DQogICAgICAgICAgY29uc3QgYT1zaGVsdGVyVHJhaW5pbmdSZXR1cm4obSxwLHIsMTY4LHRyYWluaW5nQ29tbWl0bWVudHMoKSk7DQogICAgICAgICAgcmV0dXJuIGEuZWxpZ2libGUmJihhLnJlc291cmNlIT09J3BhcnRzJ3x8Y2ZnLndvcmtzaG9wJiZjZmcucGFydHNUYXJnZXQ+MCk/W3twLHIsYX1dOltdOw0KICAgICAgICB9KSk7DQogICAgICAgIG9wdGlvbnMuc29ydCgoYSxiKT0+YS5hLmJlc3QucGF5YmFja0hvdXJzLWIuYS5iZXN0LnBheWJhY2tIb3Vyc3x8dHJhaW5pbmdBdChhLnApLXRyYWluaW5nQXQoYi5wKXx8YS5wLmlkLWIucC5pZHx8YS5yLmlkLWIuci5pZCk7DQogICAgICAgIGxldCBjb3VudD0wOw0KICAgICAgICBmb3IoY29uc3Qge3Ascn0gb2Ygb3B0aW9ucyl7DQogICAgICAgICAgaWYoY291bnQ+PWxpbWl0KWJyZWFrOw0KICAgICAgICAgIGlmKHJlc2VydmVkLmhhcyhwLmlkKXx8IXNhZmUoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKXx8b2NjdXBpZWQocikrKHRyYWluaW5nU2VhdHMuZ2V0KHIuaWQpfHwwKT49ci53aWR0aCoyKWNvbnRpbnVlOw0KICAgICAgICAgIGNvbnN0IGE9c2hlbHRlclRyYWluaW5nUmV0dXJuKG0scCxyLDE2OCx0cmFpbmluZ0NvbW1pdG1lbnRzKCkpOw0KICAgICAgICAgIGlmKCFhLmVsaWdpYmxlKWNvbnRpbnVlOw0KICAgICAgICAgIHJlc2VydmUocCk7dHJhaW5pbmdTZWF0cy5zZXQoci5pZCwodHJhaW5pbmdTZWF0cy5nZXQoci5pZCl8fDApKzEpO2NvdW50Kys7DQogICAgICAgICAgcmVzZXJ2ZVRyYWluaW5nKHAuaWQsYS5iZXN0LnJvb20sYSk7DQogICAgICAgICAgYWN0aW9ucy5wdXNoKHsuLi5hc3NpZ24ocCxyLCd0cmFpbmluZycsYOeUn+S6p+iuree7g+S4gOagvO+8mumihOiuoSR7YS5ob3Vycy50b0ZpeGVkKDIpfeWwj+aXtuWujOaIkO+8jCR7YS5iZXN0LnBheWJhY2tIb3Vycy50b0ZpeGVkKDEpfeWwj+aXtuWbnuacrO+8jOS4g+WkqeWHgOWiniR7YS5iZXN0LmRlbHRhLnRvRml4ZWQoMSl9JHtzaGVsdGVyUmVzb3VyY2VzW2EucmVzb3VyY2VdfWApLA0KICAgICAgICAgICAgcHVycG9zZToncHJvZHVjdGlvbicsdW50aWw6YS5maW5pc2hBdCs2MDAwMDAsd2luZG93RW5kOm5vdysxNjgqMzYwMDAwMCxkZXN0aW5hdGlvbjphLmJlc3Qucm9vbSxhc3Nlc3NtZW50OmF9KTsNCiAgICAgICAgfQ0KICAgICAgICBpZighY291bnQpbm90ZXMucHVzaCgn55Sf5Lqn6K6t57uD77ya5b2T5YmN5peg5bey5pyJ56m65L2N5LiU5LiD5aSp5YaF5Zue5oql5Li65q2j55qE5Y2V5qC85pa55qGI77yM57un57ut55Sf5Lqn77yb5pyq55+l5a625bqtL+aImOaWl+aUtuebiuS4jeaKmOeul+S4uuehruWumuS6p+mHj+OAgicpOw0KICAgICAgICByZXR1cm47DQogICAgICB9DQogICAgICBjb25zdCBjYW5kaWRhdGVzPWZpZ2h0ZXJzKCkuZmlsdGVyKHA9PnNhZmUoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKSYmWydlbmQnLCdzdHInLCdhZ2knXS5zb21lKGs9PnAuc3RhdHNba108dHJhaW5pbmdUYXJnZXQpKQ0KICAgICAgICAuc29ydCgoYSxiKT0+dHJhaW5pbmdBdChhKS10cmFpbmluZ0F0KGIpfHxjb21iYXRPcmRlcihhLGIpKTsNCiAgICAgIGxldCBjb3VudD0wOw0KICAgICAgZm9yKGNvbnN0IHAgb2YgY2FuZGlkYXRlcyl7DQogICAgICAgIGlmKGNvdW50Pj1saW1pdClicmVhazsNCiAgICAgICAgaWYoIXNhZmUoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKSljb250aW51ZTsNCiAgICAgICAgaWYoZGFpbHlUcmFpbiYmWydlbmQnLCdzdHInLCdhZ2knXS5ldmVyeShrPT5wLnN0YXRzW2tdPj1jZmcudHJhaW5UYXJnZXQpJiYNCiAgICAgICAgICByb2xlcy5maWx0ZXIocj0+ci5yb2xlPT09J3RyYWluaW5nJyYmcmVzZXJ2ZWQuaGFzKHIuaWQpKS5sZW5ndGgrYWN0aW9ucy5maWx0ZXIoYT0+YS5yb2xlPT09J3RyYWluaW5nJykubGVuZ3RoPj1kYWlseVRyYWluLnJlbWFpbmluZyljb250aW51ZTsNCiAgICAgICAgY29uc3Qgc3RhdHM9WydlbmQnLCdzdHInLCdhZ2knXS5maWx0ZXIoaz0+cC5zdGF0c1trXTx0cmFpbmluZ1RhcmdldCkuc29ydCgoYSxiKT0+cC5zdGF0c1thXS1wLnN0YXRzW2JdKTsNCiAgICAgICAgLy8g55u45ZCM55+t5p2/5Zyo5omA5pyJ5Y+v55So6K6t57uD5a6k5LiA6LW35q+U6L6D6YCf5bqm77yM5LiN6IO96KKr5bGe5oCn5p6a5Li+6aG65bqP5o+Q5YmN6ZSB5a6a5L2O57qn5oi/44CCDQogICAgICAgIGNvbnN0IHJvb209cy5yb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3RyYWluaW5nJyYmc3RhdHMuaW5jbHVkZXMoci50cmFpblN0YXQpJiZhY3RpdmUocikmJg0KICAgICAgICAgIG9jY3VwaWVkKHIpKyh0cmFpbmluZ1NlYXRzLmdldChyLmlkKXx8MCk8ci53aWR0aCoyKS5zb3J0KChhLGIpPT5wLnN0YXRzW2EudHJhaW5TdGF0XS1wLnN0YXRzW2IudHJhaW5TdGF0XXx8DQogICAgICAgICAgICBiLmxldmVsLWEubGV2ZWx8fHN0YXRzLmluZGV4T2YoYS50cmFpblN0YXQpLXN0YXRzLmluZGV4T2YoYi50cmFpblN0YXQpfHxhLmlkLWIuaWQpWzBdOw0KICAgICAgICBpZighcm9vbSljb250aW51ZTsNCiAgICAgICAgcmVzZXJ2ZShwKTt0cmFpbmluZ1NlYXRzLnNldChyb29tLmlkLCh0cmFpbmluZ1NlYXRzLmdldChyb29tLmlkKXx8MCkrMSk7Y291bnQrKzsNCiAgICAgICAgYWN0aW9ucy5wdXNoKGFzc2lnbihwLHJvb20sJ3RyYWluaW5nJywn5L+d55WZ5Z+55YW75Lq66YCJ77yM5oyJ6K6t57uD5a6k5a6e6ZmF56m65L2N6L2u5o2i77yb5o+Q5Y2H5LiA5qC85ZCO6YeN5paw6K+E5LywJykpOw0KICAgICAgfQ0KICAgICAgaWYoIWNvdW50JiZidWlsZCYmIXByb2plY3RzLnNvbWUocD0+cC50eXBlPT09J3RyYWluaW5nJykpew0KICAgICAgICBjb25zdCBwPWNhbmRpZGF0ZXMuZmluZChwPT4hcy5yb29tcy5zb21lKHI9PnIudHlwZT09PSd0cmFpbmluZycmJlsnZW5kJywnc3RyJywnYWdpJ10uaW5jbHVkZXMoci50cmFpblN0YXQpJiZwLnN0YXRzW3IudHJhaW5TdGF0XTx0cmFpbmluZ1RhcmdldCkpOw0KICAgICAgICBpZihwKXsNCiAgICAgICAgICBjb25zdCBzdGF0PVsnZW5kJywnc3RyJywnYWdpJ10uZmlsdGVyKGs9PnAuc3RhdHNba108dHJhaW5pbmdUYXJnZXQpLnNvcnQoKGEsYik9PnAuc3RhdHNbYV0tcC5zdGF0c1tiXSlbMF07DQogICAgICAgICAgcmVzZXJ2ZShwKTtwcm9qZWN0cy5wdXNoKHt0eXBlOid0cmFpbmluZycsdHJhaW5TdGF0OnN0YXQscGVyc29uOnAuaWQscm9sZTondHJhaW5pbmcnLHByaW9yaXR5OjI1LA0KICAgICAgICAgICAgYmVuZWZpdDpg5Li65Z+55YW75Lq66YCJ6KGlJHt7ZW5kOifogJDlipsnLHN0cjon5Yqb6YePJyxhZ2k6J+aVj+aNtyd9W3N0YXRdfeiuree7g+WupO+8m+W7uuaIkOWQjuaMieWunumZheepuuS9jeWuieaOku+8jOW7uuiuvuS7jeWPl+W8gOWFs+WSjOmihOeul+e6puadn2B9KTsNCiAgICAgICAgfQ0KICAgICAgfQ0KICAgIH07DQogICAgLy8g5bey5byA5ZCv6K6t57uD5pe25YWI5L+d55WZ5LiA5Liq5Z+55YW75L2N572u77yM6YG/5YWN5q+P5qyh5b2S5p2l5Y+I6KKr5YWo6YOo5rS+6LWw77yb5Ymp5L2Z56m65L2N5Zyo5rS+6YGj6K+E5Lyw5ZCO5L2/55So44CCDQogICAgaWYoIXJvbGVzLnNvbWUocj0+ci5yb2xlPT09J3RyYWluaW5nJyYmcmVzZXJ2ZWQuaGFzKHIuaWQpKSl0cmFpbigxLHRydWUpOw0KICAgIGlmKGNmZy5leHBsb3JlKXsNCiAgICAgIGlmKCFkcm9wc09LfHx0cmlwSG91cnM+MjQpbm90ZXMucHVzaCgn5rG95rC05o6J6JC95p2h5Lu25pqC5LiN5Y+v5qC45a+55oiW6LaF6L+HMjTlsI/ml7bvvIzmmoLlgZzmlrDnmoTmma7pgJrlh7rlj5HjgIInKTsNCiAgICAgIGVsc2UgaWYocXVvdGFCbG9ja2VkKXsvKiDkv53nlZnljp/ooYznqIvlpITnkIbvvIzku4XlgZzmraLmjInmsb3msLTnm67moIfov73liqDkurrlkZjlkozooaXnu5njgIIgKi99DQogICAgICBlbHNlIGlmKGNmZy5zb2RhRWZmaWNpZW5jeSYmZXhwZWRpdGlvbi5wcm9iYWJpbGl0eT09PTApbm90ZXMucHVzaCgn5b2T5YmN5Y+v55So5Yy65Z+f5rG95rC05qaC546H5Li6MO+8jOaViOeOh+aooeW8j+S4jeWNoOeUqOaOoumZqeS6uuaJi+WSjOayu+eWl+mSiO+8jOe7p+e7reeUn+S6p+OAgeiuree7g+S4juWRqOS7u+WKoeOAgicpOw0KICAgICAgZWxzZSBpZihzLnJlc291cmNlcy5zdGltcGFrPGNmZy5zdGltcGFrcytjZmcucmVzZXJ2ZSlub3Rlcy5wdXNoKCfmsrvnlpfpkojkuI3otrPmkLrluKbph4/lj4rkv53nlZnph4/vvIzlhYjooaXlhYXljLvliqHlrqTkuqflh7rjgIInKTsNCiAgICAgIGVsc2UgZm9yKGxldCBpPTA7aTxmcmVlO2krKyl7DQogICAgICAgIGNvbnN0IGVmZmVjdGl2ZUx1Y2s9cD0+e2NvbnN0IG91dGZpdD1zLml0ZW1zLmZpbmQoaT0+aS5pZD09PXAub3V0Zml0SWQpO3JldHVybiBNYXRoLm1pbigxNywocC5zdGF0cy5sY2t8fDApKyhvdXRmaXQ/LmJvbnVzPy5sY2t8fDApKTt9Ow0KICAgICAgICBjb25zdCBwPWZpZ2h0ZXJzKCkuZmlsdGVyKG5hbWVPSykuc29ydCgoYSxiKT0+Y29tYmF0KGIpLWNvbWJhdChhKXx8ZWZmZWN0aXZlTHVjayhiKS1lZmZlY3RpdmVMdWNrKGEpfHxsb3NzKFthLmlkXSktbG9zcyhbYi5pZF0pfHxhLmlkLWIuaWQpDQogICAgICAgICAgLmZpbmQocD0+c2FmZShbLi4ucHJvamVjdGVkSWRzKCkscC5pZF0pJiZndWFyZGVkKFtwXSxsb2Fkb3V0KFtwXSkpKTtpZighcClicmVhazsNCiAgICAgICAgaWYocy5yZXNvdXJjZXMuc3RpbXBhay1jZmcuc3RpbXBha3MqaTxjZmcuc3RpbXBha3MrY2ZnLnJlc2VydmUpYnJlYWs7DQogICAgICAgIHJlc2VydmUocCk7DQogICAgICAgIGNvbnN0IGdlYXI9bG9hZG91dChbcF0pO2RlcGFydGluZy5wdXNoKHAuaWQpO2RlcGFydHVyZUdlYXIucHVzaCguLi5nZWFyLmNoYW5nZXMpO2VxdWlwKGdlYXIpOw0KICAgICAgICBjb25zdCB0aWVyPWV4cGVkaXRpb24udGllcjsNCiAgICAgICAgYWN0aW9ucy5wdXNoKHtraW5kOidleHBsb3JlLXN0YXJ0Jyx0YXJnZXRzOltwLmlkLHRpZXIsY2ZnLnN0aW1wYWtzXSxpZDpwLmlkLG5hbWU6bm9ybWFsaXplZChwLm5hbWUpLGhvdXJzOnRyaXBIb3VycywNCiAgICAgICAgICByZWFzb246YOaZrumAmuaOoumZqeWMuuWfnyR7dGllcn3vvIzorqHliJIke3RyaXBIb3Vyc33lsI/ml7bvvJvnvZHpobXmsb3msLTmpoLnjofnuqYke2Ryb3BzLnRpZXJQZXJtaWxsZVt0aWVyXS8xMH0l77yMJHtjZmcuc29kYUVmZmljaWVuY3k/YOWQq+i/lOeoi+iHs+WwkeWNoOeUqCR7ZXhwZWRpdGlvbi5jeWNsZUhvdXJzfeWwj+aXtu+8iOacquiuoeeWl+S8pO+8ie+8jOaMieaxveawtOi1hOagvOaXtumVv+i9ruaNou+8m2A6Jyd95ZCM5oiY5Yqb5LyY5YWI5bm46L+Q77yI5b2T5YmNJHtlZmZlY3RpdmVMdWNrKHApfe+8ie+8jOeUqOS6juijheWkh+WSjOayu+eWl+mSiOe/u+aJvu+8jOS4jeiuoeaxveawtOWKoOaIkO+8m+S4jeWKoOmAn+OAgeS4jei/m+WFpea3sea4imB9KTsNCiAgICAgIH0NCiAgICAgIGlmKGZyZWUmJiFxdW90YUJsb2NrZWQmJighY2ZnLnNvZGFFZmZpY2llbmN5fHxleHBlZGl0aW9uPy5wcm9iYWJpbGl0eT4wKSYmIWFjdGlvbnMuc29tZShhPT5hLmtpbmQ9PT0nZXhwbG9yZS1zdGFydCcpKW5vdGVzLnB1c2goJ+WwmuaXoOihgOmHjzkwJeS7peS4iuS4lOaVtOe7hOemu+Wyl+WQjuS7jeiDveS/neS9j+S+m+W6lOeahOaOoumZqeS6uumAieOAgicpOw0KICAgIH0NCiAgICBjb25zdCB3ZWVrPW0udmlldy5lbnY/LndlZWsscXVlc3RzPW0udmlldy5lbnY/LnF1ZXN0czsNCiAgICBpZihjZmcucXVlc3RzKXsNCiAgICAgIGlmKHR5cGVvZiB3ZWVrIT09J3N0cmluZyd8fCF3ZWVrfHwhQXJyYXkuaXNBcnJheShxdWVzdHMpfHwhQXJyYXkuaXNBcnJheShzLndlZWtseT8uY29tcGxldGVkKSlub3Rlcy5wdXNoKCfmnKzlkajku7vliqHouqvku73miJblrozmiJDorrDlvZXkuI3lrozmlbTvvIzmmoLnvJPlh7rlj5HjgIInKTsNCiAgICAgIGVsc2UgaWYocy5xdWVzdHMubGVuZ3RoPDIpew0KICAgICAgICAvLyDlpJblh7rmjqfku7bku43lj6rmnInlp5PlkI3vvIzkuI7lsYXmsJHor6bmg4Xlj6/nlKjnmoTnu4TlkIjouqvku73kuI3lkIzjgIINCiAgICAgICAgY29uc3QgYWxsPWZpZ2h0ZXJzKCkuZmlsdGVyKG5hbWVPSyksbG93PVsuLi5hbGxdLnNvcnQoKGEsYik9Pmxvc3MoW2EuaWRdKS1sb3NzKFtiLmlkXSl8fGNvbWJhdE9yZGVyKGEsYikpOw0KICAgICAgICBjb25zdCBzaG9ydGxpc3Q9Wy4uLm5ldyBNYXAoWy4uLmFsbC5zbGljZSgwLDEyKSwuLi5sb3cuc2xpY2UoMCw4KV0ubWFwKHA9PltwLmlkLHBdKSkudmFsdWVzKCldOw0KICAgICAgICBsZXQgYmVzdD1udWxsLHVua25vd25SZXdhcmRzPTA7DQogICAgICAgIGNvbnN0IG5vR2FpblF1ZXN0cz1uZXcgU2V0KCk7DQogICAgICAgIGZvcihjb25zdCBxIG9mIHF1ZXN0cyl7DQogICAgICAgICAgaWYodHlwZW9mIHEuaWQhPT0nc3RyaW5nJ3x8IXEuaWR8fHF1ZXN0cy5maWx0ZXIobz0+by5pZD09PXEuaWQpLmxlbmd0aCE9PTF8fHR5cGVvZiBxLnRpdGxlIT09J3N0cmluZyd8fCFxLnRpdGxlfHwNCiAgICAgICAgICAgICFOdW1iZXIuaXNGaW5pdGUocS5zdGFnZU1pbnV0ZXMpfHxxLnN0YWdlTWludXRlczw9MHx8cy53ZWVrbHkuY29tcGxldGVkLmluY2x1ZGVzKHEuaWQpfHxzLnF1ZXN0cy5zb21lKHI9PnIucXVlc3RJZD09PXEuaWQpKWNvbnRpbnVlOw0KICAgICAgICAgIGNvbnN0IGF0dGVtcHRzPShyZWNvcmQuYXR0ZW1wdHN8fFtdKS5maWx0ZXIoYT0+YS53ZWVrPT09d2VlayYmYS5xdWVzdD09PXEuaWQpOw0KICAgICAgICAgIGlmKGF0dGVtcHRzLmxlbmd0aD49Y2ZnLmF0dGVtcHRzfHxhdHRlbXB0cy5zb21lKGE9Pm5vdy1hLmF0PDIxNjAwMDAwKSljb250aW51ZTsNCiAgICAgICAgICBpZighc2hlbHRlclF1ZXN0VmFsdWUocSwxLDEscy5zZWFzb24ucG9pbnRzLDApKXt1bmtub3duUmV3YXJkcysrO2NvbnRpbnVlO30NCiAgICAgICAgICBjb25zdCBjaGVjaz10ZWFtPT57DQogICAgICAgICAgICBjb25zdCBnZWFyPWxvYWRvdXQodGVhbSksY2hhbmNlPXNoZWx0ZXJRdWVzdENoYW5jZShnZWFyLmNvbWJhdCxxKTsNCiAgICAgICAgICAgIGlmKGNoYW5jZT09PW51bGx8fGNoYW5jZSoxMDArMWUtOTxjZmcuY2hhbmNlfHwhc2FmZShbLi4ucHJvamVjdGVkSWRzKCksLi4udGVhbS5tYXAocD0+cC5pZCldKXx8IWd1YXJkZWQodGVhbSxnZWFyKSlyZXR1cm47DQogICAgICAgICAgICBjb25zdCBjb3N0PWxvc3ModGVhbS5tYXAocD0+cC5pZCkpKnEuc3RhZ2VzKnEuc3RhZ2VNaW51dGVzLzYwOw0KICAgICAgICAgICAgY29uc3QgZ3Jvd3RoPXNoZWx0ZXJRdWVzdEdyb3d0aChnZWFyLmNvbWJhdCxxLHRlYW0pO2lmKCFncm93dGgpcmV0dXJuOw0KICAgICAgICAgICAgY29uc3QgdmFsdWU9c2hlbHRlclF1ZXN0VmFsdWUocSxjaGFuY2UsdGVhbS5sZW5ndGgscy5zZWFzb24ucG9pbnRzLE1hdGgubWF4KDAsbS5wcm9kdWN0aW9uLnNjcmFwLXByb2plY3Rpb24odGVhbS5tYXAocD0+cC5pZCkpLnNjcmFwKSxncm93dGgpOw0KICAgICAgICAgICAgLy8g5rKh5pyJ5pyJ5pWI57uP6aqM5pe25omN5o6S6Zmk4oCc5Y2z5L2/5oiQ5Yqf5Lmf5LiN5oq155Sf5Lqn5o2f5aSx4oCd55qE57qv5bqf5paZ5pa55qGI77yb5aSx6LSl5Y+v6IO95o+Q5YmN6L+U56iL77yMDQogICAgICAgICAgICAvLyDkuI3og73mi7/miJDlip/lhajnqIvmiJDmnKzmiaPmr4/np43lpLHotKXliIbmlK/vvIzlho3kvKrnp7DmnJ/mnJvmlLbnm4rkuLrotJ/jgIINCiAgICAgICAgICAgIGlmKHZhbHVlLnNlYXNvblJhdGU8PTAmJnZhbHVlLmdlYXJSYXRlPD0wJiZ2YWx1ZS5wYXJ0c1JhdGU8PTAmJnZhbHVlLnNjcmFwTmV0T25TdWNjZXNzPD0wJiZncm93dGguZXhwZWN0ZWRVc2VmdWxYcDw9MCl7bm9HYWluUXVlc3RzLmFkZChxLmlkKTtyZXR1cm47fQ0KICAgICAgICAgICAgY29uc3QgY2FuZGlkYXRlPXtxLHRlYW0sY29zdCxjaGFuY2UsZ2Vhcix2YWx1ZX07aWYoc2hlbHRlclF1ZXN0QmV0dGVyKGNhbmRpZGF0ZSxiZXN0KSliZXN0PWNhbmRpZGF0ZTsNCiAgICAgICAgICB9Ow0KICAgICAgICAgIGZvcihsZXQgaT0wO2k8c2hvcnRsaXN0Lmxlbmd0aDtpKyspew0KICAgICAgICAgICAgY2hlY2soW3Nob3J0bGlzdFtpXV0pOw0KICAgICAgICAgICAgZm9yKGxldCBqPWkrMTtqPHNob3J0bGlzdC5sZW5ndGg7aisrKXsNCiAgICAgICAgICAgICAgY2hlY2soW3Nob3J0bGlzdFtpXSxzaG9ydGxpc3Rbal1dKTsNCiAgICAgICAgICAgICAgZm9yKGxldCBrPWorMTtrPHNob3J0bGlzdC5sZW5ndGg7aysrKWNoZWNrKFtzaG9ydGxpc3RbaV0sc2hvcnRsaXN0W2pdLHNob3J0bGlzdFtrXV0pOw0KICAgICAgICAgICAgfQ0KICAgICAgICAgIH0NCiAgICAgICAgfQ0KICAgICAgICBpZih1bmtub3duUmV3YXJkcylub3Rlcy5wdXNoKGAke3Vua25vd25SZXdhcmRzfSDkuKrlkajku7vliqHnmoTlpZblirHmiJblhbPljaHml7bpl7TkuI3lrozmlbTvvIzmnKrnurPlhaXmlLbnm4rmr5TovoPjgIJgKTsNCiAgICAgICAgaWYobm9HYWluUXVlc3RzLnNpemUpbm90ZXMucHVzaChgJHtub0dhaW5RdWVzdHMuc2l6ZX0g5Liq5ZGo5Lu75Yqh5a2Y5Zyo5peg5pyJ5pWI56ev5YiGL+ijheWkhy/pm7bku7blj4rnrYnnuqfnu4/pqozjgIHkuJTljbPkvb/miJDlip/lup/mlpnku43kuI3mirXlhbPljaHmnJ/pl7TnprvlspfmjZ/lpLHnmoTpmJ/kvI3mlrnmoYjvvIzlt7Lot7Pov4fov5nkupvmlrnmoYjjgIJgKTsNCiAgICAgICAgaWYoYmVzdCl7DQogICAgICAgICAgY29uc3Qgdj1iZXN0LnZhbHVlLHI9di5yZXdhcmRzOw0KICAgICAgICAgIGRlcGFydGluZy5wdXNoKC4uLmJlc3QudGVhbS5tYXAocD0+cC5pZCkpO2RlcGFydHVyZUdlYXIucHVzaCguLi5iZXN0LmdlYXIuY2hhbmdlcyk7DQogICAgICAgICAgYmVzdC50ZWFtLmZvckVhY2gocmVzZXJ2ZSk7ZXF1aXAoYmVzdC5nZWFyKTthY3Rpb25zLnB1c2goe2tpbmQ6J3F1ZXN0LXN0YXJ0Jyx0YXJnZXRzOltiZXN0LnEuaWQsLi4uYmVzdC50ZWFtLm1hcChwPT5wLmlkKV0sd2Vlayx0aXRsZTpub3JtYWxpemVkKGJlc3QucS50aXRsZSksDQogICAgICAgICAgICB0ZWFtOmJlc3QudGVhbS5tYXAocD0+cC5pZCksYXNzZXNzbWVudDp7Li4udixjaGFuY2U6YmVzdC5jaGFuY2V9LA0KICAgICAgICAgICAgcmVhc29uOmDlkajku7vliqHjgIwke2Jlc3QucS50aXRsZX3jgI3mlbTnqIvmiJDlip/njockeyhiZXN0LmNoYW5jZSoxMDApLnRvRml4ZWQoMSl9Je+8jCR7YmVzdC50ZWFtLmxlbmd0aH3kurrjgIHlhbPljaHnuqYke3YuaG91cnMudG9GaXhlZCgxKX3lsI/ml7bvvJtgKw0KICAgICAgICAgICAgICBg5oiQ5Yqf5aWW5YqxJHtyLnNlYXNvblBvaW50c33np6/liIbjgIEke3Iuc2NyYXB95bqf5paZ44CBJHtyLnBhcnRzfembtuS7tiR7ci5pdGVtVGllcj09PW51bGw/Jyc6YOOAgSR7ci5pdGVtVGllcn3moaPoo4XlpIdgfe+8m2ArDQogICAgICAgICAgICAgIGDnp6/liIbmlYjnjocke3Yuc2Vhc29uUmF0ZS50b0ZpeGVkKDIpfS/lhbPljaHkurrml7bvvJvmnInmlYjnu4/pqozkvLDorqEke3YuZ3Jvd3RoLmV4cGVjdGVkVXNlZnVsWHAudG9GaXhlZCgyKX3jgIHmlYjnjocke3YuZ3Jvd3RoLnhwUmF0ZS50b0ZpeGVkKDIpfS/lhbPljaHkurrml7ZgKw0KICAgICAgICAgICAgICAn77yI5oyJ5Ye65Y+R5oiY5Yqb5ZKM6Zif5ZGY5a2Y5rS76YCQ5YWz5Lyw566X77yMNTDnuqflsIHpobbvvIzmnKrorqHov5TnqIvlkoznlpfkvKTvvIzkuZ/mnKrmiaPnlZnlspfnu4/pqozvvIknfSk7DQogICAgICAgICAgbm90ZXMucHVzaCh2Lm5leHRTb2RhUG9pbnRzPT09bnVsbD8n5YWN6LS56LWb5a2j5bey5ruhMzDmoaPvvIzpgInpmJ/ovazlkJHoo4XlpIfmoaPmrKHjgIHoo4XlpIfmlYjnjoflkozmnZDmlpnvvJvlkIznrYnotYTmupDlho3mr5TovoPmnInmlYjnu4/pqozjgIInOg0KICAgICAgICAgICAgYOWFjei0uei1m+Wto+S4i+S4quaxveawtOaho+i/mOW3riAke01hdGgubWF4KDAsdi5uZXh0U29kYVBvaW50cy1zLnNlYXNvbi5wb2ludHMpfSDnp6/liIbvvJvkvJjlhYjnp6/liIbmlYjnjofvvIzlho3mr5TovoPoo4XlpIfjgIHmnZDmlpnlkozmnInmlYjnu4/pqozvvIzkuI3miornp6/liIblvZPkvZzlt7Lojrflvpfmsb3msLTjgIJgKTsNCiAgICAgICAgfQ0KICAgICAgICBlbHNlIG5vdGVzLnB1c2goJ+aaguaXoOi+vuWIsOaIkOWKn+eOh+mXqOanm+OAgemHjeivlemXtOmalOWSjOS+m+W6lOadoeS7tueahOWRqOS7u+WKoemYn++8m+WFiOiuree7g+aIluetieW+heW9kuadpeOAgicpOw0KICAgICAgfQ0KICAgIH0NCiAgICBjb25zdCBmdXR1cmU9Z3Jvd3RoLmZ1dHVyZU1vdXRoczsgLy8g5bey5ZCr5YCS5LiL5LiO5b6F5Lqn6aKE55WZ44CCDQogICAgaWYoZ3VhcmRSZWplY3RlZClub3Rlcy5wdXNoKCfpg6jliIblpJblh7rlgJnpgInkvJrkvb/nlZnlrojkurrmlbDmiJblipvph4/kuI7mrablmajmjIfmoIfkuI3otrPvvIzlt7LmlLnpgInmiJbmmoLnvJPvvJvkuI3kvJrnrYnmnaXooq3lkI7lho3pnaDlj6zlm57ooaXpmLLjgIInKTsNCiAgICBpZihkZXBhcnRpbmcubGVuZ3RoKXtyZXN1bHQuZ3VhcmQ9Z3VhcmQoKTtpZihyZXN1bHQuZ3VhcmQuYWN0aXZlKW5vdGVzLnB1c2goYOacrOi9ruiuoeWIkuWHuuWPkeWQju+8miR7cmVzdWx0Lmd1YXJkLm5vdGV9YCk7fQ0KICAgIHJlc3VsdC5wb3B1bGF0aW9uRGVmZW5zZS5ndWFyZD1zaGVsdGVyR3VhcmRQbGFuKG0sY2ZnLGRlcGFydGluZyxkZXBhcnR1cmVHZWFyLHJlY29yZCx0cnVlKTsNCiAgICBjb25zdCByYWRpb1N1cHBseT1pZHM9Pntjb25zdCBhZnRlcj1wcm9qZWN0aW9uKGlkcyk7cmV0dXJuIFsnZm9vZCcsJ3dhdGVyJ10uZXZlcnkoaz0+DQogICAgICBhZnRlcltrXT49KGRlbWFuZFtrXSsxKSoxLjItMWUtOSYmcy5yZXNvdXJjZXNba10+PTIqKGRlbWFuZFtrXSsxKSk7fTsNCiAgICBjb25zdCByYWRpb1NhZmU9TnVtYmVyLmlzSW50ZWdlcih0YXJnZXQpJiZmdXR1cmU8TWF0aC5taW4odGFyZ2V0LG0ucG9wdWxhdGlvbkNhcCkmJnNhZmUocHJvamVjdGVkSWRzKCkpJiZyYWRpb1N1cHBseShwcm9qZWN0ZWRJZHMoKSkmJg0KICAgICAgKGZ1dHVyZTwxNHx8cy5yb29tcy5zb21lKHI9PnIudHlwZT09PSdkb29yJyYmYWN0aXZlKHIpJiZzLnJlc2lkZW50cy5zb21lKHA9PmhvbWUocCkmJmhlYWx0aHkocCkmJnAucm9vbUlkPT09ci5pZCkpKTsNCiAgICAvLyDnlLXlj7DmsqHmnInljZXni6zlhbPpl63mi5vli5/nmoTljp/nlJ/lvIDlhbPjgILlj6rmnInlrp7pmYXmu6HluorjgIHkuJTml6Dmianlrrnmlr3lt6Xml7bmiY3og73lj6rlj5blv4Pmg4XmlLbnm4rogIzkuI3nqoHnoLTkurrlj6Pnm67moIfjgIINCiAgICBjb25zdCByYWRpb01vb2Q9Z3Jvd3RoLnBvcHVsYXRpb24+PW0ucG9wdWxhdGlvbkNhcCYmbS5wb3B1bGF0aW9uQ2FwPjAmJnNhZmUocHJvamVjdGVkSWRzKCkpJiYNCiAgICAgICFncm93dGguY29uc3RydWN0aW9uLnNvbWUocj0+ci50eXBlPT09J3F1YXJ0ZXJzJykmJnMucm9vbXMuc29tZShyPT5yLnR5cGU9PT0ncmFkaW8nJiZhY3RpdmUocikpOw0KICAgIGlmKGNmZy5yYWRpbyl7DQogICAgICBzdXBwb3J0KCdyYWRpbycsJ2NoYScscmFkaW9TYWZlfHxyYWRpb01vb2QsJ3JhZGlvJywzNSxwPT5yYWRpb1NhZmU/cmFkaW9TdXBwbHkoWy4uLnByb2plY3RlZElkcygpLHAuaWRdKToNCiAgICAgICAgcC5yb29tSWQ9PT1udWxsfHxvd25lZChwKT8ucm9sZT09PSdyYWRpbycpOw0KICAgICAgaWYocmFkaW9Nb29kKW5vdGVzLnB1c2goJ+Wuv+iIjeWunumZheW3sua7oeS4lOaXoOaJqeWuueaWveW3pe+8jOeUteWPsOS/neeVmeW/g+aDheWAvOePre+8m+aXoOS6uuWAvOePreaXtuS7heeUqOmXsue9ruS6uuWRmO+8jOS4jeS4uuatpOaMqui1sOeUn+S6p+iAheOAguW/g+aDheebruaghysxMOmAkOatpeeUn+aViOOAgicpOw0KICAgICAgZWxzZSBpZighcmFkaW9TYWZlKW5vdGVzLnB1c2goJ+eUteWPsOetieW+heebruagh+S6uuWPo+OAgeepuuW6iuS9jeOAgeS4i+S4gOS6uuWPo+S+m+W6lOWPijE15Lq66Ziy5b6h5YeG5aSH77yb5pyJ56m65bqK5pe25LiN6IO95Y+q5L+d55WZ5b+D5oOF6ICM56aB5q2i5oub5Yuf77yM6YeK5pS+6Ieq5Yqo5YC854+t44CCJyk7DQogICAgfQ0KICAgIHRyYWluKEluZmluaXR5LGZhbHNlKTsNCiAgICBpZihjZmcuZXhwbG9yZSYmIXF1b3RhQmxvY2tlZCYmTnVtYmVyLmlzSW50ZWdlcihzLmRlcHRoKSYmcy5kaWdnaW5nPT09bnVsbCYmc2FmZShwcm9qZWN0ZWRJZHMoKSkpew0KICAgICAgY29uc3QgZ29hbHM9W10sdG90YWw9ZGVwdGg9PkFycmF5LmZyb20oe2xlbmd0aDpkZXB0aC1zLmRlcHRofSwoXyxpKT0+TWF0aC5jZWlsKDEyMCpNYXRoLnBvdyhzLmRlcHRoK2krMSwxLjQpKSkucmVkdWNlKChuLHYpPT5uK3YsMCk7DQogICAgICBpZihzbG90czw2JiZzLmV4cGxvcmVycy5sZW5ndGgrYWN0aW9ucy5maWx0ZXIoYT0+YS5raW5kPT09J2V4cGxvcmUtc3RhcnQnKS5sZW5ndGg+PXNsb3RzJiZzLnJlc291cmNlcy5zdGltcGFrPj1jZmcucmVzZXJ2ZStjZmcuc3RpbXBha3MqKGZyZWUrMSkpew0KICAgICAgICBjb25zdCBwPWZpZ2h0ZXJzKCkuZmluZChwPT5zYWZlKFsuLi5wcm9qZWN0ZWRJZHMoKSxwLmlkXSkmJmd1YXJkKFtwXSxsb2Fkb3V0KFtwXSkpLmFsbG93ZWQpLG1pbGVzdG9uZT0oTWF0aC5mbG9vcihzLmRlcHRoLzgpKzEpKjg7DQogICAgICAgIGlmKHApZ29hbHMucHVzaCh7cGVyc29uOnAuaWQsbWlsZXN0b25lLHB1cnBvc2U6J3Nsb3RzJyx0b3RhbFNjcmFwOnRvdGFsKG1pbGVzdG9uZSksDQogICAgICAgICAgYmVuZWZpdDon5b2T5YmN5o6i6Zmp5L2N5Y+v55So5ruh77yM5LuN5pyJ5Y+v5a6J5YWo5aSW5Ye655qE5Lq66YCJ5ZKM6KGl57uZ77yb5o6o6L+b5q+POOWxguaWsOWinuaOoumZqeS9jSd9KTsNCiAgICAgIH0NCiAgICAgIGNvbnN0IGN1cnJlbnQ9TWF0aC5mbG9vcihzLmRlcHRoLzEwKSxuZXh0PWN1cnJlbnQrMSxkZXBhcnQ9YWN0aW9ucy5maW5kKGE9PmEua2luZD09PSdleHBsb3JlLXN0YXJ0JyksDQogICAgICAgIHRyaXA9cy5leHBsb3JlcnMuZmluZChlPT5lLmFieXNzPT09ZmFsc2UmJihyZWNvcmQudHJpcHN8fFtdKS5zb21lKHQ9PnQuaWQ9PT1lLmlkJiZ0LnJlc2lkZW50PT09ZS5yZXNpZGVudElkKSk7DQogICAgICBjb25zdCBjdXJyZW50RHJvcD1leHBlZGl0aW9uP2Ryb3BzLnRpZXJQZXJtaWxsZVtleHBlZGl0aW9uLnRpZXJdOmRyb3BzPy50aWVyUGVybWlsbGU/LltjdXJyZW50XTsNCiAgICAgIGlmKGRyb3BzT0smJmNmZy50aWVyPj1uZXh0JiZuZXh0PGRyb3BzLnRpZXJQZXJtaWxsZS5sZW5ndGgmJmRyb3BzLnRpZXJQZXJtaWxsZVtuZXh0XT5jdXJyZW50RHJvcCYmKGRlcGFydHx8dHJpcCkmJg0KICAgICAgICAgIHMucmVzb3VyY2VzLnN0aW1wYWs+PWNmZy5yZXNlcnZlK2NmZy5zdGltcGFrcyl7DQogICAgICAgIGNvbnN0IG1pbGVzdG9uZT1uZXh0KjEwO2dvYWxzLnB1c2goe3BlcnNvbjpkZXBhcnQ/LmlkPz90cmlwLnJlc2lkZW50SWQsbWlsZXN0b25lLHB1cnBvc2U6J3JlZ2lvbicsdG90YWxTY3JhcDp0b3RhbChtaWxlc3RvbmUpLA0KICAgICAgICAgIGJlbmVmaXQ6YOWcqOiuvue9rueahOWMuuWfn+S4iumZkOWGheino+mUgeWMuuWfnyR7bmV4dH3vvJvnvZHpobXmsb3msLTmpoLnjofnlLEke2N1cnJlbnREcm9wLzEwfSXliLAke2Ryb3BzLnRpZXJQZXJtaWxsZVtuZXh0XS8xMH0l77yM5pu06auY5Yy65Z+f55qE5Lyk5a6z5pS255uK5bCa5pyq5qC45a6eYH0pOw0KICAgICAgfQ0KICAgICAgY29uc3QgZ29hbD1nb2Fscy5zb3J0KChhLGIpPT5hLnRvdGFsU2NyYXAtYi50b3RhbFNjcmFwfHxhLm1pbGVzdG9uZS1iLm1pbGVzdG9uZSlbMF07DQogICAgICBpZihnb2FsKXByb2plY3RzLnB1c2goey4uLmdvYWwsdHlwZTonZWxldmF0b3InLHByaW9yaXR5OjQwLA0KICAgICAgICBiZW5lZml0OmAke2dvYWwuYmVuZWZpdH3vvJvliLDnrKwke2dvYWwubWlsZXN0b25lfeWxgue0r+iuoeS4i+aMlumcgCR7Z29hbC50b3RhbFNjcmFwfeW6n+aWme+8jOmAkOWxgumHjeivhO+8jOS4jeWboOacieepuuWcsOWPlua2iOmHjOeoi+eikWB9KTsNCiAgICB9DQogICAgcmVzdWx0LmFkb3B0aW9ucz1yZXN1bHQuYWRvcHRpb25zLmZpbHRlcihyPT5yZXNlcnZlZC5oYXMoci5pZCkmJiFhY3Rpb25zLnNvbWUoYT0+YS5pZD09PXIuaWQmJmEucm9sZT09PSd0cmFpbmluZy1yZWxlYXNlJykpOw0KICAgIHJlc3VsdC5yZXNlcnZlZD1bLi4ucmVzZXJ2ZWRdOw0KICAgIHJlc3VsdC5wb3B1bGF0aW9uRGVmZW5zZS5zdXBwbHk9cHJvamVjdGlvbihwcm9qZWN0ZWRJZHMoKSk7DQogICAgbm90ZXMudW5zaGlmdChg5pmu6YCa5o6i6Zmp5L2NICR7cy5leHBsb3JlcnMubGVuZ3RofS8ke3Nsb3Rzfe+8m+e7vOWQiOiuoeWIkumihOeVmSAke3Jlc2VydmVkLnNpemV9IOS6uuOAguWRqOS7u+WKoeacgOS9juaIkOWKn+eOhyAke2NmZy5jaGFuY2V9Je+8jOavj+S7u+WKoeavj+WRqOacgOWkmiAke2NmZy5hdHRlbXB0c30g5qyh77yM5Ye65Y+R6Ze06ZqU6Iez5bCRNuWwj+aXtuOAgmApOw0KICAgIGlmKHByb2plY3RzLmxlbmd0aClub3Rlcy5wdXNoKC4uLnByb2plY3RzLm1hcChwPT5wLmJlbmVmaXQpKTsNCiAgICByZXN1bHQuY2hvaWNlPWFjdGlvbnNbMF18fG51bGw7cmV0dXJuIHJlc3VsdDsNCiAgfQ0KICBmdW5jdGlvbiB2YWxpZFNoZWx0ZXJNYXRlcmlhbHModikgew0KICAgIGNvbnN0IHBvc2l0aXZlPW49Pk51bWJlci5pc1NhZmVJbnRlZ2VyKG4pJiZuPjA7DQogICAgLy8g5ZCv5Yqo6K+75Y+W5pep5LqO5bu6562R6KeE5YiZ5bi46YeP5Yid5aeL5YyW77yb5q2k5oyB5LmF5YyW5qCh6aqM5Y+q55So54us56uL5p6a5Li+77yM5LiN6IO96Kem5Y+R5pqC5pe25oCn5q275Yy644CCDQogICAgcmV0dXJuIG9iamVjdFN0YXRlKHYpJiZwb3NpdGl2ZSh2LnZhdWx0Tm8pJiZwb3NpdGl2ZSh2LmlkKSYmWydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCcsJ21lZGJheScsJ3dvcmtzaG9wJywnc3RvcmFnZScsJ3F1YXJ0ZXJzJ10uaW5jbHVkZXModi50eXBlKSYmDQogICAgICB2LmxldmVsPT09MyYmcG9zaXRpdmUodi50YXJnZXRMZXZlbCkmJnBvc2l0aXZlKHYuZmluYWxUYXJnZXQpJiZ2LnRhcmdldExldmVsPD12LmZpbmFsVGFyZ2V0Ow0KICB9DQogIGZ1bmN0aW9uIHZhbGlkQ2FtcGFpZ25SZWNvcmQodikgew0KICAgIGNvbnN0IHBvc2l0aXZlPXg9Pk51bWJlci5pc1NhZmVJbnRlZ2VyKHgpJiZ4PjAsYXQ9eD0+TnVtYmVyLmlzRmluaXRlKHgpJiZ4Pj0wOw0KICAgIHJldHVybiBvYmplY3RTdGF0ZSh2KSYmWydyb2xlcycsJ3RyaXBzJywnYXR0ZW1wdHMnLCdoZWFscycsJ3RyYWluaW5nUmVzdCddLmV2ZXJ5KGs9PkFycmF5LmlzQXJyYXkodltrXSkmJnZba10ubGVuZ3RoPD0yMDAwKSYmDQogICAgICAodi5tYXRlcmlhbHM9PT11bmRlZmluZWR8fHZhbGlkU2hlbHRlck1hdGVyaWFscyh2Lm1hdGVyaWFscykpJiYNCiAgICAgICh2LmRlZmVuc2U9PT11bmRlZmluZWR8fEFycmF5LmlzQXJyYXkodi5kZWZlbnNlKSYmdi5kZWZlbnNlLmxlbmd0aDw9MjAwJiZ2LmRlZmVuc2UuZXZlcnkocj0+cG9zaXRpdmUoci5pZCkmJnBvc2l0aXZlKHIucm9vbSkmJg0KICAgICAgICAoci5mcm9tPT09bnVsbHx8cG9zaXRpdmUoci5mcm9tKSkmJmF0KHIuYXQpKSYmbmV3IFNldCh2LmRlZmVuc2UubWFwKHI9PnIuaWQpKS5zaXplPT09di5kZWZlbnNlLmxlbmd0aCkmJg0KICAgICAgKHYuZGVmZW5zZU1hbnVhbD09PXVuZGVmaW5lZHx8QXJyYXkuaXNBcnJheSh2LmRlZmVuc2VNYW51YWwpJiZ2LmRlZmVuc2VNYW51YWwubGVuZ3RoPD0yMDAmJnYuZGVmZW5zZU1hbnVhbC5ldmVyeShwb3NpdGl2ZSkpJiYNCiAgICAgIHYucm9sZXMuZXZlcnkocj0+cG9zaXRpdmUoci5pZCkmJnBvc2l0aXZlKHIucm9vbSkmJmF0KHIuYXQpJiZbJ3RyYWluaW5nJywncmFkaW8nLCdtZWRpY2FsJywnd29ya3Nob3AnXS5pbmNsdWRlcyhyLnJvbGUpJiYNCiAgICAgICAgKHIucm9sZSE9PSd0cmFpbmluZyd8fChyLnB1cnBvc2U9PT0ncHJvZHVjdGlvbic/WydzdHInLCdwZXInLCdlbmQnLCdhZ2knLCdpbnQnXS5pbmNsdWRlcyhyLnN0YXQpJiZhdChyLnVudGlsKSYmci51bnRpbD5yLmF0JiYNCiAgICAgICAgICBhdChyLndpbmRvd0VuZCkmJnIud2luZG93RW5kPnIuYXQmJnBvc2l0aXZlKHIuZGVzdGluYXRpb24pOnIucHVycG9zZT09PSdwYXJlbnQnP1snc3RyJywncGVyJywnZW5kJywnY2hhJywnaW50JywnYWdpJywnbGNrJ10uaW5jbHVkZXMoci5zdGF0KSYmYXQoci51bnRpbCkmJnIudW50aWw+ci5hdDoNCiAgICAgICAgICByLnB1cnBvc2U9PT11bmRlZmluZWQmJlsnc3RyJywnZW5kJywnYWdpJ10uaW5jbHVkZXMoci5zdGF0KSkmJk51bWJlci5pc0Zpbml0ZShyLmJhc2UpJiZyLmJhc2U+PTAmJnIuYmFzZTw9MTApKSYmDQogICAgICBuZXcgU2V0KHYucm9sZXMubWFwKHI9PnIuaWQpKS5zaXplPT09di5yb2xlcy5sZW5ndGgmJg0KICAgICAgdi50cmlwcy5ldmVyeShyPT5wb3NpdGl2ZShyLmlkKSYmcG9zaXRpdmUoci5yZXNpZGVudCkmJmF0KHIuYXQpJiZOdW1iZXIuaXNGaW5pdGUoci5ob3VycykmJnIuaG91cnM+PTAmJnIuaG91cnM8PTI0JiYNCiAgICAgICAgKHIuc3RhcnRlZEF0PT09dW5kZWZpbmVkfHxhdChyLnN0YXJ0ZWRBdCkpJiYoci52YXVsdE5vPT09dW5kZWZpbmVkfHxwb3NpdGl2ZShyLnZhdWx0Tm8pKSkmJg0KICAgICAgdi5hdHRlbXB0cy5ldmVyeShyPT50eXBlb2Ygci5vcGVyYXRpb249PT0nc3RyaW5nJyYmdHlwZW9mIHIud2Vlaz09PSdzdHJpbmcnJiZ0eXBlb2Ygci5xdWVzdD09PSdzdHJpbmcnJiZhdChyLmF0KSkmJg0KICAgICAgWy4uLnYuaGVhbHMsLi4udi50cmFpbmluZ1Jlc3RdLmV2ZXJ5KHI9PnBvc2l0aXZlKHIuaWQpJiZhdChyLmF0KSk7DQogIH0NCiAgZnVuY3Rpb24gdmFsaWRDYW1wYWlnblBlbmRpbmcocCkgew0KICAgIGNvbnN0IGM9cC5iZWZvcmUuY2FtcGFpZ24sY2hvaWNlPWM/LmNob2ljZSxwb3NpdGl2ZT14PT5OdW1iZXIuaXNTYWZlSW50ZWdlcih4KSYmeD4wOw0KICAgIGlmKCFvYmplY3RTdGF0ZShjKXx8IW9iamVjdFN0YXRlKGNob2ljZSl8fGNob2ljZS5raW5kIT09cC5raW5kfHxKU09OLnN0cmluZ2lmeShjaG9pY2UudGFyZ2V0cykhPT1KU09OLnN0cmluZ2lmeShwLnRhcmdldHMpfHwNCiAgICAgICFOdW1iZXIuaXNGaW5pdGUocC5iZWZvcmUuc2VydmVyVGltZSl8fCFBcnJheS5pc0FycmF5KGMuaWRzKXx8IWMuaWRzLmV2ZXJ5KHBvc2l0aXZlKXx8IU51bWJlci5pc0Zpbml0ZShjLmhwKXx8Yy5ocDwwfHwNCiAgICAgICEocC5jYW1wYWlnbktleT09PXVuZGVmaW5lZHx8L15bQS1aYS16MC05LV17OCw2NH0kLy50ZXN0KHAuY2FtcGFpZ25LZXkpKXx8DQogICAgICAhKGNob2ljZS5tYXRlcmlhbHM9PT11bmRlZmluZWR8fGNob2ljZS5yb2xlPT09J3dvcmtzaG9wJyYmdmFsaWRTaGVsdGVyTWF0ZXJpYWxzKGNob2ljZS5tYXRlcmlhbHMpKSlyZXR1cm4gZmFsc2U7DQogICAgY29uc3QgdD1wLnRhcmdldHM7DQogICAgaWYocC5raW5kPT09J2V4cGxvcmUtc3RhcnQnKXJldHVybiB0Lmxlbmd0aD09PTMmJnBvc2l0aXZlKHRbMF0pJiZOdW1iZXIuaXNJbnRlZ2VyKHRbMV0pJiZ0WzFdPj0wJiZ0WzFdPD0xMDAmJg0KICAgICAgTnVtYmVyLmlzSW50ZWdlcih0WzJdKSYmdFsyXT49MCYmdFsyXTw9MTAmJk51bWJlci5pc0Zpbml0ZShjaG9pY2UuaG91cnMpJiZjaG9pY2UuaG91cnM+PS41JiZjaG9pY2UuaG91cnM8PTI0Ow0KICAgIGlmKHAua2luZD09PSdxdWVzdC1zdGFydCcpcmV0dXJuIHQubGVuZ3RoPj0yJiZ0Lmxlbmd0aDw9NCYmdHlwZW9mIHRbMF09PT0nc3RyaW5nJyYmdFswXS5sZW5ndGg+MCYmdC5zbGljZSgxKS5ldmVyeShwb3NpdGl2ZSkmJg0KICAgICAgbmV3IFNldCh0LnNsaWNlKDEpKS5zaXplPT09dC5sZW5ndGgtMSYmdHlwZW9mIGNob2ljZS53ZWVrPT09J3N0cmluZycmJmNob2ljZS53ZWVrLmxlbmd0aD4wOw0KICAgIGlmKHAua2luZD09PSdxdWVzdC1jbGFpbScpcmV0dXJuIHQubGVuZ3RoPT09MSYmcG9zaXRpdmUodFswXSkmJkFycmF5LmlzQXJyYXkoY2hvaWNlLnRlYW0pJiZjaG9pY2UudGVhbS5sZW5ndGg+PTEmJmNob2ljZS50ZWFtLmxlbmd0aDw9MyYmY2hvaWNlLnRlYW0uZXZlcnkocG9zaXRpdmUpOw0KICAgIGlmKFsnZXhwbG9yZS1yZWNhbGwnLCdzdGltcGFrJ10uaW5jbHVkZXMocC5raW5kKSlyZXR1cm4gdC5sZW5ndGg9PT0xJiZwb3NpdGl2ZSh0WzBdKTsNCiAgICBpZihwLmtpbmQ9PT0nY3JhZnQnKXJldHVybiB0Lmxlbmd0aD09PTImJnBvc2l0aXZlKHRbMF0pJiZ0WzFdPT09MCYmY2hvaWNlLmNvc3Q/LnNjcmFwPT09ODAmJmNob2ljZS5jb3N0LnBhcnRzPT09MDsNCiAgICBpZihwLmtpbmQ9PT0nYXNzaWduJylyZXR1cm4gWydtZWRpY2FsJywncmFkaW8nLCd0cmFpbmluZycsJ3dvcmtzaG9wJywnbWVkaWNhbC1yZWxlYXNlJywncmFkaW8tcmVsZWFzZScsJ3RyYWluaW5nLXJlbGVhc2UnLCd3b3Jrc2hvcC1yZWxlYXNlJywnZGVmZW5zZScsJ2RlZmVuc2UtcmVsZWFzZSddLmluY2x1ZGVzKGNob2ljZS5yb2xlKSYmDQogICAgICAoIWNob2ljZS5yb2xlLnN0YXJ0c1dpdGgoJ2RlZmVuc2UnKXx8Y2hvaWNlLm9yaWdpbmFsPT09bnVsbHx8cG9zaXRpdmUoY2hvaWNlLm9yaWdpbmFsKSkmJg0KICAgICAgKGNob2ljZS5yb2xlIT09J3RyYWluaW5nJ3x8KGNob2ljZS5wdXJwb3NlPT09J3Byb2R1Y3Rpb24nP1snc3RyJywncGVyJywnZW5kJywnYWdpJywnaW50J10uaW5jbHVkZXMoY2hvaWNlLnN0YXQpJiYNCiAgICAgICAgTnVtYmVyLmlzRmluaXRlKGNob2ljZS51bnRpbCkmJmNob2ljZS51bnRpbD5wLmJlZm9yZS5zZXJ2ZXJUaW1lJiZOdW1iZXIuaXNGaW5pdGUoY2hvaWNlLndpbmRvd0VuZCkmJmNob2ljZS53aW5kb3dFbmQ+cC5iZWZvcmUuc2VydmVyVGltZSYmcG9zaXRpdmUoY2hvaWNlLmRlc3RpbmF0aW9uKTpjaG9pY2UucHVycG9zZT09PSdwYXJlbnQnP1snc3RyJywncGVyJywnZW5kJywnY2hhJywnaW50JywnYWdpJywnbGNrJ10uaW5jbHVkZXMoY2hvaWNlLnN0YXQpJiYNCiAgICAgICAgTnVtYmVyLmlzRmluaXRlKGNob2ljZS51bnRpbCkmJmNob2ljZS51bnRpbD5wLmJlZm9yZS5zZXJ2ZXJUaW1lOmNob2ljZS5wdXJwb3NlPT09dW5kZWZpbmVkJiZbJ3N0cicsJ2VuZCcsJ2FnaSddLmluY2x1ZGVzKGNob2ljZS5zdGF0KSkmJg0KICAgICAgICBOdW1iZXIuaXNGaW5pdGUoY2hvaWNlLmJhc2UpJiZjaG9pY2UuYmFzZT49MCYmY2hvaWNlLmJhc2U8MTApOw0KICAgIHJldHVybiBwLmtpbmQ9PT0nZXF1aXAnJiZjaG9pY2Uucm9sZT09PSdjb21iYXRHZWFyJzsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQ2FtcGFpZ25Qcm9vZihwLHN0YXR1cyxyZXF1ZXN0LGJvZHkpIHsNCiAgICBpZighcC5iZWZvcmU/LmNhbXBhaWdufHwhcC5jYW1wYWlnbktleXx8cmVxdWVzdD8uaWRlbXBvdGVuY3lLZXkhPT1wLmNhbXBhaWduS2V5fHwhTnVtYmVyLmlzSW50ZWdlcihzdGF0dXMpfHxzdGF0dXM8MjAwfHxzdGF0dXM+PTMwMHx8Ym9keT8uY29kZT09PSdyZXRyeScpcmV0dXJuIG51bGw7DQogICAgY29uc3QgZXhwZWN0ZWQ9c2hlbHRlclJlcXVlc3RBY3Rpb24ocC5raW5kLHAudGFyZ2V0cyksYWN0aW9uPXJlcXVlc3QuYWN0aW9uOw0KICAgIGlmKCFzaGVsdGVyQWN0aW9uTWF0Y2hlcyhhY3Rpb24sZXhwZWN0ZWQpKXJldHVybiBudWxsOw0KICAgIGxldCBtO3RyeXttPXNoZWx0ZXJNb2RlbChib2R5LnZpZXcpO31jYXRjaHtyZXR1cm4gbnVsbDt9DQogICAgaWYobS52aWV3LnZhdWx0Tm8hPT1wLnZhdWx0Tm98fG0ubm93PHAuYmVmb3JlLnNlcnZlclRpbWUpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgcz1tLnN0YXRlLGM9cC5iZWZvcmUuY2FtcGFpZ24sdD1wLnRhcmdldHMscGVyc29uPXMucmVzaWRlbnRzLmZpbmQocj0+ci5pZD09PXRbMF0pO2xldCBjaGFuZ2VkPWZhbHNlLG1pc3Npb249bnVsbDsNCiAgICBpZihwLmtpbmQ9PT0nZXhwbG9yZS1zdGFydCcpew0KICAgICAgY29uc3QgZm91bmQ9cy5leHBsb3JlcnM/LmZpbHRlcihlPT4hYy5pZHMuaW5jbHVkZXMoZS5pZCkmJmUucmVzaWRlbnRJZD09PXRbMF0mJmUudGllcj09PXRbMV0mJmUuYWJ5c3M9PT1mYWxzZSYmDQogICAgICAgIE51bWJlci5pc0Zpbml0ZShlLnN0YXJ0ZWRBdCkmJmUuc3RhcnRlZEF0Pj1wLmJlZm9yZS5zZXJ2ZXJUaW1lJiZOdW1iZXIuaXNGaW5pdGUoZS5zdGltcGFrcykmJmUuc3RpbXBha3M8PXRbMl0pOw0KICAgICAgY2hhbmdlZD1mb3VuZD8ubGVuZ3RoPT09MSYmcGVyc29uPy5hd2F5Py5raW5kPT09J2V4cGxvcmUnO21pc3Npb249Y2hhbmdlZD9mb3VuZFswXS5pZDpudWxsOw0KICAgIH1lbHNlIGlmKHAua2luZD09PSdleHBsb3JlLXJlY2FsbCcpY2hhbmdlZD1zLmV4cGxvcmVycz8uc29tZShlPT5lLmlkPT09dFswXSYmTnVtYmVyLmlzRmluaXRlKGUucmVjYWxsZWRBdCkmJmUucmVjYWxsZWRBdD49cC5iZWZvcmUuc2VydmVyVGltZSYmTnVtYmVyLmlzRmluaXRlKGUucmV0dXJuQXQpKTsNCiAgICBlbHNlIGlmKHAua2luZD09PSdxdWVzdC1zdGFydCcpew0KICAgICAgY29uc3QgZm91bmQ9cy5xdWVzdHM/LmZpbHRlcihxPT4hYy5pZHMuaW5jbHVkZXMocS5pZCkmJnEucXVlc3RJZD09PXRbMF0mJnEuc3RhdHVzPT09J2FjdGl2ZScmJkFycmF5LmlzQXJyYXkocS50ZWFtKSYmDQogICAgICAgIHEudGVhbS5sZW5ndGg9PT10Lmxlbmd0aC0xJiZ0LnNsaWNlKDEpLmV2ZXJ5KGlkPT5xLnRlYW0uaW5jbHVkZXMoaWQpJiZzLnJlc2lkZW50cy5zb21lKHI9PnIuaWQ9PT1pZCYmci5hd2F5Py5raW5kPT09J3F1ZXN0JykpKTsNCiAgICAgIGNoYW5nZWQ9Zm91bmQ/Lmxlbmd0aD09PTE7bWlzc2lvbj1jaGFuZ2VkP2ZvdW5kWzBdLmlkOm51bGw7DQogICAgfWVsc2UgaWYocC5raW5kPT09J3F1ZXN0LWNsYWltJyljaGFuZ2VkPUFycmF5LmlzQXJyYXkocy5xdWVzdHMpJiYhcy5xdWVzdHMuc29tZShxPT5xLmlkPT09dFswXSkmJg0KICAgICAgYy5jaG9pY2UudGVhbS5ldmVyeShpZD0+cy5yZXNpZGVudHMuc29tZShyPT5yLmlkPT09aWQmJnIuYXdheT09PW51bGwmJnIuZGVhZEF0PT09bnVsbCkpOw0KICAgIGVsc2UgaWYocC5raW5kPT09J3N0aW1wYWsnKWNoYW5nZWQ9cGVyc29uPy5hd2F5PT09bnVsbCYmcGVyc29uLmRlYWRBdD09PW51bGwmJnBlcnNvbi5ocD5jLmhwOw0KICAgIGVsc2UgaWYocC5raW5kPT09J2Fzc2lnbicpY2hhbmdlZD1wZXJzb24/LnJvb21JZD09PXRbMV07DQogICAgZWxzZSBpZihwLmtpbmQ9PT0nZXF1aXAnKWNoYW5nZWQ9cGVyc29uPy5bdFsyXT09PSd3ZWFwb24nPyd3ZWFwb25JZCc6J291dGZpdElkJ109PT10WzFdOw0KICAgIGVsc2UgaWYocC5raW5kPT09J2NyYWZ0JyljaGFuZ2VkPXMucm9vbXMuc29tZShyPT5yLmlkPT09dFswXSYmWydhcm1vcnknLCd0YWlsb3InXS5pbmNsdWRlcyhyLnR5cGUpJiYNCiAgICAgIHIuY3JhZnQ/LnRpZXI9PT10WzFdJiZOdW1iZXIuaXNGaW5pdGUoci5jcmFmdC5kb25lQXQpJiZyLmNyYWZ0LmRvbmVBdD5wLmJlZm9yZS5zZXJ2ZXJUaW1lKTsNCiAgICBpZighY2hhbmdlZClyZXR1cm4gbnVsbDsNCiAgICByZXR1cm4ge2tpbmQ6cC5raW5kLG9wZXJhdGlvbjpwLmlkLGtleTpwLmNhbXBhaWduS2V5LHZhdWx0Tm86cC52YXVsdE5vLGF0Om0ubm93LG1pc3Npb259Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJDYW1wYWlnbkNvbmZpcm1lZChwLG0pIHsNCiAgICBjb25zdCBwcm9vZj1wLnJlc3VsdD8uY2FtcGFpZ25Qcm9vZjsNCiAgICBpZighcHJvb2Z8fHByb29mLmtpbmQhPT1wLmtpbmR8fHByb29mLm9wZXJhdGlvbiE9PXAuaWR8fHByb29mLmtleSE9PXAuY2FtcGFpZ25LZXl8fHByb29mLnZhdWx0Tm8hPT1wLnZhdWx0Tm98fA0KICAgICAgbS52aWV3LnZhdWx0Tm8hPT1wLnZhdWx0Tm98fCFOdW1iZXIuaXNGaW5pdGUocHJvb2YuYXQpfHxwcm9vZi5hdDxwLmJlZm9yZS5zZXJ2ZXJUaW1lfHxtLm5vdzxwcm9vZi5hdClyZXR1cm4gZmFsc2U7DQogICAgY29uc3QgdD1wLnRhcmdldHMscz1tLnN0YXRlOw0KICAgIGlmKHAua2luZD09PSdleHBsb3JlLXN0YXJ0JylyZXR1cm4gQXJyYXkuaXNBcnJheShzLmV4cGxvcmVycykmJnMuZXhwbG9yZXJzLnNvbWUoZT0+ZS5pZD09PXByb29mLm1pc3Npb24mJmUucmVzaWRlbnRJZD09PXRbMF0pOw0KICAgIGlmKHAua2luZD09PSdxdWVzdC1zdGFydCcpcmV0dXJuIEFycmF5LmlzQXJyYXkocy5xdWVzdHMpJiZzLnF1ZXN0cy5zb21lKHE9PnEuaWQ9PT1wcm9vZi5taXNzaW9uJiZxLnF1ZXN0SWQ9PT10WzBdKTsNCiAgICBpZihwLmtpbmQ9PT0ncXVlc3QtY2xhaW0nKXJldHVybiBBcnJheS5pc0FycmF5KHMucXVlc3RzKSYmIXMucXVlc3RzLnNvbWUocT0+cS5pZD09PXRbMF0pOw0KICAgIGlmKHAua2luZD09PSdleHBsb3JlLXJlY2FsbCcpcmV0dXJuIEFycmF5LmlzQXJyYXkocy5leHBsb3JlcnMpJiZzLmV4cGxvcmVycy5zb21lKGU9PmUuaWQ9PT10WzBdJiZOdW1iZXIuaXNGaW5pdGUoZS5yZWNhbGxlZEF0KSk7DQogICAgaWYocC5raW5kPT09J2Fzc2lnbicpcmV0dXJuIHMucmVzaWRlbnRzLnNvbWUocj0+ci5pZD09PXRbMF0mJnIucm9vbUlkPT09dFsxXSk7DQogICAgaWYocC5raW5kPT09J2VxdWlwJylyZXR1cm4gcy5yZXNpZGVudHMuc29tZShyPT5yLmlkPT09dFswXSYmclt0WzJdPT09J3dlYXBvbic/J3dlYXBvbklkJzonb3V0Zml0SWQnXT09PXRbMV0pOw0KICAgIGlmKHAua2luZD09PSdjcmFmdCcpcmV0dXJuIHRydWU7IC8vIOWOn+ivt+axguWbnuaJp+W3suivgeaYjuW8gOWni+WItuS9nO+8m+WQjue7reWujOaIkOWFpeW6k+S4jeimgeaxguS/neeVmWNyYWZ05a2X5q6144CCDQogICAgcmV0dXJuIHAua2luZD09PSdzdGltcGFrJzsgLy8g57uR5a6a5Zue5omn5bey6K+B5piO5Zue6KGA77yM5LiN6KaB5rGC5LiL5qyh6K+75Y+W5pe25LuN5L+d5oyB5ZCM5LiA6KGA6YeP44CCDQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckxldmVsUHJvZ3Jlc3MobSkgew0KICAgIGNvbnN0IHM9bS5zdGF0ZSx0aHJlc2hvbGQ9bGV2ZWw9PmxldmVsPD0xPzA6MzArTWF0aC5jZWlsKDIuMjUqKGxldmVsLTEpKioyKTsNCiAgICBjb25zdCB1bml0cz1zLnJvb21zLmZpbHRlcihyPT5yLmJ1aWx0QXQ8PW0ubm93JiYhWydkb29yJywnZWxldmF0b3InXS5pbmNsdWRlcyhyLnR5cGUpKS5yZWR1Y2UoKG4scik9Pm4rci53aWR0aCpyLmxldmVsLDApOw0KICAgIGNvbnN0IHNjb3JlPTIqcy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCkubGVuZ3RoK3VuaXRzKzMqcy5kZXB0aDsNCiAgICBjb25zdCBsZXZlbD0xK01hdGguZmxvb3IoTWF0aC5zcXJ0KE1hdGgubWF4KDAsc2NvcmUtMzApKS8xLjUpOw0KICAgIGlmKCFOdW1iZXIuaXNTYWZlSW50ZWdlcihzY29yZSl8fGxldmVsIT09bS52aWV3LnByb2dyZXNzLmxldmVsKXJldHVybiBudWxsOw0KICAgIGNvbnN0IGNvbW1pdHRlZD1zY29yZSsyKnMuYmlydGhzLmxlbmd0aCtzLnJvb21zLmZpbHRlcihyPT4hWydkb29yJywnZWxldmF0b3InXS5pbmNsdWRlcyhyLnR5cGUpKS5yZWR1Y2UoKG4scik9Pg0KICAgICAgbisoci5idWlsdEF0Pm0ubm93P3Iud2lkdGgqci5sZXZlbDpyLnVwZ3JhZGVBdCE9PW51bGw/ci53aWR0aDowKSwwKSsocy5kaWdnaW5nPzM6MCk7DQogICAgcmV0dXJuIHtzY29yZSxsZXZlbCxuZXh0OnRocmVzaG9sZChsZXZlbCsxKSxyZW1haW5pbmc6dGhyZXNob2xkKGxldmVsKzEpLXNjb3JlLGNvbW1pdHRlZH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclJlc29sdmVkTGV2ZWxUYXJnZXQobSxyZXF1ZXN0ZWQpIHsNCiAgICBpZihyZXF1ZXN0ZWQhPT0nYXV0bycpcmV0dXJuIHJlcXVlc3RlZDsNCiAgICBjb25zdCBwcm9ncmVzcz1zaGVsdGVyTGV2ZWxQcm9ncmVzcyhtKTsNCiAgICByZXR1cm4gcHJvZ3Jlc3MmJk51bWJlci5pc1NhZmVJbnRlZ2VyKHByb2dyZXNzLmxldmVsKzEpP3Byb2dyZXNzLmxldmVsKzE6bnVsbDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyTGV2ZWxFdmVudHMobSkgew0KICAgIHJldHVybiBbLi4ubS5zdGF0ZS5iaXJ0aHMubWFwKGI9Pih7YXQ6Yi5kdWVBdCxnYWluOjJ9KSksLi4ubS5zdGF0ZS5yb29tcy5maWx0ZXIocj0+IVsnZG9vcicsJ2VsZXZhdG9yJ10uaW5jbHVkZXMoci50eXBlKSkNCiAgICAgIC5mbGF0TWFwKHI9PnIuYnVpbHRBdD5tLm5vdz9be2F0OnIuYnVpbHRBdCxnYWluOnIud2lkdGgqci5sZXZlbH1dOnIudXBncmFkZUF0IT09bnVsbD9be2F0OnIudXBncmFkZUF0LGdhaW46ci53aWR0aH1dOltdKSwNCiAgICAgIC4uLihtLnN0YXRlLmRpZ2dpbmc/W3thdDptLnN0YXRlLmRpZ2dpbmcuZG9uZUF0LGdhaW46M31dOltdKV0uZmlsdGVyKGU9Pk51bWJlci5pc0Zpbml0ZShlLmF0KSkuc29ydCgoYSxiKT0+YS5hdC1iLmF0KTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUGxhbm5pbmdTdG9jayhtKSB7DQogICAgcmV0dXJuIHtob3VyczowLHJlc291cmNlczp7Li4ubS5zdGF0ZS5yZXNvdXJjZXN9LGNhcHM6ey4uLm0uY2Fwc30sZGVtYW5kOnsuLi5zaGVsdGVyR3Jvd3RoTmVlZHMobSkuZGVtYW5kfSwNCiAgICAgIHJvb21zOm0ucm9vbXMuZmlsdGVyKHI9PnIuYmF0Y2g+MCkubWFwKHI9Pih7aWQ6ci5pZCxyZXNvdXJjZTpyLnJlc291cmNlLHJhdGU6ci5yYXRlLGJhdGNoOnIuYmF0Y2gsc3RvcmVkOnIuc3RvcmVkLA0KICAgICAgICBhdXRvbWF0aWM6ci5hdXRvbWF0aWMsdGljazpNYXRoLm1heCgwLChyLm5leHRUaWNrQXQtbS5ub3cpLzM2MDAwMDApfSkpfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQWR2YW5jZVBsYW5uaW5nU3RvY2sobSxwLGhvdXJzLHBhdXNlZD1udWxsKSB7DQogICAgLy8g5Lul5pW05om56aKG5Y+W5Lyw566X5pSS5paZ77yb546w5pyJ5Zyo5bu65bel56iL5pyq5p2l5aKe5Lqn5pqC5LiN5o+Q5YmN6K6h5YWl77yM6YG/5YWN5ou/5pyq5YWR546w5Lqn6IO95pSv5LuY5LiL5LiA56yU44CCDQogICAgY29uc3QgZW5kPXAuaG91cnMraG91cnMse21pbixtYXgsZmxvb3J9PU1hdGgsZGVtYW5kS2V5cz1PYmplY3Qua2V5cyhwLmRlbWFuZCkscmVzb3VyY2VLZXlzPU9iamVjdC5rZXlzKHAucmVzb3VyY2VzKTsNCiAgICB3aGlsZShwLmhvdXJzPGVuZC0xZS05KXsNCiAgICAgIGxldCBuZXh0PWVuZDsNCiAgICAgIGZvcihjb25zdCByIG9mIHAucm9vbXMpbmV4dD1taW4obmV4dCxyLnRpY2s+cC5ob3VycysxZS05P3IudGljazpwLmhvdXJzKzEvNik7DQogICAgICBjb25zdCBlbGFwc2VkPW5leHQtcC5ob3VyczsNCiAgICAgIGZvcihjb25zdCBrIG9mIGRlbWFuZEtleXMpcC5yZXNvdXJjZXNba10tPXAuZGVtYW5kW2tdKmVsYXBzZWQ7DQogICAgICBwLmhvdXJzPW5leHQ7DQogICAgICBmb3IoY29uc3QgciBvZiBwLnJvb21zKXsNCiAgICAgICAgaWYoci50aWNrPm5leHQrMWUtOSljb250aW51ZTsNCiAgICAgICAgci50aWNrPW5leHQrMS82Ow0KICAgICAgICBpZihyLmlkIT09cGF1c2VkKXsNCiAgICAgICAgICBsZXQgbWFkZT1tYXgoMCxtaW4oci5yYXRlLzYsNCpyLmJhdGNoLXIuc3RvcmVkKSk7DQogICAgICAgICAgaWYoci5yZXNvdXJjZT09PSdwYXJ0cycpe21hZGU9bWluKG1hZGUsbWF4KDAscC5yZXNvdXJjZXMuc2NyYXApLzYpO3AucmVzb3VyY2VzLnNjcmFwLT02Km1hZGU7fQ0KICAgICAgICAgIHIuc3RvcmVkKz1tYWRlOw0KICAgICAgICB9DQogICAgICAgIGNvbnN0IGFtb3VudD1mbG9vcigoci5zdG9yZWQrMWUtOSkvci5iYXRjaCkqci5iYXRjaDsNCiAgICAgICAgLy8g5omL5Yqo5pS25Y+W5LiN6IO95ouG5om577yb5bey5pyJ566h5a625oyJ5YWs5byA6KeE5YiZ5Y+q5Luj5pS25pW05pWw56m65L2N77yM5LuN5YWx5Lqr5ZCM5LiA5Lu95bqT5a2Y5a656YeP44CCDQogICAgICAgIGNvbnN0IGF2YWlsYWJsZT1tYXgoMCxwLmNhcHNbci5yZXNvdXJjZV0tcC5yZXNvdXJjZXNbci5yZXNvdXJjZV0pOw0KICAgICAgICBjb25zdCB0YWtlPXIuYXV0b21hdGljP21pbihhbW91bnQsZmxvb3IoYXZhaWxhYmxlKSk6YW1vdW50PD1hdmFpbGFibGUrMWUtOT9hbW91bnQ6MDsNCiAgICAgICAgcC5yZXNvdXJjZXNbci5yZXNvdXJjZV0rPXRha2U7ci5zdG9yZWQ9bWF4KDAsci5zdG9yZWQtdGFrZSk7DQogICAgICB9DQogICAgICBmb3IoY29uc3QgayBvZiByZXNvdXJjZUtleXMpaWYocC5yZXNvdXJjZXNba108LS4wMDEpe3AuZmFpbHVyZT1gJHtzaGVsdGVyUmVzb3VyY2VzW2tdfeWcqOetieW+heacn+mXtOS4jei2s2A7cmV0dXJuIGZhbHNlO30NCiAgICB9DQogICAgcmV0dXJuIHRydWU7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlck1hdGVyaWFsRm9yZWNhc3QobSkgew0KICAgIGNvbnN0IHA9c2hlbHRlclBsYW5uaW5nU3RvY2sobSksc2FtcGxlcz1be2hvdXJzOjAscmVzb3VyY2VzOnsuLi5wLnJlc291cmNlc319XTsNCiAgICAvLyDlkIzkuIDova7miYDmnInlgJnpgInlhbHnlKjkuIDmrKHml7bpl7Tmjqjov5vvvIzkvYblkIToh6rku47lvZPliY3lupPlrZjmr5TovoPvvIzkuI3miorlgJnpgInlvIDmlK/lj6DliqDjgIINCiAgICByZXR1cm4gY29zdD0+ew0KICAgICAgY29uc3QgcmVhZHk9cz0+cy5yZXNvdXJjZXMuc2NyYXArMWUtOT49Y29zdC5zY3JhcCYmcy5yZXNvdXJjZXMucGFydHMrMWUtOT49Y29zdC5wYXJ0czsNCiAgICAgIGNvbnN0IGV4aXN0aW5nPXNhbXBsZXMuZmluZChyZWFkeSk7aWYoZXhpc3RpbmcpcmV0dXJuIHtob3VyczpleGlzdGluZy5ob3VycyxyZWFzb246Jyd9Ow0KICAgICAgY29uc3QgbWlzc2luZz1bJ3NjcmFwJywncGFydHMnXS5maWx0ZXIoaz0+bS5zdGF0ZS5yZXNvdXJjZXNba10rMWUtOTxjb3N0W2tdKTsNCiAgICAgIGlmKG1pc3Npbmcuc29tZShrPT5jb3N0W2tdPm0uY2Fwc1trXSkpcmV0dXJuIHtob3VyczpudWxsLHJlYXNvbjon5omA6ZyA5p2Q5paZ6LaF6L+H5b2T5YmN5a656YeP77yM5YWI5qC45a+55omp5a6557uT5p6cJ307DQogICAgICBjb25zdCB1bmF2YWlsYWJsZT1taXNzaW5nLmZpbHRlcihrPT4hcC5yb29tcy5zb21lKHI9PnIucmVzb3VyY2U9PT1rJiYoci5yYXRlPjB8fHIuc3RvcmVkKzFlLTk+PXIuYmF0Y2gpKSk7DQogICAgICBpZih1bmF2YWlsYWJsZS5sZW5ndGgpcmV0dXJuIHtob3VyczpudWxsLHJlYXNvbjpgJHt1bmF2YWlsYWJsZS5tYXAoaz0+c2hlbHRlclJlc291cmNlc1trXSkuam9pbign44CBJyl95rKh5pyJ5b2T5YmN5Lqn6IO95oiW5Y+v6aKG5Y+W5pW05om577yM5peg5rOV5Lyw6K6h5pSS6b2Q5pe26Ze0YH07DQogICAgICB3aGlsZSghcC5mYWlsdXJlJiZwLmhvdXJzPDcyLTFlLTkpew0KICAgICAgICBpZighc2hlbHRlckFkdmFuY2VQbGFubmluZ1N0b2NrKG0scCwxLzYpKWJyZWFrOw0KICAgICAgICBjb25zdCBzYW1wbGU9e2hvdXJzOnAuaG91cnMscmVzb3VyY2VzOnsuLi5wLnJlc291cmNlc319O3NhbXBsZXMucHVzaChzYW1wbGUpOw0KICAgICAgICBpZihyZWFkeShzYW1wbGUpKXJldHVybiB7aG91cnM6cC5ob3VycyxyZWFzb246Jyd9Ow0KICAgICAgfQ0KICAgICAgaWYocC5mYWlsdXJlKXJldHVybiB7aG91cnM6bnVsbCxyZWFzb246YCR7cC5mYWlsdXJlfe+8jOaXoOazleS8sOiuoeadkOaWmeaUkum9kOaXtumXtO+8jOWFiOaBouWkjeS+m+W6lGB9Ow0KICAgICAgY29uc3Qgb3ZlcmZsb3c9cC5yb29tcy5zb21lKHI9Pm1pc3NpbmcuaW5jbHVkZXMoci5yZXNvdXJjZSkmJnIuc3RvcmVkKzFlLTk+PXIuYmF0Y2gmJg0KICAgICAgICBNYXRoLmZsb29yKChyLnN0b3JlZCsxZS05KS9yLmJhdGNoKSpyLmJhdGNoPk1hdGgubWF4KDAsbS5jYXBzW3IucmVzb3VyY2VdLXAucmVzb3VyY2VzW3IucmVzb3VyY2VdKSsxZS05KTsNCiAgICAgIHJldHVybiB7aG91cnM6bnVsbCxyZWFzb246b3ZlcmZsb3c/J+aVtOaJueS6p+WHuuWPl+W6k+WtmOWuuemHj+mZkOWItu+8jOW9k+WJjeaXoOazleS8sOiuoeadkOaWmeaUkum9kOaXtumXtCc6J+aMieW9k+WJjeS6p+iDveWPiuS+m+aWme+8jDcy5bCP5pe25YaF5pyq5Lyw5Ye65p2Q5paZ5pSS6b2Q5pe26Ze077yb5p2h5Lu25Y+Y5YyW5ZCO6YeN6K+EJ307DQogICAgfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyTWF0ZXJpYWxUaW1lVGV4dChjKSB7DQogICAgaWYoIWN8fCFPYmplY3QudmFsdWVzKGMuc2hvcnRhZ2UpLnNvbWUodj0+dj4wKSlyZXR1cm4gJyc7DQogICAgaWYoYy5zYXZlSG91cnM9PT1udWxsKXJldHVybiBjLnNhdmVSZWFzb258fCflvZPliY3ml6Dms5XkvLDorqHmnZDmlpnmlJLpvZDml7bpl7QnOw0KICAgIGNvbnN0IHRpbWU9Yy5zYXZlSG91cnM8MT9gJHtNYXRoLmNlaWwoYy5zYXZlSG91cnMqNjAtMWUtOCl9IOWIhumSn2A6YCR7Yy5zYXZlSG91cnMudG9GaXhlZCgxKX0g5bCP5pe2YDsNCiAgICByZXR1cm4gYOadkOaWmeaMieeOsOacieW6k+WtmOOAgeaVtOaJueS6p+WHuuWSjOW3peWdiuS+m+aWmeS8sOiuoee6piAke3RpbWV95ZCO5Y+v5pSS6b2Q77yb5Lul5q+P5Y2B5YiG6ZKf5oyB57ut5pS25Y+W44CB5Lqn6IO95LiN5Y+Y5LiU5peg5YW25LuW5pSv5Ye65Li65YmN5o+Q77yM5LiN5ZCr5pa95bel44CB6aKE566X5oiW6aG16Z2i562J5b6FYDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyTGV2ZWxTZWFyY2hCdWRnZXQobSxvcHRpb25zLGRlZXA9dHJ1ZSkgew0KICAgIGNvbnN0IG1heFByb2plY3RzPWRlZXA/ODozLGJlYW1XaWR0aD1kZWVwPzg6Nixob3Jpem9uSG91cnM9ZGVlcD8xNjg6NzI7DQogICAgLy8g5bey5Zyo6YCU55qE5YWo6YOo5YiG5pWw5Lmf6K6h5YWl5LmQ6KeC5LiK55WM77yb5LiN5oyJ5bqT5a2Y5oiW5bel5pyf5o6o5pat5pu05L2O5LiK55WM44CCDQogICAgLy8g5ZCO57un5Y+q5Lya5paw5bu65LiA5qC844CB5Y2H57qn546w5pyJL+acgOWkmuS4ieagvOWQiOW5tuaIv+OAgeaIluS4i+aMluS4ieWIhuOAgg0KICAgIGNvbnN0IG1heEdhaW49TWF0aC5tYXgoMywuLi5tLnN0YXRlLnJvb21zLm1hcChyPT5yLndpZHRoKSwuLi5vcHRpb25zLm1hcChjPT5jLmxldmVsR2Fpbnx8MCkpOw0KICAgIHJldHVybiB7bWF4UHJvamVjdHMsYmVhbVdpZHRoLGhvcml6b25Ib3VycyxtYXhHYWluLA0KICAgICAgc2NvcmVVcHBlckJvdW5kOnNoZWx0ZXJMZXZlbFByb2dyZXNzKG0pLmNvbW1pdHRlZCttYXhQcm9qZWN0cyptYXhHYWlufTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyTGV2ZWxSb3V0ZXMobSxvcHRpb25zLHRhcmdldFNjb3JlLGZpcnN0PW51bGwscGxhbm5pbmc9e30pIHsNCiAgICBjb25zdCBwcm9ncmVzcz1zaGVsdGVyTGV2ZWxQcm9ncmVzcyhtKTtpZighcHJvZ3Jlc3MpcmV0dXJuIFtdOw0KICAgIGNvbnN0IGRlZXA9cGxhbm5pbmcuZGVlcCE9PWZhbHNlLHttYXhQcm9qZWN0cyxiZWFtV2lkdGgsaG9yaXpvbkhvdXJzfT1zaGVsdGVyTGV2ZWxTZWFyY2hCdWRnZXQobSxvcHRpb25zLGRlZXApOw0KICAgIGNvbnN0IHVuaXF1ZT1bLi4ubmV3IE1hcChvcHRpb25zLmZpbHRlcihjPT5jLmxldmVsR2Fpbj4wJiZOdW1iZXIuaXNGaW5pdGUoYy5ob3VycykmJmMuaG91cnM+MCYmDQogICAgICAhYy5ibG9ja3MubGVuZ3RoKS5tYXAoYz0+W2Ake2Mua2luZH06JHtjLmlkPz9gJHtjLmZsb29yfToke2MuY29sfWB9YCxjXSkpLnZhbHVlcygpXS5zbGljZSgwLGRlZXA/SW5maW5pdHk6MTIpOw0KICAgIGNvbnN0IGR1ZT1zaGVsdGVyTGV2ZWxFdmVudHMobSksc3RvcmFnZVBlcms9bS5zdGF0ZS5sZWdhY3k/LnBlcmtzPy5zdG9yYWdlPz8wOw0KICAgIGNvbnN0IGluaXRpYWw9ey4uLnNoZWx0ZXJQbGFubmluZ1N0b2NrKG0pLHN0ZXBzOltdLGdhaW46MCxjb3N0OjAsaXRlbUNhcDptLml0ZW1DYXAsDQogICAgICBjYXBhY2l0eVJvb21zOm0uc3RhdGUucm9vbXMuZmlsdGVyKHI9PnIuYnVpbHRBdDw9bS5ub3cpLm1hcChyPT4oey4uLnJ9KSksbWVyZ2VkSWRzOltdLA0KICAgICAgcmVzaWRlbnRzOm0uc3RhdGUucmVzaWRlbnRzLm1hcChwPT4oey4uLnB9KSksbWF0ZXJpYWxNb3ZlczpbXX07DQogICAgY29uc3QgY2xvbmU9cD0+KHsuLi5wLHJlc291cmNlczp7Li4ucC5yZXNvdXJjZXN9LGNhcHM6ey4uLnAuY2Fwc30sZGVtYW5kOnsuLi5wLmRlbWFuZH0scm9vbXM6cC5yb29tcy5tYXAocj0+KHsuLi5yfSkpLA0KICAgICAgY2FwYWNpdHlSb29tczpwLmNhcGFjaXR5Um9vbXMubWFwKHI9Pih7Li4ucn0pKSxtZXJnZWRJZHM6Wy4uLnAubWVyZ2VkSWRzXSxzdGVwczpbLi4ucC5zdGVwc10sDQogICAgICByZXNpZGVudHM6cC5yZXNpZGVudHMubWFwKHI9Pih7Li4ucn0pKSxtYXRlcmlhbE1vdmVzOlsuLi5wLm1hdGVyaWFsTW92ZXNdfSk7DQogICAgY29uc3QgYWR2YW5jZT0ocCxob3VycyxwYXVzZWQ9bnVsbCk9PnNoZWx0ZXJBZHZhbmNlUGxhbm5pbmdTdG9jayhtLHAsaG91cnMscGF1c2VkKTsNCiAgICBjb25zdCBzdGlsbE5lZWRlZD0ocCxjKT0+Yy5sZXZlbEludmVzdG1lbnR8fCFjLnN0b3JhZ2VEZW1hbmR8fA0KICAgICAgYy5zdG9yYWdlRGVtYW5kLmVxdWlwbWVudCYmbS5zdGF0ZS5pdGVtcy5sZW5ndGg+PS45KnAuaXRlbUNhcHx8DQogICAgICBjLnN0b3JhZ2VEZW1hbmQucmVzb3VyY2VzLnNvbWUoaz0+cC5yZXNvdXJjZXNba10+PS45KnAuY2Fwc1trXSYmDQogICAgICAgICEoT2JqZWN0Lmhhc093bihjLnN0b3JhZ2VEZW1hbmQucmVzZXJ2ZXMsaykmJnAucmVzb3VyY2VzW2tdPj1jLnN0b3JhZ2VEZW1hbmQucmVzZXJ2ZXNba10pKTsNCiAgICBjb25zdCBzY29yZT1wPT5wcm9ncmVzcy5zY29yZStwLmdhaW4rZHVlLmZpbHRlcihlPT5lLmF0PD1tLm5vdytwLmhvdXJzKjM2MDAwMDApLnJlZHVjZSgobixlKT0+bitlLmdhaW4sMCk7DQogICAgY29uc3QgcmFuaz0oYSxiKT0+TnVtYmVyKHNjb3JlKGIpPj10YXJnZXRTY29yZSktTnVtYmVyKHNjb3JlKGEpPj10YXJnZXRTY29yZSl8fA0KICAgICAgKHNjb3JlKGEpPj10YXJnZXRTY29yZT9hLmhvdXJzLWIuaG91cnM6YS5ob3Vycy9NYXRoLm1heCgxLHNjb3JlKGEpLXByb2dyZXNzLnNjb3JlKS1iLmhvdXJzL01hdGgubWF4KDEsc2NvcmUoYiktcHJvZ3Jlc3Muc2NvcmUpKXx8YS5jb3N0LWIuY29zdDsNCiAgICBjb25zdCBxdW90ZVVwZ3JhZGU9KHAscix0ZW1wbGF0ZSk9PnsNCiAgICAgIGNvbnN0IHtlY29ub21pY3M6b2xkRWNvbm9taWNzLGxheW91dCwuLi5iYXNlfT10ZW1wbGF0ZSxsZXZlbD1yLmxldmVsKzEsaG91cnM9ci53aWR0aCoobGV2ZWw9PT0yPzE6Myk7DQogICAgICBjb25zdCBjb3N0PXtzY3JhcDpNYXRoLmNlaWwoc2hlbHRlckJ1aWxkUnVsZXNbci50eXBlXVsxXSpyLndpZHRoKihsZXZlbD09PTI/Mi41OjYpKSxwYXJ0czpsZXZlbD09PTM/MTUqci53aWR0aDowfTsNCiAgICAgIGNvbnN0IHJhdGU9cC5yb29tcy5maW5kKHJvdz0+cm93LmlkPT09ci5pZCk/LnJhdGV8fDAsZ2Fpbj1yYXRlKihbMCwxLDEuNSwyLjFdW2xldmVsXS9bMCwxLDEuNSwyLjFdW3IubGV2ZWxdLTEpOw0KICAgICAgY29uc3QgbWF0ZXJpYWxTY3JhcD1jb3N0LnNjcmFwKzYqY29zdC5wYXJ0cyxsb3N0U2NyYXA9cmF0ZSpob3VyczsNCiAgICAgIHJldHVybiB7Li4uYmFzZSxraW5kOid1cGdyYWRlJyx0eXBlOnIudHlwZSxpZDpyLmlkLGxldmVsLGxldmVsR2FpbjpyLndpZHRoLGhvdXJzLGNvc3QsZ2FpbiwNCiAgICAgICAgLi4uKHIudHlwZT09PSdzY3JhcCcmJmdhaW4+MD97ZWNvbm9taWNzOntnYWluLG1hdGVyaWFsU2NyYXAsbG9zdFNjcmFwLHBheWJhY2tIb3Vyczpob3VycysobWF0ZXJpYWxTY3JhcCtsb3N0U2NyYXApL2dhaW59fTp7fSksDQogICAgICAgIHNob3J0YWdlOk9iamVjdC5mcm9tRW50cmllcyhPYmplY3QuZW50cmllcyhjb3N0KS5tYXAoKFtrLHZdKT0+W2ssTWF0aC5tYXgoMCxNYXRoLmNlaWwodi1wLnJlc291cmNlc1trXSkpXSkpLA0KICAgICAgICB0aXRsZTpg56ysICR7ci5mbG9vcn0g5bGCJHtzaGVsdGVyQnVpbGRSdWxlc1tyLnR5cGVdWzBdfeWNh+iHsyAke2xldmVsfSDnuqdgLA0KICAgICAgICBiZW5lZml0OmDmjInliY3pobnlrozlt6XlkI7nmoQgJHtyLndpZHRofSDmoLzmiL/pl7Tph43mlrDmoLjnrpfvvJvmlr3lt6UgJHtob3Vyc30g5bCP5pe277yM5aKe5YqgICR7ci53aWR0aH0g562J57qn5YiGJHtyYXRlPjA/J++8jOaWveW3peacn+mXtOWBnOS6pyc6Jyd9YCxibG9ja3M6W119Ow0KICAgIH07DQogICAgY29uc3QgY2FuZGlkYXRlcz1wPT57DQogICAgICBjb25zdCBjaG9pY2VzPVtdOw0KICAgICAgZm9yKGNvbnN0IG9yaWdpbmFsIG9mIHVuaXF1ZSl7DQogICAgICAgIGlmKG9yaWdpbmFsLmtpbmQ9PT0ndXBncmFkZScpew0KICAgICAgICAgIGNvbnN0IHI9cC5jYXBhY2l0eVJvb21zLmZpbmQocj0+ci5pZD09PW9yaWdpbmFsLmlkKSxiZWZvcmU9bS5zdGF0ZS5yb29tcy5maW5kKHI9PnIuaWQ9PT1vcmlnaW5hbC5pZCk7DQogICAgICAgICAgaWYoIXJ8fHIubGV2ZWw+PTN8fHIudXBncmFkZUF0IT09bnVsbCljb250aW51ZTsNCiAgICAgICAgICBjaG9pY2VzLnB1c2goci5sZXZlbD09PWJlZm9yZS5sZXZlbCYmci53aWR0aD09PWJlZm9yZS53aWR0aD9vcmlnaW5hbDpxdW90ZVVwZ3JhZGUocCxyLG9yaWdpbmFsKSk7DQogICAgICAgIH1lbHNlIGlmKG9yaWdpbmFsLmtpbmQ9PT0nYnVpbGQnKXsNCiAgICAgICAgICBjb25zdCB1c2VkPXAuc3RlcHMuc29tZShzdGVwPT5zdGVwLnByb2plY3Qua2luZD09PSdidWlsZCcmJnN0ZXAucHJvamVjdC50eXBlPT09b3JpZ2luYWwudHlwZSk7DQogICAgICAgICAgLy8gUHJvZHVjdGlvbiBidWlsZHMgbmVlZCBhbiBpbmRlcGVuZGVudGx5IGJvdW5kIG5ldyB3b3JrZXIgc2V0OyBuZXZlciByZXVzZSB0aGUgZmlyc3QgYnVpbGQncyB3b3JrZXJzLg0KICAgICAgICAgIGlmKHVzZWQmJiEob3JpZ2luYWwudHlwZT09PSdzdG9yYWdlJyYmb3JpZ2luYWwubGV2ZWxJbnZlc3RtZW50KSljb250aW51ZTsNCiAgICAgICAgICBpZighcC5jYXBhY2l0eVJvb21zLnNvbWUocj0+ci5mbG9vcj09PW9yaWdpbmFsLmZsb29yJiZyLmNvbDw9b3JpZ2luYWwuY29sJiZyLmNvbCtyLndpZHRoPm9yaWdpbmFsLmNvbCkpY2hvaWNlcy5wdXNoKG9yaWdpbmFsKTsNCiAgICAgICAgICBlbHNlIGlmKG9yaWdpbmFsLnR5cGU9PT0nc3RvcmFnZScmJm9yaWdpbmFsLmxldmVsSW52ZXN0bWVudCl7DQogICAgICAgICAgICBmb3IobGV0IGZsb29yPTE7Zmxvb3I8PW0uc3RhdGUuZGVwdGg7Zmxvb3IrKyl7DQogICAgICAgICAgICAgIGlmKCFwLmNhcGFjaXR5Um9vbXMuc29tZShyPT5yLmZsb29yPT09Zmxvb3ImJnIuY29sPD0xJiZyLmNvbCtyLndpZHRoPjEpKWNvbnRpbnVlOw0KICAgICAgICAgICAgICBsZXQgY29sPTI7DQogICAgICAgICAgICAgIHdoaWxlKGNvbDw4KXtjb25zdCByPXAuY2FwYWNpdHlSb29tcy5maW5kKHI9PnIuZmxvb3I9PT1mbG9vciYmci5jb2w9PT1jb2wpO2lmKCFyKWJyZWFrO2NvbCs9ci53aWR0aDt9DQogICAgICAgICAgICAgIGlmKGNvbD49OHx8cC5jYXBhY2l0eVJvb21zLnNvbWUocj0+ci5mbG9vcj09PWZsb29yJiZyLmNvbDw4JiZyLmNvbCtyLndpZHRoPmNvbCkpY29udGludWU7DQogICAgICAgICAgICAgIGNvbnN0IGNlbGxzPXAuY2FwYWNpdHlSb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3N0b3JhZ2UnKS5yZWR1Y2UoKG4scik9Pm4rci53aWR0aCwwKTsNCiAgICAgICAgICAgICAgY2hvaWNlcy5wdXNoKHsuLi5vcmlnaW5hbCxmbG9vcixjb2wsY29zdDp7c2NyYXA6TWF0aC5jZWlsKHNoZWx0ZXJCdWlsZFJ1bGVzLnN0b3JhZ2VbMV0qKDErLjIqY2VsbHMpKSxwYXJ0czowfSwNCiAgICAgICAgICAgICAgICB0aXRsZTpg56ysICR7Zmxvb3J9IOWxguWPs+S+p+aWsOW7uuS4gOagvOS7k+W6k2B9KTsNCiAgICAgICAgICAgIH0NCiAgICAgICAgICB9DQogICAgICAgIH1lbHNlIGlmKCFwLnN0ZXBzLnNvbWUoc3RlcD0+c3RlcC5wcm9qZWN0LmtpbmQ9PT1vcmlnaW5hbC5raW5kKSljaG9pY2VzLnB1c2gob3JpZ2luYWwpOw0KICAgICAgfQ0KICAgICAgZm9yKGNvbnN0IHIgb2YgcC5jYXBhY2l0eVJvb21zLmZpbHRlcihyPT50eXBlb2Ygci5pZD09PSdzdHJpbmcnJiZyLnR5cGU9PT0nc3RvcmFnZScmJnIubGV2ZWw8Mykpew0KICAgICAgICBjb25zdCBvcmlnaW5hbD11bmlxdWUuZmluZChjPT5jLmtpbmQ9PT0nYnVpbGQnJiZjLnR5cGU9PT0nc3RvcmFnZScmJmMubGV2ZWxJbnZlc3RtZW50KTsNCiAgICAgICAgaWYob3JpZ2luYWwpY2hvaWNlcy5wdXNoKHF1b3RlVXBncmFkZShwLHIsb3JpZ2luYWwpKTsNCiAgICAgIH0NCiAgICAgIC8vIEEgYnVpbGQgY2FuIG1lcmdlIGludG8gYSByb290IHN0b3JhZ2UgdGhhdCBoYWQgbm8gdXBncmFkZSBxdW90ZSBpbiB0aGlzIHJlYWQuDQogICAgICBmb3IoY29uc3QgaWQgb2YgcC5tZXJnZWRJZHMpew0KICAgICAgICBjb25zdCByPXAuY2FwYWNpdHlSb29tcy5maW5kKHI9PnIuaWQ9PT1pZCk7DQogICAgICAgIGlmKCFyfHxyLnR5cGUhPT0nc3RvcmFnZSd8fHIubGV2ZWw+PTN8fGNob2ljZXMuc29tZShjPT5jLmtpbmQ9PT0ndXBncmFkZScmJmMuaWQ9PT1pZCkpY29udGludWU7DQogICAgICAgIGNvbnN0IG9yaWdpbmFsPXVuaXF1ZS5maW5kKGM9PmMua2luZD09PSdidWlsZCcmJmMudHlwZT09PSdzdG9yYWdlJyYmYy5sZXZlbEludmVzdG1lbnQpOw0KICAgICAgICBpZihvcmlnaW5hbCljaG9pY2VzLnB1c2gocXVvdGVVcGdyYWRlKHAscixvcmlnaW5hbCkpOw0KICAgICAgfQ0KICAgICAgLy8gQSByb290IGxldmVsLW9uZSB1cGdyYWRlIGNhbiB1bmxvY2sgdGhlIGxhdGVyLCB6ZXJvLXBhcnRzIGNvbnN0cnVjdGlvbg0KICAgICAgLy8gYWx0ZXJuYXRpdmUuIEdlbmVyYXRlIGl0IGZyb20gdGhlIGNvbXBsZXRlZCBsYXlvdXQgaW5zdGVhZCBvZiByZXF1aXJpbmcNCiAgICAgIC8vIHRoZSBzYW1lIGJ1aWxkIHRvIGhhdmUgYmVlbiBhIGxlZ2FsIHJvb3QgY2FuZGlkYXRlIGFscmVhZHkuDQogICAgICBpZihwbGFubmluZy5hbGxvd0xldmVsSW52ZXN0bWVudCYmcC5zdGVwcy5sZW5ndGgmJnBsYW5uaW5nLmNhbXBhaWduPy5jb25zdHJ1Y3Rpb25Qb2xpY3k/LmJ1aWxkIT09ZmFsc2UmJg0KICAgICAgICAgICFjaG9pY2VzLnNvbWUoYz0+Yy5raW5kPT09J2J1aWxkJyYmYy50eXBlPT09J3N0b3JhZ2UnKSYmDQogICAgICAgICAgIWNob2ljZXMuc29tZShjPT5jLmtpbmQ9PT0ndXBncmFkZScmJnAuY2FwYWNpdHlSb29tcy5maW5kKHI9PnIuaWQ9PT1jLmlkKT8ubGV2ZWw9PT0xKSl7DQogICAgICAgIGZvcihsZXQgZmxvb3I9MTtmbG9vcjw9bS5zdGF0ZS5kZXB0aDtmbG9vcisrKXsNCiAgICAgICAgICBpZighcC5jYXBhY2l0eVJvb21zLnNvbWUocj0+ci5mbG9vcj09PWZsb29yJiZyLmNvbDw9MSYmci5jb2wrci53aWR0aD4xKSljb250aW51ZTsNCiAgICAgICAgICBsZXQgY29sPTI7DQogICAgICAgICAgd2hpbGUoY29sPDgpe2NvbnN0IHI9cC5jYXBhY2l0eVJvb21zLmZpbmQocj0+ci5mbG9vcj09PWZsb29yJiZyLmNvbD09PWNvbCk7aWYoIXIpYnJlYWs7Y29sKz1yLndpZHRoO30NCiAgICAgICAgICBpZihjb2w+PTh8fHAuY2FwYWNpdHlSb29tcy5zb21lKHI9PnIuZmxvb3I9PT1mbG9vciYmci5jb2w8OCYmci5jb2wrci53aWR0aD5jb2wpKWNvbnRpbnVlOw0KICAgICAgICAgIGNvbnN0IGNlbGxzPXAuY2FwYWNpdHlSb29tcy5maWx0ZXIocj0+ci50eXBlPT09J3N0b3JhZ2UnKS5yZWR1Y2UoKG4scik9Pm4rci53aWR0aCwwKTsNCiAgICAgICAgICBjb25zdCBjb3N0PXtzY3JhcDpNYXRoLmNlaWwoc2hlbHRlckJ1aWxkUnVsZXMuc3RvcmFnZVsxXSooMSsuMipjZWxscykpLHBhcnRzOjB9Ow0KICAgICAgICAgIGNob2ljZXMucHVzaCh7a2luZDonYnVpbGQnLHR5cGU6J3N0b3JhZ2UnLGZsb29yLGNvbCxjb3N0LGhvdXJzOjEvNixsZXZlbEdhaW46MSxsZXZlbEludmVzdG1lbnQ6dHJ1ZSxwcmlvcml0eToyOCwNCiAgICAgICAgICAgIHNob3J0YWdlOntzY3JhcDpNYXRoLm1heCgwLE1hdGguY2VpbChjb3N0LnNjcmFwLXAucmVzb3VyY2VzLnNjcmFwKSkscGFydHM6MH0sYmxvY2tzOltdLA0KICAgICAgICAgICAgdGl0bGU6YOesrCAke2Zsb29yfSDlsYLlj7PkvqfmlrDlu7rkuIDmoLzku5PlupNgLGJlbmVmaXQ6J+WJjemhueWujOW3peWQjuW3suacieWuieWFqOS4gOe6p+WNh+e6p+W3sueUqOWwve+8jOWwhuacrOmhuee6s+WFpeWQjOS4gOWujOaVtOi+vue6p+i3r+e6v+avlOi+gyd9KTsNCiAgICAgICAgfQ0KICAgICAgfQ0KICAgICAgcmV0dXJuIFsuLi5uZXcgTWFwKGNob2ljZXMubWFwKGM9PltgJHtjLmtpbmR9OiR7Yy5pZD8/YCR7Yy5mbG9vcn06JHtjLmNvbH1gfToke2MubGV2ZWw/PzB9YCxjXSkpLnZhbHVlcygpXTsNCiAgICB9Ow0KICAgIGNvbnN0IG1hdGVyaWFsQ2FjaGU9bmV3IE1hcCgpO2xldCBtYXRlcmlhbFBsYW5uZXJDYWxscz0wLG1hdGVyaWFsQ2FjaGVIaXRzPTA7DQogICAgY29uc3QgcHJlcGFyZVBhcnRzPShwLGMpPT57DQogICAgICBpZighZGVlcHx8IXBsYW5uaW5nLmNhbXBhaWdufHxwLnJlc291cmNlcy5wYXJ0cz49Yy5jb3N0LnBhcnRzfHxwLnJvb21zLnNvbWUocj0+ci5yZXNvdXJjZT09PSdwYXJ0cycmJnIucmF0ZT4wKSlyZXR1cm47DQogICAgICBjb25zdCByZXNlcnZlZD1bLi4ubmV3IFNldChbLi4uKHBsYW5uaW5nLmNhbXBhaWduLnJlc2VydmVkfHxbXSksLi4uKHBsYW5uaW5nLmNhbXBhaWduLmRhaWx5UmVzZXJ2ZWR8fFtdKV0pXTsNCiAgICAgIGNvbnN0IHJvbGVzPVtdOw0KICAgICAgY29uc3QgdmlydHVhbElkcz1uZXcgTWFwKHAuY2FwYWNpdHlSb29tcy5maWx0ZXIocj0+dHlwZW9mIHIuaWQ9PT0nc3RyaW5nJykubWFwKChyLGkpPT4NCiAgICAgICAgW3IuaWQsTWF0aC5tYXgoMCwuLi5tLnN0YXRlLnJvb21zLm1hcChyPT5yLmlkKSkrMStpXSkpOw0KICAgICAgY29uc3QgcHJvamVjdGVkUmVzaWRlbnRzPSgpPT5wLnJlc2lkZW50cy5tYXAocGVyc29uPT4oey4uLnBlcnNvbixyb29tSWQ6dmlydHVhbElkcy5nZXQocGVyc29uLnJvb21JZCk/P3BlcnNvbi5yb29tSWR9KSk7DQogICAgICBmb3IobGV0IGk9MDtpPDg7aSsrKXsNCiAgICAgICAgY29uc3Qgdmlldz17Li4ubS52aWV3LHNlcnZlclRpbWU6bS5ub3crcC5ob3VycyozNjAwMDAwLHN0YXRlOnsuLi5tLnN0YXRlLHJlc291cmNlczp7Li4ucC5yZXNvdXJjZXN9LA0KICAgICAgICAgIHJlc2lkZW50czpwcm9qZWN0ZWRSZXNpZGVudHMoKSxyb29tczpwLmNhcGFjaXR5Um9vbXMubWFwKHI9Pih7Li4ucixpZDp2aXJ0dWFsSWRzLmdldChyLmlkKT8/ci5pZCwNCiAgICAgICAgICAgIHN0b3JlZDpwLnJvb21zLmZpbmQocm93PT5yb3cuaWQ9PT1yLmlkKT8uc3RvcmVkfHwwfSkpfX07DQogICAgICAgIC8vIENhY2hlIG9ubHkgd2l0aGluIHRoaXMgc2VhcmNoLiBBbGwgb3RoZXIgbW9kZWwvY29uZmlndXJhdGlvbiBmaWVsZHMNCiAgICAgICAgLy8gYXJlIGZpeGVkIGhlcmU7IGluY2x1ZGUgZXZlcnkgZmllbGQgdGhlIHByb2plY3RlZCBicmFuY2hlcyBjYW4gY2hhbmdlLg0KICAgICAgICAvLyBUaGUgdGFyZ2V0IElEIG9ubHkgcHJvdGVjdHMgaXRzIGV4aXN0aW5nIHByb2R1Y2Vycy4gRW1wdHkgdGFyZ2V0cw0KICAgICAgICAvLyB3aXRoIHRoZSBzYW1lIGNvc3RzIGltcG9zZSBleGFjdGx5IHRoZSBzYW1lIHN0YWZmaW5nIGNvbnN0cmFpbnRzLg0KICAgICAgICBjb25zdCBwcm90ZWN0ZWRQcm9qZWN0PXAucmVzaWRlbnRzLnNvbWUocj0+ci5yb29tSWQ9PT1jLmlkKT9jLmlkOm51bGw7DQogICAgICAgIGNvbnN0IGtleT1wbGFubmluZy5tYXRlcmlhbENhY2hlPT09ZmFsc2U/bnVsbDpKU09OLnN0cmluZ2lmeShbcC5ob3VycyxwLnJlc291cmNlcyxwLmNhcGFjaXR5Um9vbXMsDQogICAgICAgICAgcC5yb29tcy5tYXAocj0+W3IuaWQsci5zdG9yZWRdKSxwLnJlc2lkZW50cy5tYXAocj0+W3IuaWQsci5yb29tSWRdKSxyb2xlcyxwcm90ZWN0ZWRQcm9qZWN0LGMuY29zdF0pOw0KICAgICAgICBsZXQgYWN0aW9uOw0KICAgICAgICBpZihrZXkhPT1udWxsJiZtYXRlcmlhbENhY2hlLmhhcyhrZXkpKXthY3Rpb249bWF0ZXJpYWxDYWNoZS5nZXQoa2V5KTttYXRlcmlhbENhY2hlSGl0cysrO30NCiAgICAgICAgZWxzZSB7DQogICAgICAgICAgY29uc3QgY3VycmVudD1zaGVsdGVyTW9kZWwodmlldykscG9saWN5PXBsYW5uaW5nLmNhbXBhaWduLmNvbnN0cnVjdGlvblBvbGljeXx8e307DQogICAgICAgICAgY29uc3QgcGxhbm5lZD1zaGVsdGVyQ2FtcGFpZ25QbGFuKGN1cnJlbnQsey4uLmNhbXBhaWduRGVmYXVsdHMsd29ya3Nob3A6dHJ1ZSxkZXZlbG9wbWVudDp0cnVlLA0KICAgICAgICAgICAgcGFydHNUYXJnZXQ6Yy5jb3N0LnBhcnRzKyhwb2xpY3kucGFydHNSZXNlcnZlfHwwKSxwYXJ0c1Jlc2VydmU6cG9saWN5LnBhcnRzUmVzZXJ2ZXx8MCwNCiAgICAgICAgICAgIHdvcmtzaG9wU2NyYXBSZXNlcnZlOmMuY29zdC5zY3JhcCsocG9saWN5LnNjcmFwUmVzZXJ2ZXx8MCksd29ya3Nob3BQcm9qZWN0OmMuaWR9LA0KICAgICAgICAgICAge3JvbGVzLGZhbWlseVJlc2VydmVkOnJlc2VydmVkLGNvbnN0cnVjdGlvblBvbGljeTpwb2xpY3kscG9wdWxhdGlvblByZXBhcmF0aW9uOnBsYW5uaW5nLmNhbXBhaWduLnBvcHVsYXRpb25QcmVwYXJhdGlvbn0scGxhbm5pbmcucG9wdWxhdGlvblRhcmdldCk7DQogICAgICAgICAgbWF0ZXJpYWxQbGFubmVyQ2FsbHMrKzsNCiAgICAgICAgICBjb25zdCBjaG9pY2U9cGxhbm5lZC5hY3Rpb25zLmZpbmQoYT0+YS5yb2xlPT09J3dvcmtzaG9wJyYmcC5jYXBhY2l0eVJvb21zLnNvbWUocj0+ci5pZD09PWEucm9vbSkpOw0KICAgICAgICAgIGFjdGlvbj1jaG9pY2U/e2lkOmNob2ljZS5pZCxyb29tOmNob2ljZS5yb29tfTpudWxsOw0KICAgICAgICAgIGlmKGtleSE9PW51bGwpe2lmKG1hdGVyaWFsQ2FjaGUuc2l6ZT49MjU2KW1hdGVyaWFsQ2FjaGUuZGVsZXRlKG1hdGVyaWFsQ2FjaGUua2V5cygpLm5leHQoKS52YWx1ZSk7bWF0ZXJpYWxDYWNoZS5zZXQoa2V5LGFjdGlvbik7fQ0KICAgICAgICB9DQogICAgICAgIGlmKCFhY3Rpb24pYnJlYWs7DQogICAgICAgIGNvbnN0IHBlcnNvbj1wLnJlc2lkZW50cy5maW5kKHBlcnNvbj0+cGVyc29uLmlkPT09YWN0aW9uLmlkKSxiZWZvcmU9cGVyc29uLnJvb21JZDsNCiAgICAgICAgaWYoIWFkdmFuY2UocCwxLzYpKXJldHVybjsNCiAgICAgICAgcGVyc29uLnJvb21JZD1hY3Rpb24ucm9vbTtyb2xlcy5wdXNoKHtpZDpwZXJzb24uaWQscm9vbTphY3Rpb24ucm9vbSxyb2xlOid3b3Jrc2hvcCcsYXQ6dmlldy5zZXJ2ZXJUaW1lfSk7DQogICAgICAgIHAubWF0ZXJpYWxNb3Zlcy5wdXNoKHtpZDpwZXJzb24uaWQsZnJvbTpiZWZvcmUscm9vbTphY3Rpb24ucm9vbSxhdEhvdXJzOnAuaG91cnN9KTsNCiAgICAgICAgY29uc3QgYWZ0ZXI9c2hlbHRlck1vZGVsKHsuLi52aWV3LHN0YXRlOnsuLi52aWV3LnN0YXRlLHJlc2lkZW50czpwcm9qZWN0ZWRSZXNpZGVudHMoKX19KTsNCiAgICAgICAgZm9yKGNvbnN0IHJvdyBvZiBhZnRlci5yb29tcyl7Y29uc3QgZXhpc3Rpbmc9cC5yb29tcy5maW5kKHI9PnIuaWQ9PT1yb3cuaWQpO2lmKGV4aXN0aW5nKXtleGlzdGluZy5yYXRlPXJvdy5yYXRlO2V4aXN0aW5nLmJhdGNoPXJvdy5iYXRjaDt9fQ0KICAgICAgfQ0KICAgIH07DQogICAgbGV0IGJlYW09W2luaXRpYWxdLGV4cGFuZGVkPTAsdHJ1bmNhdGVkPWZhbHNlLGJlYW1UcnVuY2F0ZWQ9ZmFsc2UsZGVwdGhUcnVuY2F0ZWQ9ZmFsc2UsYmVzdEhvdXJzPUluZmluaXR5O2NvbnN0IHJlc3VsdHM9W107DQogICAgZm9yKGxldCBkZXB0aD0wO2RlcHRoPG1heFByb2plY3RzO2RlcHRoKyspew0KICAgICAgY29uc3QgbmV4dD1bXTsNCiAgICAgIG91dGVyOmZvcihjb25zdCBvbGQgb2YgYmVhbSlmb3IoY29uc3QgYyBvZiBkZWVwP2NhbmRpZGF0ZXMob2xkKTp1bmlxdWUpew0KICAgICAgICBpZihwbGFubmluZy5yb3V0ZVN0ZXBzKXsNCiAgICAgICAgICBjb25zdCByZXF1aXJlZD1wbGFubmluZy5yb3V0ZVN0ZXBzW2RlcHRoXTsNCiAgICAgICAgICBpZighcmVxdWlyZWR8fFsna2luZCcsJ2lkJywndHlwZScsJ2Zsb29yJywnY29sJywnbGV2ZWwnXS5zb21lKGs9PnJlcXVpcmVkW2tdIT09Y1trXSkpY29udGludWU7DQogICAgICAgIH0NCiAgICAgICAgaWYoZXhwYW5kZWQ+PTIwMDApe3RydW5jYXRlZD10cnVlO2JyZWFrIG91dGVyO31leHBhbmRlZCsrOw0KICAgICAgICBpZighb2xkLnN0ZXBzLmxlbmd0aCYmZmlyc3QmJlsna2luZCcsJ2lkJywndHlwZScsJ2Zsb29yJywnY29sJywnbGV2ZWwnXS5zb21lKGs9Pk9iamVjdC5oYXNPd24oZmlyc3QsaykmJmZpcnN0W2tdIT09Y1trXSkpY29udGludWU7DQogICAgICAgIGlmKCFkZWVwJiYob2xkLm1lcmdlZElkcy5pbmNsdWRlcyhjLmlkKXx8b2xkLnN0ZXBzLnNvbWUoeD0+Yy5raW5kPT09J2J1aWxkJyYmeC5wcm9qZWN0LmtpbmQ9PT0nYnVpbGQnfHxjLmlkIT1udWxsJiZ4LnByb2plY3QuaWQ9PT1jLmlkKSkpY29udGludWU7DQogICAgICAgIC8vIEV2ZXJ5IGxhdGVyIGFjdGlvbiB0YWtlcyBub25uZWdhdGl2ZSB0aW1lLiBPbmNlIGEgd2hvbGUgcm91dGUgaXMga25vd24sDQogICAgICAgIC8vIGEgcHJlZml4IGFscmVhZHkgc2xvd2VyIHRoYW4gdGhhdCBmaW5pc2ggY2Fubm90IGJlYXQgaXQgYnkgYWRkaW5nIHdvcmsuDQogICAgICAgIGlmKGRlZXAmJm9sZC5ob3VycytjLmhvdXJzPmJlc3RIb3VycysxZS05KWNvbnRpbnVlOw0KICAgICAgICAvLyDljp/lgJnpgInlj6rku6PooajlvZPliY3pnIDmsYLvvJvliY3pobnmtojotLnmiJbmianlrrnlkI7vvIzlt7Lop6PpmaTnmoTmu6Hku5PljovlipvkuI3og73nu6fnu63lhYXlvZPlop7liIbnkIbnlLHjgIINCiAgICAgICAgaWYoIXN0aWxsTmVlZGVkKG9sZCxjKSljb250aW51ZTsNCiAgICAgICAgY29uc3QgcD1jbG9uZShvbGQpLHJvb209cC5yb29tcy5maW5kKHI9PnIuaWQ9PT1jLmlkKTsNCiAgICAgICAgaWYoYy5jb3N0LnNjcmFwPnAuY2Fwcy5zY3JhcHx8Yy5jb3N0LnBhcnRzPnAuY2Fwcy5wYXJ0cyljb250aW51ZTsNCiAgICAgICAgcHJlcGFyZVBhcnRzKHAsYyk7aWYocC5mYWlsdXJlKWNvbnRpbnVlOw0KICAgICAgICAvLyBObyBjb25zdHJ1Y3Rpb24gaGFzIHN0YXJ0ZWQgeWV0OiB3YWl0aW5nIGNhbm5vdCBjcmVhdGUgYSBtaXNzaW5nDQogICAgICAgIC8vIHJlc291cmNlIHdpdGggbmVpdGhlciBhIHByb2R1Y2VyIG5vciBlbm91Z2ggZXhpc3Rpbmcgd2hvbGUgYmF0Y2hlcy4NCiAgICAgICAgaWYoWydzY3JhcCcsJ3BhcnRzJ10uc29tZShrPT5wLnJlc291cmNlc1trXTxjLmNvc3Rba10mJg0KICAgICAgICAgICAgIXAucm9vbXMuc29tZShyPT5yLnJlc291cmNlPT09ayYmci5yYXRlPjApJiYNCiAgICAgICAgICAgIHAucmVzb3VyY2VzW2tdK3Aucm9vbXMuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT1rKS5yZWR1Y2UoKG4scik9Pm4rTWF0aC5mbG9vcigoci5zdG9yZWQrMWUtOSkvci5iYXRjaCkqci5iYXRjaCwwKTxjLmNvc3Rba10tMWUtOSkpY29udGludWU7DQogICAgICAgIHdoaWxlKChwLnJlc291cmNlcy5zY3JhcDxjLmNvc3Quc2NyYXB8fHAucmVzb3VyY2VzLnBhcnRzPGMuY29zdC5wYXJ0cykmJnAuaG91cnM8aG9yaXpvbkhvdXJzJiYoIWRlZXB8fHAuaG91cnMrYy5ob3Vyczw9YmVzdEhvdXJzKzFlLTkpKXsNCiAgICAgICAgICBpZighYWR2YW5jZShwLDEvNikpe3AuaG91cnM9aG9yaXpvbkhvdXJzKzE7YnJlYWs7fX0NCiAgICAgICAgaWYocC5yZXNvdXJjZXMuc2NyYXA8Yy5jb3N0LnNjcmFwfHxwLnJlc291cmNlcy5wYXJ0czxjLmNvc3QucGFydHMpY29udGludWU7DQogICAgICAgIGlmKHAuaG91cnM+PWhvcml6b25Ib3Vyc3x8IXN0aWxsTmVlZGVkKHAsYykpY29udGludWU7DQogICAgICAgIGlmKHJvb20mJk9iamVjdC5rZXlzKHAuZGVtYW5kKS5zb21lKGs9Pms9PT1yb29tLnJlc291cmNlJiZwLnJlc291cmNlc1trXTwocC5kZW1hbmRba10tcC5yb29tcy5maWx0ZXIocj0+ciE9PXJvb20mJnIucmVzb3VyY2U9PT1rKS5yZWR1Y2UoKG4scik9Pm4rci5yYXRlLDApKSpjLmhvdXJzKSljb250aW51ZTsNCiAgICAgICAgcC5yZXNvdXJjZXMuc2NyYXAtPWMuY29zdC5zY3JhcDtwLnJlc291cmNlcy5wYXJ0cy09Yy5jb3N0LnBhcnRzOw0KICAgICAgICBjb25zdCBzdGFydGVkPXAuaG91cnM7DQogICAgICAgIGlmKCFhZHZhbmNlKHAsYy5ob3VycyxjLmtpbmQ9PT0ndXBncmFkZSc/Yy5pZDpudWxsKXx8cC5ob3Vycz5ob3Jpem9uSG91cnMpY29udGludWU7DQogICAgICAgIC8vIOWuuemHj+S7heWcqOacrOmhueaooeaLn+WujOW3peWQjuWinuWKoO+8m+WJjeWQjuWIhuWIq+WPluaVtO+8jOS4jeiDveaPkOWJjeWAn+eUqOWuuemHj+aIluaUueWGmeecn+WunuW6k+WtmOOAgg0KICAgICAgICBjb25zdCBiZWZvcmVDYXBhY2l0eT1zaGVsdGVyQ2FwYWNpdHkocC5jYXBhY2l0eVJvb21zLHN0b3JhZ2VQZXJrKTsNCiAgICAgICAgbGV0IG1lcmdlZElkPW51bGw7DQogICAgICAgIGNvbnN0IHVwZ3JhZGVkUm9vbT1jLmtpbmQ9PT0ndXBncmFkZSc/cC5jYXBhY2l0eVJvb21zLmZpbmQocj0+ci5pZD09PWMuaWQpOm51bGwsb2xkTGV2ZWw9dXBncmFkZWRSb29tPy5sZXZlbDsNCiAgICAgICAgaWYodXBncmFkZWRSb29tKXVwZ3JhZGVkUm9vbS5sZXZlbCsrOw0KICAgICAgICBlbHNlIGlmKGMua2luZD09PSdidWlsZCcpew0KICAgICAgICAgIGNvbnN0IGxlZnQ9cC5jYXBhY2l0eVJvb21zLmZpbmQocj0+ci5mbG9vcj09PWMuZmxvb3ImJnIuY29sK3Iud2lkdGg9PT1jLmNvbCYmci50eXBlPT09Yy50eXBlJiYNCiAgICAgICAgICAgIHIubGV2ZWw9PT0xJiZyLndpZHRoPDMmJnIudXBncmFkZUF0PT09bnVsbCYmKGMudHlwZSE9PSd0cmFpbmluZyd8fHIudHJhaW5TdGF0PT09Yy50cmFpblN0YXQpKTsNCiAgICAgICAgICBpZihsZWZ0KXtsZWZ0LndpZHRoKys7aWYoIXAubWVyZ2VkSWRzLmluY2x1ZGVzKGxlZnQuaWQpKXAubWVyZ2VkSWRzLnB1c2gobGVmdC5pZCk7bWVyZ2VkSWQ9bGVmdC5pZDt9DQogICAgICAgICAgZWxzZSBwLmNhcGFjaXR5Um9vbXMucHVzaCh7aWQ6YG5ldzoke2MuZmxvb3J9OiR7Yy5jb2x9YCx0eXBlOmMudHlwZSxmbG9vcjpjLmZsb29yLGNvbDpjLmNvbCx3aWR0aDoxLGxldmVsOjEsdHJhaW5TdGF0OmMudHJhaW5TdGF0LA0KICAgICAgICAgICAgYnVpbHRBdDptLm5vdytwLmhvdXJzKjM2MDAwMDAsc3RvcmVkOjAsdXBncmFkZUF0Om51bGwsaW5jaWRlbnQ6bnVsbCx1bnBvd2VyZWQ6ZmFsc2V9KTsNCiAgICAgICAgfQ0KICAgICAgICBjb25zdCBhZnRlckNhcGFjaXR5PXNoZWx0ZXJDYXBhY2l0eShwLmNhcGFjaXR5Um9vbXMsc3RvcmFnZVBlcmspOw0KICAgICAgICBmb3IoY29uc3QgayBvZiBPYmplY3Qua2V5cyhwLmNhcHMpKXAuY2Fwc1trXSs9YWZ0ZXJDYXBhY2l0eS5jYXBzW2tdLWJlZm9yZUNhcGFjaXR5LmNhcHNba107DQogICAgICAgIHAuaXRlbUNhcCs9YWZ0ZXJDYXBhY2l0eS5pdGVtQ2FwLWJlZm9yZUNhcGFjaXR5Lml0ZW1DYXA7DQogICAgICAgIGlmKHJvb20mJmMua2luZD09PSd1cGdyYWRlJyl7DQogICAgICAgICAgY29uc3QgcmF0aW89WzAsMSwxLjUsMi4xXVtvbGRMZXZlbCsxXS9bMCwxLDEuNSwyLjFdW29sZExldmVsXTsNCiAgICAgICAgICByb29tLnJhdGUqPXJhdGlvO3Jvb20uYmF0Y2gqPXJhdGlvOw0KICAgICAgICB9ZWxzZSBpZihjLmtpbmQ9PT0nYnVpbGQnJiZzaGVsdGVyUm9vbXNbYy50eXBlXVsxXSl7DQogICAgICAgICAgY29uc3Qgam9pbmVkPXAucm9vbXMuZmluZChyPT5yLmlkPT09bWVyZ2VkSWQpOw0KICAgICAgICAgIGlmKGpvaW5lZCl7am9pbmVkLnJhdGUrPWMuZ2Fpbnx8MDtqb2luZWQuYmF0Y2grPXNoZWx0ZXJSb29tc1tjLnR5cGVdWzNdO30NCiAgICAgICAgICBlbHNlIGlmKGMuZ2Fpbj4wKXAucm9vbXMucHVzaCh7aWQ6YG5ldzoke2MuZmxvb3J9OiR7Yy5jb2x9YCxyZXNvdXJjZTpzaGVsdGVyUm9vbXNbYy50eXBlXVsxXSwNCiAgICAgICAgICAgIHJhdGU6Yy5nYWluLGJhdGNoOnNoZWx0ZXJSb29tc1tjLnR5cGVdWzNdLHN0b3JlZDowLGF1dG9tYXRpYzoobS5zdGF0ZS5oYW5kaWVzfHxbXSkuc29tZShoPT5oLmZsb29yPT09Yy5mbG9vciksdGljazpwLmhvdXJzKzEvNn0pOw0KICAgICAgICB9DQogICAgICAgIGlmKGMudHlwZSE9PSdwb3dlcicmJmMua2luZCE9PSdkaWcnKXAuZGVtYW5kLnBvd2VyKz0oc2hlbHRlclJvb21zW2MudHlwZV1bMV0/MTouNSkqKHVwZ3JhZGVkUm9vbT91cGdyYWRlZFJvb20ud2lkdGg6MSk7DQogICAgICAgIGlmKHAucm9vbXMuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT0ncG93ZXInKS5yZWR1Y2UoKG4scik9Pm4rci5yYXRlLDApPHAuZGVtYW5kLnBvd2VyKjEuMi0xZS05KWNvbnRpbnVlOw0KICAgICAgICBwLmdhaW4rPWMubGV2ZWxHYWluO3AuY29zdCs9Yy5jb3N0LnNjcmFwKzYqYy5jb3N0LnBhcnRzO3Auc3RlcHMucHVzaCh7cHJvamVjdDpjLHN0YXJ0SG91cnM6c3RhcnRlZCxmaW5pc2hIb3VyczpwLmhvdXJzfSk7DQogICAgICAgIHJlc3VsdHMucHVzaChwKTtpZihzY29yZShwKTx0YXJnZXRTY29yZSluZXh0LnB1c2gocCk7ZWxzZSBiZXN0SG91cnM9TWF0aC5taW4oYmVzdEhvdXJzLHAuaG91cnMpOw0KICAgICAgfQ0KICAgICAgaWYobmV4dC5sZW5ndGg+YmVhbVdpZHRoKWJlYW1UcnVuY2F0ZWQ9dHJ1ZTsNCiAgICAgIGlmKGRlcHRoPT09bWF4UHJvamVjdHMtMSYmbmV4dC5sZW5ndGgpZGVwdGhUcnVuY2F0ZWQ9dHJ1ZTsNCiAgICAgIGNvbnN0IHJhbmtlZD1uZXh0LmZpbHRlcihwPT4hZGVlcHx8cC5ob3VyczxiZXN0SG91cnMrMWUtOSkuc29ydChyYW5rKTsNCiAgICAgIGlmKGRlZXApew0KICAgICAgICAvLyBQcmVzZXJ2ZSBjb21wZXRpbmcgZmlyc3QgaW52ZXN0bWVudHMgaW5zdGVhZCBvZiBmaWxsaW5nIHRoZSBiZWFtIHdpdGgNCiAgICAgICAgLy8gcGVybXV0YXRpb25zIG9mIHRoZSBzYW1lIGNoZWFwIHByZWZpeCBiZWZvcmUgdGhleSBjYW4gcmVhY2ggdGhlIGdvYWwuDQogICAgICAgIGNvbnN0IGZpcnN0cz1uZXcgU2V0KCk7YmVhbT1bXTsNCiAgICAgICAgZm9yKGNvbnN0IHAgb2YgcmFua2VkKXtjb25zdCBjPXAuc3RlcHNbMF0ucHJvamVjdCxrZXk9YCR7Yy5raW5kfToke2MuaWQ/P2Ake2MuZmxvb3J9OiR7Yy5jb2x9YH1gOw0KICAgICAgICAgIGlmKCFmaXJzdHMuaGFzKGtleSkpe2ZpcnN0cy5hZGQoa2V5KTtiZWFtLnB1c2gocCk7fWlmKGJlYW0ubGVuZ3RoPT09YmVhbVdpZHRoKWJyZWFrO30NCiAgICAgICAgZm9yKGNvbnN0IHAgb2YgcmFua2VkKXtpZihiZWFtLmxlbmd0aD09PWJlYW1XaWR0aClicmVhaztpZighYmVhbS5pbmNsdWRlcyhwKSliZWFtLnB1c2gocCk7fQ0KICAgICAgfWVsc2UgYmVhbT1yYW5rZWQuc2xpY2UoMCxiZWFtV2lkdGgpOw0KICAgICAgaWYoIWJlYW0ubGVuZ3RofHx0cnVuY2F0ZWQpYnJlYWs7DQogICAgfQ0KICAgIHJldHVybiByZXN1bHRzLnNvcnQocmFuaykuc2xpY2UoMCwzKS5tYXAocD0+KHtraW5kOidwcm9qZWN0cycsc3RlcHM6cC5zdGVwcyxob3VyczpwLmhvdXJzLHNjb3JlOnNjb3JlKHApLGNvbXBsZXRlOnNjb3JlKHApPj10YXJnZXRTY29yZSxjb3N0OnAuY29zdCwNCiAgICAgIG1hdGVyaWFsTW92ZXM6cC5tYXRlcmlhbE1vdmVzLHNlYXJjaDp7ZXhwYW5kZWQsbGltaXQ6MjAwMCxtYXhQcm9qZWN0cyxiZWFtV2lkdGgsaG9yaXpvbkhvdXJzLA0KICAgICAgICBtYXRlcmlhbFBsYW5uZXJDYWxscyxtYXRlcmlhbENhY2hlSGl0cyxtYXRlcmlhbENhY2hlRW50cmllczptYXRlcmlhbENhY2hlLnNpemUsDQogICAgICAgIHRydW5jYXRlZDp0cnVuY2F0ZWR8fGJlYW1UcnVuY2F0ZWR8fGRlcHRoVHJ1bmNhdGVkLGJ1ZGdldEV4aGF1c3RlZDp0cnVuY2F0ZWQsYmVhbVRydW5jYXRlZCxkZXB0aFRydW5jYXRlZH19KSk7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclBvcHVsYXRpb25BZHZpY2UobSx0YXJnZXQsZmluYWxMZXZlbCxjYW1wYWlnbj1udWxsKSB7DQogICAgY29uc3QgcHJvZ3Jlc3M9c2hlbHRlckxldmVsUHJvZ3Jlc3MobSksZ3Jvd3RoPXNoZWx0ZXJHcm93dGhOZWVkcyhtKSxmdXR1cmU9Z3Jvd3RoLmZ1dHVyZU1vdXRoczsNCiAgICBpZighcHJvZ3Jlc3N8fCFOdW1iZXIuaXNJbnRlZ2VyKGZpbmFsTGV2ZWwpfHxwcm9ncmVzcy5sZXZlbD49ZmluYWxMZXZlbClyZXR1cm4gJyc7DQogICAgY29uc3QgZGVmZW5zZT1jYW1wYWlnbj8ucG9wdWxhdGlvbkRlZmVuc2Usc3VwcGx5PWRlZmVuc2U/LnN1cHBseXx8bS5wcm9kdWN0aW9uOw0KICAgIGNvbnN0IHN1cHBsaWVkPU1hdGguZmxvb3IoTWF0aC5taW4obS5wcm9kdWN0aW9uLmZvb2QsbS5wcm9kdWN0aW9uLndhdGVyLHN1cHBseS5mb29kLHN1cHBseS53YXRlcikvMS4yKTsNCiAgICBjb25zdCBjYXBhY2l0eT1NYXRoLm1pbigyMDAsbS5wb3B1bGF0aW9uQ2FwLHN1cHBsaWVkKSxzdWdnZXN0ZWQ9TWF0aC5taW4oY2FwYWNpdHksZnV0dXJlK01hdGgubWF4KDIsTWF0aC5jZWlsKHByb2dyZXNzLnJlbWFpbmluZy8yKSkpOw0KICAgIGNvbnN0IGxpbmVzPVtOdW1iZXIuaXNJbnRlZ2VyKHRhcmdldCkmJnRhcmdldDw9ZnV0dXJlPw0KICAgICAgYOW9k+WJjeWPiuW3sumihOeVmeS6uuWPoyAke2Z1dHVyZX0g5bey6L6+5Yiw6K6+572u55uu5qCHICR7dGFyZ2V0fe+8jOaWsOmFjeWvueWPl+mZkGA6YOW9k+WJjeS6uuWPo+ebruaghyAke3RhcmdldD8/J+acquiuvue9rid977yM5bey6aKE55WZICR7ZnV0dXJlfWAsDQogICAgICBg5oyJ5b2T5YmN5bqK5L2N5LiO5Y+j57Ku44CBMjAl5L6b5bqU5L2Z6YeP5Y+K5pys6L2u5aSW5Ye6L+iwg+Wyl+mihOeVme+8jOS4iumZkOe6piAke2NhcGFjaXR5fSDkurrvvIzov5nlj6rmmK/kvpvlupTlrrnph49gXTsNCiAgICBpZihtLnN0YXRlLnJvb21zLnNvbWUocj0+ci5pbmNpZGVudD8ua2luZD09PSdyYWlkZXJzJykpcmV0dXJuIGxpbmVzLmpvaW4oJ++8mycpKyfvvJvlvZPliY3mnInmjqDlpLrogIXmnaXooq3vvIzlhYjlpITnkIbkuovku7blubbmgaLlpI3nlZnlrojvvIzlho3or4TkvLDmj5Dpq5jkurrlj6Pnm67moIfjgIInOw0KICAgIGlmKE1hdGgubWluKG0ucHJvZHVjdGlvbi5wb3dlcixzdXBwbHkucG93ZXIpPGdyb3d0aC5kZW1hbmQucG93ZXIqMS4yLTFlLTkpDQogICAgICByZXR1cm4gbGluZXMuam9pbign77ybJykrJ++8m+eUteWKm+S+m+W6lOS9memHj+S4jei2s++8jOWFiOaguOWvueW9k+WJjeWPiuWcqOW7uuaIv+mXtOeahOeUqOeUte+8jOWGjeivhOS8sOaJqeS6uuWPo+OAgic7DQogICAgaWYoTWF0aC5tYXgoZnV0dXJlLHRhcmdldD8/MCxzdWdnZXN0ZWQpPj0xNSl7DQogICAgICBsaW5lcy5wdXNoKCfkurrlj6Povr7liLAgMTUg5Lq65ZCO6ZyA5qC45a+56Ziy5a6I77yM5paw55Sf5YS/5LiN6IO956uL5Y2z6K6h5YWl5Y+v5oiY5paX5oiQ5Lq6Jyk7DQogICAgICBpZihkZWZlbnNlPy5lbmFibGVkPT09ZmFsc2UpcmV0dXJuIGxpbmVzLmpvaW4oJ++8mycpKyfvvJvoh6rliqjpmLLlrojmnKrlvIDlkK/vvIzor7flhYjnoa7orqTmiYvliqjpmLLlrojlronmjpLmiJblvIDlkK/lubbmoLjlr7nnlZnlrojvvIzlho3lhrPlrprmmK/lkKbmj5Dpq5jkurrlj6Pnm67moIfjgIInOw0KICAgICAgY29uc3QgZ3VhcmQ9ZGVmZW5zZT8uZ3VhcmQ7DQogICAgICBpZighZ3VhcmQ/LmFjdGl2ZSlyZXR1cm4gbGluZXMuam9pbign77ybJykrJ++8m+mYsuWuiOi1hOaWmeWwmuacquaguOWvue+8jOaaguS4jeebtOaOpeW7uuiuruaJqeS6uuWPo+OAgic7DQogICAgICBpZihndWFyZC51bmtub3duKXJldHVybiBsaW5lcy5qb2luKCfvvJsnKSsn77yb6YOo5YiG5oiQ5Lq66KOF5aSH6LWE5paZ5peg5rOV5qC45a+577yM5YWI5qC45a+55q2m5Zmo5ZKM6Ziy5YW377yM5YaN6K+E5Lyw5omp5Lq65Y+j44CCJzsNCiAgICAgIGlmKCFndWFyZC5hbGxvd2VkKXJldHVybiBsaW5lcy5qb2luKCfvvJsnKStg77yb55WZ5a6I5pyq6L6+5qCH77yMJHtndWFyZC5ub3RlfSDlhYjmgaLlpI3lnKjlrrblgaXlurfkurrmiYvlubbmoLjlr7noo4XlpIfvvIzlho3or4TkvLDmiankurrlj6PjgIJgOw0KICAgICAgbGluZXMucHVzaChg5ruh6Laz5b2T5YmN55WZ5a6I6K6+572u77yI5YGl5bq35Zyo5a625oiQ5Lq6ICR7Z3VhcmQuY291bnR9LyR7Z3VhcmQubWluaW11bX3vvIzlipvph4/kuI7mrablmajmjIfmoIcgJHtndWFyZC5wb3dlci50b0ZpeGVkKDEpfS8ke2d1YXJkLnJlcXVpcmVkUG93ZXIudG9GaXhlZCgxKX3vvInvvIzkuI3ku6Pooajlv4Xog5zvvJvlrp7pmYXlh7rlj5HmiJbosIPlspflkI7ph43or4RgKTsNCiAgICB9DQogICAgaWYoTnVtYmVyLmlzSW50ZWdlcih0YXJnZXQpJiZ0YXJnZXQ8PWZ1dHVyZSl7DQogICAgICBpZihzdWdnZXN0ZWQ+dGFyZ2V0JiZzdWdnZXN0ZWQ+ZnV0dXJlKXJldHVybiBsaW5lcy5qb2luKCfvvJsnKStg77yb5Y+v6K+E5Lyw6LCD5YiwICR7c3VnZ2VzdGVkfSDkurrvvIzpnIDkvaDkv67mlLnkurrlj6Pnm67moIflkI7miY3nlJ/mlYjjgIJgOw0KICAgICAgcmV0dXJuIGxpbmVzLmpvaW4oJ++8mycpKyfvvJvlhYjooaXotrPluorkvY3miJbpo5/niakv5YeA5rC05L2Z6YeP77yM5YaN5o+Q6auY5Lq65Y+j55uu5qCH77yM5LiN5Lya6Ieq5Yqo56qB56C05q2k5LiK6ZmQ44CCJzsNCiAgICB9DQogICAgcmV0dXJuIGxpbmVzLmpvaW4oJ++8mycpKyfvvJvlh7rnlJ/pobvmjInlrp7pmYXlrozmiJDorqHliIbvvIzorr7nva7nm67moIfkuI3kvJroh6rliqjmlLnlj5jjgIInOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJEYWlseUdvYWxzKG0pIHsNCiAgICBjb25zdCBkPW0uc3RhdGUuZGFpbHksbGV2ZWw9bS52aWV3LnByb2dyZXNzLmxldmVsLGxhYmVscz17Y29sbGVjdDon5pS25Y+W5Lqn5Ye6Jyxjb2xsZWN0X3NjcmFwOifmlLbpm4blup/mlpknLGNvbGxlY3RfZm9vZDon5pS26ZuG6aOf54mpJywNCiAgICAgIHdpbjon5bqf5Zyf6IOc5YipJyxidWlsZDon5bu66YCg5oiW5Y2H57qnJyxpbmNpZGVudDon5aSE55CG5LqL5Lu2JyxjcmFmdDon5Yi25L2c6KOF5aSHJyx0cmFpbjon5bGe5oCn5o+Q5Y2HJyxiYWJ5OifmlrDnlJ/lhL8nLGNhcmF2YW46J+WVhumYn+iuouWNlSd9Ow0KICAgIGNvbnN0IHVua25vd249e2dvYWxzOltdLG5vdGVzOlsn5q+P5pel55uu5qCH6LWE5paZ5pqC5LiN5a6M5pW077yM57un57ut5pei5pyJ5Y+R5bGV5bm25oyJ572R6aG15oyJ6ZKu6aKG5Y+W77yM5LiN54yc5rWL55uu5qCH44CCJ119Ow0KICAgIGlmKCFvYmplY3RTdGF0ZShkLmNvdW50ZXJzKSlyZXR1cm4gdW5rbm93bjsNCiAgICBsZXQgcGlja3M9ZC5waWNrczsNCiAgICBpZihwaWNrcz09bnVsbCl7DQogICAgICBpZighTnVtYmVyLmlzU2FmZUludGVnZXIobS5zdGF0ZS5zZWVkKSlyZXR1cm4gdW5rbm93bjsNCiAgICAgIGNvbnN0IGhhc2g9cz0+e2xldCBuPTB4ODExYzlkYzU7Zm9yKGxldCBpPTA7aTxzLmxlbmd0aDtpKyspbj1NYXRoLmltdWwobl5zLmNoYXJDb2RlQXQoaSksMHgxMDAwMTkzKT4+PjA7cmV0dXJuIG47fTsNCiAgICAgIGNvbnN0IGRlZnM9W1snY29sbGVjdCcsOCtsZXZlbCwxXSxbJ2NvbGxlY3Rfc2NyYXAnLDE1MCpsZXZlbCwxXSxbJ2NvbGxlY3RfZm9vZCcsNjAqbGV2ZWwsMV0sWyd3aW4nLDMrTWF0aC5mbG9vcihsZXZlbC8yKSwyXSwNCiAgICAgICAgWydidWlsZCcsMiwxXSxbJ2luY2lkZW50JywyLDNdLFsnY3JhZnQnLDEsNl0sWyd0cmFpbicsMSw0XSxbJ2JhYnknLDEsMl0sWydjYXJhdmFuJywxLDVdXS5maWx0ZXIoeD0+bGV2ZWw+PXhbMl0pOw0KICAgICAgY29uc3QgY2hvc2VuPVtdO2xldCBzZWVkPWhhc2goYCR7ZC5kYXl9OiR7bS5zdGF0ZS5zZWVkfWApOw0KICAgICAgZm9yKGxldCBpPTA7Y2hvc2VuLmxlbmd0aDwzJiZpPDEwMDA7aSsrKXtjb25zdCBpdGVtPWRlZnNbc2VlZCVkZWZzLmxlbmd0aF07aWYoIWNob3Nlbi5pbmNsdWRlcyhpdGVtKSljaG9zZW4ucHVzaChpdGVtKTtzZWVkPWhhc2goU3RyaW5nKHNlZWQpKTt9DQogICAgICBwaWNrcz1jaG9zZW4ubWFwKChba2V5LHRhcmdldF0pPT4oe2tleSx0YXJnZXQscmV3YXJkOntzY3JhcDo4MCs0MCpsZXZlbCxwYXJ0czpNYXRoLmNlaWwobGV2ZWwvMykscG9pbnRzOjMwfX0pKTsNCiAgICB9DQogICAgaWYoIUFycmF5LmlzQXJyYXkocGlja3MpfHxwaWNrcy5sZW5ndGghPT0zfHxuZXcgU2V0KHBpY2tzLm1hcChwPT5wPy5rZXkpKS5zaXplIT09M3x8cGlja3Muc29tZShwPT4hcHx8IWxhYmVsc1twLmtleV18fA0KICAgICAgIU51bWJlci5pc1NhZmVJbnRlZ2VyKHAudGFyZ2V0KXx8cC50YXJnZXQ8MXx8IW9iamVjdFN0YXRlKHAucmV3YXJkKXx8WydzY3JhcCcsJ3BhcnRzJywncG9pbnRzJ10uc29tZShrPT4hTnVtYmVyLmlzU2FmZUludGVnZXIocC5yZXdhcmRba10pfHxwLnJld2FyZFtrXTwwKXx8DQogICAgICAhTnVtYmVyLmlzRmluaXRlKGQuY291bnRlcnNbcC5rZXldPz8wKXx8KGQuY291bnRlcnNbcC5rZXldPz8wKTwwKSlyZXR1cm4gdW5rbm93bjsNCiAgICBjb25zdCBnb2Fscz1waWNrcy5tYXAoKHAsaW5kZXgpPT4oey4uLnAsaW5kZXgsbGFiZWw6bGFiZWxzW3Aua2V5XSxwcm9ncmVzczpNYXRoLm1pbihwLnRhcmdldCxNYXRoLmZsb29yKGQuY291bnRlcnNbcC5rZXldPz8wKSksDQogICAgICByZW1haW5pbmc6TWF0aC5tYXgoMCxwLnRhcmdldC1NYXRoLmZsb29yKGQuY291bnRlcnNbcC5rZXldPz8wKSksY2xhaW1lZDpkLmNsYWltZWQuaW5jbHVkZXMoaW5kZXgpfSkpOw0KICAgIGNvbnN0IG5vdGVzPWdvYWxzLm1hcChnPT5g5LuK5pelJHtnLmxhYmVsfSAke2cucHJvZ3Jlc3N9LyR7Zy50YXJnZXR977yaJHtnLmNsYWltZWQ/J+W3sumihuWPlic6Zy5yZW1haW5pbmc/YOi/mOW3riAke2cucmVtYWluaW5nfWA6J+W3sui+vuaIkO+8jOetieW+hemihuWPlid977yb5aWW5YqxICR7Zy5yZXdhcmQuc2NyYXB9IOW6n+aWmeOAgSR7Zy5yZXdhcmQucGFydHN9IOmbtuS7tuOAgSR7Zy5yZXdhcmQucG9pbnRzfSDotZvlraPnp6/liIbjgIJgKTsNCiAgICBmb3IoY29uc3QgZyBvZiBnb2Fscy5maWx0ZXIoZz0+IWcuY2xhaW1lZCYmZy5yZW1haW5pbmcpKXsNCiAgICAgIGlmKGcua2V5PT09J3dpbicpbm90ZXMucHVzaCgn5bqf5Zyf55uu5qCH5oyJ572R56uZ6IOc5Yip6K6h5pWw5qC45a+577yb5L+d5oyB5bey5byA5ZCv55qE5pmu6YCa5o6i6Zmp5LiO5ZGo5Lu75Yqh6L2u6L2s77yM5LiN5oqK5Ye65Y+R5qyh5pWw5b2T6IOc5Yip77yM5Lmf5LiN5L+d6K+B5oiY5paX5b+F6IOc44CCJyk7DQogICAgICBpZihnLmtleT09PSdjcmFmdCcpbm90ZXMucHVzaCgn5q+P5pel5Yi25L2c6ZyA5byA5ZCv5Y2V54us5byA5YWz77yb5LuF5Zyo5bey5pyJ5Y+v55So5bel5Z2K5ZKM5YC854+t5Lq65ZGY5pe26YCJ5oupMOaho++8jOiKsTgw5bqf5paZ77yM5YWx55So5bu66K6+6aKd5bqm5bm25L+d55WZ5b2T5YmN5bel56iL5pys6YeR44CCJyk7DQogICAgICBpZihnLmtleT09PSdjYXJhdmFuJylub3Rlcy5wdXNoKCfllYbpmJ/nm67moIfpnIDlvIDlkK/mr4/ml6XllYbpmJ/lvIDlhbPvvJvlj6rkuqTku5jmnKzml6XmnIDkvY7miJDmnKzlj6/otJ/mi4XorqLljZXvvIzlubbkv53nlZnlt7LpgInlu7rorr7mnKzph5HjgIInKTsNCiAgICAgIGlmKGcua2V5PT09J2luY2lkZW50Jylub3Rlcy5wdXNoKCfkuovku7bnm67moIfpmo/lrp7pmYXpgYfooq3lpITnkIbmjqjov5vvvIzkuI3kuLvliqjliLbpgKDkuovmlYXvvJvlvZPliY3oh6rliqjpmLLlrojlj6rlpITnkIbmjqDlpLrogIXjgIInKTsNCiAgICB9DQogICAgcmV0dXJuIHtkYXk6ZC5kYXksZ29hbHMsbm90ZXN9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJEYWlseUNyYWZ0KG0sY29uZmlnLGJ1ZGdldCxzdGF0ZSxwZW5kaW5nLG5vdyxwcm9qZWN0PW51bGwpIHsNCiAgICBpZighY29uZmlnLmRhaWx5R29hbHN8fCFjb25maWcuY3JhZnREYWlseXx8bS5zdGF0ZS5yb29tcy5zb21lKHI9PnIuaW5jaWRlbnR8fHIuY3JhZnQpfHxwZW5kaW5nfHwNCiAgICAgIG0uc3RhdGUuaXRlbXMubGVuZ3RoPj1tLml0ZW1DYXApcmV0dXJuIG51bGw7DQogICAgY29uc3QgZ29hbD1zaGVsdGVyRGFpbHlHb2FscyhtKS5nb2Fscy5maW5kKGc9Pmcua2V5PT09J2NyYWZ0JyYmIWcuY2xhaW1lZCYmZy5yZW1haW5pbmc+MCk7DQogICAgaWYoIWdvYWx8fGdvYWwucmV3YXJkLnNjcmFwPDgwKXJldHVybiBudWxsOw0KICAgIGNvbnN0IHJvb209bS5zdGF0ZS5yb29tcy5maW5kKHI9PlsnYXJtb3J5JywndGFpbG9yJ10uaW5jbHVkZXMoci50eXBlKSYmci5idWlsdEF0PD1tLm5vdyYmci51cGdyYWRlQXQ9PT1udWxsJiYhci51bnBvd2VyZWQmJg0KICAgICAgbS5zdGF0ZS5yZXNpZGVudHMuc29tZShwPT5wLnJvb21JZD09PXIuaWQmJnAuYXdheT09PW51bGwmJnAuZGVhZEF0PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdykpOw0KICAgIGlmKCFyb29tKXJldHVybiBudWxsOw0KICAgIGNvbnN0IHVzZWQ9c2hlbHRlckNvbnN0cnVjdGlvblNwZW50KHN0YXRlLHBlbmRpbmcsbm93KSxjb3N0PXtzY3JhcDo4MCxwYXJ0czowfTsNCiAgICBpZih1c2VkLnNjcmFwKzgwPmJ1ZGdldC5zY3JhcExpbWl0fHxtLnN0YXRlLnJlc291cmNlcy5zY3JhcC04MDxidWRnZXQuc2NyYXBSZXNlcnZlKyhwcm9qZWN0Py5jb3N0LnNjcmFwfHwwKXx8DQogICAgICBtLnN0YXRlLnJlc291cmNlcy5wYXJ0czxidWRnZXQucGFydHNSZXNlcnZlKyhwcm9qZWN0Py5jb3N0LnBhcnRzfHwwKSlyZXR1cm4gbnVsbDsNCiAgICByZXR1cm4ge2tpbmQ6J2NyYWZ0Jyxyb2xlOidjcmFmdERhaWx5JyxpZDpyb29tLmlkLHR5cGU6cm9vbS50eXBlLHRhcmdldHM6W3Jvb20uaWQsMF0sY29zdCxkYXk6bS5zdGF0ZS5kYWlseS5kYXksDQogICAgICB0aXRsZTpgJHtzaGVsdGVyQnVpbGRSdWxlc1tyb29tLnR5cGVdWzBdfeWItuS9nDDmoaPoo4XlpIdgLHJlYXNvbjon55SoODDlup/mlpnmjqjov5vmr4/ml6XliLbkvZzvvIzkv53nlZnlvZPliY3lu7rorr7mnKzph5HvvJvlrozlt6XlhaXlupPlkI7mjInlrp7pmYXorqHmlbDpooblpZYnfTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyRGV2ZWxvcG1lbnRQbGFuKG0sdGFyZ2V0PTE0LGNhbXBhaWduPW51bGwsZmluYWxMZXZlbD1udWxsKSB7DQogICAgY29uc3QgY29udGludW91c0xldmVsPWZpbmFsTGV2ZWw9PT0nYXV0byc7DQogICAgZmluYWxMZXZlbD1zaGVsdGVyUmVzb2x2ZWRMZXZlbFRhcmdldChtLGZpbmFsTGV2ZWwpOw0KICAgIGNvbnN0IHM9bS5zdGF0ZSwgbm93PW0ubm93LCBjYW5kaWRhdGVzPVtdLCByZWplY3RlZExldmVsPVtdLCBub3Rlcz1bXSwgYnVpbGRSZXF1ZXN0cz1bXSwgZm10PW49Pk51bWJlcihuLnRvRml4ZWQoMSkpOw0KICAgIGNvbnN0IGJ1aWx0PXMucm9vbXMuZmlsdGVyKHI9PnIuYnVpbHRBdDw9bm93KSwgbGl2aW5nPXMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwpOw0KICAgIGNvbnN0IHtwb3B1bGF0aW9uLHJlY292ZXJpbmcsY29uc3RydWN0aW9uLHBhaXJzLGZ1dHVyZU1vdXRocyxjb21taXR0ZWRQb3dlcixkZW1hbmR9PXNoZWx0ZXJHcm93dGhOZWVkcyhtLGNhbXBhaWduPy5wb3B1bGF0aW9uUHJlcGFyYXRpb24sdGFyZ2V0KTsNCiAgICBpZihjYW1wYWlnbj8ucG93ZXJQcmVwYXJhdGlvbil7DQogICAgICBkZW1hbmQucG93ZXIrPWNhbXBhaWduLnBvd2VyUHJlcGFyYXRpb24uZXh0cmE7DQogICAgICBub3Rlcy5wdXNoKCfkuIvkuIDlt6XnqIvku4XnvLrkvpvnlLXvvIznjrDmnInlj5HnlLXlspfkvY3lt7Lmu6HvvJvlhYjmjInlj6/lronlhajosIPliqjnmoTnnJ/lrp7kurrmiYvor4TkvLDlj5HnlLXmiankuqfvvIzlrozlt6XooaXlkZjlkI7lho3moLjlr7nljp/lt6XnqIvjgIInKTsNCiAgICB9DQogICAgY29uc3Qgc3RvcmFnZVBlcms9cy5sZWdhY3k/LnBlcmtzPy5zdG9yYWdlPz8wOw0KICAgIGNvbnN0IGNvbW1pdHRlZFJvb21zPXMucm9vbXMubWFwKHI9PnIuYnVpbHRBdDw9bm93JiZyLnVwZ3JhZGVBdCE9PW51bGw/ey4uLnIsbGV2ZWw6TWF0aC5taW4oMyxyLmxldmVsKzEpfTpyKTsNCiAgICBjb25zdCBjb21taXR0ZWQ9c2hlbHRlckNhcGFjaXR5KGNvbW1pdHRlZFJvb21zLHN0b3JhZ2VQZXJrKSxjb21taXR0ZWRDYXBhY2l0eT1jb21taXR0ZWQucG9wdWxhdGlvbkNhcDsNCiAgICBjb25zdCBmaXRzQ29tbWl0dGVkQ2FwYWNpdHk9Yz0+T2JqZWN0LmVudHJpZXMoYy5jb3N0KS5ldmVyeSgoW2tleSxjb3N0XSk9PmNvc3Q8PWNvbW1pdHRlZC5jYXBzW2tleV0pOw0KICAgIGNvbnN0IGNhcGFjaXR5UGVuZGluZz1jb21taXR0ZWQuaXRlbUNhcD5tLml0ZW1DYXB8fE9iamVjdC5rZXlzKG0uY2Fwcykuc29tZShrPT5jb21taXR0ZWQuY2Fwc1trXT5tLmNhcHNba10pOw0KICAgIGNvbnN0IHJlcXVlc3RlZFRhcmdldD1OdW1iZXIuaXNJbnRlZ2VyKHRhcmdldCkmJnRhcmdldD49MiYmdGFyZ2V0PD0yMDA/dGFyZ2V0Om51bGw7DQogICAgY29uc3Qgd2FudGVkPU1hdGgubWF4KHJlcXVlc3RlZFRhcmdldD8/MCxmdXR1cmVNb3V0aHMpOw0KICAgIGNvbnN0IHBvcHVsYXRpb25QcmVwYXJhdGlvbj1jYW1wYWlnbj8ucG9wdWxhdGlvblByZXBhcmF0aW9uOw0KICAgIGlmKE51bWJlci5pc1NhZmVJbnRlZ2VyKHBvcHVsYXRpb25QcmVwYXJhdGlvbikmJnBvcHVsYXRpb25QcmVwYXJhdGlvbj5mdXR1cmVNb3V0aHMmJg0KICAgICAgcG9wdWxhdGlvblByZXBhcmF0aW9uPD1NYXRoLm1pbihyZXF1ZXN0ZWRUYXJnZXQ/PzAsbS5wb3B1bGF0aW9uQ2FwKSl7DQogICAgICBub3Rlcy5wdXNoKGDkurrlj6Plj5HlsZXlhYjkuLrkuIvkuIDmibkgJHtwb3B1bGF0aW9uUHJlcGFyYXRpb259IOS6uuWHhuWkh+aIkOW5tOWPo+eyruWPijIwJeS9memHj++8m+eOsOacieWyl+S9jeaXoOazleihpei2s+aXtuivhOS8sOWinuS6p+W7uuiuvu+8jOS4jeS4gOasoemihOaUr+WFqOmDqOebruagh+S6uuWPo+eahOi1hOa6kOOAgmApOw0KICAgIH0NCiAgICBpZihwYWlycy5zaXplKW5vdGVzLnB1c2goYOW3suaciSAke3BhaXJzLnNpemV9IOWvueWfueWFu+aEn+aDheeahOWutuW6re+8jOWPpumihOeVmSAke3BhaXJzLnNpemV9IOS4quWHuueUn+WQjemineOAgeW6iuS9jeWPiuaIkOW5tOWPo+eyru+8m+i9rOS4uuW+heS6p+WQjuS4jemHjeWkjemihOeVmeOAgmApOw0KICAgIGlmKHJlY292ZXJpbmcpbm90ZXMucHVzaChg5YCS5LiL5bGF5rCRICR7cmVjb3ZlcmluZ30g5Lq65LuN5Zyo5ZCN5Y2V5Lit77yM5bey6aKE55WZ5oGi5aSN5ZCO55qE5bqK5L2N5LiO5oiQ5bm05Y+j57Ku77yb6K6w5b2V56e76Zmk5ZCO5omN6YeK5pS+6aKE55WZ77yM5b2T5YmN5Lqn5Ye65ZKM5raI6ICX5LiN5YyF5ZCr5LuW5Lus44CCYCk7DQogICAgY29uc3Qgc2hvcnRhZ2VzPU9iamVjdC5rZXlzKGRlbWFuZCkuZmlsdGVyKGs9Pm0ucHJvZHVjdGlvbltrXTxkZW1hbmRba10qMS4yLTFlLTkpOw0KICAgIGNvbnN0IG5ldFNjcmFwPW0ucHJvZHVjdGlvbi5zY3JhcC02Km0ucHJvZHVjdGlvbi5wYXJ0czsNCiAgICBpZihjYW1wYWlnbj8uZmFtaWx5U3VwcGx5UGxhbm5pbmcpew0KICAgICAgY29uc3QgcmVhc29uPWNhbXBhaWduLmZhbWlseVN1cHBseVBsYW5uaW5nLnN0YXR1cz09PSdydW5uaW5nJ3x8Y2FtcGFpZ24uZmFtaWx5U3VwcGx5UGxhbm5pbmcuc3RhdHVzPT09J3F1ZXVlZCc/DQogICAgICAgICflkI7lj7DmraPlnKjmr5TovoPlrrbluq3mjqXmm7/kuI7miankuqfvvJvkvpvnu5nmlrnmoYjlsLHnu6rlkI7nu6fnu63osIPlspflkozlu7rorr4nOg0KICAgICAgICAn5a625bqt5L6b57uZ5ZCO5Y+w5q+U6L6D5pyq5a6M5oiQ77yM5L+d55WZ5b2T5YmN5bKX5L2N5LiO5p2Q5paZ77yM56iN5ZCO6YeN5paw6K+75Y+WJzsNCiAgICAgIHJldHVybiB7YXQ6bm93LHBvcHVsYXRpb24scmVjb3ZlcmluZyxyZXNlcnZlZEJpcnRoczpwYWlycy5zaXplLHJlcXVlc3RlZFRhcmdldCxjYXBhY2l0eTptLnBvcHVsYXRpb25DYXAsY29tbWl0dGVkQ2FwYWNpdHksDQogICAgICAgIHRhcmdldDp3YW50ZWQsbmV0U2NyYXAsbGV2ZWxQcm9ncmVzczpzaGVsdGVyTGV2ZWxQcm9ncmVzcyhtKSxyb3V0ZXM6W10scG9wdWxhdGlvbkFkdmljZTpzaGVsdGVyUG9wdWxhdGlvbkFkdmljZShtLHJlcXVlc3RlZFRhcmdldCxmaW5hbExldmVsLGNhbXBhaWduKSwNCiAgICAgICAgcGFydHNUYXJnZXQ6MCxwYXJ0c1Byb2plY3Q6bnVsbCxub3RlczpbLi4ubm90ZXMscmVhc29uXSxuZXh0OntraW5kOidmYW1pbHktcGxhbm5pbmcnLHN0YXR1czond2FpdCcsdGl0bGU6J+etieW+heWutuW6reS+m+e7meavlOi+gycscmVhc29ufSwNCiAgICAgICAgcmV0YWluZWRQcm9qZWN0Om51bGwsbGV2ZWxTZWFyY2g6bnVsbCxyZWplY3RlZExldmVsOltdLGNhbmRpZGF0ZVRvdGFsOjAsY2FuZGlkYXRlczpbXX07DQogICAgfQ0KICAgIGNvbnN0IGFjdGl2ZT1yPT5yLmJ1aWx0QXQ8PW5vdyYmci51cGdyYWRlQXQ9PT1udWxsJiYhci5pbmNpZGVudCYmIXIudW5wb3dlcmVkOw0KICAgIC8vIOS4tOaXtuWkh+aWmeS4jeaehOaIkOmVv+mpu+S6p+iDve+8m+S4jeiDveWboOWuieaOkuW3peWdiuWAvOePreiAjOaUuemAieW3peWdiuWNh+e6p++8jOWGjeS7peaXoOmcgOmbtuS7tuS4uueUseaSpOWbnuivpeS6uumAieOAgg0KICAgIGNvbnN0IHByb2R1Y3RpdmVVcGdyYWRlPXI9PihtLnJvb21zLmZpbmQocm93PT5yb3cuaWQ9PT1yLmlkKT8ucmF0ZXx8MCk+MCYmDQogICAgICAoci50eXBlIT09J3dvcmtzaG9wJ3x8bGl2aW5nLmZpbHRlcihwPT5wLnJvb21JZD09PXIuaWQmJnAuYXdheT09PW51bGwmJnAuYWR1bHRBdDw9bm93KS5zbGljZSgwLHIud2lkdGgqMikNCiAgICAgICAgLnNvbWUocD0+IWNhbXBhaWduPy53b3Jrc2hvcFdvcmtlcnM/LmluY2x1ZGVzKHAuaWQpJiZzaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LHAscik+MCkpOw0KICAgIGNvbnN0IGlkbGU9bGl2aW5nLmZpbHRlcihwPT4hY2FtcGFpZ24/LnJlc2VydmVkPy5pbmNsdWRlcyhwLmlkKSYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1ub3cmJg0KICAgICAgKHAucm9vbUlkPT09bnVsbHx8Y2FtcGFpZ24/LnVuZW1wbG95ZWRSZXNpZGVudHM/LmluY2x1ZGVzKHAuaWQpKSYmIXAucm9tYW5jZSYmDQogICAgICBOdW1iZXIuaXNGaW5pdGUocC5ocCkmJnAuaHA+PS42Kk1hdGgucm91bmQoMTAwKyhNYXRoLm1pbig1MCwxK01hdGguZmxvb3IoTWF0aC5zcXJ0KHAueHAvMykpKS0xKSooMisuNSpwLnN0YXRzLmVuZCkpKTsNCiAgICBjb25zdCBkb3JtV29ya2Vycz1pZGxlLmZpbHRlcihwPT5wLnJvb21JZCE9PW51bGwpOw0KICAgIGlmKGRvcm1Xb3JrZXJzLmxlbmd0aClub3Rlcy5wdXNoKGDlrr/oiI3kuK0gJHtkb3JtV29ya2Vycy5sZW5ndGh9IOWQjeWPr+WwseS4mueahOWBpeW6t+aIkOS6uuWPr+WuieaOkueUn+S6p++8jOWMheaLrOW3suehruiupOW+heS6p+aIluWGt+WNtOS4reeahOeItuavje+8m+eOsOacieWyl+S9jeS4jei2s+aXtue6s+WFpeaJqeW7uuS6uuaJi++8jOS4jeW/heWFiOiwg+WIsOS8keaBr+OAgmApOw0KICAgIC8vIExheW91dCBpcyBhZHZpc29yeS1vbmx5OiBvbGQgb3IgaW5jb21wbGV0ZSBzbmFwc2hvdHMgbXVzdCBub3Qgc3RvcCBjb2xsZWN0aW9uL3N0YWZmaW5nLg0KICAgIGxldCBsYXlvdXQ9TnVtYmVyLmlzSW50ZWdlcihzLmRlcHRoKSYmcy5kZXB0aD49MSYmcy5kZXB0aDw9MTAwMCYmcy5yb29tcy5ldmVyeShyPT4NCiAgICAgIE51bWJlci5pc0ludGVnZXIoci5mbG9vcikmJnIuZmxvb3I+PTAmJnIuZmxvb3I8PXMuZGVwdGgmJk51bWJlci5pc0ludGVnZXIoci5jb2wpJiZyLmNvbD49MCYmci5jb2wrci53aWR0aDw9OCk7DQogICAgaWYobGF5b3V0KWxheW91dD0hcy5yb29tcy5zb21lKChyLGkpPT5zLnJvb21zLnNsaWNlKGkrMSkuc29tZShvPT5yLmZsb29yPT09by5mbG9vciYmci5jb2w8by5jb2wrby53aWR0aCYmby5jb2w8ci5jb2wrci53aWR0aCkpOw0KICAgIGNvbnN0IHNwb3RzPVtdOw0KICAgIGlmKGxheW91dClmb3IobGV0IGZsb29yPTE7Zmxvb3I8PXMuZGVwdGg7Zmxvb3IrKykgew0KICAgICAgaWYoIXMucm9vbXMuc29tZShyPT5yLmZsb29yPT09Zmxvb3ImJnIuY29sPD0xJiZyLmNvbCtyLndpZHRoPjEpKWNvbnRpbnVlOw0KICAgICAgbGV0IGNvbD0yLHByZXZpb3VzPW51bGw7DQogICAgICB3aGlsZShjb2w8OCl7Y29uc3Qgcj1zLnJvb21zLmZpbmQocj0+ci5mbG9vcj09PWZsb29yJiZyLmNvbDw9Y29sJiZyLmNvbCtyLndpZHRoPmNvbCk7aWYoIXIpYnJlYWs7DQogICAgICAgIGlmKHIuY29sIT09Y29sKXtsYXlvdXQ9ZmFsc2U7YnJlYWs7fXByZXZpb3VzPXI7Y29sKz1yLndpZHRoO30NCiAgICAgIGlmKGNvbDw4KXNwb3RzLnB1c2goe2Zsb29yLGNvbCxwcmV2aW91c30pOw0KICAgIH0NCiAgICBpZighbGF5b3V0KXtzcG90cy5sZW5ndGg9MDtub3Rlcy5wdXNoKCfluIPlsYDotYTmlpnkuI3lrozmlbTvvIzmmoLkuI3mjIflrprlu7rpgKDkvY3nva7miJbliKTmlq3mmK/lkKbpnIDopoHkuIvmjJbvvJvpooblj5bkuI7kurrlkZjnrqHnkIbnhafluLjjgIInKTt9DQogICAgZWxzZSBub3Rlcy5wdXNoKHNwb3RzLmxlbmd0aD9g546w5pyJICR7c3BvdHMubGVuZ3RofSDlsYLov5jmnInlj7Pkvqflj6/lu7rnqbrkvY3vvIzlhYjliKnnlKjnqbrkvY3vvJvmjqLpmankvY3ph4znqIvnopHlj6booYzor4TkvLDjgIJgOifnjrDmnInmpbzlsYLmsqHmnInlj6/mjqXnu63lu7rpgKDnmoTnqbrkvY3jgIInKTsNCiAgICBpZihjb25zdHJ1Y3Rpb24ubGVuZ3RoKW5vdGVzLnB1c2goYOaWveW3peaIluWNh+e6pyAke2NvbnN0cnVjdGlvbi5sZW5ndGh9LzIg6aG577yb5pyq5a6M5oiQ55qE5a6/6IiN5a656YeP5bey6K6h5YWl6KeE5YiS77yM6YG/5YWN6YeN5aSN5omp5a6544CCYCk7DQogICAgaWYoY29tbWl0dGVkUG93ZXI+MClub3Rlcy5wdXNoKGDlt7LlnKjmlr3lt6XmiJbljYfnuqfnmoTmiL/pl7Tlrozlt6XlkI7ov5jpnIAgJHtmbXQoY29tbWl0dGVkUG93ZXIpfSDnlLXlipsv5bCP5pe277yM5bey5Li66L+Z6YOo5YiG6ICX55S16aKE55WZ5L6b5bqU44CCYCk7DQogICAgaWYoY29uc3RydWN0aW9uLnNvbWUocj0+ci50eXBlPT09J3Bvd2VyJykpbm90ZXMucHVzaCgn5Zyo5bu65oiW5Y2H57qn5Lit55qE5Y+R55S156uZ5bCa5pyq5o+Q5YmN6K6h5YWl5paw5aKe5Lqn6IO977yM5a6M5bel5ZCO5oyJ5a6e6ZmF5Lq65ZGY6YeN566X77yM5YWI5qC45a+557uT5p6c5YaN5Yaz5a6a5piv5ZCm57un57ut5omp5bu644CCJyk7DQogICAgaWYoc2hvcnRhZ2VzLmluY2x1ZGVzKCdwb3dlcicpKW5vdGVzLnB1c2goJ+eUteWKm+S6p+WHuuWwmuacquimhueblueOsOacieWPiuW3suW8gOW3peaIv+mXtOWujOW3peWQjuaJgOmcgOeahCAyMCUg5L6b5bqU5L2Z6YeP77yM5LyY5YWI6KGl6Laz44CCJyk7DQogICAgY29uc3QgbW91dGhTaG9ydGFnZXM9c2hvcnRhZ2VzLmZpbHRlcihrPT5rIT09J3Bvd2VyJyk7DQogICAgaWYobW91dGhTaG9ydGFnZXMubGVuZ3RoKW5vdGVzLnB1c2goYCR7bW91dGhTaG9ydGFnZXMubWFwKGs9PnNoZWx0ZXJSZXNvdXJjZXNba10pLmpvaW4oJ+OAgScpfeWwmuacquimhuebluWkluWHuuWxheawkeW9kuadpeOAgeWAkuS4i+WxheawkeaBouWkjeOAgeeOsOacieWEv+erpeaIkOW5tOOAgeW+heS6p+WPiuW3sumFjeWvueS6uuWPo+aJgOmcgOeahCAyMCUg5L6b5bqU5L2Z6YeP77yM5LyY5YWI6KGl6Laz44CCYCk7DQogICAgY29uc3QgYXdheUFzc2lnbmVkPWxpdmluZy5maWx0ZXIocD0+cC5hd2F5IT09bnVsbCYmcC5hZHVsdEF0PD1ub3cmJmJ1aWx0LnNvbWUocj0+ci5pZD09PXAucm9vbUlkJiZbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ10uaW5jbHVkZXMoci50eXBlKSkpLmxlbmd0aDsNCiAgICBpZihhd2F5QXNzaWduZWQpbm90ZXMucHVzaChgJHthd2F5QXNzaWduZWR9IOWQjeWkluWHuuWxheawkeS7jeeZu+iusOWcqOeUn+S6p+aIv+mXtO+8jOWOn+eUn+iwg+Wyl+aMieiusOW9leWNoOS9je+8jOi/meS6m+S9jee9ruS4jeiDveebtOaOpeihpeWRmO+8m+W9k+WJjeS4jeiuoeS7luS7rOeahOS6p+WHuu+8jOW9kuadpeaIluWyl+S9jemHiuaUvuWQjuWGjeaguOWvueepuuS9jeOAgmApOw0KICAgIGlmKGJ1aWx0LnNvbWUocj0+ci5pbmNpZGVudHx8ci51bnBvd2VyZWQpKW5vdGVzLnB1c2goJ+acieaIv+mXtOWboOS6i+S7tuaIluWBnOeUteWBnOS6p++8jOWFiOaBouWkjeeOsOacieS6p+iDve+8jOWGjeaMieato+W4uOS6p+mHj+mHjeeul+aJqeW7uuaUtuebiuOAgicpOw0KICAgIGlmKG5ldFNjcmFwPD0wKW5vdGVzLnB1c2goJ+W3peWdiuavj+eUn+S6pyAxIOmbtuS7tua2iOiAlyA2IOW6n+aWme+8m+W9k+WJjeW6n+aWmeWHgOWinuS4jeS4uuato++8jOS4jeiDveaMieWbnuaUtuermeavm+S6p+mHj+aOqOeul+aUkuaWmeaXtumXtOOAgicpOw0KICAgIGlmKHMuaGFuZGllcz8ubGVuZ3RoKW5vdGVzLnB1c2goJ+adkOaWmeS4jui3r+e6v+mihOa1i+iuoeWFpeW3suacieeuoeWutuaJgOWcqOalvOWxgueahOS7o+aUtu+8muaUkua7oeaJuemHj+WQjuacgOWkmuaUtui/m+S7k+W6k+WJqeS9meeahOaVtOaVsOepuumXtO+8m+WFtuS7lualvOWxgueahOaJi+WKqOaUtuWPluS7jemcgOWuuee6s+aVtOaJue+8jOS4jeWBh+Wumui0reS5sOaIluenu+WKqOeuoeWutuOAguWunumZheW8gOW3peS7jeetieW6k+WtmOabtOaWsOOAgicpOw0KICAgIGNvbnN0IGFzc2Vzcz0oYyxyZWNvcmQ9dHJ1ZSk9PnsNCiAgICAgIGMuYmxvY2tzPz89W107Yy5jb3N0Pz89e3NjcmFwOjAscGFydHM6MH07DQogICAgICBpZihjLmtpbmQ9PT0nZGlnJyYmYy5mbG9vcj49MjApew0KICAgICAgICBjb25zdCBoZWFsdGh5PXA9PnAuZGVhZEF0PT09bnVsbCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1ub3cmJnNoZWx0ZXJIZWFsdGgocCk/LmhwPj0uOSpzaGVsdGVySGVhbHRoKHApPy5tYXg7DQogICAgICAgIGNvbnN0IG1lZGJheT1idWlsdC5zb21lKHI9PnIudHlwZT09PSdtZWRiYXknJiZhY3RpdmUocikmJmxpdmluZy5zb21lKHA9PmhlYWx0aHkocCkmJnAucm9vbUlkPT09ci5pZCkpOw0KICAgICAgICBjb25zdCBkZWZlbmRlcj1saXZpbmcuc29tZShwPT5oZWFsdGh5KHApJiYhY2FtcGFpZ24/LnJlc2VydmVkPy5pbmNsdWRlcyhwLmlkKSYmDQogICAgICAgICAgcy5pdGVtcy5zb21lKGk9PmkuaWQ9PT1wLndlYXBvbklkJiZpLnNsb3Q9PT0nd2VhcG9uJyYmQXJyYXkuaXNBcnJheShpLmRhbWFnZSkmJmkuZGFtYWdlLmxlbmd0aD09PTImJmkuZGFtYWdlLmV2ZXJ5KG49Pk51bWJlci5pc0Zpbml0ZShuKSYmbj49MCkmJmkuZGFtYWdlWzBdK2kuZGFtYWdlWzFdPjApKTsNCiAgICAgICAgaWYoIW1lZGJheXx8cy5yZXNvdXJjZXMuc3RpbXBhazwxfHwhZGVmZW5kZXIpYy5ibG9ja3MucHVzaCgn56ysMjDlsYLotbfmnInmt7HlsYLph47lhb3po47pmanvvJrlhYjlh4blpIfmnInlgaXlurflgLznj63ogIXnmoTljLvliqHlrqTjgIHoh7PlsJEx5pSv5rK755aX6ZKI5ZKM55WZ5a6I55qE5YGl5bq35oyB5q2m5Zmo5oiQ5Lq677yI5LiN5Luj6KGo6IO95L+d6K+B5omT6YCA77yJJyk7DQogICAgICAgIGMuYmVuZWZpdCs9J++8m+esrDIw5bGC6LW35pyA5rex5bGC5Y+v6IO95Ye6546w6YeO5YW977yM5byA5bel5YmN5q+P6L2u5qC45a+55Yy755aX5LiO55WZ5a6I5Lq65omLJzsNCiAgICAgIH0NCiAgICAgIGMuc2hvcnRhZ2U9T2JqZWN0LmZyb21FbnRyaWVzKE9iamVjdC5lbnRyaWVzKGMuY29zdCkubWFwKChbayx2XSk9PltrLE1hdGgubWF4KDAsTWF0aC5jZWlsKHYtcy5yZXNvdXJjZXNba10pKV0pKTsNCiAgICAgIGlmKGMua2luZCE9PSdzdGFmZicmJmMua2luZCE9PSdkaWcnJiZjb25zdHJ1Y3Rpb24ubGVuZ3RoPj0yKWMuYmxvY2tzLnB1c2goJ+WFiOetieS4gOS4quaWveW3peWQjemineepuuWHuicpOw0KICAgICAgaWYoYy5raW5kIT09J3N0YWZmJykgew0KICAgICAgICBjb25zdCBsaW1pdHM9T2JqZWN0LmVudHJpZXMoYy5jb3N0KS5maWx0ZXIoKFtrLHZdKT0+dj5tLmNhcHNba10pOw0KICAgICAgICBpZihsaW1pdHMuc29tZSgoW2ssdl0pPT52PmNvbW1pdHRlZC5jYXBzW2tdKSljLmJsb2Nrcy5wdXNoKCfmiYDpnIDotYTmupDotoXov4flvZPliY3lj4rlt7LlvIDlt6Xlt6XnqIvlrozlt6XlkI7nmoTlupPlrZjlrrnph4/vvIzlhYjmianku5MnKTsNCiAgICAgICAgZWxzZSBpZihsaW1pdHMubGVuZ3RoKWMuYmxvY2tzLnB1c2goJ+WFiOetieW3suW8gOW3peW3peeoi+WujOW3pe+8jOaJgOmcgOW6k+WtmOWuuemHj+WwmuacqueUn+aViCcpOw0KICAgICAgfQ0KICAgICAgYy5zYXZlSG91cnM9bnVsbDsNCiAgICAgIGlmKHJlY29yZCljYW5kaWRhdGVzLnB1c2goYyk7DQogICAgICByZXR1cm4gYzsNCiAgICB9Ow0KICAgIGNvbnN0IHBvd2VyQ2hlY2s9ZXh0cmE9PmV4dHJhPjAmJm0ucHJvZHVjdGlvbi5wb3dlcjwoZGVtYW5kLnBvd2VyK2V4dHJhKSoxLjItMWUtOT9bJ+aJqeW7uuWQjueUteWKm+S9memHj+S4jei2s++8jOWFiOihpeWPkeeUtSddOltdOw0KICAgIGNvbnN0IHZhY2FuY3k9dHlwZT0+YnVpbHQuZmlsdGVyKHI9PnIudHlwZT09PXR5cGUmJmFjdGl2ZShyKSkucmVkdWNlKChuLHIpPT5uK01hdGgubWF4KDAsci53aWR0aCoyLQ0KICAgICAgbGl2aW5nLmZpbHRlcihwPT5wLmFkdWx0QXQ8PW5vdyYmcC5yb29tSWQ9PT1yLmlkKS5sZW5ndGgpLDApOw0KICAgIGNvbnN0IGxhYmVscz10eXBlPT5zaGVsdGVyQnVpbGRSdWxlc1t0eXBlXVswXTsNCiAgICBjb25zdCBidWlsZD0odHlwZSxwcmlvcml0eSxiZW5lZml0LGdhaW49MCxzdHJhdGVneT1udWxsLGVtcGxveW1lbnQ9ZmFsc2UpPT57DQogICAgICBjb25zdCBbbGFiZWwsYmFzZSx1bmxvY2tdPXNoZWx0ZXJCdWlsZFJ1bGVzW3R5cGVdOw0KICAgICAgY29uc3QgY2VsbHM9cy5yb29tcy5maWx0ZXIocj0+ci50eXBlPT09dHlwZSkucmVkdWNlKChuLHIpPT5uK3Iud2lkdGgsMCk7DQogICAgICBjb25zdCBleHRyYT1zaGVsdGVyUm9vbXNbdHlwZV1bMV0/dHlwZT09PSdwb3dlcic/MDoxOi41Ow0KICAgICAgY29uc3QgYmxvY2tzPXBvd2VyQ2hlY2soZXh0cmEpOw0KICAgICAgaWYobS52aWV3LnByb2dyZXNzLmxldmVsPHVubG9jaylibG9ja3MucHVzaChg6YG/6Zq+5omAICR7dW5sb2NrfSDnuqfop6PplIFgKTsNCiAgICAgIGNvbnN0IGNvc3Q9e3NjcmFwOk1hdGguY2VpbChiYXNlKigxKy4yKmNlbGxzKSkscGFydHM6MH07DQogICAgICBidWlsZFJlcXVlc3RzLnB1c2goe3R5cGUsbGFiZWwscHJpb3JpdHksY29zdCxibG9ja3MsZ2FpbixzdHJhdGVneSxlbXBsb3ltZW50fSk7DQogICAgICBpZighbGF5b3V0fHwhc3BvdHMubGVuZ3RoKXJldHVybjsNCiAgICAgIGNvbnN0IHByaW1hcnk9Wydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddLHdpZGU9cHJpbWFyeS5pbmNsdWRlcyh0eXBlKTsNCiAgICAgIGNvbnN0IG1lcmdlPXA9PnAucHJldmlvdXM/LnR5cGU9PT10eXBlJiYodHlwZSE9PSd0cmFpbmluZyd8fHAucHJldmlvdXMudHJhaW5TdGF0PT09c3RyYXRlZ3k/LnRyYWluU3RhdCkmJg0KICAgICAgICBwLnByZXZpb3VzLmxldmVsPT09MSYmcC5wcmV2aW91cy53aWR0aDwzJiZhY3RpdmUocC5wcmV2aW91cyk7DQogICAgICBjb25zdCBwcm90ZWN0PXA9PnByaW1hcnkuaW5jbHVkZXMocC5wcmV2aW91cz8udHlwZSkmJnAucHJldmlvdXMubGV2ZWw9PT0xJiZwLnByZXZpb3VzLndpZHRoPDM7DQogICAgICAvLyDlhYjmjqXlkIznsbvlkIjlubblubbpgb/lvIDlhbbku5blsI/nlJ/kuqfmiL/lj7PkvqfvvJvlrp7pmYXpl7Lnva7kurrmiYvotoXov4fkuIDmoLzlrrnph4/ml7bmiY3kvJjlhYjpooTnlZnkuInmoLzjgIINCiAgICAgIC8vIOayoeacieabv+S7o+S9jee9ruaXtuS7jeWFgeiuuOW/heimgeW7uuiuvu+8jOeVmeS9jeS4jeaYr+aPkOWJjea2iOi0ueaIluW8uuWItuS/ruaIkOS4ieagvOOAgg0KICAgICAgY29uc3Qgc3BvdD1bLi4uc3BvdHNdLnNvcnQoKGEsYik9Pk51bWJlcihtZXJnZShiKSktTnVtYmVyKG1lcmdlKGEpKXx8TnVtYmVyKHByb3RlY3QoYSkpLU51bWJlcihwcm90ZWN0KGIpKXx8DQogICAgICAgICh3aWRlJiZpZGxlLmxlbmd0aD4yP051bWJlcig4LWIuY29sPj0zKS1OdW1iZXIoOC1hLmNvbD49Myk6MCl8fGEuZmxvb3ItYi5mbG9vcilbMF07DQogICAgICBjb25zdCByb29tTGF5b3V0PXt0YXJnZXRXaWR0aDp3aWRlP01hdGgubWluKDMsKG1lcmdlKHNwb3QpP3Nwb3QucHJldmlvdXMud2lkdGg6MCkrOC1zcG90LmNvbCk6bWVyZ2Uoc3BvdCk/c3BvdC5wcmV2aW91cy53aWR0aCsxOjEsDQogICAgICAgIG1lcmdlSW50bzptZXJnZShzcG90KT9zcG90LnByZXZpb3VzLmlkOm51bGx9Ow0KICAgICAgY29uc3QgZWNvbm9taWNzPXR5cGU9PT0nc2NyYXAnJiZnYWluPjA/e2dhaW4sbWF0ZXJpYWxTY3JhcDpjb3N0LnNjcmFwLGxvc3RTY3JhcDowLHBheWJhY2tIb3VyczoxLzYrY29zdC5zY3JhcC9nYWlufTpudWxsOw0KICAgICAgYXNzZXNzKHtraW5kOididWlsZCcsdHlwZSxwcmlvcml0eSxmbG9vcjpzcG90LmZsb29yLGNvbDpzcG90LmNvbCxob3VyczoxLzYsZ2FpbixsYXlvdXQ6cm9vbUxheW91dCwuLi4oZW1wbG95bWVudD97ZW1wbG95bWVudDp0cnVlfTp7fSksLi4uKHN0cmF0ZWd5P3tzdHJhdGVneSx0cmFpblN0YXQ6c3RyYXRlZ3kudHJhaW5TdGF0fTp7fSksDQogICAgICAgIHRpdGxlOmDnrKwgJHtzcG90LmZsb29yfSDlsYLlj7PkvqfmlrDlu7rkuIDmoLwke2xhYmVsfWAsY29zdCwuLi4oZWNvbm9taWNzP3tlY29ub21pY3N9Ont9KSwNCiAgICAgICAgYmVuZWZpdDpgJHtiZW5lZml0fe+8m+aWveW3pee6piAxMCDliIbpkp9gKyh3aWRlP2DvvJvmraTlpITlj6/mjInmnIDlpJogJHtyb29tTGF5b3V0LnRhcmdldFdpZHRofSDmoLzlronmjpLlkIznsbvmiL/pl7TvvIzmnKzmrKHlj6rlu7rkuIDmoLzvvIzlkI7nu63mjInlrp7pmYXkurrmiYvkuI7pooTnrpfph43or4RgOicnKSsNCiAgICAgICAgICAoZWNvbm9taWNzP2DvvJvkuIrov7Dpl7Lnva7kurrpgInliLDlspfjgIHkuqfph4/kuI3lj5jml7bvvIzoh6rlvIDlt6Xotbflm57mnKznuqYgJHtlY29ub21pY3MucGF5YmFja0hvdXJzLnRvRml4ZWQoMSl9IOWwj+aXtu+8iOS4jeWQq+aUkuaWmeOAgeiwg+Wyl+WPiuaVtOaJuemihuWPluetieW+he+8iWA6JycpLGJsb2Nrc30pOw0KICAgIH07DQogICAgY29uc3QgdXBncmFkZUVzdGltYXRlPXI9PnsNCiAgICAgIGNvbnN0IG5leHQ9ci5sZXZlbCsxLGhvdXJzPXIud2lkdGgqKG5leHQ9PT0yPzE6MykscmF0ZT1tLnJvb21zLmZpbmQoeD0+eC5pZD09PXIuaWQpPy5yYXRlfHwwOw0KICAgICAgY29uc3QgY29zdD17c2NyYXA6TWF0aC5jZWlsKHNoZWx0ZXJCdWlsZFJ1bGVzW3IudHlwZV1bMV0qci53aWR0aCoobmV4dD09PTI/Mi41OjYpKSxwYXJ0czpuZXh0PT09Mz8xNSpyLndpZHRoOjB9Ow0KICAgICAgY29uc3QgZ2Fpbj1yYXRlKihbMCwxLDEuNSwyLjFdW25leHRdL1swLDEsMS41LDIuMV1bci5sZXZlbF0tMSk7DQogICAgICBjb25zdCBtYXRlcmlhbFNjcmFwPWNvc3Quc2NyYXArNipjb3N0LnBhcnRzLGxvc3RTY3JhcD1yYXRlKmhvdXJzOw0KICAgICAgcmV0dXJuIHtyLG5leHQsaG91cnMscmF0ZSxjb3N0LGdhaW4sZWNvbm9taWNzOnIudHlwZT09PSdzY3JhcCcmJmdhaW4+MD8NCiAgICAgICAge2dhaW4sbWF0ZXJpYWxTY3JhcCxsb3N0U2NyYXAscGF5YmFja0hvdXJzOmhvdXJzKyhtYXRlcmlhbFNjcmFwK2xvc3RTY3JhcCkvZ2Fpbn06bnVsbH07DQogICAgfTsNCiAgICBjb25zdCB1cGdyYWRlPShyLHByaW9yaXR5LGJlbmVmaXQpPT57DQogICAgICBpZihyLmxldmVsPj0zfHwhYWN0aXZlKHIpKXJldHVybjsNCiAgICAgIGNvbnN0IHtuZXh0LGhvdXJzLHJhdGUsY29zdCxlY29ub21pY3N9PXVwZ3JhZGVFc3RpbWF0ZShyKSxyZXNvdXJjZT1zaGVsdGVyUm9vbXNbci50eXBlXVsxXTsNCiAgICAgIGNvbnN0IGV4dHJhPXJlc291cmNlP3IudHlwZT09PSdwb3dlcic/MDpyLndpZHRoOi41KnIud2lkdGg7DQogICAgICBjb25zdCBibG9ja3M9cG93ZXJDaGVjayhleHRyYSksIG91dGFnZXM9W107DQogICAgICBmb3IoY29uc3QgayBvZiBPYmplY3Qua2V5cyhkZW1hbmQpKSB7DQogICAgICAgIGNvbnN0IGxlZnQ9bS5wcm9kdWN0aW9uW2tdLShyZXNvdXJjZT09PWs/cmF0ZTowKSxuZWVkPU1hdGgubWF4KDAsZGVtYW5kW2tdLWxlZnQpKmhvdXJzKzIqZGVtYW5kW2tdOw0KICAgICAgICBpZihzLnJlc291cmNlc1trXTxuZWVkKW91dGFnZXMucHVzaChgJHtzaGVsdGVyUmVzb3VyY2VzW2tdfemcgOiHs+WwkSAke01hdGguY2VpbChuZWVkKX0g5bqT5a2Y77yI5ZCr5Lik5bCP5pe25L2Z6YeP77yJYCk7DQogICAgICB9DQogICAgICBpZihvdXRhZ2VzLmxlbmd0aClibG9ja3MucHVzaChg5YGc5Lqn5pyf6Ze0JHtvdXRhZ2VzLmpvaW4oJ+OAgScpfWApOw0KICAgICAgaWYocmVzb3VyY2U9PT0ncGFydHMnJiZzLnJlc291cmNlcy5zY3JhcDw2KnJhdGUqaG91cnMpYmxvY2tzLnB1c2goJ+W3peWdiuW6n+aWmeS+m+W6lOS4jei2s++8jOWunumZheWinuS6p+W+heaguOWvuScpOw0KICAgICAgcmV0dXJuIGFzc2Vzcyh7a2luZDondXBncmFkZScsdHlwZTpyLnR5cGUsaWQ6ci5pZCxsZXZlbDpuZXh0LHByaW9yaXR5LGhvdXJzLHRpdGxlOmAke051bWJlci5pc0ludGVnZXIoci5mbG9vcik/YOesrCAke3IuZmxvb3J9IOWxgmAgOiAnJ30ke2xhYmVscyhyLnR5cGUpfeWNh+iHsyAke25leHR9IOe6p2AsDQogICAgICAgIGNvc3QsLi4uKGVjb25vbWljcz97ZWNvbm9taWNzfTp7fSksDQogICAgICAgIGJlbmVmaXQ6YCR7YmVuZWZpdH3vvJvmlbTpl7Tmlr3lt6UgJHtob3Vyc30g5bCP5pe2JHtyZXNvdXJjZT8n77yM5pyf6Ze05YGc5LqnJzonJ31gKw0KICAgICAgICAgIChlY29ub21pY3M/YO+8m+S6uuWRmOS4juS6p+mHj+S4jeWPmOS4lOaMgee7reaUtuWPluaXtu+8jOiHquW8gOW3pei1t+WbnuacrOe6piAke2Vjb25vbWljcy5wYXliYWNrSG91cnMudG9GaXhlZCgxKX0g5bCP5pe2YCsNCiAgICAgICAgICAgIGDvvIjlkKvpm7bku7bmipjlkIjlup/mlpkgJHs2KmNvc3QucGFydHN944CB5YGc5Lqn5o2f5aSx57qmICR7Zm10KGVjb25vbWljcy5sb3N0U2NyYXApfSDlup/mlpnvvIzkuI3lkKvmlJLmlpnnrYnlvoXvvIlgOicnKSxibG9ja3N9LGZhbHNlKTsNCiAgICB9Ow0KICAgIC8vIOWQhOmhueW3suW8gOW3peW3peeoi+WFseeUqOS6uuaJi++8m+WFiOihpemihOiuoeWfuuehgOS+m+W6lOe8uuWPo++8jOWGjemihOeVmeWbnuaUtuWyl+S9jeOAgg0KICAgIGNvbnN0IGZvcmVjYXN0cz1uZXcgTWFwKCkscmVtYWluaW5nPVsuLi5pZGxlXTsNCiAgICBmb3IoY29uc3QgdHlwZSBvZiBbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ10pIHsNCiAgICAgIGNvbnN0IHJlc291cmNlPXNoZWx0ZXJSb29tc1t0eXBlXVsxXSxwZW5kaW5nPWNvbnN0cnVjdGlvbi5maWx0ZXIocj0+ci50eXBlPT09dHlwZSYmIXIuaW5jaWRlbnQmJiFyLnVucG93ZXJlZCk7DQogICAgICBpZighcGVuZGluZy5sZW5ndGgpY29udGludWU7DQogICAgICBjb25zdCByZWFkeUF0PU1hdGgubWF4KG5vdywuLi5wZW5kaW5nLm1hcChyPT5yLmJ1aWx0QXQ+bm93P3IuYnVpbHRBdDpyLnVwZ3JhZGVBdCkpOw0KICAgICAgY29uc3Qgd29ya2luZz1idWlsdC5maWx0ZXIocj0+ci50eXBlPT09dHlwZSYmYWN0aXZlKHIpKTsNCiAgICAgIGNvbnN0IG91dHB1dD0oYXQsZW52KT0+d29ya2luZy5yZWR1Y2UoKHN1bSxyKT0+c3VtK2xpdmluZy5maWx0ZXIocD0+DQogICAgICAgIHAucm9vbUlkPT09ci5pZCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1hdCkuc2xpY2UoMCxyLndpZHRoKjIpDQogICAgICAgIC5yZWR1Y2UoKG4scCk9Pm4rc2hlbHRlcldvcmtlclJhdGUocyxhdCxlbnYscCxyKSwwKSwwKTsNCiAgICAgIGNvbnN0IGZvcmVjYXN0PXtwZW5kaW5nLHdhaXRIb3VyczoocmVhZHlBdC1ub3cpLzM2MDAwMDAsZnV0dXJlUmF0ZTpvdXRwdXQocmVhZHlBdCxtLnZpZXcuZW52KSwNCiAgICAgICAgd2FpdGluZ1JhdGU6TWF0aC5taW4obS5wcm9kdWN0aW9uW3Jlc291cmNlXSxvdXRwdXQobm93LHsuLi5tLnZpZXcuZW52LGV2ZW50czpbXX0pKSxyZXNlcnZlZDpbXSxyb29tczpbXX07DQogICAgICBmb3IoY29uc3QgciBvZiBbLi4ucGVuZGluZ10uc29ydCgoYSxiKT0+Yi5sZXZlbC1hLmxldmVsfHxhLmlkLWIuaWQpKSB7DQogICAgICAgIGNvbnN0IHJvb209ey4uLnIsYnVpbHRBdDpub3csdXBncmFkZUF0Om51bGwsbGV2ZWw6ci5idWlsdEF0Pm5vdz9yLmxldmVsOk1hdGgubWluKDMsci5sZXZlbCsxKX07DQogICAgICAgIGNvbnN0IGFzc2lnbmVkPWxpdmluZy5maWx0ZXIocD0+cC5yb29tSWQ9PT1yLmlkJiZwLmFkdWx0QXQ8PXJlYWR5QXQpOw0KICAgICAgICBmb3JlY2FzdC5mdXR1cmVSYXRlKz1hc3NpZ25lZC5maWx0ZXIocD0+cC5hd2F5PT09bnVsbCkuc2xpY2UoMCxyLndpZHRoKjIpDQogICAgICAgICAgLnJlZHVjZSgobixwKT0+bitzaGVsdGVyV29ya2VyUmF0ZShzLHJlYWR5QXQsbS52aWV3LmVudixwLHJvb20pLDApOw0KICAgICAgICBmb3JlY2FzdC5yb29tcy5wdXNoKHtzbG90czpNYXRoLm1heCgwLHIud2lkdGgqMi1hc3NpZ25lZC5sZW5ndGgpLA0KICAgICAgICAgIHJhdGVzOm5ldyBNYXAoaWRsZS5tYXAocD0+W3AuaWQsc2hlbHRlcldvcmtlclJhdGUocyxyZWFkeUF0LG0udmlldy5lbnYscCxyb29tKV0pKX0pOw0KICAgICAgfQ0KICAgICAgZm9yZWNhc3RzLnNldCh0eXBlLGZvcmVjYXN0KTsNCiAgICB9DQogICAgd2hpbGUocmVtYWluaW5nLmxlbmd0aCkgew0KICAgICAgbGV0IGJlc3Q9bnVsbDsNCiAgICAgIGZvcihjb25zdCBbdHlwZSxmXSBvZiBmb3JlY2FzdHMpZm9yKGNvbnN0IHJvb20gb2YgZi5yb29tcykgew0KICAgICAgICBpZighcm9vbS5zbG90cyljb250aW51ZTsNCiAgICAgICAgY29uc3QgcmVzb3VyY2U9c2hlbHRlclJvb21zW3R5cGVdWzFdLG5lZWQ9ZGVtYW5kW3Jlc291cmNlXSoxLjIsZ2FwPU1hdGgubWF4KDAsbmVlZC1mLmZ1dHVyZVJhdGUpOw0KICAgICAgICBmb3IoY29uc3QgcCBvZiByZW1haW5pbmcpIHsNCiAgICAgICAgICBjb25zdCByYXRlPXJvb20ucmF0ZXMuZ2V0KHAuaWQpLGNvdmVyPXJlc291cmNlPT09J3NjcmFwJz8wOk1hdGgubWluKGdhcCxyYXRlKS9NYXRoLm1heCgxLG5lZWQpLHNjcmFwPXJlc291cmNlPT09J3NjcmFwJz9yYXRlOjA7DQogICAgICAgICAgaWYoY292ZXI8PTFlLTkmJnNjcmFwPD0xZS05KWNvbnRpbnVlOw0KICAgICAgICAgIC8vIOWQjOetieihpee8uuaXtuWFiOeUqOWNlemhueS6uumAie+8jOe7meS7jeaciee8uuWPo+eahOWFtuS7luW3peeoi+eVmeS4i+WFvOmVv+WxheawkeOAgg0KICAgICAgICAgIGxldCBhbHRlcm5hdGl2ZT0wOw0KICAgICAgICAgIGlmKGNvdmVyPjApZm9yKGNvbnN0IFtvdGhlclR5cGUsb3RoZXJdIG9mIGZvcmVjYXN0cykgew0KICAgICAgICAgICAgY29uc3Qgb3RoZXJSZXNvdXJjZT1zaGVsdGVyUm9vbXNbb3RoZXJUeXBlXVsxXSxvdGhlck5lZWQ9ZGVtYW5kW290aGVyUmVzb3VyY2VdKjEuMjsNCiAgICAgICAgICAgIGlmKG90aGVyVHlwZT09PXR5cGV8fG90aGVyUmVzb3VyY2U9PT0nc2NyYXAnKWNvbnRpbnVlOw0KICAgICAgICAgICAgZm9yKGNvbnN0IG90aGVyUm9vbSBvZiBvdGhlci5yb29tcylpZihvdGhlclJvb20uc2xvdHMpYWx0ZXJuYXRpdmU9TWF0aC5tYXgoYWx0ZXJuYXRpdmUsDQogICAgICAgICAgICAgIE1hdGgubWluKE1hdGgubWF4KDAsb3RoZXJOZWVkLW90aGVyLmZ1dHVyZVJhdGUpLG90aGVyUm9vbS5yYXRlcy5nZXQocC5pZCkpL01hdGgubWF4KDEsb3RoZXJOZWVkKSk7DQogICAgICAgICAgfQ0KICAgICAgICAgIGlmKCFiZXN0fHxjb3Zlcj5iZXN0LmNvdmVyKzFlLTl8fE1hdGguYWJzKGNvdmVyLWJlc3QuY292ZXIpPD0xZS05JiYNCiAgICAgICAgICAgICAgKHNjcmFwPmJlc3Quc2NyYXArMWUtOXx8TWF0aC5hYnMoc2NyYXAtYmVzdC5zY3JhcCk8PTFlLTkmJmFsdGVybmF0aXZlPGJlc3QuYWx0ZXJuYXRpdmUtMWUtOSkpDQogICAgICAgICAgICBiZXN0PXtmLHJvb20scCxyYXRlLGNvdmVyLHNjcmFwLGFsdGVybmF0aXZlfTsNCiAgICAgICAgfQ0KICAgICAgfQ0KICAgICAgaWYoIWJlc3QpYnJlYWs7DQogICAgICBiZXN0LnJvb20uc2xvdHMtLTtiZXN0LmYuZnV0dXJlUmF0ZSs9YmVzdC5yYXRlO2Jlc3QuZi5yZXNlcnZlZC5wdXNoKGJlc3QucCk7DQogICAgICByZW1haW5pbmcuc3BsaWNlKHJlbWFpbmluZy5maW5kSW5kZXgocD0+cC5pZD09PWJlc3QucC5pZCksMSk7DQogICAgfQ0KICAgIGZvcihjb25zdCB0eXBlIG9mIFsncG93ZXInLCdkaW5lcicsJ3dhdGVyJywnc2NyYXAnXSkgew0KICAgICAgY29uc3QgcmVzb3VyY2U9c2hlbHRlclJvb21zW3R5cGVdWzFdLGRlZmljaXQ9c2hvcnRhZ2VzLmluY2x1ZGVzKHJlc291cmNlKSxwcmlvcml0eT1kZWZpY2l0PzEwOnJlc291cmNlPT09J3NjcmFwJz81MDo5MDsNCiAgICAgIGlmKCFkZWZpY2l0JiZyZXNvdXJjZSE9PSdzY3JhcCcpY29udGludWU7DQogICAgICBjb25zdCB2YWNhbmNpZXM9dmFjYW5jeSh0eXBlKTsNCiAgICAgIGNvbnN0IGZvcmVjYXN0PWZvcmVjYXN0cy5nZXQodHlwZSkscGVuZGluZz1mb3JlY2FzdD8ucGVuZGluZ3x8W10scmVzZXJ2ZWQ9Zm9yZWNhc3Q/LnJlc2VydmVkfHxbXTsNCiAgICAgIGNvbnN0IGZ1dHVyZVJhdGU9Zm9yZWNhc3Q/LmZ1dHVyZVJhdGU/P20ucHJvZHVjdGlvbltyZXNvdXJjZV0sd2FpdGluZ1JhdGU9Zm9yZWNhc3Q/LndhaXRpbmdSYXRlPz9tLnByb2R1Y3Rpb25bcmVzb3VyY2VdLHdhaXRIb3Vycz1mb3JlY2FzdD8ud2FpdEhvdXJzfHwwOw0KICAgICAgaWYocGVuZGluZy5sZW5ndGgpIHsNCiAgICAgICAgbm90ZXMucHVzaChg5bey5pyJICR7cGVuZGluZy5sZW5ndGh9IOmXtCR7bGFiZWxzKHR5cGUpfeato+WcqOaWveW3peaIluWNh+e6p++8jOS4uuWFtuepuuWyl+mihOeVmSAke3Jlc2VydmVkLmxlbmd0aH0g5ZCN546w5pyJ6Zey572u5oiQ5Lq677ybYCsNCiAgICAgICAgICBg57qmICR7TWF0aC5jZWlsKHdhaXRIb3Vycyo2MCl9IOWIhumSn+WQjuaguOWvueWujOW3pee7k+aenO+8jOS4jeiDveaKiui/meS6m+S6uumHjeWkjeiuoeWFpeWPpuS4gOmXtOaWsOaIv+eahOaUtuebiuOAgmApOw0KICAgICAgICBpZihkZWZpY2l0JiZmdXR1cmVSYXRlPGRlbWFuZFtyZXNvdXJjZV0qMS4yLTFlLTkpbm90ZXMucHVzaChgJHtsYWJlbHModHlwZSl95a6M5bel5ZCO5oyJ5bey5Zyo5bKX5Y+K5pys6aG56aKE55WZ5Lq65omL6aKE6K6hICR7Zm10KGZ1dHVyZVJhdGUpfSAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfS/lsI/ml7bvvIxgKw0KICAgICAgICAgIGDku43mnKrovr7liLAgJHtmbXQoZGVtYW5kW3Jlc291cmNlXSoxLjIpfSDnmoTkvpvlupTlh4blpIfnur/vvJvlhYjor4TkvLDosIPlspfmiJbnrYnlvoXlranlrZDmiJDlubTvvIzlkITpobnlt6XnqIvkuI3lhbHnlKjlkIzkuIDpooTnlZnkurrpgInjgIJgKTsNCiAgICAgIH0NCiAgICAgIGNvbnN0IHJlc2VydmU9ZGVmaWNpdD9NYXRoLm1heCgwLGRlbWFuZFtyZXNvdXJjZV0td2FpdGluZ1JhdGUpKndhaXRIb3VycysyKmRlbWFuZFtyZXNvdXJjZV06MDsNCiAgICAgIGNvbnN0IGNhbldhaXQ9ZGVmaWNpdCYmcGVuZGluZy5sZW5ndGgmJmZ1dHVyZVJhdGU+PWRlbWFuZFtyZXNvdXJjZV0qMS4yLTFlLTkmJnMucmVzb3VyY2VzW3Jlc291cmNlXT49cmVzZXJ2ZTsNCiAgICAgIGlmKGNhbldhaXQpbm90ZXMucHVzaChgJHtsYWJlbHModHlwZSl95a6M5bel5ZCO5oyJ546w5pyJ5Lq65ZGY5Y+K6aKE55WZ5Lq66YCJ6aKE6K6h5Y+v6KaG55uW5L6b5bqU77yM5bqT5a2Y5Y+v562J5b6F5bm25L+d55WZ5Lik5bCP5pe25L2Z6YeP77yb5YWI562J546w5pyJ5bel56iL77yM5LiN6YeN5aSN5paw5bu644CC5Lqn6YeP5pyq6K6h5YWl5b2T5YmN5pS25YWl77yM5a6M5bel5ZCO6YeN5paw5qC45a+544CCYCk7DQogICAgICBlbHNlIGlmKGRlZmljaXQmJnBlbmRpbmcubGVuZ3RoJiZzLnJlc291cmNlc1tyZXNvdXJjZV08cmVzZXJ2ZSlub3Rlcy5wdXNoKGAke2xhYmVscyh0eXBlKX3lrozlt6XliY3nmoTlupPlrZjnvJPlhrLkuI3otrPvvIzku43pnIDor4TkvLDlhbbku5booaXlkZjmiJbooaXmlZHlu7rorr7vvIzkuI3og73lj6rnrYnnjrDmnInlt6XnqIvjgIJgKTsNCiAgICAgIGNvbnN0IHVyZ2VudD1kZWZpY2l0JiZwZW5kaW5nLmxlbmd0aCYmd2FpdEhvdXJzPjEvNiYmcy5yZXNvdXJjZXNbcmVzb3VyY2VdPHJlc2VydmU7DQogICAgICBjb25zdCBhdmFpbGFibGU9dXJnZW50P1suLi5yZW1haW5pbmcsLi4ucmVzZXJ2ZWRdOlsuLi5yZW1haW5pbmddOw0KICAgICAgaWYodHlwZT09PSdwb3dlcicmJmNhbXBhaWduPy5wb3dlclByZXBhcmF0aW9uKWZvcihjb25zdCBpZCBvZiBjYW1wYWlnbi5wb3dlclByZXBhcmF0aW9uLmRvbm9ycyl7DQogICAgICAgIGNvbnN0IHA9bGl2aW5nLmZpbmQocD0+cC5pZD09PWlkKTsNCiAgICAgICAgaWYocCYmIWF2YWlsYWJsZS5zb21lKG90aGVyPT5vdGhlci5pZD09PWlkKSlhdmFpbGFibGUucHVzaChwKTsNCiAgICAgIH0NCiAgICAgIGlmKHZhY2FuY2llcyYmYXZhaWxhYmxlLmxlbmd0aClhc3Nlc3Moe2tpbmQ6J3N0YWZmJyx0eXBlLHByaW9yaXR5OmRlZmljaXQ/NTpjYW1wYWlnbj8uZW5hYmxlZD81NToxNSx0aXRsZTpg5YWI6KGl546w5pyJJHtsYWJlbHModHlwZSl95bKX5L2NYCwNCiAgICAgICAgYmVuZWZpdDpg5bey5pyJICR7dmFjYW5jaWVzfSDkuKrnqbrlspfvvJvlj6/lhYjor4TkvLAgJHthdmFpbGFibGUubGVuZ3RofSDlkI3mnKrooqvlhbbku5blt6XnqIvpooTnlZnnmoTlgaXlurfpl7Lnva7miJDkurrvvIzmjInlrp7pmYXlop7kuqflronmjpLvvIzkuI3opoHmsYLloavmu6FgLGJsb2NrczpbXX0pOw0KICAgICAgZWxzZSBpZih2YWNhbmNpZXMpbm90ZXMucHVzaChgJHtsYWJlbHModHlwZSl95pyJICR7dmFjYW5jaWVzfSDkuKrnqbrlspfvvIzkvYbmmoLml6DmnKrooqvpooTnlZnnmoTlgaXlurfpl7Lnva7miJDkurrvvJvkurrlkZjnrqHnkIblj6/nu6fnu63or4TkvLDosIPlspfvvIznqbrlspfkuI3kvZzkuLrljYfnuqfmiJblhbbku5blu7rorr7nmoTliY3nva7mnaHku7bjgIJgKTsNCiAgICAgIGlmKHVyZ2VudCYmcmVzZXJ2ZWQubGVuZ3RoKW5vdGVzLnB1c2goYOmihOeVmee7mSR7bGFiZWxzKHR5cGUpfeeahOmXsue9ruS6uuaJi+WPr+WFiOivhOS8sOabtOaXqeWujOW3peeahOihpeaVkeaIv+mXtO+8m+WOn+W3peeoi+WujOW3peWQjumHjeaWsOWIhumFje+8jOS4jeiDveWQjOaXtueul+S4pOWkhOS6p+mHj+OAgmApOw0KICAgICAgaWYoIXZhY2FuY2llcyYmYXZhaWxhYmxlLmxlbmd0aCYmIWNhbldhaXQpIHsNCiAgICAgICAgY29uc3QgaHlwb3RoZXRpY2FsPXt0eXBlLHdpZHRoOjEsbGV2ZWw6MSxidWlsdEF0OjAsdXBncmFkZUF0Om51bGwsaW5jaWRlbnQ6bnVsbCx1bnBvd2VyZWQ6ZmFsc2V9Ow0KICAgICAgICBjb25zdCBnYWluPWF2YWlsYWJsZS5tYXAocD0+c2hlbHRlcldvcmtlclJhdGUocyxub3csbS52aWV3LmVudixwLGh5cG90aGV0aWNhbCkpLnNvcnQoKGEsYik9PmItYSkuc2xpY2UoMCwyKS5yZWR1Y2UoKG4sdik9Pm4rdiwwKTsNCiAgICAgICAgLy8g5a6/6IiN5a2Q5aWz5ZKM5LyR5oGv5Lit55qE5Y+v6LCD5oiQ5Lq66YO96ZyA6KaB5bKX5L2N77yb5pen5oi/5Y2H57qn5LiN5aKe5Yqg5bqn5L2N77yM5LiN6IO95Zug5Lq65Zyo5LyR5oGv6ICM6YCA5Zue5pmu6YCa6L+957qn44CCDQogICAgICAgIGNvbnN0IGVtcGxveW1lbnQ9dHlwZT09PSdzY3JhcCcmJmdhaW4+MCYmYXZhaWxhYmxlLnNvbWUocD0+ZG9ybVdvcmtlcnMuaW5jbHVkZXMocCl8fA0KICAgICAgICAgIHAucm9vbUlkPT09bnVsbCYmY2FtcGFpZ24/LnJlc3RpbmdSZXNpZGVudHM/LmluY2x1ZGVzKHAuaWQpJiYNCiAgICAgICAgICAhY2FtcGFpZ24/LmRhaWx5UmVzZXJ2ZWQ/LmluY2x1ZGVzKHAuaWQpJiZzaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LHAsaHlwb3RoZXRpY2FsKT4wKTsNCiAgICAgICAgYnVpbGQodHlwZSxlbXBsb3ltZW50PzI0OnByaW9yaXR5LGAke2VtcGxveW1lbnQ/J+WFiOS4uuW+heWwseS4muaIkOS6uuWinuWKoOeUn+S6p+Wyl+S9je+8myc6Jyd95a6J5o6S546w5pyJ6Zey572u5oiQ5Lq65ZCO57qm5aKe5YqgICR7Zm10KGdhaW4pfSAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfS/lsI/ml7bvvJvnqbrmiL/mnKzouqvkuI3lop7kuqdgLGdhaW4sbnVsbCxlbXBsb3ltZW50KTsNCiAgICAgIH0NCiAgICAgIGlmKCF2YWNhbmNpZXMmJiFpZGxlLmxlbmd0aCYmZGVmaWNpdCYmIWJ1aWx0LnNvbWUocj0+ci50eXBlPT09dHlwZSkmJiFwZW5kaW5nLmxlbmd0aCkNCiAgICAgICAgYnVpbGQodHlwZSxwcmlvcml0eSwn5bCa5peg5Y+v55u05o6l5a6J5o6S55qE5YGl5bq36Zey572u5oiQ5Lq677yM5YWI56Gu6K6k6LCD5bKX5Lq66YCJ77yb5bu65oiQ56m65oi/5LiN5Lya5aKe5Yqg5Lqn6YePJyk7DQogICAgICBjb25zdCB1cGdyYWRlcz1idWlsdC5maWx0ZXIocj0+ci50eXBlPT09dHlwZSYmYWN0aXZlKHIpJiZyLmxldmVsPDMpLm1hcCh1cGdyYWRlRXN0aW1hdGUpLmZpbHRlcih4PT54LmdhaW4+MCkNCiAgICAgICAgLnNvcnQoKGEsYik9PnR5cGU9PT0nc2NyYXAnP2EuZWNvbm9taWNzLnBheWJhY2tIb3Vycy1iLmVjb25vbWljcy5wYXliYWNrSG91cnN8fGEuY29zdC5zY3JhcC1iLmNvc3Quc2NyYXB8fGEuci5pZC1iLnIuaWQ6DQogICAgICAgICAgYi5nYWluL2Iuci53aWR0aC1hLmdhaW4vYS5yLndpZHRoKTsNCiAgICAgIGlmKHVwZ3JhZGVzLmxlbmd0aCYmIWNhbldhaXQpIHsNCiAgICAgICAgY29uc3QgY2hvaWNlcz11cGdyYWRlcy5tYXAoKHtyLGdhaW59KT0+dXBncmFkZShyLHR5cGU9PT0nc2NyYXAnP3ByaW9yaXR5OnByaW9yaXR5KzEsDQogICAgICAgICAgYOaMieW9k+WJjeS6uuWRmOe6puWinuWKoCAke2ZtdChnYWluKX0gJHtzaGVsdGVyUmVzb3VyY2VzW3Jlc291cmNlXX0v5bCP5pe2YCkpOw0KICAgICAgICAvLyDlhYjmoLjlr7nmr4/pl7TnmoTkvpvnlLXjgIHlgZzkuqflgqjlpIflkozlrrnph4/vvJvlkIznrYnlj6/ooYzmnaHku7bkuIvkv53mjIHljp/mlLbnm4rpobrluo/jgIINCiAgICAgICAgY29uc3QgY2hvaWNlPWNob2ljZXMuZmluZChjPT4hYy5ibG9ja3MubGVuZ3RoKXx8Y2hvaWNlcy5maW5kKGZpdHNDb21taXR0ZWRDYXBhY2l0eSl8fGNob2ljZXNbMF07DQogICAgICAgIGlmKGNob2ljZSE9PWNob2ljZXNbMF0pbm90ZXMucHVzaChgJHtjaG9pY2VzWzBdLnRpdGxlfeaaguacqua7oei2s+adoeS7tu+8miR7Y2hvaWNlc1swXS5ibG9ja3Muam9pbign77ybJyl977ybYCsNCiAgICAgICAgICBg5pys6L2u5pS56K+E5LywJHtjaG9pY2UudGl0bGV977yM5p2h5Lu25Y+Y5YyW5ZCO5YaN5oyJ5aKe5Lqn5oiW5Zue5pys6YeN5paw5q+U6L6D44CCYCk7DQogICAgICAgIGNhbmRpZGF0ZXMucHVzaChjaG9pY2UpOw0KICAgICAgfQ0KICAgIH0NCiAgICBmb3IoY29uc3QgW3Jlc291cmNlLHByZXBhcmF0aW9uXSBvZiBPYmplY3QuZW50cmllcyhjYW1wYWlnbj8ucG9wdWxhdGlvbkZhbWlseVN1cHBseT8ucmVzb3VyY2VzfHx7fSkpew0KICAgICAgY29uc3Qge3R5cGUsY2FwYWNpdHksbmVlZCxnYWluLGRvbm9ycyxwZW5kaW5nfT1wcmVwYXJhdGlvbjsNCiAgICAgIG5vdGVzLnB1c2goYOWOn+WutuW6reemu+Wyl+WQju+8jOeOsOaciSR7bGFiZWxzKHR5cGUpfeaOpeabv+WuuemHj+S4iueVjCAke2ZtdChjYXBhY2l0eSl9LyR7Zm10KG5lZWQpfSAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfS/lsI/ml7bvvJvmjInmjqXmm7/kurrlkZjor4TkvLDmiankuqfvvIzkuI3msr/nlKjniLbmr43nmoTkuqfph4/jgIJgKTsNCiAgICAgIGlmKHByZXBhcmF0aW9uLnRyYW5zaXRpb24pbm90ZXMucHVzaCgn5Y6f5a625bqt55qE5pyA57uI5bKX5L2N5a656YeP6Jm954S26Laz5aSf77yM5L2G5b2T5YmN5rKh5pyJ5om+5Yiw5LiN56C05Z2P5L6b5bqU5L2Z6YeP55qE6KGl5ZGY5oiW5o2i5L2N5q2l6aqk77yb5YWI5YeG5aSH5Y+v5a6J5YWo5Lqk5o6l55qE6L+H5rih5Lqn6IO944CCJyk7DQogICAgICBpZihwZW5kaW5nLmxlbmd0aCl7bm90ZXMucHVzaCgn5Y6f5a625bqt5o6l5pu/5YWI562J5bey5pyJ55Sf5Lqn5bel56iL5a6M5bel77yM5qC45a+55a6e6ZmF5bKX5L2N5ZCO5YaN5Yaz5a6a5piv5ZCm5omp5bu677yM5LiN6IO96YeN5aSN6aKE55WZ5ZCM5LiA5om55Lq65omL44CCJyk7Y29udGludWU7fQ0KICAgICAgY29uc3QgdXBncmFkZXM9cHJlcGFyYXRpb24udXBncmFkZXMuZmlsdGVyKHg9PnguY2FwYWNpdHk+PW5lZWQtMWUtOSkubWFwKHg9PnsNCiAgICAgICAgY29uc3Qgcj1idWlsdC5maW5kKHI9PnIuaWQ9PT14LmlkKTsNCiAgICAgICAgcmV0dXJuIHVwZ3JhZGUociwxMSxg5Y6f5a625bqt56a75bKX5ZCO77yM5o6l5pu/5a656YeP5LiK55WM5Y+v5aKe6IezICR7Zm10KHguY2FwYWNpdHkpfSAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfS/lsI/ml7bvvJvlrozlt6XlkI7ku43pnIDmoLjlr7nlrp7pmYXosIPlspdgKTsNCiAgICAgIH0pOw0KICAgICAgdXBncmFkZXMuc29ydCgoYSxiKT0+YS5jb3N0LnNjcmFwKzYqYS5jb3N0LnBhcnRzLWIuY29zdC5zY3JhcC02KmIuY29zdC5wYXJ0c3x8YS5ob3Vycy1iLmhvdXJzKTsNCiAgICAgIGNvbnN0IHZpYWJsZT11cGdyYWRlcy5maW5kKGM9PiFjLmJsb2Nrcy5sZW5ndGgpOw0KICAgICAgaWYodmlhYmxlKWNhbmRpZGF0ZXMucHVzaCh2aWFibGUpOw0KICAgICAgaWYoZ2Fpbj4wKWJ1aWxkKHR5cGUsMTAsYOWOn+WutuW6rei/lOWuv+iIjeWJjeaJqeWFheaOpeabv+Wyl+S9je+8m+W3suaguOWvuSAke2Rvbm9ycy5sZW5ndGh9IOWQjeWPr+WuieWFqOiwg+WKqOaIkOS6uu+8jOaWsOWyl+S9jemihOiuoeWinuWKoCAke2ZtdChnYWluKX0gJHtzaGVsdGVyUmVzb3VyY2VzW3Jlc291cmNlXX0v5bCP5pe277yM5a6M5bel5ZCO5oyJ5a6e6ZmF5Yiw5bKX6YeN566XYCxnYWluKTsNCiAgICAgIGVsc2UgaWYoIXZpYWJsZSYmdXBncmFkZXMubGVuZ3RoKWNhbmRpZGF0ZXMucHVzaCh1cGdyYWRlc1swXSk7DQogICAgICBlbHNlIGlmKCF2aWFibGUpbm90ZXMucHVzaChg5Y6f5a625bqt5o6l5pu/57y65bCR5Y+v5a6J5YWo6LCD5Yqo55qEJHtsYWJlbHModHlwZSl95Lq65omL77yM5pqC5LiN5Li656m65oi/5raI6LS544CCYCk7DQogICAgfQ0KICAgIGlmKGNvbW1pdHRlZENhcGFjaXR5PHdhbnRlZCkgew0KICAgICAgY29uc3QgYmVuZWZpdD1g5Lq65Y+j5a656YeP5aKe5YqgICR7TWF0aC5taW4oMjAwLGNvbW1pdHRlZENhcGFjaXR5KzQpLWNvbW1pdHRlZENhcGFjaXR5fe+8jOW9k+WJjeWPiuaWveW3peWQjuWuuemHjyAke20ucG9wdWxhdGlvbkNhcH0vJHtjb21taXR0ZWRDYXBhY2l0eX3vvIzop4TliJLoh7PlsJEgJHt3YW50ZWR977yb5LiN5Yqg5b+r5Z+55YW75oSf5oOFYDsNCiAgICAgIGNvbnN0IHNwYXJlPWNvbW1pdHRlZENhcGFjaXR5LWZ1dHVyZU1vdXRoczsNCiAgICAgIGNvbnN0IHN1cHBseUZpcnN0PXNwYXJlPjAmJihzaG9ydGFnZXMubGVuZ3RofHxPYmplY3Qua2V5cyhjYW1wYWlnbj8ucG9wdWxhdGlvbkZhbWlseVN1cHBseT8ucmVzb3VyY2VzfHx7fSkubGVuZ3RoKTsNCiAgICAgIGNvbnN0IHByZXBhcmluZ1BhaXI9cG9wdWxhdGlvblByZXBhcmF0aW9uPmZ1dHVyZU1vdXRocyYmcG9wdWxhdGlvblByZXBhcmF0aW9uPD1jb21taXR0ZWRDYXBhY2l0eTsNCiAgICAgIGNvbnN0IGhvdXNpbmdQcmlvcml0eT1zcGFyZT4xfHxzdXBwbHlGaXJzdHx8cHJlcGFyaW5nUGFpcj83MDpzaG9ydGFnZXMubGVuZ3RoPzY1OnNwYXJlPD0wPzIwOjMwOw0KICAgICAgaWYoaG91c2luZ1ByaW9yaXR5PT09MjApbm90ZXMucHVzaCgn5bey5om/6K+65Lq65Y+j55So5ruh546w5pyJ5Y+K5Zyo5bu65bqK5L2N77yM5L6b57uZ5bey5bCx57uq77yb5b+F6KaB5omp5a655YWI5LqO5pmu6YCa562J57qn5bel56iL5aSH5paZ77yM5LuN5qC45a+55Y6f5bu66K6+6aKE566X44CCJyk7DQogICAgICBpZihob3VzaW5nUHJpb3JpdHk9PT03MClub3Rlcy5wdXNoKGDlt7LmnInlj4rlnKjlu7rluorkvY3ov5jlj6/lrrnnurMgJHtzcGFyZX0g5Lq677yM5a6/6IiN5pqC5YiX5ZCO57ut77ybYCsNCiAgICAgICAgKHN1cHBseUZpcnN0fHxwcmVwYXJpbmdQYWlyPyflhYjokL3lrp7kuIvkuIDlr7nniLbmr43lj4rlhbbkvpvnu5nvvIzlrp7pmYXpooTnuqbljaDnlKjluorkvY3lkI7lho3or4TkvLDmianlrrnvvIzkuI3lm6DnrYnnuqfliqDliIbmj5DliY3mianlrr/oiI3jgIInOg0KICAgICAgICAgICflhYjmj5Dpq5jlup/mlpnkuqflh7rvvIzpooTmnJ/kurrlj6Pot53lrrnph4/lj6rliakgMSDkurrkuJTkvpvnu5nlsLHnu6rml7bmj5DliY3mianlrrnjgIInKSk7DQogICAgICBidWlsZCgncXVhcnRlcnMnLGhvdXNpbmdQcmlvcml0eSxiZW5lZml0KTsNCiAgICAgIGNvbnN0IHJvb209YnVpbHQuZmlsdGVyKHI9PnIudHlwZT09PSdxdWFydGVycycmJmFjdGl2ZShyKSYmci5sZXZlbDwzKS5zb3J0KChhLGIpPT5hLmxldmVsLWIubGV2ZWx8fGEud2lkdGgtYi53aWR0aClbMF07DQogICAgICBpZihyb29tKWNhbmRpZGF0ZXMucHVzaCh1cGdyYWRlKHJvb20saG91c2luZ1ByaW9yaXR5KzEsYOS6uuWPo+WuuemHj+WinuWKoCAke01hdGgubWluKDIwMCxjb21taXR0ZWRDYXBhY2l0eSsyKnJvb20ud2lkdGgpLWNvbW1pdHRlZENhcGFjaXR5fe+8m+S4jeWKoOW/q+WfueWFu+aEn+aDhWApKTsNCiAgICB9DQogICAgY29uc3QgZnVsbD1PYmplY3Qua2V5cyhtLmNhcHMpLmZpbHRlcihrPT5zLnJlc291cmNlc1trXT49LjkqbS5jYXBzW2tdJiZtLnByb2R1Y3Rpb25ba10+MCk7DQogICAgY29uc3QgZXF1aXBtZW50RnVsbD1zLml0ZW1zLmxlbmd0aD49LjkqbS5pdGVtQ2FwOw0KICAgIGlmKGZ1bGwubGVuZ3RofHxlcXVpcG1lbnRGdWxsKSB7DQogICAgICBjb25zdCBhZnRlckZ1bGw9ZnVsbC5maWx0ZXIoaz0+cy5yZXNvdXJjZXNba10+PS45KmNvbW1pdHRlZC5jYXBzW2tdKSxhZnRlckVxdWlwbWVudEZ1bGw9ZXF1aXBtZW50RnVsbCYmcy5pdGVtcy5sZW5ndGg+PS45KmNvbW1pdHRlZC5pdGVtQ2FwOw0KICAgICAgY29uc3QgcGVuZGluZz1mdWxsLmZpbHRlcihrPT5jb21taXR0ZWQuY2Fwc1trXT5tLmNhcHNba10pLm1hcChrPT5gJHtzaGVsdGVyUmVzb3VyY2VzW2tdfSAke20uY2Fwc1trXX3ihpIke2NvbW1pdHRlZC5jYXBzW2tdfWApOw0KICAgICAgaWYoZXF1aXBtZW50RnVsbCYmY29tbWl0dGVkLml0ZW1DYXA+bS5pdGVtQ2FwKXBlbmRpbmcucHVzaChg6KOF5aSHICR7bS5pdGVtQ2FwfeKGkiR7Y29tbWl0dGVkLml0ZW1DYXB9YCk7DQogICAgICBub3Rlcy5wdXNoKGAke1suLi5mdWxsLm1hcChrPT5zaGVsdGVyUmVzb3VyY2VzW2tdKSwuLi4oZXF1aXBtZW50RnVsbD9bJ+ijheWkhyddOltdKV0uam9pbign44CBJyl95b2T5YmN5o6l6L+R5ruh5LuT44CCYCk7DQogICAgICBpZihwZW5kaW5nLmxlbmd0aClub3Rlcy5wdXNoKGDlt7LlvIDlt6Xlt6XnqIvlrozlt6XlkI7nmoTlrrnph4/vvJoke3BlbmRpbmcuam9pbign44CBJyl977yI5b2T5YmN4oaS5a6M5bel5ZCO77yJ77yb5bCa5pyq55Sf5pWI77yM6aKG5Y+W5LuN5oyJ5b2T5YmN5a656YeP44CCYCk7DQogICAgICBpZighYWZ0ZXJGdWxsLmxlbmd0aCYmIWFmdGVyRXF1aXBtZW50RnVsbClub3Rlcy5wdXNoKCflhYjnrYnnjrDmnInlt6XnqIvlrozlt6XvvIzlj6/nvJPop6PlvZPliY3mu6Hku5PljovlipvvvIzmmoLkuI3lu7rorq7ph43lpI3mianku5PvvJvmnJ/pl7TnlZnmhI/lupPlrZjlj5jljJbjgIInKTsNCiAgICAgIGVsc2Ugew0KICAgICAgICBub3Rlcy5wdXNoKGAke2NvbnN0cnVjdGlvbi5sZW5ndGg/J+WujOW3peWQjuS7jeaciSc6Jyd9JHtbLi4uYWZ0ZXJGdWxsLm1hcChrPT5zaGVsdGVyUmVzb3VyY2VzW2tdKSwuLi4oYWZ0ZXJFcXVpcG1lbnRGdWxsP1sn6KOF5aSHJ106W10pXS5qb2luKCfjgIEnKX3mjqXov5Hmu6Hku5PvvIzlj6/mr5TovoPlhYjmtojotLnlupPlrZjkuI7nu6fnu63mianku5PjgIJgKTsNCiAgICAgICAgY29uc3Qgc3RvcmFnZUdhaW49Y2VsbHM9PnsNCiAgICAgICAgICBjb25zdCBuZXh0PXNoZWx0ZXJDYXBhY2l0eShjb21taXR0ZWRSb29tcyxzdG9yYWdlUGVyayxjZWxscyk7DQogICAgICAgICAgcmV0dXJuIGAke2NhcGFjaXR5UGVuZGluZz8n5Zyo5bey5byA5bel5bel56iL5a6M5bel5ZCO55qE5Z+656GA5LiK77yMJzonJ33lrrnph4/lop7liqDvvJoke09iamVjdC5rZXlzKG0uY2FwcykubWFwKGs9PmAke3NoZWx0ZXJSZXNvdXJjZXNba119ICR7bmV4dC5jYXBzW2tdLWNvbW1pdHRlZC5jYXBzW2tdfWApLmpvaW4oJ+OAgScpfeOAgeijheWkhyAke25leHQuaXRlbUNhcC1jb21taXR0ZWQuaXRlbUNhcH3vvJvlop7liqDlrrnph4/kuI3kvJrnm7TmjqXkuqfnlJ/otYTmupBgOw0KICAgICAgICB9Ow0KICAgICAgICAvLyDov73nuqfml7bvvIzlt7LmnInlhYXliIblgqjlpIfnmoTmtojogJflk4HkuI3lupTpnaDlj43lpI3mianku5Pnu6fnu63lm6Tnp6/jgILmnZDmlpnjgIHoo4XlpIfmiJbnnJ/lrp7lgZzkuqcv5Yy755aX6ZyA5rGC5LuN5L+d55WZ5omp5a6544CCDQogICAgICAgIGNvbnN0IHB1cnN1aW5nPU51bWJlci5pc0ludGVnZXIoZmluYWxMZXZlbCkmJnNoZWx0ZXJMZXZlbFByb2dyZXNzKG0pPy5sZXZlbDxmaW5hbExldmVsOw0KICAgICAgICBjb25zdCBzdG9yYWdlTmVlZD17Li4uT2JqZWN0LmZyb21FbnRyaWVzKE9iamVjdC5lbnRyaWVzKGRlbWFuZCkubWFwKChbayxuXSk9PltrLDIqbl0pKSxzdGltcGFrOmNhbXBhaWduPy5zdGltcGFrVGFyZ2V0fHwwfTsNCiAgICAgICAgY29uc3QgdW50aWw9TWF0aC5tYXgobm93LC4uLmNvbnN0cnVjdGlvbi5tYXAocj0+ci5idWlsdEF0Pm5vdz9yLmJ1aWx0QXQ6ci51cGdyYWRlQXQpKTsNCiAgICAgICAgZm9yKGNvbnN0IGsgb2YgT2JqZWN0LmtleXMoZGVtYW5kKSlzdG9yYWdlTmVlZFtrXSs9TWF0aC5tYXgoMCxkZW1hbmRba10tbS5wcm9kdWN0aW9uW2tdKSoodW50aWwtbm93KS8zNjAwMDAwOw0KICAgICAgICBmb3IoY29uc3QgciBvZiBidWlsdC5maWx0ZXIocj0+YWN0aXZlKHIpJiZyLmxldmVsPDMmJnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdKSl7DQogICAgICAgICAgY29uc3Qge2hvdXJzLHJhdGV9PXVwZ3JhZGVFc3RpbWF0ZShyKSxyZXNvdXJjZT1zaGVsdGVyUm9vbXNbci50eXBlXVsxXTsNCiAgICAgICAgICBmb3IoY29uc3QgayBvZiBPYmplY3Qua2V5cyhkZW1hbmQpKXN0b3JhZ2VOZWVkW2tdPU1hdGgubWF4KHN0b3JhZ2VOZWVkW2tdLA0KICAgICAgICAgICAgTWF0aC5tYXgoMCxkZW1hbmRba10tKG0ucHJvZHVjdGlvbltrXS0ocmVzb3VyY2U9PT1rP3JhdGU6MCkpKSpob3VycysyKmRlbWFuZFtrXSk7DQogICAgICAgIH0NCiAgICAgICAgY29uc3Qgc3VycGx1c09ubHk9cHVyc3VpbmcmJiFhZnRlckVxdWlwbWVudEZ1bGwmJmFmdGVyRnVsbC5sZW5ndGg+MCYmYWZ0ZXJGdWxsLmV2ZXJ5KGs9Pg0KICAgICAgICAgIE9iamVjdC5oYXNPd24oc3RvcmFnZU5lZWQsaykmJnMucmVzb3VyY2VzW2tdPj1zdG9yYWdlTmVlZFtrXSk7DQogICAgICAgIGNvbnN0IHByaW9yaXR5PXN1cnBsdXNPbmx5PzcwOjIwOw0KICAgICAgICBpZihzdXJwbHVzT25seSlub3Rlcy5wdXNoKCflvZPliY3mjqXov5Hmu6Hku5PnmoTmtojogJflk4HlgqjlpIflt7LlhYXotrPvvIzopobnm5blt7Lnn6Xmlr3lt6XjgIHlgJnpgInljYfnuqflgZzkuqflkozljLvnlpfpooTnlZnvvJvmianku5PliJfkuLrlkI7nu63vvIzlhYjmjqjov5vlj5HlsZXvvIzkuI3kuLrnu6fnu63lm6Tnp6/ljaDnlKjlu7rorr7otYTph5HjgILmnKrog73mlbTmibnmlLbkuIvnmoTkuqflh7rku43nlZnlnKjmiL/pl7TjgIInKTsNCiAgICAgICAgY29uc3Qgc3RvcmFnZURlbWFuZD17cmVzb3VyY2VzOmFmdGVyRnVsbCxlcXVpcG1lbnQ6YWZ0ZXJFcXVpcG1lbnRGdWxsLHJlc2VydmVzOnB1cnN1aW5nP3N0b3JhZ2VOZWVkOnt9fTsNCiAgICAgICAgY29uc3Qgc3RhcnQ9Y2FuZGlkYXRlcy5sZW5ndGg7DQogICAgICAgIGJ1aWxkKCdzdG9yYWdlJyxwcmlvcml0eSxzdG9yYWdlR2FpbigxKSk7DQogICAgICAgIGNvbnN0IHJvb209YnVpbHQuZmlsdGVyKHI9PnIudHlwZT09PSdzdG9yYWdlJyYmYWN0aXZlKHIpJiZyLmxldmVsPDMpLnNvcnQoKGEsYik9PmEubGV2ZWwtYi5sZXZlbHx8YS53aWR0aC1iLndpZHRoKVswXTsNCiAgICAgICAgaWYocm9vbSljYW5kaWRhdGVzLnB1c2godXBncmFkZShyb29tLHByaW9yaXR5KzEsc3RvcmFnZUdhaW4ocm9vbS53aWR0aCkpKTsNCiAgICAgICAgZm9yKGNvbnN0IGMgb2YgY2FuZGlkYXRlcy5zbGljZShzdGFydCkpYy5zdG9yYWdlRGVtYW5kPXN0b3JhZ2VEZW1hbmQ7DQogICAgICB9DQogICAgfQ0KICAgIGNvbnN0IGNvbXBhcmVQcm9qZWN0cz0oYSxiKT0+YS5wcmlvcml0eS1iLnByaW9yaXR5fHxhLmJsb2Nrcy5sZW5ndGgtYi5ibG9ja3MubGVuZ3RofHwNCiAgICAgIChhLmVjb25vbWljcyYmYi5lY29ub21pY3M/YS5lY29ub21pY3MucGF5YmFja0hvdXJzLWIuZWNvbm9taWNzLnBheWJhY2tIb3VyczowKXx8YS5jb3N0LnNjcmFwLWIuY29zdC5zY3JhcDsNCiAgICBjb25zdCBwb2xpY3k9Y2FtcGFpZ24/LmNvbnN0cnVjdGlvblBvbGljeSxtYXRlcmlhbD1jYW1wYWlnbj8ubWF0ZXJpYWxzOw0KICAgIGNvbnN0IHJldGFpbmVkRnVuZGluZz12YWxpZFNoZWx0ZXJNYXRlcmlhbHMobWF0ZXJpYWwpJiZtYXRlcmlhbC52YXVsdE5vPT09bS52aWV3LnZhdWx0Tm8mJm1hdGVyaWFsLmZpbmFsVGFyZ2V0PT09ZmluYWxMZXZlbCYmDQogICAgICBtYXRlcmlhbC50YXJnZXRMZXZlbD09PU1hdGgubWluKGZpbmFsTGV2ZWwsbS52aWV3LnByb2dyZXNzLmxldmVsKzEpJiZzLnJvb21zLnNvbWUocj0+ci5pZD09PW1hdGVyaWFsLmlkJiZyLnR5cGU9PT1tYXRlcmlhbC50eXBlJiZyLmxldmVsKzE9PT1tYXRlcmlhbC5sZXZlbCk7DQogICAgY29uc3QgZGV2ZWxvcGluZz13YW50ZWQ+ZnV0dXJlTW91dGhzfHxOdW1iZXIuaXNJbnRlZ2VyKGZpbmFsTGV2ZWwpJiZmaW5hbExldmVsPm0udmlldy5wcm9ncmVzcy5sZXZlbHx8Y2FtcGFpZ24/LnByb2plY3RzPy5sZW5ndGg7DQogICAgY29uc3QgY2FuRnVuZD1jPT4hT2JqZWN0LnZhbHVlcyhjLnNob3J0YWdlKS5zb21lKHg9Png+MCkmJighcG9saWN5fHwhcG9saWN5LnBlbmRpbmcmJnBvbGljeVtjLmtpbmRdJiYNCiAgICAgIFsnc2NyYXAnLCdwYXJ0cyddLmV2ZXJ5KGs9PmMuY29zdFtrXStwb2xpY3lbYCR7a31SZXNlcnZlYF08PXMucmVzb3VyY2VzW2tdJiYNCiAgICAgICAgYy5jb3N0W2tdKyhwb2xpY3kuc3BlbnQ/LltrXXx8MCk8PXBvbGljeVtgJHtrfUxpbWl0YF0pKTsNCiAgICBpZihkZXZlbG9waW5nJiYhc2hvcnRhZ2VzLmxlbmd0aCYmIXJldGFpbmVkRnVuZGluZyYmIWNhbXBhaWduPy5kZWZlbnNlPy5idXN5JiYNCiAgICAgICAgIWNvbnN0cnVjdGlvbi5zb21lKHI9PnIudHlwZT09PSdzY3JhcCcpJiYhcy5yb29tcy5zb21lKHI9PnIuaW5jaWRlbnR8fHIudW5wb3dlcmVkKSl7DQogICAgICBjb25zdCBpbnZlc3RtZW50cz1jYW5kaWRhdGVzLmZpbHRlcihjPT5jLnR5cGU9PT0nc2NyYXAnJiZbJ2J1aWxkJywndXBncmFkZSddLmluY2x1ZGVzKGMua2luZCkmJiFjLmJsb2Nrcy5sZW5ndGgmJg0KICAgICAgICBjLmVjb25vbWljcz8uZ2Fpbj4wJiZjLmVjb25vbWljcy5wYXliYWNrSG91cnM8PTI0JiZjYW5GdW5kKGMpKTsNCiAgICAgIGZvcihjb25zdCBjIG9mIGludmVzdG1lbnRzKXsNCiAgICAgICAgYy5wcmlvcml0eT1NYXRoLm1pbihjLnByaW9yaXR5LDIzLjUpO2Muc2NyYXBJbnZlc3RtZW50PXtob3Jpem9uSG91cnM6MjQscGF5YmFja0hvdXJzOmMuZWNvbm9taWNzLnBheWJhY2tIb3VycyxnYWluOmMuZWNvbm9taWNzLmdhaW59Ow0KICAgICAgICBjLmJlbmVmaXQrPSfvvJvlup/mlpnlj5HlsZXmipXotYTvvJrnjrDmnInkurrmiYvkuI7pooTnrpflj6/okL3lrp7jgIHkvLDorqEyNOWwj+aXtuWGheWbnuacrO+8jOWFiOS6juWPr+W7tuWQjueahOaOoumZqeS9jeS4i+aMluWSjOaZrumAmuetiee6p+aKleWFpe+8m+WfuuehgOS+m+W6lOOAgeW/heimgeW6iuS9jeOAgeW6k+WtmOWuuemHj+WPiuW3suehruiupOWkh+aWmeS7jeS8mOWFiCc7DQogICAgICB9DQogICAgICBpZihpbnZlc3RtZW50cy5sZW5ndGgpbm90ZXMucHVzaCgn5bqf5paZ5omp5Lqn5oyJ5a6e6ZmF5aKe5ZGY5oiW5bey5pyJ5bel5Lq65aKe5Lqn5q+U6L6D5Zue5pys77yb55+t5Zue5pys5LiU5b2T5YmN5Y+v5pSv5LuY55qE5bel56iL5o+Q6auY5LyY5YWI57qn77yM5ZCI5bm25LuF5aKe5Yqg5a656YeP77yM5LiN6aKd5aSW5o+Q6auY5q+P5Lq65pWI546H44CCJyk7DQogICAgfQ0KICAgIC8vIOadkOaWmeWHhuWkh+i3n+maj+acrOi9ruW7uuiuvuWPluiIje+8m+i/nOacn+aJqeWuueWSjOiiq+abtOS8mOaWsOW7uuabv+S7o+eahOWNh+e6p+S4jeaPkOWJjeinpuWPkeW3peWdiuOAgg0KICAgIGNvbnN0IHBhcnRzUmVzZXJ2ZT1jYW1wYWlnbj8ucGFydHNSZXNlcnZlfHwwOw0KICAgIGNvbnN0IHBhcnRzVXBncmFkZXM9Y2FuZGlkYXRlcy5maWx0ZXIoYz0+Yy5raW5kPT09J3VwZ3JhZGUnJiZmaXRzQ29tbWl0dGVkQ2FwYWNpdHkoYykmJmMuY29zdC5wYXJ0cz4wJiYNCiAgICAgIGMuY29zdC5wYXJ0cytwYXJ0c1Jlc2VydmU8PWNvbW1pdHRlZC5jYXBzLnBhcnRzJiZjLmNvc3QucGFydHMrcGFydHNSZXNlcnZlPnMucmVzb3VyY2VzLnBhcnRzKTsNCiAgICBjb25zdCBwYXJ0c0Nob2ljZXM9cGFydHNVcGdyYWRlcy5maWx0ZXIoYz0+Yy5wcmlvcml0eTw3MCYmIWNhbmRpZGF0ZXMuc29tZShvdGhlcj0+b3RoZXIudHlwZT09PWMudHlwZSYmDQogICAgICBvdGhlci5raW5kPT09J2J1aWxkJyYmIW90aGVyLmJsb2Nrcy5sZW5ndGgmJmNvbXBhcmVQcm9qZWN0cyhvdGhlcixjKTwwKSk7DQogICAgY29uc3QgcGFydHNTaG9ydGFnZXM9cGFydHNDaG9pY2VzLm1hcChjPT5jLmNvc3QucGFydHMrcGFydHNSZXNlcnZlLXMucmVzb3VyY2VzLnBhcnRzKTsNCiAgICBpZihwYXJ0c1Nob3J0YWdlcy5sZW5ndGg8cGFydHNVcGdyYWRlcy5sZW5ndGgpbm90ZXMucHVzaCgn5ZCO57ut5omp5a655oiW5pyq5LyY5YWI6YeH55So55qE5Y2H57qn5LuN5YiX5Ye65p2Q5paZ57y65Y+j77yM5pqC5LiN5Li66L+Z5Lqb5aSH6YCJ5pa55qGI5o+Q5YmN5a6J5o6S5bel5Z2K77yb5bu66K6+6aG65bqP5pS55Y+Y5ZCO5YaN6K+E5Lyw44CCJyk7DQogICAgaWYocGFydHNTaG9ydGFnZXMubGVuZ3RoKSB7DQogICAgICBjb25zdCBuZWVkZWQ9TWF0aC5taW4oLi4ucGFydHNTaG9ydGFnZXMpLGZlZWQ9NipuZWVkZWQsd29ya3Nob3BzPXMucm9vbXMuZmlsdGVyKHI9PnIudHlwZT09PSd3b3Jrc2hvcCcpOw0KICAgICAgbm90ZXMucHVzaChg5aSH6YCJ5Y2H57qn6Iez5bCR6L+Y57y6ICR7bmVlZGVkfSDpm7bku7bvvJvlhYjpgInlrprkuIDpobnvvIzlhbbku5bmlrnmoYjnmoTpm7bku7bpnIDmsYLkuI3ntK/liqDjgILlt6XlnYrmr4/nlJ/kuqcgMSDpm7bku7bmtojogJcgNiDlup/mlpnvvIzooaXotrPov5npg6jliIboh7PlsJHlj6blpJbmtojogJcgJHtmZWVkfSDlup/mlpnvvIzpobvkuI7ljYfnuqfjgIHlu7rpgKDotLnnlKjliIbliKvpooTnlZnjgIJgKTsNCiAgICAgIGlmKHMucmVzb3VyY2VzLnNjcmFwPGZlZWQpbm90ZXMucHVzaChg5LuF6L+Z6YOo5YiG6Zu25Lu255qE5L6b5paZ5bqf5paZ5LiN6Laz77yM5bCa5beuICR7TWF0aC5jZWlsKGZlZWQtcy5yZXNvdXJjZXMuc2NyYXApfe+8m+WFiOS/neivgeWfuuehgOS+m+W6lOWSjOWbnuaUtuWHgOS6p+mHj+OAgmApOw0KICAgICAgaWYobS5wcm9kdWN0aW9uLnBhcnRzPjApbm90ZXMucHVzaChg5b2T5YmN5bel5Z2K57qmICR7Zm10KG0ucHJvZHVjdGlvbi5wYXJ0cyl9IOmbtuS7ti/lsI/ml7bvvJvlnKjmjIHnu63kvpvmlpnlkozmlLblj5bjgIHkuqfph4/kuI3lj5jml7bvvIzooaXotrPoh7PlsJHnuqbpnIAgJHsobmVlZGVkL20ucHJvZHVjdGlvbi5wYXJ0cykudG9GaXhlZCgxKX0g5bCP5pe244CC5bey5pyJ5oi/6Ze05YWI57un57ut55Sf5Lqn77yM5LiN5Li66L+Z56yU6ZyA5rGC6YeN5aSN5bu66YCg44CCYCk7DQogICAgICBlbHNlIGlmKHdvcmtzaG9wcy5zb21lKHI9PnIuYnVpbHRBdD5ub3d8fHIudXBncmFkZUF0IT09bnVsbCkpbm90ZXMucHVzaCgn5bey5pyJ5bel5Z2K5q2j5Zyo5pa95bel5oiW5Y2H57qn77yM5YWI562J546w5pyJ5bel56iL5a6M5bel77yM5YaN5qC45a+55YC854+t5Lq65ZGY5ZKM5Lqn6YeP44CCJyk7DQogICAgICBlbHNlIGlmKHdvcmtzaG9wcy5zb21lKGFjdGl2ZSkpIHsNCiAgICAgICAgY29uc3QgdmFjYW5jaWVzPXZhY2FuY3koJ3dvcmtzaG9wJyk7DQogICAgICAgIC8vIOepuuWyl+S9jeS4jeaYr+eLrOeri+W3peeoi++8jOS4jeiDveS7heWHreWkh+mAieWNh+e6p+e8uuS7tuaKouWNoOacrOi9ruW7uuiuvumhuuW6j+OAgg0KICAgICAgICAvLyDnu7zlkIjosIPluqblnKjpgInlrprlrp7pmYXkuIvkuIDpobnlt6XnqIvlkI7vvIzlho3mjInlhbbpm7bku7bnvLrlj6PlronmjpLlt6XlnYrjgIINCiAgICAgICAgaWYodmFjYW5jaWVzKW5vdGVzLnB1c2goYOeOsOacieW3peWdiuaciSAke3ZhY2FuY2llc30g5Liq56m65bKX77yb5LuF5b2T5pys6L2u6YCJ5a6a5bel56iL6ZyA6KaB6Zu25Lu25pe25a6J5o6S5YC854+t77yM5LiN5Li65YW25LuW5aSH6YCJ5Y2H57qn5o+Q5YmN5oq96LCD5Lq65ZGY44CCYCk7DQogICAgICAgIGVsc2Ugbm90ZXMucHVzaCgn5bel5Z2K5bKX5L2N5LuN6KKr5aSW5Ye65oiQ5Lq65Y2g55So77yM562J5b6F5b2S5p2l5oiW5omL5Yqo6YeK5pS+5bKX5L2N5ZCO5YaN5qC45a+577yM5LiN5oqK5Y2g5L2N5b2T56m65bKX44CCJyk7DQogICAgICB9IGVsc2UgaWYod29ya3Nob3BzLmxlbmd0aClub3Rlcy5wdXNoKCflhYjmgaLlpI3njrDmnInlt6XlnYrnmoTkuovku7bmiJblgZznlLXvvIzlho3moLjlr7nkuqfph4/vvIzkuI3ph43lpI3lu7rpgKDjgIInKTsNCiAgICAgIGVsc2UgaWYoIWNhbXBhaWduPy5wcm9qZWN0cz8uc29tZShwPT5wLnR5cGU9PT0nd29ya3Nob3AnKSkgew0KICAgICAgICBjb25zdCBoeXBvdGhldGljYWw9e3R5cGU6J3dvcmtzaG9wJyx3aWR0aDoxLGxldmVsOjEsYnVpbHRBdDowLHVwZ3JhZGVBdDpudWxsLGluY2lkZW50Om51bGwsdW5wb3dlcmVkOmZhbHNlfTsNCiAgICAgICAgY29uc3QgZ2Fpbj1yZW1haW5pbmcubWFwKHA9PnNoZWx0ZXJXb3JrZXJSYXRlKHMsbm93LG0udmlldy5lbnYscCxoeXBvdGhldGljYWwpKS5zb3J0KChhLGIpPT5iLWEpLnNsaWNlKDAsMikucmVkdWNlKChuLHYpPT5uK3YsMCk7DQogICAgICAgIGJ1aWxkKCd3b3Jrc2hvcCcsMjUsZ2Fpbj4wP2DlronmjpLnjrDmnInpl7Lnva7miJDkurrlkI7nuqbkuqcgJHtmbXQoZ2Fpbil9IOmbtuS7ti/lsI/ml7bvvIzlkIzml7bmtojogJcgJHtmbXQoNipnYWluKX0g5bqf5paZL+Wwj+aXtu+8m+W8gOWQr+iHquWKqOWNh+e6p+WSjOS6uuWRmOeuoeeQhuWPr+aMiemcgOWAvOePrWA6DQogICAgICAgICAgJ+WFiOehruiupOaZuuWKm+mrmOeahOWAvOePreS6uumAieWSjOW6n+aWmeS+m+W6lO+8m+ayoeacieWPr+iHquWKqOWIsOWyl+S6uumAieaXtuaaguS4jeW7uuepuuW3peWdiicpOw0KICAgICAgfQ0KICAgIH0NCiAgICBjb25zdCBob21lSHVydD1saXZpbmcuZmlsdGVyKHA9PnsNCiAgICAgIGNvbnN0IGhlYWx0aD1wLmF3YXk9PT1udWxsP3NoZWx0ZXJIZWFsdGgocCk6bnVsbDsNCiAgICAgIHJldHVybiBoZWFsdGgmJmhlYWx0aC5ocDxoZWFsdGgubWF4Ow0KICAgIH0pOw0KICAgIGlmKGhvbWVIdXJ0Lmxlbmd0aCYmcy5yZXNvdXJjZXMuc3RpbXBhazwxJiYhY2FtcGFpZ24/LmVuYWJsZWQpIHsNCiAgICAgIGNvbnN0IG1lZGJheXM9cy5yb29tcy5maWx0ZXIocj0+ci50eXBlPT09J21lZGJheScpOw0KICAgICAgbm90ZXMucHVzaChg5Zyo5a62ICR7aG9tZUh1cnQubGVuZ3RofSDlkI3kvKTlkZjkuJTmsrvnlpfpkojkuI3otrMgMSDmlK/vvIzlhYjlh4blpIfljLvnlpfkvpvlupTvvJvljLvliqHlrqTmnInkurrlgLznj63ml7bkvKTlkZjmgaLlpI3mm7Tlv6vvvIzlspfkvY3lkozmsrvnlpfnlLHkvaDlronmjpLjgIJgKTsNCiAgICAgIGlmKG0ucm9vbXMuc29tZShyPT5yLnJlc291cmNlPT09J3N0aW1wYWsnJiZyLnN0b3JlZCsxZS05Pj1yLmJhdGNoKSkNCiAgICAgICAgbm90ZXMucHVzaCgn5Yy75Yqh5a6k5bey5a2Y5pW05om55rK755aX6ZKI77yM5YWI5Zue5oi/6Ze05qC45a+56aKG5Y+W54q25oCB77yM6aKG5Y+W5ZCO5YaN5qC45a+55bqT5a2Y5ZKM5Lyk5ZGY77yb5peg6ZyA5Li66L+Z5qyh57y66ZKI6YeN5aSN5bu66YCg44CCJyk7DQogICAgICBlbHNlIGlmKG0ucHJvZHVjdGlvbi5zdGltcGFrPjApDQogICAgICAgIG5vdGVzLnB1c2goYOW9k+WJjeWMu+WKoeWupOe6piAke2ZtdChtLnByb2R1Y3Rpb24uc3RpbXBhayl9IOayu+eWl+mSiC/lsI/ml7bvvIzlhYjnu7TmjIHnlJ/kuqflubbmjInmlbTmibnmlLblj5bvvJvmsrvnlpfmlYjmnpzlkozkvKTlkZjmgaLlpI3ml7bpl7Tku6XnvZHpobXkuLrlh4bvvIzkuI3ph43lpI3lu7rpgKDjgIJgKTsNCiAgICAgIGVsc2UgaWYobWVkYmF5cy5zb21lKGFjdGl2ZSkpIHsNCiAgICAgICAgY29uc3QgdmFjYW5jaWVzPXZhY2FuY3koJ21lZGJheScpOw0KICAgICAgICBpZih2YWNhbmNpZXMpYXNzZXNzKHtraW5kOidzdGFmZicsdHlwZTonbWVkYmF5Jyxwcmlvcml0eToxOCx0aXRsZTon5YWI6KGl546w5pyJ5Yy75Yqh5a6k5bKX5L2NJywNCiAgICAgICAgICBiZW5lZml0OmDlt7LmnIkgJHt2YWNhbmNpZXN9IOS4quepuuWyl++8jOWFiOivhOS8sOaZuuWKm+mrmOeahOWBpeW6t+aIkOS6uu+8jOS/neS9j+mjn+eJqeOAgeWHgOawtOWSjOeUteWKm+S+m+W6lO+8m+WMu+WKoeWupOS6uuWRmOeUseS9oOWuieaOkmAsYmxvY2tzOltdfSk7DQogICAgICAgIGVsc2Ugbm90ZXMucHVzaCgn5Yy75Yqh5a6k5bKX5L2N5LuN6KKr5aSW5Ye65oiQ5Lq65Y2g55So77yM562J5b6F5b2S5p2l5oiW5omL5Yqo6YeK5pS+5bKX5L2N5ZCO5YaN5qC45a+577yM5LiN5oqK5Y2g5L2N5b2T56m65bKX44CCJyk7DQogICAgICB9IGVsc2UgaWYobWVkYmF5cy5zb21lKHI9PnIuYnVpbHRBdD5ub3d8fHIudXBncmFkZUF0IT09bnVsbCkpDQogICAgICAgIG5vdGVzLnB1c2goJ+W3suacieWMu+WKoeWupOato+WcqOaWveW3peaIluWNh+e6p++8jOWFiOetieeOsOacieW3peeoi+WujOW3pe+8jOWGjeaguOWvueWAvOePreS6uuWRmOWSjOS6p+mHj+OAgicpOw0KICAgICAgZWxzZSBpZihtZWRiYXlzLmxlbmd0aClub3Rlcy5wdXNoKCflhYjmgaLlpI3njrDmnInljLvliqHlrqTnmoTkuovku7bmiJblgZznlLXvvIzlho3moLjlr7nkuqfph4/vvIzkuI3ph43lpI3lu7rpgKDjgIInKTsNCiAgICAgIGVsc2Ugew0KICAgICAgICBjb25zdCBoeXBvdGhldGljYWw9e3R5cGU6J21lZGJheScsd2lkdGg6MSxsZXZlbDoxLGJ1aWx0QXQ6MCx1cGdyYWRlQXQ6bnVsbCxpbmNpZGVudDpudWxsLHVucG93ZXJlZDpmYWxzZX07DQogICAgICAgIGNvbnN0IGdhaW49cmVtYWluaW5nLm1hcChwPT5zaGVsdGVyV29ya2VyUmF0ZShzLG5vdyxtLnZpZXcuZW52LHAsaHlwb3RoZXRpY2FsKSkuc29ydCgoYSxiKT0+Yi1hKS5zbGljZSgwLDIpLnJlZHVjZSgobix2KT0+bit2LDApOw0KICAgICAgICBidWlsZCgnbWVkYmF5JywxOCxnYWluPjA/YOWuieaOkueOsOaciemXsue9ruaIkOS6uuWQjue6puS6pyAke2ZtdChnYWluKX0g5rK755aX6ZKIL+Wwj+aXtu+8m+S6uuWRmOeUseS9oOWuieaOkmA6DQogICAgICAgICAgJ+WFiOehruiupOaZuuWKm+mrmOeahOWBpeW6t+WAvOePreS6uumAieW5tuS/neS9j+WfuuehgOS+m+W6lO+8m+epuuWMu+WKoeWupOS4jeS8mueUn+S6p+ayu+eWl+mSiO+8jOS6uuWRmOeUseS9oOWuieaOkicpOw0KICAgICAgfQ0KICAgIH0NCiAgICBmb3IoY29uc3QgcHJvamVjdCBvZiBjYW1wYWlnbj8ucHJvamVjdHN8fFtdKWlmKHByb2plY3QudHlwZSE9PSdlbGV2YXRvcicpew0KICAgICAgaWYocHJvamVjdC50eXBlPT09J3RyYWluaW5nJyYmcHJvamVjdC51cGdyYWRlSWQpew0KICAgICAgICBjb25zdCByb29tPXMucm9vbXMuZmluZChyPT5yLmlkPT09cHJvamVjdC51cGdyYWRlSWQmJnIudHlwZT09PSd0cmFpbmluZycmJnIudHJhaW5TdGF0PT09cHJvamVjdC50cmFpblN0YXQpOw0KICAgICAgICBjb25zdCBjYW5kaWRhdGU9cm9vbSYmdXBncmFkZShyb29tLHByb2plY3QucHJpb3JpdHkscHJvamVjdC5iZW5lZml0KTsNCiAgICAgICAgaWYoY2FuZGlkYXRlKWNhbmRpZGF0ZXMucHVzaCh7Li4uY2FuZGlkYXRlLHN0cmF0ZWd5OnByb2plY3QsdHJhaW5TdGF0OnByb2plY3QudHJhaW5TdGF0fSk7DQogICAgICAgIGNvbnRpbnVlOw0KICAgICAgfQ0KICAgICAgY29uc3QgcGVyc29uPXMucmVzaWRlbnRzLmZpbmQocD0+cC5pZD09PXByb2plY3QucGVyc29uKSxyb29tPXt0eXBlOnByb2plY3QudHlwZSx3aWR0aDoxLGxldmVsOjEsYnVpbHRBdDowLHVwZ3JhZGVBdDpudWxsLGluY2lkZW50Om51bGwsdW5wb3dlcmVkOmZhbHNlfTsNCiAgICAgIGJ1aWxkKHByb2plY3QudHlwZSxwcm9qZWN0LnByaW9yaXR5LHByb2plY3QuYmVuZWZpdCxwZXJzb24/c2hlbHRlcldvcmtlclJhdGUocyxub3csbS52aWV3LmVudixwZXJzb24scm9vbSk6MCxwcm9qZWN0KTsNCiAgICB9DQogICAgY29uc3QgbGV2ZWxQcm9ncmVzcz1zaGVsdGVyTGV2ZWxQcm9ncmVzcyhtKSxyb3V0ZXM9W107bGV0IGxldmVsU2VhcmNoPW51bGw7DQogICAgY29uc3QgaW52ZXN0bWVudFN0YWdlUmVhZHk9bGV2ZWxQcm9ncmVzcyYmTnVtYmVyLmlzSW50ZWdlcihmaW5hbExldmVsKSYmZmluYWxMZXZlbD5sZXZlbFByb2dyZXNzLmxldmVsJiYNCiAgICAgIHJlcXVlc3RlZFRhcmdldCE9PW51bGwmJnBvcHVsYXRpb24+PXJlcXVlc3RlZFRhcmdldCYmIXJlY292ZXJpbmcmJiFzLmJpcnRocy5sZW5ndGgmJiFwYWlycy5zaXplJiYNCiAgICAgICFsaXZpbmcuc29tZShwPT5wLmFkdWx0QXQ+bm93KSYmIWNhbXBhaWduPy51bmVtcGxveWVkUmVzaWRlbnRzPy5sZW5ndGgmJiFjYW1wYWlnbj8ucmVzdGluZ1Jlc2lkZW50cz8ubGVuZ3RoOw0KICAgIGNvbnN0IGludmVzdG1lbnRSZWFkeT1pbnZlc3RtZW50U3RhZ2VSZWFkeSYmIWNhbXBhaWduPy5sZXZlbEludmVzdG1lbnRIZWxkOw0KICAgIGNvbnN0IHJldGFpbmVkSW52ZXN0bWVudD1yPT5pbnZlc3RtZW50U3RhZ2VSZWFkeSYmY2FtcGFpZ24/LmxldmVsSW52ZXN0bWVudFN3YXAmJnZhbGlkU2hlbHRlck1hdGVyaWFscyhjYW1wYWlnbi5tYXRlcmlhbHMpJiYNCiAgICAgIGNhbXBhaWduLm1hdGVyaWFscy52YXVsdE5vPT09bS52aWV3LnZhdWx0Tm8mJmNhbXBhaWduLm1hdGVyaWFscy5maW5hbFRhcmdldD09PWZpbmFsTGV2ZWwmJg0KICAgICAgY2FtcGFpZ24ubWF0ZXJpYWxzLnRhcmdldExldmVsPT09TWF0aC5taW4oZmluYWxMZXZlbCxsZXZlbFByb2dyZXNzLmxldmVsKzEpJiZjYW1wYWlnbi5tYXRlcmlhbHMuaWQ9PT1yLmlkJiYNCiAgICAgIGNhbXBhaWduLm1hdGVyaWFscy50eXBlPT09ci50eXBlJiZjYW1wYWlnbi5tYXRlcmlhbHMubGV2ZWw9PT1yLmxldmVsKzE7DQogICAgY29uc3QgY2FuSW52ZXN0PXI9PihpbnZlc3RtZW50UmVhZHl8fHJldGFpbmVkSW52ZXN0bWVudChyKSkmJlsncXVhcnRlcnMnLCdzdG9yYWdlJ10uaW5jbHVkZXMoci50eXBlKSYmDQogICAgICAhbGl2aW5nLnNvbWUocD0+cC5yb29tSWQ9PT1yLmlkKSYmIXMuYmlydGhzLnNvbWUoYj0+Yi5yb29tSWQ9PT1yLmlkKTsNCiAgICAvLyDkv53nlZnlt7LmnInkvY7miJDmnKzkuoznuqfljYfnuqfkvJjlhYjvvJvlj6rliankuInnuqfmipXlhaXml7bvvIzmiornjrDmiJDnqbrkvY3nmoTpm7bku7bpm7bmtojogJfmlrnmoYjnurPlhaXlkIzkuIDmnaHot6/nur/mr5TovoPjgIINCiAgICAvLyDkuI3kuLrov5npobnmr5TovoPmj5DliY3kuIvmjJbvvIzkuI3mkqTplIDlt7Lnu4/noa7orqTnmoTlpIfmlpnvvIzkuZ/kuI3mjKTljaDkurrlj6PjgIHkvpvlupTmiJbmjqXmm7/lu7rorr7jgIINCiAgICBpZihpbnZlc3RtZW50UmVhZHkmJmxldmVsUHJvZ3Jlc3MuY29tbWl0dGVkPGxldmVsUHJvZ3Jlc3MubmV4dCYmc3BvdHMubGVuZ3RoJiYhY29uc3RydWN0aW9uLmxlbmd0aCYmIXMuZGlnZ2luZyYmDQogICAgICAgICFzaG9ydGFnZXMubGVuZ3RoJiYhcmV0YWluZWRGdW5kaW5nJiYhY2FtcGFpZ24/LndvcmtzaG9wV29ya2Vycz8ubGVuZ3RoJiYhY2FtcGFpZ24/LnBvcHVsYXRpb25GYW1pbHlTdXBwbHkmJg0KICAgICAgICAhcy5yb29tcy5zb21lKHI9PnIuaW5jaWRlbnR8fHIudW5wb3dlcmVkKSYmDQogICAgICAgIGJ1aWx0LnNvbWUocj0+YWN0aXZlKHIpJiZyLmxldmVsPT09MiYmY2FuSW52ZXN0KHIpKSYmDQogICAgICAgICFidWlsdC5zb21lKHI9PnNoZWx0ZXJCdWlsZFJ1bGVzW3IudHlwZV0mJmFjdGl2ZShyKSYmci5sZXZlbD09PTEmJihjYW5JbnZlc3Qocil8fHByb2R1Y3RpdmVVcGdyYWRlKHIpKSkmJg0KICAgICAgICAhYnVpbGRSZXF1ZXN0cy5zb21lKGM9PmMucHJpb3JpdHk8MjgpJiYhY2FuZGlkYXRlcy5zb21lKGM9PmMucHJpb3JpdHk8MjgpKXsNCiAgICAgIGNvbnN0IHN0YXJ0PWNhbmRpZGF0ZXMubGVuZ3RoOw0KICAgICAgYnVpbGQoJ3N0b3JhZ2UnLDI4LCfku4XlianpnIDpm7bku7bnmoTkuInnuqfnrYnnuqfmipXlhaXvvIzmr5TovoPnjrDmnInnqbrkvY3mlrDku5PlupPvvJrlop7liqAx562J57qn5YiG5LiO5a656YeP77yM5LiN5YGc5Lqn44CB5LiN5raI6ICX6Zu25Lu277yb5LiN6aKE5pSv5paw5qW85bGCJyk7DQogICAgICBmb3IoY29uc3QgYyBvZiBjYW5kaWRhdGVzLnNsaWNlKHN0YXJ0KSljLmxldmVsSW52ZXN0bWVudD10cnVlOw0KICAgIH0NCiAgICAvLyDlhYjnlKjlt7LmnInlronlhajmiL/pl7TvvJvlhajpg6jljYfmu6HlkI7mjInmmI7noa7nrYnnuqfnm67moIfooaXku5PlupPvvIzkuI3lho3nrYnliLA5MCXmu6Hku5PmiY3nu6fnu63lj5HlsZXjgIINCiAgICAvLyDljp/nlJ/kuqcv5Lq65Y+jL+WuuemHj+mcgOaxguOAgeWcqOmAlOWIhuaVsOWPiuaWveW3peS7jeS8mOWFiO+8m+aWsOS7k+W6k+WPquWinuWKoOWuuemHj+S4juetiee6p+WIhuOAgg0KICAgIGlmKGludmVzdG1lbnRSZWFkeSYmbGV2ZWxQcm9ncmVzcy5jb21taXR0ZWQ8bGV2ZWxQcm9ncmVzcy5uZXh0JiYhY29uc3RydWN0aW9uLmxlbmd0aCYmIXMuZGlnZ2luZyYmDQogICAgICAgICFzLnJvb21zLnNvbWUocj0+ci5pbmNpZGVudHx8ci51bnBvd2VyZWQpJiYNCiAgICAgICAgIWJ1aWx0LnNvbWUocj0+c2hlbHRlckJ1aWxkUnVsZXNbci50eXBlXSYmYWN0aXZlKHIpJiZyLmxldmVsPDMmJihjYW5JbnZlc3Qocil8fHByb2R1Y3RpdmVVcGdyYWRlKHIpKSkmJg0KICAgICAgICAhY2FuZGlkYXRlcy5zb21lKGM9PmMucHJpb3JpdHk8NzApJiYhYnVpbGRSZXF1ZXN0cy5zb21lKGM9PmMucHJpb3JpdHk8NzApKXsNCiAgICAgIGNvbnN0IHN0YXJ0PWNhbmRpZGF0ZXMubGVuZ3RoOw0KICAgICAgYnVpbGQoJ3N0b3JhZ2UnLDI4LCflt7LmnInlj6/lronlhajljYfnuqfmiL/pl7Tlt7LnlKjlsL3vvIzmjInnrYnnuqfnm67moIfmipXotYTkuIDmoLzku5PlupPvvIzlop7liqAx562J57qn5YiG5Y+K5a656YeP77yM5LiN5aKe5Yqg55Sf5LqnJyk7DQogICAgICBidWlsZFJlcXVlc3RzLmF0KC0xKS5sZXZlbEludmVzdG1lbnQ9dHJ1ZTsNCiAgICAgIGZvcihjb25zdCBjIG9mIGNhbmRpZGF0ZXMuc2xpY2Uoc3RhcnQpKWMubGV2ZWxJbnZlc3RtZW50PXRydWU7DQogICAgfQ0KICAgIGlmKE51bWJlci5pc0ludGVnZXIocy5kZXB0aCkmJnMuZGVwdGg+PTEmJnMuZGVwdGg8PTEwMDApIHsNCiAgICAgIGNvbnN0IGNvc3Q9TWF0aC5jZWlsKDEyMCpNYXRoLnBvdyhzLmRlcHRoKzEsMS40KSk7DQogICAgICBpZihzLmRpZ2dpbmcmJk51bWJlci5pc0Zpbml0ZShzLmRpZ2dpbmcuZG9uZUF0KSlub3Rlcy5wdXNoKGDmraPlnKjkuIvmjJbvvIznuqYgJHtNYXRoLm1heCgwLE1hdGguY2VpbCgocy5kaWdnaW5nLmRvbmVBdC1ub3cpLzYwMDAwKSl9IOWIhumSn+WQjuWujOaIkO+8jOWFiOetieeOsOacieW3peeoi+OAgmApOw0KICAgICAgZWxzZSBpZihzLmRpZ2dpbmc9PT1udWxsJiZsYXlvdXQmJiFzcG90cy5sZW5ndGgpIHsNCiAgICAgICAgLy8g5pmu6YCa55Sf5Lqn55qE5paw5bu66ZyA5rGC5bey5omj6Zmk5Zyo5bu65bKX5L2NL+S6p+iDve+8m+S7jeaciemcgOaxguaXtuS4jeiDveWGjeWboOWQjOexu+aWveW3peS4gOamgui3s+i/h+OAgg0KICAgICAgICBjb25zdCBuZWVkcz1idWlsZFJlcXVlc3RzLmZpbHRlcihyZXF1ZXN0PT4oWydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddLmluY2x1ZGVzKHJlcXVlc3QudHlwZSl8fCFjb25zdHJ1Y3Rpb24uc29tZShyPT5yLnR5cGU9PT1yZXF1ZXN0LnR5cGUpKSYmDQogICAgICAgICAgIWNhbmRpZGF0ZXMuc29tZShjPT5jLnR5cGU9PT1yZXF1ZXN0LnR5cGUmJihjLmtpbmQ9PT0nc3RhZmYnfHwhcmVxdWVzdC5lbXBsb3ltZW50JiZjLmtpbmQ9PT0ndXBncmFkZScmJmZpdHNDb21taXR0ZWRDYXBhY2l0eShjKSkpKQ0KICAgICAgICAgIC5zb3J0KChhLGIpPT5hLnByaW9yaXR5LWIucHJpb3JpdHl8fGEuY29zdC5zY3JhcC1iLmNvc3Quc2NyYXApOw0KICAgICAgICBpZihuZWVkcy5sZW5ndGgpIHsNCiAgICAgICAgICBjb25zdCByZXF1ZXN0PW5lZWRzWzBdOw0KICAgICAgICAgIGFzc2Vzcyh7a2luZDonZGlnJyx0eXBlOidlbGV2YXRvcicsZmxvb3I6cy5kZXB0aCsxLHB1cnBvc2U6e3R5cGU6cmVxdWVzdC50eXBlLGdhaW46cmVxdWVzdC5nYWlufSxzdHJhdGVneTpyZXF1ZXN0LnN0cmF0ZWd5LA0KICAgICAgICAgICAgLi4uKHJlcXVlc3QuZW1wbG95bWVudD97ZW1wbG95bWVudDp0cnVlfTp7fSksDQogICAgICAgICAgICAuLi4ocmVxdWVzdC5sZXZlbEludmVzdG1lbnQ/e2xldmVsSW52ZXN0bWVudDp0cnVlfTp7fSkscHJpb3JpdHk6cmVxdWVzdC5wcmlvcml0eT49NzA/cmVxdWVzdC5wcmlvcml0eTpNYXRoLm1heCgwLHJlcXVlc3QucHJpb3JpdHktMSksDQogICAgICAgICAgICB0aXRsZTpg5ZCR5LiL5omp6Iez56ysICR7cy5kZXB0aCsxfSDlsYLvvIzkuLoke3JlcXVlc3QubGFiZWx96IW+5Ye656m66Ze0YCxjb3N0OntzY3JhcDpjb3N0LHBhcnRzOjB9LA0KICAgICAgICAgICAgYmVuZWZpdDpg546w5pyJ5qW85bGC5rKh5pyJ56m65L2N77yM5Lmf5rKh5pyJ5Y+v5YWI6KGl5ZGY55qE5ZCM57G756m65bKX5oiW5bqT5a2Y5a656YeP6Laz5aSf55qE5ZCM57G75Y2H57qn5pa55qGI77yb5LiL5oyW5ZCO5YaN5bu65LiA5qC8JHtyZXF1ZXN0LmxhYmVsfemcgCAke3JlcXVlc3QuY29zdC5zY3JhcH0g5bqf5paZ77yMYCsNCiAgICAgICAgICAgICAgYOS4pOmhueWQiOiuoSAke2Nvc3QrcmVxdWVzdC5jb3N0LnNjcmFwfSDlup/mlpnvvIzlj6/liIbpmLbmrrXnp6/mlJLvvJvkuIvmjJbmnKzouqvkuI3lop7liqDkuqfph4/vvIzlt6XmnJ/ku6XnvZHnq5nnoa7orqTkuLrlh4ZgLA0KICAgICAgICAgICAgYmxvY2tzOnJlcXVlc3QuYmxvY2tzLm1hcChtZXNzYWdlPT5g55uu5qCHJHtyZXF1ZXN0LmxhYmVsfe+8miR7bWVzc2FnZX1gKX0pOw0KICAgICAgICB9IGVsc2Ugbm90ZXMucHVzaChidWlsZFJlcXVlc3RzLmxlbmd0aD8n5YWI5Yip55So546w5pyJ5oi/6Ze06KGl5ZGY44CB5Y2H57qn5oiW562J5b6F5ZCM57G75bel56iL5a6M5bel77yM5pqC5LiN5LiL5oyW77yb5a6M5oiQ5ZCO6YeN5paw5qOA5p+l5a656YeP5ZKM5bKX5L2N44CCJzoNCiAgICAgICAgICAn5b2T5YmN5rKh5pyJ5b+F6aG75paw5aKe55qE5oi/6Ze077yM5Y2z5L2/5qW85bGC5bey5ruh5Lmf5pqC5LiN5LiL5oyW77yb6ZyA6KaB5paw5bKX5L2N5oiW5a656YeP5pe25YaN6K+E5Lyw44CCJyk7DQogICAgICB9DQogICAgICBlbHNlIGlmKGxheW91dCYmc3BvdHMubGVuZ3RoJiYhY2FtcGFpZ24/LnByb2plY3RzLnNvbWUocD0+cC50eXBlPT09J2VsZXZhdG9yJykpbm90ZXMucHVzaChg5LiL5oyW5LiA5bGC6ZyAICR7Y29zdH0g5bqf5paZ77yb55uu5YmN5pyJ56m65L2N77yM5pqC57yT6L+Z6aG55byA5pSv44CCYCk7DQogICAgICBjb25zdCBtaWxlc3RvbmU9Y2FtcGFpZ24/LnByb2plY3RzLmZpbmQocD0+cC50eXBlPT09J2VsZXZhdG9yJyk7DQogICAgICBpZihtaWxlc3RvbmUmJmxheW91dCYmcy5kaWdnaW5nPT09bnVsbClhc3Nlc3Moe2tpbmQ6J2RpZycsdHlwZTonZWxldmF0b3InLGZsb29yOnMuZGVwdGgrMSxzdHJhdGVneTptaWxlc3RvbmUscHJpb3JpdHk6bWlsZXN0b25lLnByaW9yaXR5LA0KICAgICAgICB0aXRsZTpg5ZCR5LiL5omp6Iez56ysICR7cy5kZXB0aCsxfSDlsYLvvIzmjqjov5vnrKwgJHttaWxlc3RvbmUubWlsZXN0b25lfSDlsYIke21pbGVzdG9uZS5wdXJwb3NlPT09J3JlZ2lvbic/J+WMuuWfn+ino+mUgSc6J+aOoumZqeS9jSd9YCxjb3N0OntzY3JhcDpjb3N0LHBhcnRzOjB9LA0KICAgICAgICBiZW5lZml0Om1pbGVzdG9uZS5iZW5lZml0LGJsb2NrczpbXX0pOw0KICAgIH0NCiAgICBsZXQgbGV2ZWxXYWl0aW5nPWZhbHNlLHJldGFpbmVkTWF0ZXJpYWxzPWZhbHNlLHJldGFpbmVkUHJvamVjdD1udWxsOw0KICAgIGlmKGxldmVsUHJvZ3Jlc3Mpew0KICAgICAgaWYoY29udGludW91c0xldmVsKWxldmVsUHJvZ3Jlc3MuY29udGludW91cz10cnVlOw0KICAgICAgY29uc3QgcHVyc3Vpbmc9TnVtYmVyLmlzSW50ZWdlcihmaW5hbExldmVsKSYmZmluYWxMZXZlbD5sZXZlbFByb2dyZXNzLmxldmVsOw0KICAgICAgaWYoTnVtYmVyLmlzSW50ZWdlcihmaW5hbExldmVsKSlsZXZlbFByb2dyZXNzLmZpbmFsVGFyZ2V0PWZpbmFsTGV2ZWw7DQogICAgICBub3Rlcy5wdXNoKGDpgb/pmr7miYAgJHtsZXZlbFByb2dyZXNzLmxldmVsfSDnuqfvvIznrYnnuqfliIYgJHtsZXZlbFByb2dyZXNzLnNjb3JlfS8ke2xldmVsUHJvZ3Jlc3MubmV4dH3vvIzlt64gJHtsZXZlbFByb2dyZXNzLnJlbWFpbmluZ30g5YiG77yb5bGF5rCR5q+P5Lq6MuWIhuOAgemdnuWkp+mXqC/nlLXmoq/miL/pl7Tmr4/moLzmr4/nuqcx5YiG44CB5q+P5bGC5rex5bqmM+WIhuOAguWxheawkee7j+mqjOS4jeWinuWKoOmBv+mavuaJgOetiee6p+WIhuOAgmApOw0KICAgICAgY29uc3QgbG9ja2VkUmVxdWVzdD1idWlsZFJlcXVlc3RzLmZpbHRlcihyPT5yLnByaW9yaXR5PDcwJiZzaGVsdGVyQnVpbGRSdWxlc1tyLnR5cGVdWzJdPmxldmVsUHJvZ3Jlc3MubGV2ZWwpDQogICAgICAgIC5zb3J0KChhLGIpPT5hLnByaW9yaXR5LWIucHJpb3JpdHl8fHNoZWx0ZXJCdWlsZFJ1bGVzW2EudHlwZV1bMl0tc2hlbHRlckJ1aWxkUnVsZXNbYi50eXBlXVsyXSlbMF07DQogICAgICBjb25zdCBsb2NrZWQ9bG9ja2VkUmVxdWVzdHx8IChwdXJzdWluZz97bGFiZWw6J+aMgee7reWPkeWxlScscHJpb3JpdHk6Mjh9Om51bGwpOw0KICAgICAgaWYobG9ja2VkKXsNCiAgICAgICAgY29uc3QgdGFyZ2V0TGV2ZWw9cHVyc3Vpbmc/TWF0aC5taW4oZmluYWxMZXZlbCxsZXZlbFByb2dyZXNzLmxldmVsKzEpOnNoZWx0ZXJCdWlsZFJ1bGVzW2xvY2tlZC50eXBlXVsyXSx0YXJnZXRTY29yZT0zMCtNYXRoLmNlaWwoMi4yNSoodGFyZ2V0TGV2ZWwtMSkqKjIpOw0KICAgICAgICBjb25zdCBnYXA9TWF0aC5tYXgoMCx0YXJnZXRTY29yZS1sZXZlbFByb2dyZXNzLmNvbW1pdHRlZCk7DQogICAgICAgIGxldmVsUHJvZ3Jlc3MudGFyZ2V0TGV2ZWw9dGFyZ2V0TGV2ZWw7bGV2ZWxQcm9ncmVzcy50YXJnZXRTY29yZT10YXJnZXRTY29yZTsNCiAgICAgICAgaWYocHVyc3Vpbmcpbm90ZXMucHVzaChg5oyB57ut55uu5qCHICR7ZmluYWxMZXZlbH0g57qn77yb5pys6Zi25q61ICR7bGV2ZWxQcm9ncmVzcy5sZXZlbH3ihpIke3RhcmdldExldmVsfe+8jOWujOaIkOWQjuiHquWKqOmHjeeul+S4i+S4gOmYtuaute+8jOS4jeaPkOmrmOW3suiuvue9rueahOS6uuWPo+S4iumZkOOAgmApOw0KICAgICAgICBpZighZ2FwKXsNCiAgICAgICAgICBsZXZlbFdhaXRpbmc9dHJ1ZTtub3Rlcy5wdXNoKGDnjrDmnInlvoXkuqflkozlt7LlvIDlt6Xlt6XnqIvlrozmiJDlkI7pooTorqHovr7liLAgJHtsZXZlbFByb2dyZXNzLmNvbW1pdHRlZH0g5YiG77yM5Y+v6L6+5YiwJHt0YXJnZXRMZXZlbH3nuqfvvJvnrYnlvoXnu5PmnpzvvIzkuI3ph43lpI3kuLrnrYnnuqfmtojotLnjgIJgKTsNCiAgICAgICAgICBsZXQgc2NvcmU9bGV2ZWxQcm9ncmVzcy5zY29yZTsNCiAgICAgICAgICBmb3IoY29uc3QgZSBvZiBzaGVsdGVyTGV2ZWxFdmVudHMobSkpew0KICAgICAgICAgICAgc2NvcmUrPWUuZ2FpbjtpZihzY29yZTx0YXJnZXRTY29yZSljb250aW51ZTsNCiAgICAgICAgICAgIGNvbnN0IGF0PU1hdGgubWF4KG5vdyxlLmF0KTsNCiAgICAgICAgICAgIHJvdXRlcy5wdXNoKHtraW5kOid3YWl0JyxzY29yZSxob3VyczooYXQtbm93KS8zNjAwMDAwLHN0ZXBzOltdLGNvbXBsZXRlOnRydWV9KTsNCiAgICAgICAgICAgIG5vdGVzLnB1c2goYOaMieW3suefpeWujOW3peWPiuWHuueUn+aXtumXtO+8jOmihOiuoSAke25ldyBEYXRlKGF0KS50b0xvY2FsZVN0cmluZygnemgtQ04nLHt0aW1lWm9uZTonQXNpYS9TaGFuZ2hhaScsaG91cjEyOmZhbHNlfSl9IOWQjuaguOWvuSR7dGFyZ2V0TGV2ZWx957qn77yb5LiN5b+F562J5b6F5peg5YWz55qE6L6D5pma5bel56iL77yM5a6e6ZmF5Lul572R6aG157uT566X5Li65YeG44CCYCk7DQogICAgICAgICAgICBicmVhazsNCiAgICAgICAgICB9DQogICAgICAgIH0NCiAgICAgICAgZWxzZSBpZihsYXlvdXQmJiFzLnJvb21zLnNvbWUocj0+ci5pbmNpZGVudCkpew0KICAgICAgICAgIGNvbnN0IG9wdGlvbnM9W10sbWF0ZXJpYWw9Y2FtcGFpZ24/Lm1hdGVyaWFsczsNCiAgICAgICAgICBjb25zdCBtYXRlcmlhbEN1cnJlbnQ9bWF0ZXJpYWwmJnZhbGlkU2hlbHRlck1hdGVyaWFscyhtYXRlcmlhbCkmJm1hdGVyaWFsLnZhdWx0Tm89PT1tLnZpZXcudmF1bHRObyYmDQogICAgICAgICAgICBtYXRlcmlhbC5maW5hbFRhcmdldD09PWZpbmFsTGV2ZWwmJm1hdGVyaWFsLnRhcmdldExldmVsPT09dGFyZ2V0TGV2ZWw7DQogICAgICAgICAgY29uc3QgbWF0ZXJpYWxQcm9qZWN0PWM9Pm1hdGVyaWFsQ3VycmVudCYmYy5raW5kPT09J3VwZ3JhZGUnJiZjLmlkPT09bWF0ZXJpYWwuaWQmJmMudHlwZT09PW1hdGVyaWFsLnR5cGUmJg0KICAgICAgICAgICAgYy5sZXZlbD09PW1hdGVyaWFsLmxldmVsJiZjLmNvc3QucGFydHM+MDsNCiAgICAgICAgICAvLyDkurrlj6PpmLbmrrXlj4rmiJDlubTlsLHkuJrlrozmiJDlkI7vvIzlhYHorrjlnKjljp/pooTnrpflhoXkuLrnrYnnuqfljYfnuqflt7LmnInnqbrlrrnph4/miL/jgIINCiAgICAgICAgICAvLyDkuI3mlrDlu7rnqbrmiL/lh5HliIbvvIzkuI3mjKrotbDkvY/miLfvvJvnlJ/ogrLjgIHmgaLlpI3jgIHmjaLkvY3lkozln7rnoYDkvpvlupTku43lhYjlpITnkIbjgIINCiAgICAgICAgICBmb3IoY29uc3QgciBvZiBidWlsdC5maWx0ZXIocj0+c2hlbHRlckJ1aWxkUnVsZXNbci50eXBlXSYmYWN0aXZlKHIpJiZyLmxldmVsPDMpKXsNCiAgICAgICAgICAgIGNvbnN0IGludmVzdG1lbnQ9Y2FuSW52ZXN0KHIpLHByb2R1Y3Rpb249c2hlbHRlclJvb21zW3IudHlwZV1bMV07DQogICAgICAgICAgICBjb25zdCBpbmhlcml0ZWQ9Wydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddLmluY2x1ZGVzKHIudHlwZSkmJm1hdGVyaWFsQ3VycmVudCYmDQogICAgICAgICAgICAgIG1hdGVyaWFsLmlkPT09ci5pZCYmbWF0ZXJpYWwudHlwZT09PXIudHlwZSYmbWF0ZXJpYWwubGV2ZWw9PT1yLmxldmVsKzE7DQogICAgICAgICAgICBpZighaW52ZXN0bWVudCYmKCFwcm9kdWN0aW9ufHwhcHJvZHVjdGl2ZVVwZ3JhZGUocikpJiYhaW5oZXJpdGVkKWNvbnRpbnVlOw0KICAgICAgICAgICAgY29uc3QgYz11cGdyYWRlKHIsTWF0aC5tYXgoNixsb2NrZWQucHJpb3JpdHktLjUpLGludmVzdG1lbnQ/DQogICAgICAgICAgICAgIGDkurrlj6PpmLbmrrXlrozmiJDvvIzmipXlhaXlt7LmnInnqboke2xhYmVscyhyLnR5cGUpfeWNh+e6p++8jOWinuWKoCAke3Iud2lkdGh9IOetiee6p+WIhuS4juWuuemHj++8m+S4jeWinuWKoOS6p+WHuuaIluWKoOW/q+eUn+iCsmA6DQogICAgICAgICAgICAgIGDlop7liqAgJHtyLndpZHRofSDnrYnnuqfliIbvvIzlubbmj5Dpq5jlt7LmnInlnKjlspfkurrlkZjkuqfog73vvIzmjqjov5ske3RhcmdldExldmVsfee6pyR7bG9ja2VkLmxhYmVsfeino+mUgWApOw0KICAgICAgICAgICAgaWYoaW5oZXJpdGVkJiZbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ10uaW5jbHVkZXMoci50eXBlKSYmIXByb2R1Y3RpdmVVcGdyYWRlKHIpKXsNCiAgICAgICAgICAgICAgYy5yZXF1aXJlc1N0YWZmPXRydWU7Yy5ibG9ja3MucHVzaCgn5Y6f5bel56iL5pqC5peg5Zyo5bKX55Sf5Lqn6ICF77yM5YWI6KGl5ZGY5ZCO6YeN5paw5qC45a+5Jyk7DQogICAgICAgICAgICAgIGMuYmVuZWZpdD0n5bey56Gu6K6k5Y6f5bel56iL6ZyA6KaB5YWI5oGi5aSN55yf5a6e55Sf5Lqn6ICF77yb6KGl5ZGY5YmN5LiN6K6h5pyq5p2l5aKe5Lqn77yM5Lmf5LiN5byA5belJzsNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIC8vIOaNouS9jeWPquaaguWBnOWOn+W3peeoi+W8gOW3pe+8jOS4jeaSpOmUgOW3sue7j+ehruiupOeahOWkh+aWme+8m+S4jeW+l+WAn+atpOW8gOWni+WPpuS4gOmhueetiee6p+aKlei1hOOAgg0KICAgICAgICAgICAgaWYoaW52ZXN0bWVudCYmIWludmVzdG1lbnRSZWFkeSljLmJsb2Nrcy5wdXNoKCflhYjlrozmiJDlt7Lnoa7orqTnmoTkurrlkZjmjaLkvY0nKTsNCiAgICAgICAgICAgIC8vIOW3suehruiupOWOn+W3peeoi+WPr+etieW+heS+m+eUtS/mlr3lt6XlkI3pop3vvJvkuI3og73mmoLml7bov4fmu6TlroPvvIzooaXnlLXlkI7lj4jmiorlpIfpgInmm7/mjaLlm57mnaXjgIINCiAgICAgICAgICAgIGlmKCFjLmJsb2Nrcy5sZW5ndGh8fGludmVzdG1lbnR8fG1hdGVyaWFsUHJvamVjdChjKSYmYy5ibG9ja3MuZXZlcnkocmVhc29uPT4NCiAgICAgICAgICAgICAgICBbJ+aJqeW7uuWQjueUteWKm+S9memHj+S4jei2s++8jOWFiOihpeWPkeeUtScsJ+WFiOetieS4gOS4quaWveW3peWQjemineepuuWHuicsJ+WOn+W3peeoi+aaguaXoOWcqOWyl+eUn+S6p+iAhe+8jOWFiOihpeWRmOWQjumHjeaWsOaguOWvuSddLmluY2x1ZGVzKHJlYXNvbikpKQ0KICAgICAgICAgICAgICBvcHRpb25zLnB1c2goey4uLmMsbGV2ZWxHYWluOnIud2lkdGgsLi4uKGludmVzdG1lbnQ/e2xldmVsSW52ZXN0bWVudDp0cnVlfTp7fSl9KTsNCiAgICAgICAgICB9DQogICAgICAgICAgZm9yKGNvbnN0IGMgb2YgY2FuZGlkYXRlcy5maWx0ZXIoYz0+WydidWlsZCcsJ3VwZ3JhZGUnLCdkaWcnXS5pbmNsdWRlcyhjLmtpbmQpJiYhYy5ibG9ja3MubGVuZ3RoJiZjLnByaW9yaXR5PDcwKSl7DQogICAgICAgICAgICBjb25zdCBnYWluPWMua2luZD09PSdkaWcnPzM6Yy5raW5kPT09J2J1aWxkJz8xOnMucm9vbXMuZmluZChyPT5yLmlkPT09Yy5pZCk/LndpZHRoOw0KICAgICAgICAgICAgY29uc3QgaW52ZXN0bWVudD1jLmxldmVsSW52ZXN0bWVudHx8Yy5raW5kPT09J3VwZ3JhZGUnJiZjYW5JbnZlc3Qocy5yb29tcy5maW5kKHI9PnIuaWQ9PT1jLmlkKSk7DQogICAgICAgICAgICBpZihnYWluKW9wdGlvbnMucHVzaCh7Li4uYyxsZXZlbEdhaW46Z2FpbiwuLi4oaW52ZXN0bWVudD97bGV2ZWxJbnZlc3RtZW50OnRydWV9Ont9KX0pOw0KICAgICAgICAgIH0NCiAgICAgICAgICBjb25zdCByZXRhaW5lZD1vcHRpb25zLmZpbmQobWF0ZXJpYWxQcm9qZWN0KTsNCiAgICAgICAgICBjb25zdCBkZWVwUm91dGVzPWludmVzdG1lbnRSZWFkeSYmIXJldGFpbmVkJiYhc2hvcnRhZ2VzLmxlbmd0aCYmIWNhbXBhaWduPy53b3Jrc2hvcFdvcmtlcnM/Lmxlbmd0aCYmDQogICAgICAgICAgICAhY29uc3RydWN0aW9uLmxlbmd0aCYmIXMuZGlnZ2luZyYmIWNhbXBhaWduPy5wb3B1bGF0aW9uRmFtaWx5U3VwcGx5Ow0KICAgICAgICAgIGNvbnN0IHNlYXJjaEJ1ZGdldD1zaGVsdGVyTGV2ZWxTZWFyY2hCdWRnZXQobSxvcHRpb25zLGRlZXBSb3V0ZXMpOw0KICAgICAgICAgIC8vIOacieecn+WunuaJqeS7k+mcgOaxguaXtu+8jOmDqOWIhui3r+e6v+S7jeeUqOS6juaguOWvueWIsOm9kOS4juWujOW3peaXtumXtO+8jOe7p+e7reS/neeVmei/meenjeacieeUqOmAlOeahOavlOi+g+OAgg0KICAgICAgICAgIGlmKHB1cnN1aW5nJiZkZWVwUm91dGVzJiYhb3B0aW9ucy5zb21lKGM9PmMuc3RvcmFnZURlbWFuZCkmJnNlYXJjaEJ1ZGdldC5zY29yZVVwcGVyQm91bmQ8dGFyZ2V0U2NvcmUpew0KICAgICAgICAgICAgbGV2ZWxTZWFyY2g9ey4uLnNlYXJjaEJ1ZGdldCx0YXJnZXRTY29yZSxleHBhbmRlZDowLHRydW5jYXRlZDp0cnVlLHJlYXNvbjoncHJvamVjdC1saW1pdCd9Ow0KICAgICAgICAgICAgbm90ZXMucHVzaChg5b2T5YmN5pyA5aSa5pCc57SiICR7c2VhcmNoQnVkZ2V0Lm1heFByb2plY3RzfSDpobnlt6XnqIvvvIzljbPkvb/mr4/pobnlop7liqAgJHtzZWFyY2hCdWRnZXQubWF4R2Fpbn0g5YiG44CB5YWo6YOo5Zyo6YCU5YWR546w77yM5Lmf6Iez5aSaICR7c2VhcmNoQnVkZ2V0LnNjb3JlVXBwZXJCb3VuZH0vJHt0YXJnZXRTY29yZX0g5YiG77yb5q2k5pCc57Si6IyD5Zu05LiN6Laz5Lul57uE5oiQ5a6M5pW06Lev57q/77yM6Lez6L+H5b+F5a6a5peg6Kej55qE5o6o5ryU77yM57un57ut5qC45a+554us56uL55So6YCU44CCYCk7DQogICAgICAgICAgfWVsc2UgaWYocHVyc3Vpbmcpew0KICAgICAgICAgICAgY29uc3QgcGxhbm5pbmc9e2RlZXA6ZGVlcFJvdXRlcyxhbGxvd0xldmVsSW52ZXN0bWVudDpkZWVwUm91dGVzLGNhbXBhaWduLHBvcHVsYXRpb25UYXJnZXQ6cmVxdWVzdGVkVGFyZ2V0fTsNCiAgICAgICAgICAgIGlmKGRlZXBSb3V0ZXMmJnR5cGVvZiBzaGVsdGVyQmFja2dyb3VuZExldmVsUm91dGVzPT09J2Z1bmN0aW9uJyl7DQogICAgICAgICAgICAgIGNvbnN0IGJhY2tncm91bmQ9c2hlbHRlckJhY2tncm91bmRMZXZlbFJvdXRlcyhtLG9wdGlvbnMsdGFyZ2V0U2NvcmUscmV0YWluZWQscGxhbm5pbmcpOw0KICAgICAgICAgICAgICByb3V0ZXMucHVzaCguLi5iYWNrZ3JvdW5kLnJvdXRlcyk7DQogICAgICAgICAgICAgIGlmKGJhY2tncm91bmQuc3RhdHVzPT09J3JlYWR5Jyl7DQogICAgICAgICAgICAgICAgbGV2ZWxTZWFyY2g9ey4uLnNlYXJjaEJ1ZGdldCx0YXJnZXRTY29yZSxyZWFzb246J2JhY2tncm91bmQtcmVhZHknLGpvYklkOmJhY2tncm91bmQuam9iSWQsc25hcHNob3RBdDpiYWNrZ3JvdW5kLnNuYXBzaG90QXR9Ow0KICAgICAgICAgICAgICB9ZWxzZXsNCiAgICAgICAgICAgICAgICBsZXZlbFNlYXJjaD17Li4uc2VhcmNoQnVkZ2V0LHRhcmdldFNjb3JlLGV4cGFuZGVkOjAsdHJ1bmNhdGVkOnRydWUscmVhc29uOidiYWNrZ3JvdW5kLScrYmFja2dyb3VuZC5zdGF0dXN9Ow0KICAgICAgICAgICAgICAgIG5vdGVzLnB1c2goWydydW5uaW5nJywncXVldWVkJ10uaW5jbHVkZXMoYmFja2dyb3VuZC5zdGF0dXMpPyflkI7lj7DmraPlnKjmr5TovoPlrozmlbTnrYnnuqfot6/nur/vvIzkvpvnu5njgIHpmLLlrojlkozlt7LmnInku7vliqHnhafluLjmoLjlr7njgIInOg0KICAgICAgICAgICAgICAgICAgJ+WQjuWPsOetiee6p+avlOi+g+acquWujOaIkO+8jOacrOi9ruS4jeaNruatpOaKleWFpee6r+etiee6p+W3peeoi++8m+W9k+WJjeacieeUqOmAlOeahOW7uuiuvuS7jeWNleeLrOaguOWvueOAgicpOw0KICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9ZWxzZSByb3V0ZXMucHVzaCguLi5zaGVsdGVyTGV2ZWxSb3V0ZXMobSxvcHRpb25zLHRhcmdldFNjb3JlLHJldGFpbmVkLHBsYW5uaW5nKSk7DQogICAgICAgICAgfQ0KICAgICAgICAgIG9wdGlvbnMuc29ydCgoYSxiKT0+TnVtYmVyKEJvb2xlYW4oYS5ibG9ja3MubGVuZ3RoKSktTnVtYmVyKEJvb2xlYW4oYi5ibG9ja3MubGVuZ3RoKSl8fA0KICAgICAgICAgICAgKGEuY29zdC5zY3JhcCs2KmEuY29zdC5wYXJ0cykvTWF0aC5taW4oZ2FwLGEubGV2ZWxHYWluKS0oYi5jb3N0LnNjcmFwKzYqYi5jb3N0LnBhcnRzKS9NYXRoLm1pbihnYXAsYi5sZXZlbEdhaW4pfHwNCiAgICAgICAgICAgIChhLmhvdXJzfHwwKS0oYi5ob3Vyc3x8MCl8fGEuY29zdC5zY3JhcC1iLmNvc3Quc2NyYXApOw0KICAgICAgICAgIGNvbnN0IGNvbXBsZXRlUm91dGU9cm91dGVzLmZpbmQocj0+ci5jb21wbGV0ZSYmci5zdGVwcy5sZW5ndGgpOw0KICAgICAgICAgIC8vIEEgY2hlYXAgcHJlZml4IGlzIG5vdCBhIGNvbXBsZXRlZCBsZXZlbCByb3V0ZS4gS2VlcCByZWFsIGNhcGFjaXR5L3N1cHBseQ0KICAgICAgICAgIC8vIHdvcmssIGJ1dCBkbyBub3QgZmlsbCB0aGUgcmVtYWluaW5nIGxheW91dCB3aXRoIGFuIHVucHJvdmVuIHBvaW50LW9ubHkgaW52ZXN0bWVudC4NCiAgICAgICAgICBsZXQgaW5kZXBlbmRlbnQ9bnVsbDsNCiAgICAgICAgICBpZihwdXJzdWluZyYmZGVlcFJvdXRlcyYmIWNvbXBsZXRlUm91dGUmJiFyZXRhaW5lZCl7DQogICAgICAgICAgICBjb25zdCByZWplY3RlZD1uZXcgU2V0KCk7DQogICAgICAgICAgICBmb3IoY29uc3QgYyBvZiBbLi4ub3B0aW9ucywuLi5jYW5kaWRhdGVzXS5maWx0ZXIoYz0+Yy5sZXZlbEludmVzdG1lbnQpKXsNCiAgICAgICAgICAgICAgY29uc3Qga2V5PWAke2Mua2luZH06JHtjLmlkPz9gJHtjLmZsb29yfToke2MuY29sfWB9OiR7Yy5sZXZlbD8/MH1gOw0KICAgICAgICAgICAgICBpZihyZWplY3RlZC5oYXMoa2V5KSljb250aW51ZTtyZWplY3RlZC5hZGQoa2V5KTsNCiAgICAgICAgICAgICAgY29uc3QgYmFja2dyb3VuZFBlbmRpbmc9WydiYWNrZ3JvdW5kLXJ1bm5pbmcnLCdiYWNrZ3JvdW5kLXF1ZXVlZCddLmluY2x1ZGVzKGxldmVsU2VhcmNoPy5yZWFzb24pOw0KICAgICAgICAgICAgICBjb25zdCByZWFzb25zPVtiYWNrZ3JvdW5kUGVuZGluZz8n5ZCO5Y+w5q+U6L6D5bCa5pyq5a6M5oiQ77yM5pqC5LiN5oqV5YWl57qv562J57qn5bel56iLJzoNCiAgICAgICAgICAgICAgICBsZXZlbFNlYXJjaD8ucmVhc29uPy5zdGFydHNXaXRoKCdiYWNrZ3JvdW5kLScpJiZsZXZlbFNlYXJjaC5yZWFzb24hPT0nYmFja2dyb3VuZC1yZWFkeSc/DQogICAgICAgICAgICAgICAgICAn5ZCO5Y+w5q+U6L6D5pyq5a6M5oiQ77yM5bCa5peg6KaG55uW5LiL5LiA562J57qn55qE5bey5qC45a+55a6M5pW06Lev57q/Jzon5pys6L2u5pyJ55WM5pCc57Si5pyq5om+5Yiw6KaG55uW5LiL5LiA562J57qn55qE5a6M5pW06Lev57q/J107DQogICAgICAgICAgICAgIGlmKGxldmVsU2VhcmNoPy5yZWFzb249PT0ncHJvamVjdC1saW1pdCcpcmVhc29ucy5wdXNoKGDmnIDlpJogJHtsZXZlbFNlYXJjaC5tYXhQcm9qZWN0c30g6aG55bel56iL55qE5LmQ6KeC5YiG5pWw5LiK55WMICR7bGV2ZWxTZWFyY2guc2NvcmVVcHBlckJvdW5kfSDku43kvY7kuo4gJHt0YXJnZXRTY29yZX3vvJvlubbpnZ7or4HmmI7muLjmiI/kuK3msLjov5zml6Dms5XljYfnuqdgKTsNCiAgICAgICAgICAgICAgaWYoIU51bWJlci5pc0Zpbml0ZShjLmhvdXJzKSlyZWFzb25zLnB1c2goJ+W3peeoi+W3peacn+WwmuacquaguOWvue+8jOS4jeiDveaKiuacquefpeiAl+aXtuiusOS4uumbticpOw0KICAgICAgICAgICAgICBmb3IoY29uc3QgayBvZiBbJ3NjcmFwJywncGFydHMnXSlpZihOdW1iZXIuaXNTYWZlSW50ZWdlcihwb2xpY3k/LltgJHtrfUxpbWl0YF0pJiZjLmNvc3Rba10+cG9saWN5W2Ake2t9TGltaXRgXSkNCiAgICAgICAgICAgICAgICByZWFzb25zLnB1c2goYOWNleeslOmcgCAke2MuY29zdFtrXX0gJHtzaGVsdGVyUmVzb3VyY2VzW2tdfe+8jOi2hei/hzI05bCP5pe25oC76aKd5bqmICR7cG9saWN5W2Ake2t9TGltaXRgXX3vvJvnrYnlvoXpop3luqbmgaLlpI3kuZ/kuI3otrNgKTsNCiAgICAgICAgICAgICAgcmVqZWN0ZWRMZXZlbC5wdXNoKHtwcm9qZWN0OmMscmVhc29uc30pOw0KICAgICAgICAgICAgfQ0KICAgICAgICAgICAgZm9yKGxldCBpPWNhbmRpZGF0ZXMubGVuZ3RoLTE7aT49MDtpLS0paWYoY2FuZGlkYXRlc1tpXS5sZXZlbEludmVzdG1lbnQpY2FuZGlkYXRlcy5zcGxpY2UoaSwxKTsNCiAgICAgICAgICAgIGNvbnN0IGZvcmVjYXN0PXNoZWx0ZXJNYXRlcmlhbEZvcmVjYXN0KG0pOw0KICAgICAgICAgICAgY29uc3QgY2FwYWNpdHk9b3B0aW9ucy5maWx0ZXIoYz0+IWMuYmxvY2tzLmxlbmd0aCYmYy5zdG9yYWdlRGVtYW5kKQ0KICAgICAgICAgICAgICAubWFwKGM9Pih7Yyx3YWl0OmZvcmVjYXN0KGMuY29zdCkuaG91cnN9KSkuZmlsdGVyKHg9Pngud2FpdCE9PW51bGwpDQogICAgICAgICAgICAgIC5zb3J0KChhLGIpPT5hLndhaXQrYS5jLmhvdXJzLWIud2FpdC1iLmMuaG91cnN8fGEuYy5jb3N0LnNjcmFwLWIuYy5jb3N0LnNjcmFwKVswXT8uYzsNCiAgICAgICAgICAgIGluZGVwZW5kZW50PWNhcGFjaXR5P3suLi5jYXBhY2l0eSxsZXZlbEludmVzdG1lbnQ6ZmFsc2V9Om9wdGlvbnMuZmlsdGVyKGM9PiFjLmJsb2Nrcy5sZW5ndGgmJiFjLmxldmVsSW52ZXN0bWVudCYmYy5lY29ub21pY3M/LmdhaW4+MCkNCiAgICAgICAgICAgICAgLm1hcChjPT4oe2Msd2FpdDpmb3JlY2FzdChjLmNvc3QpLmhvdXJzfSkpLmZpbHRlcih4PT54LndhaXQhPT1udWxsJiZ4LndhaXQreC5jLmVjb25vbWljcy5wYXliYWNrSG91cnM8PTE2OCkNCiAgICAgICAgICAgICAgLnNvcnQoKGEsYik9PmEud2FpdCthLmMuZWNvbm9taWNzLnBheWJhY2tIb3Vycy1iLndhaXQtYi5jLmVjb25vbWljcy5wYXliYWNrSG91cnMpWzBdPy5jOw0KICAgICAgICAgICAgbm90ZXMucHVzaCgobGV2ZWxTZWFyY2g/LnJlYXNvbj8uc3RhcnRzV2l0aCgnYmFja2dyb3VuZC0nKSYmbGV2ZWxTZWFyY2gucmVhc29uIT09J2JhY2tncm91bmQtcmVhZHknPw0KICAgICAgICAgICAgICAn5ZCO5Y+w5q+U6L6D5bCa5pyq5a6M5oiQJzon5pys6L2u5pyJ55WM5pCc57Si5pyq5om+5Yiw5a6M5pW06L6+57qn6Lev57q/JykrDQogICAgICAgICAgICAgICfvvJvkuI3mjInmnIDkvr/lrpzkuIDliIbov73liqDku5PlupPmiJbnqbrmiL/ljYfnuqfvvIzlj6rkv53nlZnmnInni6znq4vnlKjpgJTnmoTlt6XnqIvjgIHlj6/lm57mnKzlop7kuqfmiJbnrYnlvoXlt7Lnn6Xkuovku7bjgIInKTsNCiAgICAgICAgICAgIGZvcihjb25zdCByb3cgb2YgcmVqZWN0ZWRMZXZlbC5zbGljZSgwLDgpKWlmKHJvdy5yZWFzb25zLmxlbmd0aD4xKQ0KICAgICAgICAgICAgICBub3Rlcy5wdXNoKGDmnKrpgInjgIwke3Jvdy5wcm9qZWN0LnRpdGxlfeOAje+8miR7cm93LnJlYXNvbnMuc2xpY2UoMSkuam9pbign77ybJyl944CCYCk7DQogICAgICAgICAgfQ0KICAgICAgICAgIGNvbnN0IGNob3Nlbj1yZXRhaW5lZHx8Y29tcGxldGVSb3V0ZT8uc3RlcHNbMF0/LnByb2plY3R8fChwdXJzdWluZyYmZGVlcFJvdXRlcz9pbmRlcGVuZGVudDpyb3V0ZXMuZmluZChyPT5yLnN0ZXBzLmxlbmd0aCk/LnN0ZXBzWzBdPy5wcm9qZWN0fHxvcHRpb25zWzBdKTsNCiAgICAgICAgICBpZihyZXRhaW5lZCl7DQogICAgICAgICAgICByZXRhaW5lZE1hdGVyaWFscz10cnVlO3JldGFpbmVkUHJvamVjdD1yZXRhaW5lZDsNCiAgICAgICAgICAgIC8vIOWwseS4muaJqeW7uuS4jemcgOimgembtuS7tu+8jOS5n+S4jeW6lOWboOWPpuS4gOmhueWNh+e6p+Wkh+aWmeiAjOmVv+acn+WBnOaRhuOAgg0KICAgICAgICAgICAgLy8g5Lik6aG55pys6YeR44CB5Y6f5L6b5paZ5ZKM5L6b55S15YWo6YOo54us56uL55WZ6Laz5pe25YWB6K645YWI5byA5bCx5Lia5bel56iL77yb5Y6f5bel5Z2K55So6YCU5LuN5L+d55WZ44CCDQogICAgICAgICAgICBjb25zdCBwYXJhbGxlbEVtcGxveW1lbnQ9Yz0+ew0KICAgICAgICAgICAgICBpZighcG9saWN5fHxwb2xpY3kucGVuZGluZ3x8IWMuZW1wbG95bWVudHx8Yy5ibG9ja3MubGVuZ3RofHwhWydidWlsZCcsJ2RpZyddLmluY2x1ZGVzKGMua2luZCl8fCFwb2xpY3lbYy5raW5kXSlyZXR1cm4gZmFsc2U7DQogICAgICAgICAgICAgIGNvbnN0IHJlcXVlc3Q9Yy5raW5kPT09J2RpZyc/YnVpbGRSZXF1ZXN0cy5maW5kKHI9PnIuZW1wbG95bWVudCYmci50eXBlPT09Yy5wdXJwb3NlPy50eXBlKTpudWxsOw0KICAgICAgICAgICAgICBpZihjLmtpbmQ9PT0nZGlnJyYmKCFyZXF1ZXN0fHwhcG9saWN5LmJ1aWxkKSlyZXR1cm4gZmFsc2U7DQogICAgICAgICAgICAgIGNvbnN0IGpvYkNvc3Q9e3NjcmFwOmMuY29zdC5zY3JhcCsocmVxdWVzdD8uY29zdC5zY3JhcHx8MCkscGFydHM6Yy5jb3N0LnBhcnRzKyhyZXF1ZXN0Py5jb3N0LnBhcnRzfHwwKX07DQogICAgICAgICAgICAgIGlmKGpvYkNvc3QucGFydHMhPT0wKXJldHVybiBmYWxzZTsNCiAgICAgICAgICAgICAgY29uc3Qge2ZlZWR9PXNoZWx0ZXJXb3Jrc2hvcEZlZWRpbmcobSxyZXRhaW5lZC5jb3N0LnBhcnRzKyhwb2xpY3kucGFydHNSZXNlcnZlfHwwKSk7DQogICAgICAgICAgICAgIGlmKCFbJ3NjcmFwJywncGFydHMnXS5ldmVyeShrPT5OdW1iZXIuaXNGaW5pdGUocG9saWN5W2srJ0xpbWl0J10pJiYNCiAgICAgICAgICAgICAgICAgIHJldGFpbmVkLmNvc3Rba10ram9iQ29zdFtrXSsocG9saWN5LnNwZW50Py5ba118fDApPD1wb2xpY3lbaysnTGltaXQnXSl8fA0KICAgICAgICAgICAgICAgICAgcmV0YWluZWQuY29zdC5zY3JhcCtqb2JDb3N0LnNjcmFwKyhwb2xpY3kuc2NyYXBSZXNlcnZlfHwwKStmZWVkPnMucmVzb3VyY2VzLnNjcmFwKXJldHVybiBmYWxzZTsNCiAgICAgICAgICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocj0+ci5pZD09PXJldGFpbmVkLmlkKSx0eXBlPXJlcXVlc3Q/LnR5cGV8fGMudHlwZTsNCiAgICAgICAgICAgICAgY29uc3QgZXh0cmE9KHJldGFpbmVkLnR5cGU9PT0ncG93ZXInPzA6cm9vbS53aWR0aCooc2hlbHRlclJvb21zW3JldGFpbmVkLnR5cGVdWzFdPzE6LjUpKSsNCiAgICAgICAgICAgICAgICAodHlwZT09PSdwb3dlcic/MDpzaGVsdGVyUm9vbXNbdHlwZV1bMV0/MTouNSk7DQogICAgICAgICAgICAgIHJldHVybiAhcG93ZXJDaGVjayhleHRyYSkubGVuZ3RoJiZzLnJlc291cmNlcy5wb3dlcj49MiooZGVtYW5kLnBvd2VyK2V4dHJhKTsNCiAgICAgICAgICAgIH07DQogICAgICAgICAgICBmb3IoY29uc3QgYyBvZiBjYW5kaWRhdGVzKWlmKGMuZW1wbG95bWVudCYmIXBhcmFsbGVsRW1wbG95bWVudChjKSkNCiAgICAgICAgICAgICAgYy5wcmlvcml0eT1NYXRoLm1heChjLnByaW9yaXR5LE1hdGgubWF4KDYsbG9ja2VkLnByaW9yaXR5LS41KSsxKTsNCiAgICAgICAgICAgIG5vdGVzLnB1c2goYOaOpee7reW3suehruiupOWOn+W3peeoi+OAjCR7cmV0YWluZWQudGl0bGV944CN77yb5oyJ5p2Q5paZ57y65Y+j5a6J5o6S5bel5Z2K77yM562J5b6F6aKd5bqm5oiW5o2i5L2N5pe25LiN5Zug5Li05pe25Lqn6YCf5Y+Y5YyW5pS55o2i5bel56iL44CC5bCx5Lia5omp5bu65LuF5Zyo5Lik6aG55pys6YeR44CB5L6b5paZ5Y+K5L6b55S154us56uL55WZ6Laz5pe25YWI6KGM77yM5Y6f5bel5Z2K55So6YCU57un57ut5L+d55WZ44CC5p2h5Lu25oiW562J57qn55uu5qCH5Y+Y5YyW5ZCO6YeN5paw5qC45a+544CCYCk7DQogICAgICAgICAgfQ0KICAgICAgICAgIGlmKGNob3Nlbil7DQogICAgICAgICAgICBsZXQgcHJpb3JpdHk9TWF0aC5tYXgoNixsb2NrZWQucHJpb3JpdHktLjUpOw0KICAgICAgICAgICAgaWYocHVyc3VpbmcmJihyb3V0ZXMubGVuZ3RofHxsZXZlbFNlYXJjaCkmJmNob3Nlbi50eXBlPT09J3N0b3JhZ2UnKXsNCiAgICAgICAgICAgICAgY29uc3QgYWx0ZXJuYXRpdmVzPWNhbmRpZGF0ZXMuZmlsdGVyKGM9PmMudHlwZT09PSdzdG9yYWdlJyYmYy5wcmlvcml0eTw3MCk7DQogICAgICAgICAgICAgIGlmKGFsdGVybmF0aXZlcy5sZW5ndGg+MSl7DQogICAgICAgICAgICAgICAgLy8g5ZCM5LiA5omp5LuT6ZyA5rGC5rK/55So6Lev57q/55qE5pW05om55pSS5paZL+aWveW3peavlOi+g++8jOWbuuWumueahOaWsOW7uuS8mOWFiOe6p+S4jeiDveimhuebluW3sumAieWNh+e6p+OAgg0KICAgICAgICAgICAgICAgIHByaW9yaXR5PU1hdGgubWluKHByaW9yaXR5LC4uLmFsdGVybmF0aXZlcy5tYXAoYz0+Yy5wcmlvcml0eSkpOw0KICAgICAgICAgICAgICAgIGZvcihjb25zdCBjIG9mIGFsdGVybmF0aXZlcyljLnByaW9yaXR5PU1hdGgubWF4KGMucHJpb3JpdHkscHJpb3JpdHkrMSk7DQogICAgICAgICAgICAgICAgbm90ZXMucHVzaCgn5pys6L2u5omp5LuT5rK/55So6Lev57q/5q+U6L6D57uT5p6c77yM6K6h5YWl5pW05om55pSS5paZ5Y+K5pa95bel562J5b6F77yb5LiN5Zu65a6a5YWI5paw5bu65oiW5YWI5Y2H57qn77yM5LuN6YCQ5qyh5qC45a+55bu66K6+6aKE566X44CCJyk7DQogICAgICAgICAgICAgIH0NCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGNhbmRpZGF0ZXMucHVzaCh7Li4uY2hvc2VuLHByaW9yaXR5LGxldmVsVGFyZ2V0OnRhcmdldExldmVsLA0KICAgICAgICAgICAgICB0aXRsZTpg5o6o6L+b6YG/6Zq+5omAICR7dGFyZ2V0TGV2ZWx9IOe6p++8miR7Y2hvc2VuLnRpdGxlfWAsDQogICAgICAgICAgICAgIGJlbmVmaXQ6Y2hvc2VuLmJlbmVmaXQrYO+8m+acrOmhueWinuWKoCAke2Nob3Nlbi5sZXZlbEdhaW59IOWIhu+8jOW9k+WJjeS7jeW3riAke3RhcmdldFNjb3JlLWxldmVsUHJvZ3Jlc3Muc2NvcmV9IOWIhu+8iOW+heS6p+WPiuWcqOW7uumihOiuoeihpSAke2xldmVsUHJvZ3Jlc3MuY29tbWl0dGVkLWxldmVsUHJvZ3Jlc3Muc2NvcmV9IOWIhu+8ie+8jOmAkOmhueWujOaIkOWQjumHjeivhGB9KTsNCiAgICAgICAgICAgIGlmKGNob3Nlbi5sZXZlbEludmVzdG1lbnQpbm90ZXMucHVzaCgn562J57qn5oqV5YWl77ya5Lq65Y+j6Zi25q615Y+K5oiQ5bm05bCx5Lia5bey5a6M5oiQ77yM5LyY5YWI5bey5pyJ5L2O5oiQ5pys5Y2H57qn77yb5LuF5Ymp5LiJ57qn5oqV5YWl5pe25q+U6L6D546w5pyJ56m65L2N55qE5paw5LuT5bqT77yM5bey56Gu6K6k5oiW5Zyo5bKX5aSH5paZ5YWI5o6l57ut44CC5a6e6ZmF5byA5bel5LuN5qC45a+55Y6fMjTlsI/ml7bpooTnrpfjgIHkv53nlZnph4/jgIHkvpvnlLXkuI7mlr3lt6XlkI3pop3jgIInKTsNCiAgICAgICAgICAgIG5vdGVzLnB1c2gocHVyc3Vpbmc/J+aMieaciemZkOi3r+e6v+mihOiuoeWujOaIkOaXtumXtOaOqOi/m+S4i+S4gOetiee6p++8m+WAmemAieS4jei2s+S7pei+vuagh+aXtuWFiOaUueWWhOS6p+iDve+8jOavj+asoee7k+aenOehruiupOWQjumHjeeul+OAgic6J+WFiOaOqOi/m+etiee6p+ino+mUgScrbG9ja2VkLmxhYmVsKyfvvIzlgJnpgInmjInmiYDpnIDmnZDmlpkv5pyJ5pWI562J57qn5YiG5q+U6L6D77yb5LuN6YG15a6I5L6b55S144CB5pa95bel44CB5bqT5a2Y5LiO5bu66K6+6aKE566X44CCJyk7DQogICAgICAgICAgfQ0KICAgICAgICB9DQogICAgICB9DQogICAgfQ0KICAgIGNvbnN0IGRhaWx5QnVpbGQ9Y2FtcGFpZ24/LmRhaWx5R29hbHM/LmdvYWxzLmZpbmQoZz0+Zy5rZXk9PT0nYnVpbGQnJiYhZy5jbGFpbWVkJiZnLnJlbWFpbmluZz4wKTsNCiAgICBpZihkYWlseUJ1aWxkJiYhcy5yb29tcy5zb21lKHI9PnIuaW5jaWRlbnQpKXsNCiAgICAgIGNvbnN0IG9wdGlvbnM9Y2FuZGlkYXRlcy5maWx0ZXIoYz0+WydidWlsZCcsJ3VwZ3JhZGUnXS5pbmNsdWRlcyhjLmtpbmQpJiZjLnByaW9yaXR5PDcwJiYhYy5ibG9ja3MubGVuZ3RoKTsNCiAgICAgIC8vIOWPquW3ruS4gOasoeaXtuWFgeiuuOS7peWlluWKseimhuebluadkOaWmeaIkOacrOeahOacieaViOeUn+S6p+WNh+e6p++8m+S4jeS4uuebruagh+W7uuepuuaIv+aIluaKiuS4i+aMluiuoeS9nOW7uumAoOOAgg0KICAgICAgaWYoZGFpbHlCdWlsZC5yZW1haW5pbmc9PT0xKWZvcihjb25zdCByb29tIG9mIGJ1aWx0LmZpbHRlcihyPT5hY3RpdmUocikmJnIubGV2ZWw8MyYmc2hlbHRlclJvb21zW3IudHlwZV1bMV0mJg0KICAgICAgICAgIHByb2R1Y3RpdmVVcGdyYWRlKHIpJiYhb3B0aW9ucy5zb21lKGM9PmMua2luZD09PSd1cGdyYWRlJyYmYy5pZD09PXIuaWQpKSl7DQogICAgICAgIGNvbnN0IGM9dXBncmFkZShyb29tLDMwLCflvZPliY3lspfkvY3mnInmlYjlop7kuqfvvIzlkIzml7booaXpvZDku4rml6Xlu7rorr7nm67moIcnKTsNCiAgICAgICAgaWYoYyYmIWMuYmxvY2tzLmxlbmd0aCYmYy5jb3N0LnNjcmFwKzYqYy5jb3N0LnBhcnRzPD1kYWlseUJ1aWxkLnJld2FyZC5zY3JhcCs2KmRhaWx5QnVpbGQucmV3YXJkLnBhcnRzKW9wdGlvbnMucHVzaChjKTsNCiAgICAgIH0NCiAgICAgIGNvbnN0IGNob3Nlbj1vcHRpb25zLmZpbHRlcihjPT4hYy5zaG9ydGFnZS5zY3JhcCYmIWMuc2hvcnRhZ2UucGFydHMpLnNvcnQoKGEsYik9PmEuY29zdC5zY3JhcCs2KmEuY29zdC5wYXJ0cy1iLmNvc3Quc2NyYXAtNipiLmNvc3QucGFydHMpWzBdOw0KICAgICAgaWYoY2hvc2VuKXsNCiAgICAgICAgaWYoIWNhbmRpZGF0ZXMuaW5jbHVkZXMoY2hvc2VuKSljYW5kaWRhdGVzLnB1c2goY2hvc2VuKTsNCiAgICAgICAgY2hvc2VuLnByaW9yaXR5PU1hdGgubWluKGNob3Nlbi5wcmlvcml0eSwyMik7Y2hvc2VuLmRhaWx5R29hbD1kYWlseUJ1aWxkLmluZGV4Ow0KICAgICAgICBjaG9zZW4uYmVuZWZpdCs9YO+8m+WQjOatpeaOqOi/m+S7iuaXpeW7uuiuvuebruagh++8iOi/mOW3riAke2RhaWx5QnVpbGQucmVtYWluaW5nfSDmrKHvvInvvIzovr7moIflkI7lj6/pooYgJHtkYWlseUJ1aWxkLnJld2FyZC5zY3JhcH0g5bqf5paZ44CBJHtkYWlseUJ1aWxkLnJld2FyZC5wYXJ0c30g6Zu25Lu244CBJHtkYWlseUJ1aWxkLnJld2FyZC5wb2ludHN9IOenr+WIhu+8m+WlluWKseacquWIsOi0puWJjeS4jeaKteaJo+mihOeul2A7DQogICAgICB9DQogICAgfQ0KICAgIGNhbmRpZGF0ZXMuc29ydChjb21wYXJlUHJvamVjdHMpOw0KICAgIGNvbnN0IGZ1bmRpbmc9c2hlbHRlck1hdGVyaWFsRm9yZWNhc3QobSk7DQogICAgZm9yKGNvbnN0IGMgb2YgY2FuZGlkYXRlcy5zbGljZSgwLDgpKWlmKGMua2luZCE9PSdzdGFmZicmJk9iamVjdC52YWx1ZXMoYy5zaG9ydGFnZSkuc29tZSh2PT52PjApKXsNCiAgICAgIGNvbnN0IGVzdGltYXRlPWZ1bmRpbmcoYy5jb3N0KTtjLnNhdmVIb3Vycz1lc3RpbWF0ZS5ob3VycztjLnNhdmVSZWFzb249ZXN0aW1hdGUucmVhc29uOw0KICAgIH0NCiAgICBjb25zdCBmaXJzdD1jYW5kaWRhdGVzLmZpbmQoYz0+Yy5wcmlvcml0eTw3MCksbWlzc2luZz1maXJzdD9PYmplY3QuZW50cmllcyhmaXJzdC5zaG9ydGFnZSkuZmlsdGVyKChbLHZdKT0+dj4wKS5tYXAoKFtrLHZdKT0+YCR7dn0gJHtzaGVsdGVyUmVzb3VyY2VzW2tdfWApOltdOw0KICAgIGNvbnN0IHdhaXRpbmc9Y29uc3RydWN0aW9uLmxlbmd0aD4wfHxzLmRpZ2dpbmcmJk51bWJlci5pc0Zpbml0ZShzLmRpZ2dpbmcuZG9uZUF0KTsNCiAgICBsZXQgbmV4dD1maXJzdD97a2luZDpmaXJzdC5raW5kLHR5cGU6Zmlyc3QudHlwZSx0aXRsZTpmaXJzdC50aXRsZSxwcm9qZWN0OmZpcnN0LA0KICAgICAgc3RhdHVzOmZpcnN0LmJsb2Nrcy5sZW5ndGg/J2Jsb2NrZWQnOmZpcnN0LmtpbmQ9PT0nc3RhZmYnPydzdGFmZic6bWlzc2luZy5sZW5ndGg/J3NhdmluZyc6J3JlYWR5JywNCiAgICAgIHJlYXNvbjpmaXJzdC5ibG9ja3MubGVuZ3RoP2ZpcnN0LmJsb2Nrcy5qb2luKCfvvJsnKTpmaXJzdC5raW5kPT09J3N0YWZmJz8n5YWI6K+E5Lyw546w5pyJ5Lq65ZGY5LiO56m65bKX77yM5LiN5b+F5YWI6Iqx6LWE5rqQ5bu66YCgJzoNCiAgICAgICAgbWlzc2luZy5sZW5ndGg/YOWwmue8uiAke21pc3Npbmcuam9pbign44CBJyl977ybJHtzaGVsdGVyTWF0ZXJpYWxUaW1lVGV4dChmaXJzdCl9YDoNCiAgICAgICAgICAn5b2T5YmN5bqT5a2Y5ZKM5bey55+l5pa95bel5p2h5Lu25ruh6Laz77yb5pON5L2c5YmN6YeN5paw5qC45a+5572R6aG16LS555So5LiO5Lq65ZGY5a6J5o6SJ306DQogICAgICB7c3RhdHVzOndhaXRpbmd8fGNhbmRpZGF0ZXMubGVuZ3RoPyd3YWl0aW5nJzonbm9uZScsdGl0bGU6d2FpdGluZz8n562J5b6F546w5pyJ5bel56iL5a6M5belJzpjYW5kaWRhdGVzLmxlbmd0aD8n5YWI5Y+R5bGV5Lq65Y+j77yM5YaN5omp5a6/6IiNJzon5L+d5oyB55Sf5Lqn5LiO5pS25Y+WJywNCiAgICAgICAgcmVhc29uOndhaXRpbmc/J+WFiOaguOWvueWujOW3peWQjueahOWuuemHj+OAgeWyl+S9jeWSjOS6p+mHj++8jOWGjeWGs+WumuS4i+S4gOeslOaKleWFpSc6Y2FuZGlkYXRlcy5sZW5ndGg/DQogICAgICAgICAgYOW3sumihOeVmeaEn+aDheS4juW+heS6p+S6uuWPo++8jOW6iuS9jeS7jeS9mSAke2NvbW1pdHRlZENhcGFjaXR5LWZ1dHVyZU1vdXRoc33vvJvpooTmnJ/kurrlj6Pot53lrrnph4/lj6rliakgMSDkurrml7blho3mipXlhaXmianlrrlgOifmmoLmnKrlj5HnjrDlv4Xpobvnq4vljbPmipXlhaXnmoTlu7rorr4nfTsNCiAgICBpZihzLmRpZ2dpbmcmJk51bWJlci5pc0Zpbml0ZShzLmRpZ2dpbmcuZG9uZUF0KSYmYnVpbGRSZXF1ZXN0cy5zb21lKHI9PnIuZW1wbG95bWVudCkmJg0KICAgICAgICAhcmV0YWluZWRNYXRlcmlhbHMmJighZmlyc3R8fGZpcnN0LnByaW9yaXR5Pj0yNCkpDQogICAgICBuZXh0PXtzdGF0dXM6J3dhaXRpbmcnLGtpbmQ6J2VtcGxveW1lbnQnLHRpdGxlOifnrYnlvoXmianlsYLlrozlt6XlkI7ooaXlvoXlsLHkuJrmiJDkurrnlJ/kuqflspfkvY0nLA0KICAgICAgICByZWFzb246J+Wyl+S9jeaJqeW7uuS7jeacieWunumZheS6uumAie+8m+S/neeVmeWQjue7reW7uuaIv+i1hOmHke+8jOS4jeWcqOS4i+aMluacn+mXtOWPpuW8gOaZrumAmuWNh+e6p+Wkh+aWmeWNoOS9j+S4i+S4gOi9ru+8jOS+m+e7meWSjOWutuW6reaApemcgOS7jeS8mOWFiCd9Ow0KICAgIGlmKGxldmVsV2FpdGluZyYmKG5leHQuc3RhdHVzPT09J25vbmUnfHxuZXh0LnN0YXR1cz09PSdibG9ja2VkJyYmbmV4dC5yZWFzb24uaW5jbHVkZXMoJ+e6p+ino+mUgScpfHwNCiAgICAgICAgY29uc3RydWN0aW9uLmxlbmd0aD4wJiZPYmplY3Qua2V5cyhkZW1hbmQpLnNvbWUoaz0+bS5wcm9kdWN0aW9uW2tdPGRlbWFuZFtrXSoxLjItMWUtOSkmJg0KICAgICAgICAhdmFsaWRTaGVsdGVyTWF0ZXJpYWxzKGNhbXBhaWduPy5tYXRlcmlhbHMpJiZuZXh0LnByb2plY3Q/LmtpbmQ9PT0ndXBncmFkZScmJg0KICAgICAgICAhbmV4dC5wcm9qZWN0LmxldmVsVGFyZ2V0JiZuZXh0LnByb2plY3QucHJpb3JpdHk+PTMwKSkNCiAgICAgIG5leHQ9e3N0YXR1czond2FpdGluZycsa2luZDonbGV2ZWwnLHRpdGxlOifnrYnlvoXnjrDmnInlt6XnqIvlj4rmlrDnlJ/lhL/lop7liqDnrYnnuqfliIYnLHJlYXNvbjon6aKE6K6h5YiG5pWw5bey6Laz5aSf77yM5a6M5oiQ5ZCO5qC45a+5562J57qn5ZKM5paw5bu6562R6Kej6ZSBJ307DQogICAgaWYoaW52ZXN0bWVudFJlYWR5JiYhc2hvcnRhZ2VzLmxlbmd0aCYmIXJldGFpbmVkRnVuZGluZyYmIWNhbXBhaWduPy53b3Jrc2hvcFdvcmtlcnM/Lmxlbmd0aCYmIWNhbXBhaWduPy5wb3B1bGF0aW9uRmFtaWx5U3VwcGx5JiYNCiAgICAgICAgY29uc3RydWN0aW9uLnNvbWUocj0+ci50eXBlPT09J3N0b3JhZ2UnJiZyLmJ1aWx0QXQ+bm93KSYmbmV4dC5wcm9qZWN0Py5wcmlvcml0eT49MjQmJg0KICAgICAgICAobmV4dC5wcm9qZWN0LmxldmVsSW52ZXN0bWVudHx8bmV4dC5wcm9qZWN0LmxldmVsVGFyZ2V0fHxuZXh0LnByb2plY3QudHlwZT09PSd3b3Jrc2hvcCcpKQ0KICAgICAgbmV4dD17c3RhdHVzOid3YWl0aW5nJyxraW5kOidsZXZlbCcsdGl0bGU6J+etieW+heaWsOS7k+W6k+WujOW3peWQjuavlOi+g+S4i+S4gOeslOetiee6p+aKleWFpScsDQogICAgICAgIHJlYXNvbjon5paw5LuT5bqT5bCa5pyq5a6M5bel77yM5YWI5qC45a+55a6e6ZmF5a656YeP44CB5ZCI5bm25LiO5Y+v5Y2H57qn5oi/6Ze077yM5LiN5Zyo5Y2B5YiG6ZKf5bu66K6+5pyf6Ze06YeN5paw5ZCv5Yqo5pen5LiJ57qn5oqV6LWE55qE5bel5Z2K5aSH5paZJ307DQogICAgaWYobGV2ZWxQcm9ncmVzcz8udGFyZ2V0TGV2ZWwmJiFsZXZlbFdhaXRpbmcmJihuZXh0LnN0YXR1cz09PSdub25lJ3x8bmV4dC5zdGF0dXM9PT0nd2FpdGluZycmJiF3YWl0aW5nKSkNCiAgICAgIG5leHQ9e3N0YXR1czonYmxvY2tlZCcsa2luZDonbGV2ZWwnLHRpdGxlOmDmjqjov5vpgb/pmr7miYAgJHtsZXZlbFByb2dyZXNzLnRhcmdldExldmVsfSDnuqfku43nvLrlj6/miafooYzlop7liIbmlrnmoYhgLA0KICAgICAgICByZWFzb246YOW9k+WJjei/mOW3riAke01hdGgubWF4KDAsbGV2ZWxQcm9ncmVzcy50YXJnZXRTY29yZS1sZXZlbFByb2dyZXNzLmNvbW1pdHRlZCl9IOWIhu+8jOWwmuaXoOWPr+W8gOW3peeahOacieaViOWinuS6p+WNh+e6p+aIluacieeUqOmAlOeahOaWsOW7ui/kuIvmjJbmlrnmoYjvvJtgKw0KICAgICAgICAgIHNoZWx0ZXJQb3B1bGF0aW9uQWR2aWNlKG0scmVxdWVzdGVkVGFyZ2V0LGZpbmFsTGV2ZWwsY2FtcGFpZ24pKyghbGF5b3V0Pycg5biD5bGA6LWE5paZ5LiN5a6M5pW077yM6ZyA5YWI6YeN5paw6K+75Y+W44CCJzonJyl9Ow0KICAgIGlmKCFuZXh0LnByb2plY3QmJlsnYmFja2dyb3VuZC1ydW5uaW5nJywnYmFja2dyb3VuZC1xdWV1ZWQnXS5pbmNsdWRlcyhsZXZlbFNlYXJjaD8ucmVhc29uKSkNCiAgICAgIG5leHQ9e3N0YXR1czond2FpdGluZycsa2luZDonbGV2ZWwtcGxhbm5pbmcnLHRpdGxlOifnrYnlvoXlkI7lj7DnrYnnuqfot6/nur/mr5TovoMnLHJlYXNvbjon5ZCO5Y+w5LuN5Zyo6K6h566X77yb5L6b57uZ44CB6Ziy5a6I5ZKM5bey5pyJ5Lu75Yqh54Wn5bi45qC45a+577yM5a6M5oiQ5ZCO5oyJ5b2T5YmN54q25oCB6YeN6K+EJ307DQogICAgY29uc3Qgc3RvcHBlZD1idWlsdC5maW5kKHI9PnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdJiZyLnVwZ3JhZGVBdD09PW51bGwmJihyLmluY2lkZW50fHxyLnVucG93ZXJlZCkmJm0ucm9vbXMuZmluZChyb3c9PnJvdy5pZD09PXIuaWQpPy53b3JrZXJzPjApOw0KICAgIGlmKHN0b3BwZWQpbmV4dD17c3RhdHVzOidyZXN0b3JlJyxraW5kOidyZXN0b3JlJyx0eXBlOnN0b3BwZWQudHlwZSx0aXRsZTpg5oGi5aSNJHtsYWJlbHMoc3RvcHBlZC50eXBlKX3njrDmnInkuqfog71gLA0KICAgICAgcmVhc29uOnN0b3BwZWQuaW5jaWRlbnQ/J+eOsOacieWAvOePreaIv+mXtOWboOS6i+S7tuWBnOS6p++8jOWFiOWkhOeQhuS6i+S7tu+8jOWGjeaMieaBouWkjeWQjueahOS6p+mHj+WGs+WumuW7uuiuvic6DQogICAgICAgICfnjrDmnInlgLznj63miL/pl7TlgZznlLXvvIzlhYjmoLjlr7nlj5HnlLXlspfkvY3jgIHnlLXlipvlupPlrZjkuI7pooblj5bvvIzmgaLlpI3kvpvnlLXlkI7lho3lhrPlrprlu7rorr4nfTsNCiAgICBjb25zdCBwcmVwYXJhdGlvbj1jYW1wYWlnbj8ud29ya3Nob3BQcmVwYXJhdGlvbjsNCiAgICBpZihwcmVwYXJhdGlvbiYmbmV4dC5wcm9qZWN0JiZzaGVsdGVyQ29uc3RydWN0aW9uU2lnbmF0dXJlKG5leHQucHJvamVjdCk9PT1zaGVsdGVyQ29uc3RydWN0aW9uU2lnbmF0dXJlKHByZXBhcmF0aW9uLm9yaWdpbmFsKSl7DQogICAgICBjb25zdCBjPXByZXBhcmF0aW9uLnByb2plY3Q7Y2FuZGlkYXRlcy51bnNoaWZ0KGMpOw0KICAgICAgbmV4dD17a2luZDpjLmtpbmQsdHlwZTpjLnR5cGUsdGl0bGU6Yy50aXRsZSxwcm9qZWN0OmMsc3RhdHVzOidyZWFkeScscmVhc29uOiflt6XlnYrmiankuqflkKvmlr3lt6XkuI7kurrlkZjnprvlspfmjZ/lpLHlkI7lj6/nvKnnn63lvZPliY3lt6XnqIvlpIfmlpnvvIzlt7Llj6bnlZnljp/lt6XnqIvmnKzph5HlkozkvpvmlpknfTsNCiAgICAgIG5vdGVzLnB1c2goYOS4uuOAjCR7cHJlcGFyYXRpb24ub3JpZ2luYWwudGl0bGV944CN5YeG5aSH5p2Q5paZ77ya57u05oyB546w5bel5Z2K57qmICR7cHJlcGFyYXRpb24uYmFzZWxpbmVIb3Vycy50b0ZpeGVkKDEpfSDlsI/ml7bvvIxgKw0KICAgICAgICBg5YWIJHtjLmtpbmQ9PT0nYnVpbGQnPyfmlrDlu7onOifljYfnuqcnfeW3peWdiuWQq+aWveW3peWPiuS6uuWRmOWPmOWMlue6piAke3ByZXBhcmF0aW9uLnRvdGFsSG91cnMudG9GaXhlZCgxKX0g5bCP5pe277yM6aKE6K6h5bCRICR7cHJlcGFyYXRpb24uc2F2ZWRIb3Vycy50b0ZpeGVkKDEpfSDlsI/ml7bvvJtgKw0KICAgICAgICAn5oyJ546w5pyJ5Lq65ZGY44CB5pW05om55pS25Y+W5Y+K5Lqn6IO95LiN5Y+Y5Lyw6K6h77yM5pa95bel5pyf6Ze05L+d55WZ5Y6f5bel56iL6ZyA5rGC77yM5a6M5bel5ZCO6YeN6K+E44CCJyk7DQogICAgfQ0KICAgIC8vIOaMgee7rei/vee6p+WAmemAieWcqOmAmueUqOWkh+aWmeWIhuaekOS5i+WQjuS6p+eUn++8jOihpeWbnuacrOi9ruaJgOmAieWNh+e6p+eahOadkOaWmeW9kuWxnu+8jOS4jee0r+WKoOi/nOacn+Wkh+mAieOAgg0KICAgIGNvbnN0IGxldmVsUGFydHNQcm9qZWN0PSFwYXJ0c0Nob2ljZXMubGVuZ3RoJiZuZXh0LnByb2plY3QmJmNhbmRpZGF0ZXMuZmluZChjPT5jLmxldmVsVGFyZ2V0JiZjLmtpbmQ9PT0ndXBncmFkZScmJmMuY29zdC5wYXJ0cz4wJiYNCiAgICAgIGZpdHNDb21taXR0ZWRDYXBhY2l0eShjKSYmYy5jb3N0LnBhcnRzK3BhcnRzUmVzZXJ2ZTw9Y29tbWl0dGVkLmNhcHMucGFydHMmJmMuY29zdC5wYXJ0cytwYXJ0c1Jlc2VydmU+cy5yZXNvdXJjZXMucGFydHMmJg0KICAgICAgKG5leHQucHJvamVjdC5raW5kPT09J3VwZ3JhZGUnJiZuZXh0LnByb2plY3QuaWQ9PT1jLmlkfHxuZXh0LnByb2plY3QudHlwZT09PSd3b3Jrc2hvcCd8fG5leHQucHJvamVjdC5wdXJwb3NlPy50eXBlPT09J3dvcmtzaG9wJykpOw0KICAgIGlmKGxldmVsUGFydHNQcm9qZWN0KXsNCiAgICAgIGNvbnN0IG5lZWRlZD1sZXZlbFBhcnRzUHJvamVjdC5jb3N0LnBhcnRzK3BhcnRzUmVzZXJ2ZS1zLnJlc291cmNlcy5wYXJ0czsNCiAgICAgIG5vdGVzLnB1c2goYOacrOi9rui/vee6p+mhueebruOAjCR7bGV2ZWxQYXJ0c1Byb2plY3QudGl0bGV944CN6L+Y6ZyA5YeG5aSHICR7bmVlZGVkfSDpm7bku7bvvIjlkKvkv53nlZnph4/vvInvvIzkvpvmlpnoh7PlsJHlj6bpnIAgJHs2Km5lZWRlZH0g5bqf5paZ77yb5bu66K6+5pys6YeRICR7bGV2ZWxQYXJ0c1Byb2plY3QuY29zdC5zY3JhcH0g5bqf5paZ5Y+m6KGM5L+d55WZ44CC5bel5Z2K6ZyA5oyJ5a6e6ZmF5pW05om555Sf5Lqn5ZKM6aKG5Y+W77yM5LiN5oqK5YW25LuW5YCZ6YCJ6ZyA5rGC57Sv5Yqg44CCYCk7DQogICAgfQ0KICAgIHJldHVybiB7YXQ6bm93LHBvcHVsYXRpb24scmVjb3ZlcmluZyxyZXNlcnZlZEJpcnRoczpwYWlycy5zaXplLHJlcXVlc3RlZFRhcmdldCxjYXBhY2l0eTptLnBvcHVsYXRpb25DYXAsY29tbWl0dGVkQ2FwYWNpdHksdGFyZ2V0OndhbnRlZCxuZXRTY3JhcCxsZXZlbFByb2dyZXNzLHJvdXRlcywNCiAgICAgIHBvcHVsYXRpb25BZHZpY2U6c2hlbHRlclBvcHVsYXRpb25BZHZpY2UobSxyZXF1ZXN0ZWRUYXJnZXQsZmluYWxMZXZlbCxjYW1wYWlnbiksDQogICAgICBwYXJ0c1RhcmdldDpwYXJ0c1Nob3J0YWdlcy5sZW5ndGg/cy5yZXNvdXJjZXMucGFydHMrTWF0aC5taW4oLi4ucGFydHNTaG9ydGFnZXMpOmxldmVsUGFydHNQcm9qZWN0P2xldmVsUGFydHNQcm9qZWN0LmNvc3QucGFydHMrcGFydHNSZXNlcnZlOjAsDQogICAgICBwYXJ0c1Byb2plY3Q6Wy4uLnBhcnRzQ2hvaWNlc10uc29ydCgoYSxiKT0+YS5jb3N0LnBhcnRzLWIuY29zdC5wYXJ0c3x8Y29tcGFyZVByb2plY3RzKGEsYikpWzBdfHxsZXZlbFBhcnRzUHJvamVjdHx8bnVsbCwNCiAgICAgIG5vdGVzLG5leHQscmV0YWluZWRQcm9qZWN0LGxldmVsU2VhcmNoLHJlamVjdGVkTGV2ZWw6cmVqZWN0ZWRMZXZlbC5zbGljZSgwLDgpLGNhbmRpZGF0ZVRvdGFsOmNhbmRpZGF0ZXMubGVuZ3RoLGNhbmRpZGF0ZXM6Y2FuZGlkYXRlcy5zbGljZSgwLDgpfTsNCiAgfQ0KICBmdW5jdGlvbiB2YWxpZFNoZWx0ZXJEZXZlbG9wbWVudFRyYWNlKHZhbHVlKSB7DQogICAgY29uc3QgYW1vdW50PW49Pk51bWJlci5pc0Zpbml0ZShuKSYmbj49MCxpbnRlZ2VyPW49Pk51bWJlci5pc1NhZmVJbnRlZ2VyKG4pJiZuPj0wOw0KICAgIGNvbnN0IHRleHQ9cz0+dHlwZW9mIHM9PT0nc3RyaW5nJyYmcy5sZW5ndGg8PTEyMDA7DQogICAgY29uc3Qgc25hcHNob3Q9cz0+b2JqZWN0U3RhdGUocykmJmFtb3VudChzLmF0KSYmaW50ZWdlcihzLmxldmVsKSYmcy5sZXZlbD4wJiZpbnRlZ2VyKHMuc2NvcmUpJiZpbnRlZ2VyKHMuY29tbWl0dGVkKSYmDQogICAgICBvYmplY3RTdGF0ZShzLnJlc291cmNlcykmJlsnc2NyYXAnLCdwYXJ0cycsJ3Bvd2VyJywnZm9vZCcsJ3dhdGVyJ10uZXZlcnkoaz0+YW1vdW50KHMucmVzb3VyY2VzW2tdKSkmJg0KICAgICAgTnVtYmVyLmlzRmluaXRlKHMubmV0U2NyYXApJiZhbW91bnQocy5wYXJ0c1JhdGUpJiZ0ZXh0KHMubmV4dCkmJnRleHQocy5yZWFzb24pJiYNCiAgICAgIChzLnJvdXRlPT09bnVsbHx8b2JqZWN0U3RhdGUocy5yb3V0ZSkmJlsnd2FpdCcsJ3Byb2plY3RzJ10uaW5jbHVkZXMocy5yb3V0ZS5raW5kKSYmdHlwZW9mIHMucm91dGUuY29tcGxldGU9PT0nYm9vbGVhbicmJg0KICAgICAgICBhbW91bnQocy5yb3V0ZS5ob3VycykmJmludGVnZXIocy5yb3V0ZS5zY29yZSkmJihzLnJvdXRlLmV4cGVjdGVkQXQ9PT1udWxsfHxhbW91bnQocy5yb3V0ZS5leHBlY3RlZEF0KSkmJg0KICAgICAgICBBcnJheS5pc0FycmF5KHMucm91dGUuc3RlcHMpJiZzLnJvdXRlLnN0ZXBzLmxlbmd0aDw9OCYmcy5yb3V0ZS5zdGVwcy5ldmVyeSh4PT5vYmplY3RTdGF0ZSh4KSYmdGV4dCh4LnRpdGxlKSYmDQogICAgICAgICAgaW50ZWdlcih4LnNjcmFwKSYmaW50ZWdlcih4LnBhcnRzKSYmYW1vdW50KHguc3RhcnRIb3VycykmJmFtb3VudCh4LmZpbmlzaEhvdXJzKSYmeC5maW5pc2hIb3Vycz49eC5zdGFydEhvdXJzKSk7DQogICAgY29uc3Qgc3RhZ2U9cz0+b2JqZWN0U3RhdGUocykmJmludGVnZXIocy50YXJnZXQpJiZzLnRhcmdldD4wJiYocy5maW5hbFRhcmdldD09PW51bGx8fGludGVnZXIocy5maW5hbFRhcmdldCkmJnMuZmluYWxUYXJnZXQ+MCkmJg0KICAgICAgc25hcHNob3Qocy5zdGFydCkmJnNuYXBzaG90KHMubGF0ZXN0KSYmcy50YXJnZXQ+cy5zdGFydC5sZXZlbCYmcy5sYXRlc3QuYXQ+PXMuc3RhcnQuYXQ7DQogICAgcmV0dXJuIG9iamVjdFN0YXRlKHZhbHVlKSYmdmFsdWUudmVyc2lvbj09PTEmJmludGVnZXIodmFsdWUudmF1bHRObykmJnZhbHVlLnZhdWx0Tm8+MCYmDQogICAgICAodmFsdWUuYWN0aXZlPT09bnVsbHx8c3RhZ2UodmFsdWUuYWN0aXZlKSkmJkFycmF5LmlzQXJyYXkodmFsdWUuaGlzdG9yeSkmJnZhbHVlLmhpc3RvcnkubGVuZ3RoPD0xMiYmDQogICAgICB2YWx1ZS5oaXN0b3J5LmV2ZXJ5KHM9PnN0YWdlKHMpJiZbJ3JlYWNoZWQnLCdzZXR0aW5ncy1jaGFuZ2VkJywnbGV2ZWwtZmVsbCddLmluY2x1ZGVzKHMub3V0Y29tZSkmJg0KICAgICAgICBzbmFwc2hvdChzLmVuZCkmJnMuZW5kLmF0Pj1zLmxhdGVzdC5hdCYmKHMub3V0Y29tZSE9PSdyZWFjaGVkJ3x8cy5lbmQubGV2ZWw+PXMudGFyZ2V0KSk7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckRldmVsb3BtZW50U25hcHNob3QobSxwbGFuKSB7DQogICAgY29uc3QgcHJvZ3Jlc3M9c2hlbHRlckxldmVsUHJvZ3Jlc3MobSk7aWYoIXByb2dyZXNzKXJldHVybiBudWxsOw0KICAgIGNvbnN0IG5leHQ9cGxhbi5uZXh0LHByb2plY3Q9bmV4dD8ucHJvamVjdDsNCiAgICBjb25zdCByb3V0ZT1wbGFuLnJvdXRlcz8uZmluZChyPT5yLmtpbmQ9PT0nd2FpdCcmJnByb2dyZXNzLmNvbW1pdHRlZD49cGxhbi5sZXZlbFByb2dyZXNzPy50YXJnZXRTY29yZSl8fA0KICAgICAgcGxhbi5yb3V0ZXM/LmZpbmQocj0+cHJvamVjdCYmci5zdGVwc1swXSYmWydraW5kJywndHlwZScsJ2lkJywnZmxvb3InLCdjb2wnXS5ldmVyeShrPT5yLnN0ZXBzWzBdLnByb2plY3Rba109PT1wcm9qZWN0W2tdKSk7DQogICAgcmV0dXJuIHthdDptLm5vdyxsZXZlbDpwcm9ncmVzcy5sZXZlbCxzY29yZTpwcm9ncmVzcy5zY29yZSxjb21taXR0ZWQ6cHJvZ3Jlc3MuY29tbWl0dGVkLA0KICAgICAgcmVzb3VyY2VzOk9iamVjdC5mcm9tRW50cmllcyhbJ3NjcmFwJywncGFydHMnLCdwb3dlcicsJ2Zvb2QnLCd3YXRlciddLm1hcChrPT5bayxtLnN0YXRlLnJlc291cmNlc1trXV0pKSwNCiAgICAgIG5ldFNjcmFwOnBsYW4ubmV0U2NyYXAscGFydHNSYXRlOm0ucHJvZHVjdGlvbi5wYXJ0cyxuZXh0OlN0cmluZyhuZXh0Py50aXRsZXx8JycpLnNsaWNlKDAsMTIwMCkscmVhc29uOlN0cmluZyhuZXh0Py5yZWFzb258fCcnKS5zbGljZSgwLDEyMDApLA0KICAgICAgcm91dGU6cm91dGU/e2tpbmQ6cm91dGUua2luZD09PSd3YWl0Jz8nd2FpdCc6J3Byb2plY3RzJyxjb21wbGV0ZTpyb3V0ZS5jb21wbGV0ZSxob3Vyczpyb3V0ZS5ob3VycyxzY29yZTpyb3V0ZS5zY29yZSwNCiAgICAgICAgZXhwZWN0ZWRBdDpyb3V0ZS5jb21wbGV0ZT9tLm5vdytyb3V0ZS5ob3VycyozNjAwMDAwOm51bGwsDQogICAgICAgIHN0ZXBzOnJvdXRlLnN0ZXBzLm1hcChzPT4oe3RpdGxlOlN0cmluZyhzLnByb2plY3QudGl0bGUpLnNsaWNlKDAsMTIwMCksc2NyYXA6cy5wcm9qZWN0LmNvc3Quc2NyYXAscGFydHM6cy5wcm9qZWN0LmNvc3QucGFydHMsDQogICAgICAgICAgc3RhcnRIb3VyczpzLnN0YXJ0SG91cnMsZmluaXNoSG91cnM6cy5maW5pc2hIb3Vyc30pKX06bnVsbH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckRldmVsb3BtZW50VHJhY2UocHJldmlvdXMsbSxwbGFuKSB7DQogICAgLy8g6K+K5pat6K6w5b2V5LiN5Y+C5LiO6LCD5bqm5oiW6LWE5rqQ6aKE55WZ77yb5o2f5Z2P44CB6LSm5Y+35LiN56ym5ZKM5YCS5bqP54q25oCB5LiN6IO96KaG55uW5bey5pyJ6Zi25q6144CCDQogICAgaWYocHJldmlvdXMhPT11bmRlZmluZWQmJighdmFsaWRTaGVsdGVyRGV2ZWxvcG1lbnRUcmFjZShwcmV2aW91cyl8fHByZXZpb3VzLnZhdWx0Tm8hPT1tLnZpZXcudmF1bHRObykpcmV0dXJuIHByZXZpb3VzOw0KICAgIGNvbnN0IGN1cnJlbnQ9c2hlbHRlckRldmVsb3BtZW50U25hcHNob3QobSxwbGFuKTtpZighY3VycmVudClyZXR1cm4gcHJldmlvdXM7DQogICAgY29uc3QgcmVjb3JkPXByZXZpb3VzfHx7dmVyc2lvbjoxLHZhdWx0Tm86bS52aWV3LnZhdWx0Tm8sYWN0aXZlOm51bGwsaGlzdG9yeTpbXX07DQogICAgbGV0IGFjdGl2ZT1yZWNvcmQuYWN0aXZlLGhpc3Rvcnk9Wy4uLnJlY29yZC5oaXN0b3J5XTsNCiAgICBpZihjdXJyZW50LmF0PChhY3RpdmU/LmxhdGVzdC5hdD8/aGlzdG9yeS5hdCgtMSk/LmVuZC5hdD8/MCkpcmV0dXJuIHByZXZpb3VzOw0KICAgIGNvbnN0IHRhcmdldD1wbGFuLmxldmVsUHJvZ3Jlc3M/LnRhcmdldExldmVsPz9udWxsLGZpbmFsVGFyZ2V0PXBsYW4ubGV2ZWxQcm9ncmVzcz8uZmluYWxUYXJnZXQ/P251bGw7DQogICAgaWYoYWN0aXZlKXsNCiAgICAgIGNvbnN0IG91dGNvbWU9Y3VycmVudC5sZXZlbD49YWN0aXZlLnRhcmdldD8ncmVhY2hlZCc6Y3VycmVudC5sZXZlbDxhY3RpdmUuc3RhcnQubGV2ZWw/J2xldmVsLWZlbGwnOg0KICAgICAgICB0YXJnZXQhPT1hY3RpdmUudGFyZ2V0fHxmaW5hbFRhcmdldCE9PWFjdGl2ZS5maW5hbFRhcmdldD8nc2V0dGluZ3MtY2hhbmdlZCc6bnVsbDsNCiAgICAgIGlmKG91dGNvbWUpe2hpc3RvcnkucHVzaCh7Li4uYWN0aXZlLG91dGNvbWUsZW5kOmN1cnJlbnR9KTtoaXN0b3J5PWhpc3Rvcnkuc2xpY2UoLTEyKTthY3RpdmU9bnVsbDt9DQogICAgICBlbHNlIGFjdGl2ZT17Li4uYWN0aXZlLGxhdGVzdDpjdXJyZW50fTsNCiAgICB9DQogICAgaWYoIWFjdGl2ZSYmTnVtYmVyLmlzU2FmZUludGVnZXIodGFyZ2V0KSYmdGFyZ2V0PmN1cnJlbnQubGV2ZWwpYWN0aXZlPXt0YXJnZXQsZmluYWxUYXJnZXQsc3RhcnQ6Y3VycmVudCxsYXRlc3Q6Y3VycmVudH07DQogICAgY29uc3QgcmVzdWx0PXt2ZXJzaW9uOjEsdmF1bHRObzptLnZpZXcudmF1bHRObyxhY3RpdmUsaGlzdG9yeX07DQogICAgcmV0dXJuIHZhbGlkU2hlbHRlckRldmVsb3BtZW50VHJhY2UocmVzdWx0KT9yZXN1bHQ6cHJldmlvdXM7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckRldmVsb3BtZW50VHJhY2VUZXh0KHJlY29yZCkgew0KICAgIGlmKHJlY29yZD09PXVuZGVmaW5lZClyZXR1cm4gJyc7DQogICAgaWYoIXZhbGlkU2hlbHRlckRldmVsb3BtZW50VHJhY2UocmVjb3JkKSlyZXR1cm4gJ+mYtuauteiusOW9leaXoOazleaguOWvue+8jOS/neeVmeWOn+iusOW9le+8m+W9k+WJjeWPkeWxleinhOWIkuS7jeeLrOeri+ivhOS8sOOAgic7DQogICAgY29uc3QgbGluZXM9W10sc3RhZ2U9cmVjb3JkLmFjdGl2ZSxsYXN0PXJlY29yZC5oaXN0b3J5LmF0KC0xKSxmb3JtYXQ9dD0+bmV3IERhdGUodCkudG9Mb2NhbGVTdHJpbmcoJ3poLUNOJyx7dGltZVpvbmU6J0FzaWEvU2hhbmdoYWknLGhvdXIxMjpmYWxzZX0pOw0KICAgIGlmKHN0YWdlKXsNCiAgICAgIGNvbnN0IHtzdGFydCxsYXRlc3R9PXN0YWdlOw0KICAgICAgbGluZXMucHVzaChg6Zi25q616Lef6Liq77yaJHtzdGFydC5sZXZlbH3ihpIke3N0YWdlLnRhcmdldH0g57qn77ybJHtmb3JtYXQoc3RhcnQuYXQpfSDpppbmrKHorrDlvZUgJHtzdGFydC5zY29yZX0g5YiG77yM55uu5YmNICR7bGF0ZXN0LnNjb3JlfSDliIbjgIJgKTsNCiAgICAgIGxpbmVzLnB1c2goYOi1t+eCueadkOaWme+8muW6n+aWmSAke3N0YXJ0LnJlc291cmNlcy5zY3JhcC50b0ZpeGVkKDEpfeOAgembtuS7tiAke3N0YXJ0LnJlc291cmNlcy5wYXJ0cy50b0ZpeGVkKDEpfe+8m+acgOi/keW6n+aWmeWHgOS6p+WHuiAke2xhdGVzdC5uZXRTY3JhcC50b0ZpeGVkKDEpfS/lsI/ml7bjgIHpm7bku7bkuqflh7ogJHtsYXRlc3QucGFydHNSYXRlLnRvRml4ZWQoMSl9L+Wwj+aXtu+8jOacquWIsOi0puWlluWKseS4jeiuoeWFpeOAgmApOw0KICAgICAgaWYobGF0ZXN0LnJvdXRlPy5leHBlY3RlZEF0IT09bnVsbCYmbGF0ZXN0LnJvdXRlPy5leHBlY3RlZEF0IT09dW5kZWZpbmVkKWxpbmVzLnB1c2gobGF0ZXN0LnJvdXRlLmtpbmQ9PT0nd2FpdCc/DQogICAgICAgIGDlt7LlvIDlt6Uv5b6F5Lqn6aKE6K6hICR7Zm9ybWF0KGxhdGVzdC5yb3V0ZS5leHBlY3RlZEF0KX0g5ZCO5qC45a+577yb5bCa5pyq56Gu6K6k5Y2H57qn44CCYDoNCiAgICAgICAgYOWAmemAiei3r+e6v+S8sOeulyAke2Zvcm1hdChsYXRlc3Qucm91dGUuZXhwZWN0ZWRBdCl977yb6aG75ruh6Laz5byA5YWz44CB6aKE566X5bm25oyJ6K6h5YiS5byA5bel77yM5LiN5piv5a6e6ZmF5a6M5oiQ5pe26Ze044CCYCk7DQogICAgICBlbHNlIGxpbmVzLnB1c2goJ+W9k+WJjeayoeaciei2s+S7peWFkeeOsOS4i+S4gOetiee6p+eahOWujOaVtOaXtumXtOS8sOeul++8m+mYu+eijeingeW7uuiuvuiuoeWIkuOAgicpOw0KICAgIH0NCiAgICBpZihsYXN0KWxpbmVzLnB1c2gobGFzdC5vdXRjb21lPT09J3JlYWNoZWQnP2DmnIDov5HlrozmiJDvvJoke2xhc3Quc3RhcnQubGV2ZWx94oaSJHtsYXN0LnRhcmdldH0g57qn77yM5LqOICR7Zm9ybWF0KGxhc3QuZW5kLmF0KX0g6aaW5qyh6KeC5a+f5YiwICR7bGFzdC5lbmQubGV2ZWx9IOe6py8ke2xhc3QuZW5kLnNjb3JlfSDliIbvvJvku47pppbmrKHorrDlvZXotbfnuqYgJHsoKGxhc3QuZW5kLmF0LWxhc3Quc3RhcnQuYXQpLzM2MDAwMDApLnRvRml4ZWQoMSl9IOWwj+aXtuOAgmA6DQogICAgICBg5pyA6L+R6Zi25q615ZugJHtsYXN0Lm91dGNvbWU9PT0nc2V0dGluZ3MtY2hhbmdlZCc/J+ebruagh+iuvue9ruWPmOWMlic6J+WunumZheetiee6p+S4i+mZjSd957uT5p2f77yM5pyq6K6w5L2c5Y2H57qn5oiQ5Yqf44CCYCk7DQogICAgaWYobGluZXMubGVuZ3RoKWxpbmVzLnB1c2goJ+S/neeVmeacgOi/kTEy5Liq5bey57uT5p2f6Zi25q6177yb6K6w5b2V5LuO6aaW5qyh5pyJ5pWI5qOA5p+l5byA5aeL77yM5LiN5YCS5o6o5q2k5YmN6ICX5pe244CCJyk7DQogICAgcmV0dXJuIGxpbmVzLmpvaW4oJ1xuJyk7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckRldmVsb3BtZW50VGV4dChwbGFuKSB7DQogICAgY29uc3QgbGluZXM9W2Dkurrlj6MgJHtwbGFuLnBvcHVsYXRpb259LyR7cGxhbi5jYXBhY2l0eX3vvIjlkKvlpJblh7rkuI7lvoXkuqfvvInvvIwke3BsYW4ucmVxdWVzdGVkVGFyZ2V0PT09bnVsbD8n5Lq65Y+j55uu5qCH5pyq6K6+572uJzpg6K6+572u55uu5qCHICR7cGxhbi5yZXF1ZXN0ZWRUYXJnZXR9YH3vvIzop4TliJLlrrnph4/oh7PlsJEgJHtwbGFuLnRhcmdldH3vvJvlup/mlpnmiaPpmaTlt6XlnYrmtojogJflkI7nuqYgJHtwbGFuLm5ldFNjcmFwLnRvRml4ZWQoMSl9L+Wwj+aXtuOAgmAsLi4ucGxhbi5ub3Rlc107DQogICAgY29uc3Qgc3RhdHVzPXtyZWFkeTon5p2h5Lu25bey5ruh6LazJyxzYXZpbmc6J+WFiOaUkui1hOa6kCcsYmxvY2tlZDon5YWI5ruh6Laz5p2h5Lu2JyxzdGFmZjon5YWI6LCD5Lq65ZGYJyx3YWl0aW5nOifnrYnlvoXml7bmnLonLG5vbmU6J+e7p+e7reeUn+S6pycscmVzdG9yZTon5YWI5oGi5aSN5Lqn6IO9J307DQogICAgaWYocGxhbi5uZXh0KWxpbmVzLnVuc2hpZnQoYOW7uuiuvuiuoeWIku+8miR7c3RhdHVzW3BsYW4ubmV4dC5zdGF0dXNdfeOAguS4i+S4gOatpe+8miR7cGxhbi5uZXh0LnRpdGxlfeOAgiR7cGxhbi5uZXh0LnJlYXNvbn3jgIJgKTsNCiAgICBpZihwbGFuLmxldmVsUHJvZ3Jlc3M/LmZpbmFsVGFyZ2V0KWxpbmVzLnVuc2hpZnQoYCR7cGxhbi5sZXZlbFByb2dyZXNzLmNvbnRpbnVvdXM/J+aMgee7reWNh+e6pyc6J+WPkeWxleebruaghyd977yaJHtwbGFuLmxldmVsUHJvZ3Jlc3MubGV2ZWx9IOKGkiAke3BsYW4ubGV2ZWxQcm9ncmVzcy5maW5hbFRhcmdldH0g57qnJHtwbGFuLmxldmVsUHJvZ3Jlc3MudGFyZ2V0TGV2ZWw/YO+8m+W9k+WJjemYtuautSAke3BsYW4ubGV2ZWxQcm9ncmVzcy50YXJnZXRMZXZlbH0g57qn77yM6ZyAICR7cGxhbi5sZXZlbFByb2dyZXNzLnRhcmdldFNjb3JlfSDliIZgOifvvJvnm67moIflt7Lovr7liLDmiJbkuLvliqjov73nuqflt7LlhbPpl60nfeOAgmApOw0KICAgIGlmKHBsYW4ucG9wdWxhdGlvbkFkdmljZSlsaW5lcy5wdXNoKHBsYW4ucG9wdWxhdGlvbkFkdmljZSk7DQogICAgZm9yKGNvbnN0IHJvdXRlIG9mIChwbGFuLnJvdXRlc3x8W10pLnNsaWNlKDAsMykpbGluZXMucHVzaChg6Lev57q/5Lyw566X77yaJHtyb3V0ZS5raW5kPT09J3dhaXQnPyfnrYnlvoXlt7LmnInlh7rnlJ/lj4rlt6XnqIsnOnJvdXRlLnN0ZXBzLm1hcCh4PT54LnByb2plY3QudGl0bGUpLmpvaW4oJyDihpIgJyl977yb57qmICR7cm91dGUuaG91cnMudG9GaXhlZCgxKX0g5bCP5pe277yM6aKE6K6hICR7cm91dGUuc2NvcmV9IOWIhiR7cm91dGUuY29tcGxldGU/J++8iOimhuebluacrOmYtuaute+8iSc6J++8iOS7jemcgOWQjue7reaKleWFpe+8iSd944CCYCk7DQogICAgaWYocGxhbi5yb3V0ZXM/Lmxlbmd0aClsaW5lcy5wdXNoKCfot6/nur/kvLDnrpfku4Xmr5TovoPlvZPliY3lt7Lnn6XlgJnpgInnmoToh7PlpJrkuInpobnkuLLooYzlt6XnqIvvvIzmjInmlbTmibnkuqflh7rlj4rlt7LmnInnrqHlrrbku6PmlLbop4TliJnmjqjnrpfvvJvmnKzpobnlrozlt6XlkI7miY3orqHlhaXmlrDlop7lrrnph4/jgILmr4/mraXlvIDlt6XliY3ph43or4Tmianku5PpnIDmsYLvvIzmtojotLnmiJbmianlrrnlt7Lop6PpmaTmu6Hku5Pljovlipvml7bkuI3ph43lpI3mianku5Plh5HliIbjgILmlrDmiL/lkIjlubblkI7vvIzljp/miL/nmoTlkI7nu63ljYfnuqfpobvnrYnlrp7pmYXlkIjlubbnu5Pmnpzph43nrpfotLnnlKjlkozlt6XmnJ/jgILkuI3lkKvpmo/mnLrlpZblirHjgIHmnKrnn6XorqLljZXmiJblsJrmnKrnoa7orqTnmoTmi5vli5/vvIzkuI3mmK/ovr7liLDnrYnnuqfnmoTkv53or4Hml7bpl7TjgIInKTsNCiAgICBmb3IoY29uc3QgW2ksY10gb2YgcGxhbi5jYW5kaWRhdGVzLmVudHJpZXMoKSkgew0KICAgICAgY29uc3QgcHJpY2U9Yy5raW5kPT09J3N0YWZmJz8n5peg6ZyA5bu66YCg6LS555SoJzpgJHtjLmNvc3Quc2NyYXB9IOW6n+aWmSR7Yy5jb3N0LnBhcnRzP2AgKyAke2MuY29zdC5wYXJ0c30g6Zu25Lu2YDonJ31gOw0KICAgICAgY29uc3QgbWlzc2luZz1PYmplY3QuZW50cmllcyhjLnNob3J0YWdlKS5maWx0ZXIoKFssdl0pPT52PjApLm1hcCgoW2ssdl0pPT5gJHt2fSAke3NoZWx0ZXJSZXNvdXJjZXNba119YCk7DQogICAgICBsaW5lcy5wdXNoKGAke2krMX0uICR7Yy5wcmlvcml0eT49NzA/J+WQjue7reinhOWIku+8iOWwmuacquWIsOW8gOW3peaXtuacuu+8ie+8mic6Jyd9JHtjLnRpdGxlfe+8miR7cHJpY2V944CCJHtjLmJlbmVmaXR944CCJHttaXNzaW5nLmxlbmd0aD9g5bCa57y6ICR7bWlzc2luZy5qb2luKCfjgIEnKX3jgIJgOicnfSR7DQogICAgICAgIHNoZWx0ZXJNYXRlcmlhbFRpbWVUZXh0KGMpP2Ake3NoZWx0ZXJNYXRlcmlhbFRpbWVUZXh0KGMpfeOAgmA6Jyd9JHsNCiAgICAgICAgYy5ibG9ja3MubGVuZ3RoP2DlhYjlhrPmnaHku7bvvJoke2MuYmxvY2tzLmpvaW4oJ++8mycpfeOAgmA6Jyd9YCk7DQogICAgfQ0KICAgIGlmKCFwbGFuLmNhbmRpZGF0ZXMubGVuZ3RoKWxpbmVzLnB1c2goJ+aaguacquWPkeeOsOW/hemhu+eri+WNs+aKleWFpeeahOaJqeW7uu+8m+WFiOS/neaMgeeUn+S6p++8jOi1hOaWmeabtOaWsOWQjumHjeaWsOivhOS8sOOAgicpOw0KICAgIGxpbmVzLnB1c2goJ+i/meS6m+aYr+Wkh+mAieaWueahiO+8jOaUtuebiuS4jeiDveWPoOWKoO+8m+iHquWKqOW7uuiuvum7mOiupOWFs+mXre+8jOW8gOWQr+WQjuS7heWcqOmineW6puS4juS/neeVmemHj+WFgeiuuOaXtuaJp+ihjOW9k+WJjeS4i+S4gOatpeOAgicpOw0KICAgIHJldHVybiBsaW5lcy5qb2luKCdcbicpOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJDb25zdHJ1Y3Rpb25TcGVudChzdGF0ZSxwZW5kaW5nLG5vdykgew0KICAgIGNvbnN0IGVudHJpZXM9KHN0YXRlLmNvbnN0cnVjdGlvbkxlZGdlcnx8W10pLmZpbHRlcihlPT5ub3ctZS5hdDw4NjQwMDAwMCksc3VtPXtzY3JhcDowLHBhcnRzOjB9Ow0KICAgIGZvcihjb25zdCBlIG9mIGVudHJpZXMpZm9yKGNvbnN0IGsgb2YgWydzY3JhcCcsJ3BhcnRzJ10pc3VtW2tdKz1lW2tdOw0KICAgIGNvbnN0IHJlc2VydmVkPXBlbmRpbmc/LmJlZm9yZT8uY29uc3RydWN0aW9uPy5wcm9qZWN0Pz8ocGVuZGluZz8ua2luZD09PSdjcmFmdCc/cGVuZGluZy5iZWZvcmUuY2FtcGFpZ24/LmNob2ljZTpudWxsKTsNCiAgICBpZihyZXNlcnZlZCYmIWVudHJpZXMuc29tZShlPT5lLmlkPT09cGVuZGluZy5pZCkpDQogICAgICBmb3IoY29uc3QgayBvZiBbJ3NjcmFwJywncGFydHMnXSlzdW1ba10rPXJlc2VydmVkLmNvc3Rba107DQogICAgaWYoc3RhdGUuY2FyYXZhbj8ucGVuZGluZyYmIWVudHJpZXMuc29tZShlPT5lLmlkPT09c3RhdGUuY2FyYXZhbi5wZW5kaW5nLmlkKSkNCiAgICAgIGZvcihjb25zdCBrIG9mIFsnc2NyYXAnLCdwYXJ0cyddKXN1bVtrXSs9c3RhdGUuY2FyYXZhbi5wZW5kaW5nLmNvc3Rba107DQogICAgcmV0dXJuIHN1bTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQ2FyYXZhblBsYW4obSxnb2FsLG9mZmVycyxjb25maWcsc3RhdGUscGVuZGluZyxub3cscHJvamVjdD1udWxsKSB7DQogICAgY29uc3QgYXZhaWxhYmxlPW9mZmVycy5maWx0ZXIobz0+IW8uZGVsaXZlcmVkKS5zb3J0KChhLGIpPT5hLnNjcmFwKzYqYS5wYXJ0cy1iLnNjcmFwLTYqYi5wYXJ0c3x8YS5zbG90LWIuc2xvdCk7DQogICAgY29uc3Qgbm9uZT1yZWFzb249Pih7Y2hvaWNlOm51bGwsY29zdDpudWxsLHJlYXNvbn0pOw0KICAgIGlmKCFOdW1iZXIuaXNTYWZlSW50ZWdlcihnb2FsLnJlbWFpbmluZyl8fGdvYWwucmVtYWluaW5nPDF8fGF2YWlsYWJsZS5sZW5ndGg8Z29hbC5yZW1haW5pbmcpDQogICAgICByZXR1cm4gbm9uZSgn5LuK5pel5Ymp5L2Z6K6i5Y2V5LiN6Laz5Lul5a6M5oiQ5ZWG6Zif55uu5qCH77yM5L+d55WZ54mp6LWEJyk7DQogICAgY29uc3QgdXNlZD1zaGVsdGVyQ29uc3RydWN0aW9uU3BlbnQoc3RhdGUscGVuZGluZyxub3cpLGxpbWl0PXt9Ow0KICAgIGZvcihjb25zdCBrIG9mIFsnc2NyYXAnLCdwYXJ0cyddKWxpbWl0W2tdPU1hdGgubWluKGNvbmZpZ1tgJHtrfUxpbWl0YF0tdXNlZFtrXSwNCiAgICAgIG0uc3RhdGUucmVzb3VyY2VzW2tdLWNvbmZpZ1tgJHtrfVJlc2VydmVgXS0ocHJvamVjdD8uY29zdFtrXXx8MCkpOw0KICAgIGNvbnN0IHJld2FyZD1nb2FsLnJld2FyZC5zY3JhcCs2KmdvYWwucmV3YXJkLnBhcnRzOw0KICAgIGxldCBiZXN0PW51bGwsbm9kZXM9MDsNCiAgICBjb25zdCB2aXNpdD0oc3RhcnQscGlja2VkLHNjcmFwLHBhcnRzKT0+ew0KICAgICAgaWYoKytub2Rlcz4yMDAwMHx8c2NyYXA+bGltaXQuc2NyYXB8fHBhcnRzPmxpbWl0LnBhcnRzfHxzY3JhcCs2KnBhcnRzPnJld2FyZHx8DQogICAgICAgIGJlc3QmJnNjcmFwKzYqcGFydHM+PWJlc3QudmFsdWUpcmV0dXJuOw0KICAgICAgaWYocGlja2VkLmxlbmd0aD09PWdvYWwucmVtYWluaW5nKXtiZXN0PXtjaG9pY2U6cGlja2VkWzBdLGNvc3Q6e3NjcmFwLHBhcnRzfSx2YWx1ZTpzY3JhcCs2KnBhcnRzfTtyZXR1cm47fQ0KICAgICAgZm9yKGxldCBpPXN0YXJ0O2k8PWF2YWlsYWJsZS5sZW5ndGgtKGdvYWwucmVtYWluaW5nLXBpY2tlZC5sZW5ndGgpO2krKyl7DQogICAgICAgIGNvbnN0IG89YXZhaWxhYmxlW2ldO3Zpc2l0KGkrMSxbLi4ucGlja2VkLG9dLHNjcmFwK28uc2NyYXAscGFydHMrby5wYXJ0cyk7DQogICAgICAgIGlmKG5vZGVzPjIwMDAwKWJyZWFrOw0KICAgICAgfQ0KICAgIH07DQogICAgdmlzaXQoMCxbXSwwLDApOw0KICAgIGlmKG5vZGVzPjIwMDAwKXJldHVybiBub25lKCfllYbpmJ/orqLljZXnu4TlkIjov4flpJrvvIzmnKzova7kv53nlZnnianotYTlubbnrYnlvoXkurrlt6XmoLjlr7knKTsNCiAgICByZXR1cm4gYmVzdHx8bm9uZSgn5a6M5oiQ5Ymp5L2Z5ZWG6Zif55uu5qCH55qE5oC75oiQ5pys6LaF6L+H5aWW5Yqx5Lu35YC844CB5Y+v55So6aKE566X5oiW5bu66K6+5pys6YeR5L2Z6YePJyk7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNvbnN0cnVjdGlvbkFsbG93YW5jZShjLG0sY29uZmlnLHN0YXRlLHBlbmRpbmcsbm93KSB7DQogICAgaWYoIWN8fCFbJ2J1aWxkJywndXBncmFkZScsJ2RpZyddLmluY2x1ZGVzKGMua2luZCkpcmV0dXJuICflvZPliY3op4TliJLmsqHmnInlj6/oh6rliqjlvIDlt6XnmoTpobnnm64nOw0KICAgIGlmKCFjb25maWdbYy5raW5kXSlyZXR1cm4gYOS4i+S4gOatpSR7e2J1aWxkOiflu7rpgKAnLHVwZ3JhZGU6J+WNh+e6pycsZGlnOifkuIvmjJYnfVtjLmtpbmRdfeacquW8gOWQr++8jOS/neeVmeinhOWIkumhuuW6j2A7DQogICAgaWYoYy5ibG9ja3M/Lmxlbmd0aHx8Yy5wcmlvcml0eT49NzApcmV0dXJuICflvZPliY3pobnnm67lsJrmnKrmu6HotrPlvIDlt6XmnaHku7YnOw0KICAgIGlmKHBlbmRpbmcpcmV0dXJuICfljp/mk43kvZzku43lvoXmoLjlr7nvvIzkv53nlZnlu7rorr7pop3luqYnOw0KICAgIGNvbnN0IHVzZWQ9c2hlbHRlckNvbnN0cnVjdGlvblNwZW50KHN0YXRlLHBlbmRpbmcsbm93KTsNCiAgICBmb3IoY29uc3QgayBvZiBbJ3NjcmFwJywncGFydHMnXSl7DQogICAgICBjb25zdCBjb3N0PWMuY29zdD8uW2tdLGxpbWl0PWNvbmZpZ1tgJHtrfUxpbWl0YF0scmVzZXJ2ZT1jb25maWdbYCR7a31SZXNlcnZlYF07DQogICAgICBpZighW2Nvc3QsbGltaXQscmVzZXJ2ZSx1c2VkW2tdXS5ldmVyeSh2PT5OdW1iZXIuaXNTYWZlSW50ZWdlcih2KSYmdj49MCl8fCFOdW1iZXIuaXNGaW5pdGUobS5zdGF0ZS5yZXNvdXJjZXNba10pKXJldHVybiAn5bu66K6+6LS555So5oiW6aKd5bqm6LWE5paZ5LiN5Y+v5qC45a+5JzsNCiAgICAgIGlmKGNvc3Q+bGltaXQpcmV0dXJuIGDmnKzpobnnm67ljZXnrJTpnIAgJHtjb3N0fSAke3NoZWx0ZXJSZXNvdXJjZXNba11977yM6LaF6L+HMjTlsI/ml7bmgLvpop3luqYgJHtsaW1pdH3vvJvnrYnlvoXpop3luqbmgaLlpI3kuZ/kuI3otrPvvIzpnIDosIPmlbTlt6XnqIvot6/nur/miJbnlLHkvaDkv67mlLnpop3luqZgOw0KICAgICAgaWYodXNlZFtrXStjb3N0PmxpbWl0KXJldHVybiBg5pys6aG555uu6LaF6L+HMjTlsI/ml7Yke3NoZWx0ZXJSZXNvdXJjZXNba1195Ymp5L2Z6aKd5bqmYDsNCiAgICAgIGlmKG0uc3RhdGUucmVzb3VyY2VzW2tdLWNvc3Q8cmVzZXJ2ZSlyZXR1cm4gYOacrOmhueebruS8muS9juS6jiR7c2hlbHRlclJlc291cmNlc1trXX3kv53nlZnph4/vvIzlhYjnp6/mlJLotYTmupBgOw0KICAgIH0NCiAgICByZXR1cm4gJyc7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNvbnN0cnVjdGlvblBvd2VyUmVzZXJ2ZShjLG0sY29uZmlnLHN0YXRlLHBlbmRpbmcsbm93KSB7DQogICAgaWYoIWN8fCFbJ2J1aWxkJywndXBncmFkZScsJ2RpZyddLmluY2x1ZGVzKGMua2luZCkpcmV0dXJuIDA7DQogICAgY29uc3QgdHlwZT1jLmtpbmQ9PT0nZGlnJz9jLnB1cnBvc2U/LnR5cGU6Yy50eXBlOw0KICAgIGlmKCFzaGVsdGVyUm9vbXNbdHlwZV18fCFzaGVsdGVyQnVpbGRSdWxlc1t0eXBlXXx8dHlwZT09PSdwb3dlcicpcmV0dXJuIDA7DQogICAgY29uc3QgcG93ZXJCbG9jaz0oYy5raW5kPT09J2RpZyc/YOebruaghyR7c2hlbHRlckJ1aWxkUnVsZXNbdHlwZV1bMF1977yaYDonJykrJ+aJqeW7uuWQjueUteWKm+S9memHj+S4jei2s++8jOWFiOihpeWPkeeUtSc7DQogICAgY29uc3QgbWF0ZXJpYWw9c3RhdGUuY2FtcGFpZ24/Lm1hdGVyaWFsczsNCiAgICBjb25zdCByZXRhaW5lZFN3YXA9Yy5raW5kPT09J3VwZ3JhZGUnJiZjLmxldmVsSW52ZXN0bWVudCYmdmFsaWRTaGVsdGVyTWF0ZXJpYWxzKG1hdGVyaWFsKSYmDQogICAgICBtYXRlcmlhbC52YXVsdE5vPT09bS52aWV3LnZhdWx0Tm8mJm1hdGVyaWFsLmlkPT09Yy5pZCYmbWF0ZXJpYWwudHlwZT09PWMudHlwZSYmDQogICAgICBtYXRlcmlhbC5sZXZlbD09PWMubGV2ZWwmJm1hdGVyaWFsLnRhcmdldExldmVsPT09Yy5sZXZlbFRhcmdldDsNCiAgICAvLyDlt7Lnoa7orqTlt6XnqIvlm6DmjaLkvY3mmoLnvJPlvIDlt6Xml7bku43kv53nlZnljp/kvpvnlLXpnIDmsYLvvIzljIXmi6zmnIDlkI7kuIDmraXliJrnu5PmnZ/kvYbmnKzova7lgJnpgInlsJrluKbnrYnlvoXmoIforrDml7bjgIINCiAgICAvLyDlkKbliJnmlbTkvZPliIbphY3lkozlj4zkurrmjaLkvY3mjInkuI3lkIzpnIDmsYLkupLnm7jmkqTplIDvvJvlj6rkv53nlZnlh4blpIfmnaHku7bvvIznnJ/lrp7lvIDlt6Xku43lj5fljp9ibG9ja3PpmZDliLbjgIINCiAgICBpZigoYy5ibG9ja3N8fFtdKS5zb21lKHJlYXNvbj0+cmVhc29uIT09cG93ZXJCbG9jayYmDQogICAgICAgICEocmV0YWluZWRTd2FwJiZyZWFzb249PT0n5YWI5a6M5oiQ5bey56Gu6K6k55qE5Lq65ZGY5o2i5L2NJykpKXJldHVybiAwOw0KICAgIC8vIOWPquS4uuW3suWFt+Wkh+adkOaWmeOAgemineW6puWPiuWFtuS7luadoeS7tueahOi/keacn+W3peeoi+WHhuWkh+S+m+eUte+8m+i/meS4jeaOiOadg+i3s+i/h+ecn+ato+W8gOW3peaXtueahOeUteWKm+ajgOafpeOAgg0KICAgIC8vIOS4i+aMluiHqui6q+S4jeiAl+eUte+8jOWHhuWkh+eahOaYr+WOn+inhOWIkuaYjuehrueahOS4i+S4gOagvOaIv+mXtO+8m+WQjue7reW7uuaIv+S7jeWPpuafpemihOeul+S4juWunumZheadoeS7tuOAgg0KICAgIGlmKHNoZWx0ZXJDb25zdHJ1Y3Rpb25BbGxvd2FuY2Uoey4uLmMsYmxvY2tzOltdfSxtLGNvbmZpZyxzdGF0ZSxwZW5kaW5nLG5vdykpew0KICAgICAgY29uc3Qgd29ya2luZz1tLnJvb21zLmZpbHRlcihyPT5yLnJlc291cmNlPT09J3BhcnRzJyYmci5yYXRlPjAmJnN0YXRlLmNhbXBhaWduPy5yb2xlcy5zb21lKHJvbGU9Pg0KICAgICAgICByb2xlLnJvbGU9PT0nd29ya3Nob3AnJiZyb2xlLnJvb209PT1yLmlkJiZtLnN0YXRlLnJlc2lkZW50cy5zb21lKHA9PnAuaWQ9PT1yb2xlLmlkJiZwLnJvb21JZD09PXIuaWQmJnAuYXdheT09PW51bGwmJnAuZGVhZEF0PT09bnVsbCkpKTsNCiAgICAgIC8vIOW3suehruiupOWcqOWkh+aWmeeahOWOn+W3peeoi+S5n+imgeS/neeVmeS+m+eUte+8m+WQpuWImeS4gOe8uuS7tuWwseaSpOWPkeeUteOAgeW3peeoi+WkseaViOWPiOaSpOW3peWdiu+8jOmaj+WQjuWPjeWQkeihpeWbnuOAgg0KICAgICAgLy8g5bey56Gu6K6k55qE562J57qn5oqV6LWE6aG75YWI6KGl55S177yb5Li05pe26YeK5pS+5bel5Z2K5LiN5bqU5pKk6ZSA5Y+R55S15YeG5aSH77yM5YaN5Y+N5ZCR5oq95Lq65aSH5paZ44CCDQogICAgICAvLyDku4XmlL7lrr3ov5nku73ljp/lt6XnqIvnmoTigJzpm7bku7blsJrmnKrlhaXlupPigJ3lh4blpIfmnaHku7bvvIzpop3luqbjgIHmnKzph5HjgIHmlbTmibnkvpvmlpnjgIHlvIDlhbPlj4rmnKrlhrPkv53miqTku43moLjlr7njgIINCiAgICAgIGlmKGMua2luZCE9PSd1cGdyYWRlJ3x8IXZhbGlkU2hlbHRlck1hdGVyaWFscyhtYXRlcmlhbCl8fG1hdGVyaWFsLnZhdWx0Tm8hPT1tLnZpZXcudmF1bHROb3x8DQogICAgICAgICAgbWF0ZXJpYWwuaWQhPT1jLmlkfHxtYXRlcmlhbC50eXBlIT09Yy50eXBlfHxtYXRlcmlhbC5sZXZlbCE9PWMubGV2ZWx8fCF3b3JraW5nLmxlbmd0aCYmIWMubGV2ZWxJbnZlc3RtZW50KXJldHVybiAwOw0KICAgICAgY29uc3QgZmVlZGluZz13b3JraW5nLmxlbmd0aD93b3JraW5nOm0ucm9vbXMuZmlsdGVyKHI9PnIucmVzb3VyY2U9PT0ncGFydHMnJiZyLmJhdGNoPjAmJm0uc3RhdGUucm9vbXMuc29tZShyb29tPT4NCiAgICAgICAgcm9vbS5pZD09PXIuaWQmJnJvb20uYnVpbHRBdDw9bS5ub3cmJnJvb20udXBncmFkZUF0PT09bnVsbCYmIXJvb20uaW5jaWRlbnQmJiFyb29tLnVucG93ZXJlZCkpOw0KICAgICAgaWYoIWZlZWRpbmcubGVuZ3RoKXJldHVybiAwOw0KICAgICAgY29uc3QgbWlzc2luZz1NYXRoLm1heCgwLGMuY29zdC5wYXJ0cytjb25maWcucGFydHNSZXNlcnZlLW0uc3RhdGUucmVzb3VyY2VzLnBhcnRzKTsNCiAgICAgIGNvbnN0IHJvb21GZWVkPWZlZWRpbmcubWFwKHI9Pk1hdGgubWF4KDAsTWF0aC5jZWlsKG1pc3Npbmcvci5iYXRjaCkqci5iYXRjaC1yLnN0b3JlZCkpOw0KICAgICAgLy8g5bey5pyJ55Sf5Lqn5oyJ5a6e6ZmF5YC854+t5oi/6aKE55WZ77yb5YWo6YOo6YeK5pS+5ZCO5Y+q6KaB5rGC5a2Y5Zyo5LiA6Ze05Y+v5L6b5paZ5bel5Z2K77yM5LiN5oqK5omA5pyJ56m65oi/5b2T5oiQ5ZCM5pe25byA5bel44CCDQogICAgICAvLyDov5nph4zlj6rkv53nlZnlj5HnlLXliY3mj5DvvIzlrp7pmYXlt6XlnYrlronmjpLku43pgJDmrKHmo4Dmn6XkurrpgInjgIHmlbTmibnkvpvmlpnlj4rlu7rorr7mnKzph5HjgIINCiAgICAgIGNvbnN0IGZlZWQ9Niood29ya2luZy5sZW5ndGg/cm9vbUZlZWQucmVkdWNlKChuLHYpPT5uK3YsMCk6TWF0aC5taW4oLi4ucm9vbUZlZWQpKTsNCiAgICAgIGlmKG0uc3RhdGUucmVzb3VyY2VzLnNjcmFwPGMuY29zdC5zY3JhcCtjb25maWcuc2NyYXBSZXNlcnZlK2ZlZWQpcmV0dXJuIDA7DQogICAgICBjb25zdCBmdW5kZWQ9ey4uLm0sc3RhdGU6ey4uLm0uc3RhdGUscmVzb3VyY2VzOnsuLi5tLnN0YXRlLnJlc291cmNlcyxwYXJ0czpNYXRoLm1heChtLnN0YXRlLnJlc291cmNlcy5wYXJ0cyxjLmNvc3QucGFydHMrY29uZmlnLnBhcnRzUmVzZXJ2ZSl9fX07DQogICAgICBpZihzaGVsdGVyQ29uc3RydWN0aW9uQWxsb3dhbmNlKHsuLi5jLGJsb2NrczpbXX0sZnVuZGVkLGNvbmZpZyxzdGF0ZSxwZW5kaW5nLG5vdykpcmV0dXJuIDA7DQogICAgfQ0KICAgIGNvbnN0IHdpZHRoPWMua2luZD09PSd1cGdyYWRlJz9tLnN0YXRlLnJvb21zLmZpbmQocj0+ci5pZD09PWMuaWQpPy53aWR0aDoxOw0KICAgIHJldHVybiBOdW1iZXIuaXNTYWZlSW50ZWdlcih3aWR0aCkmJndpZHRoPjA/KHNoZWx0ZXJSb29tc1t0eXBlXVsxXT8xOi41KSp3aWR0aDowOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJDb25zdHJ1Y3Rpb25UYXJnZXRzKGMpIHsgcmV0dXJuIGMua2luZD09PSdidWlsZCc/W2MudHlwZSxjLmZsb29yLGMuY29sLC4uLihjLnR5cGU9PT0ndHJhaW5pbmcnP1tjLnRyYWluU3RhdF06W10pXTpjLmtpbmQ9PT0ndXBncmFkZSc/W2MuaWRdOltjLmZsb29yXTsgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQ29uc3RydWN0aW9uTWF0ZXJpYWxzKGMsbSkgew0KICAgIGNvbnN0IG1hdGVyaWFsPWM/Lm1hdGVyaWFsczsNCiAgICBpZighY3x8IVsnYnVpbGQnLCd1cGdyYWRlJ10uaW5jbHVkZXMoYy5raW5kKXx8Yy50eXBlIT09J3dvcmtzaG9wJ3x8IXZhbGlkU2hlbHRlck1hdGVyaWFscyhtYXRlcmlhbCl8fA0KICAgICAgICBtYXRlcmlhbC52YXVsdE5vIT09bS52aWV3LnZhdWx0Tm98fCFtLnN0YXRlLnJvb21zLnNvbWUocj0+ci5pZD09PW1hdGVyaWFsLmlkJiZyLnR5cGU9PT1tYXRlcmlhbC50eXBlJiZyLmxldmVsPT09bWF0ZXJpYWwubGV2ZWwtMSkpcmV0dXJuIG51bGw7DQogICAgcmV0dXJuIHsuLi5tYXRlcmlhbH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNvbnN0cnVjdGlvblNpZ25hdHVyZShjKSB7IHJldHVybiBKU09OLnN0cmluZ2lmeShbYy5raW5kLGMudHlwZSxjLmZsb29yLGMuY29sLGMuaWQsYy5sZXZlbCxjLmNvc3QsYy5wdXJwb3NlLGMudHJhaW5TdGF0LGMuc3RyYXRlZ3ksYy5tYXRlcmlhbHNdKTsgfQ0KCiAgY29uc3Qgc3RhZmZSb29tVHlwZXMgPSBbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ107DQogIGNvbnN0IHN0YWZmUm9vbU5hbWVzID0geyBwb3dlcjon5Y+R55S156uZJyxkaW5lcjon6aSQ5Y6FJyx3YXRlcjon5YeA5rC056uZJyxzY3JhcDon5bqf5paZ5Zue5pS256uZJyxxdWFydGVyczon5a6/6IiNJyB9Ow0KICBmdW5jdGlvbiBzaGVsdGVyTmFtZVVuaXF1ZShzLHApIHsNCiAgICAvLyDkv53nlZnosIPnlKjlhaXlj6PvvIzliKTlrprmlLnkuLrljp/nlJ/liJfooajlkozor6bmg4Xlj6/lhbHlkIzmoLjlr7nnmoTnu4TlkIjouqvku73jgIINCiAgICByZXR1cm4gQm9vbGVhbihzaGVsdGVyUmVzaWRlbnRJZGVudGl0eShzLHApKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyVHJhaW5pbmdDb21wbGV0ZShzLHApIHsNCiAgICBjb25zdCByb29tPXMucm9vbXMuZmluZChyPT5yLmlkPT09cC5yb29tSWQpOw0KICAgIHJldHVybiByb29tPy50eXBlPT09J3RyYWluaW5nJyYmWydzdHInLCdwZXInLCdlbmQnLCdjaGEnLCdpbnQnLCdhZ2knLCdsY2snXS5pbmNsdWRlcyhyb29tLnRyYWluU3RhdCkmJg0KICAgICAgTnVtYmVyLmlzRmluaXRlKHAuc3RhdHM/Lltyb29tLnRyYWluU3RhdF0pJiZwLnN0YXRzW3Jvb20udHJhaW5TdGF0XT49MTA7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckdlYXJQbGFuKG0scG9vbCkgew0KICAgIGlmICghc2hlbHRlckdlYXIpIHJldHVybiBudWxsOw0KICAgIGNvbnN0IHMgPSBtLnN0YXRlLCB1c2VkID0gbmV3IFNldChzLnJlc2lkZW50cy5mbGF0TWFwKHAgPT4gW3Aud2VhcG9uSWQscC5vdXRmaXRJZF0pKTsNCiAgICBpZiAocy5yZXNpZGVudHMuc29tZShwID0+ICFbcC53ZWFwb25JZCxwLm91dGZpdElkXS5ldmVyeShpZCA9PiBpZCA9PT0gbnVsbCB8fCBOdW1iZXIuaXNTYWZlSW50ZWdlcihpZCkgJiYgaWQgPiAwKSkgfHwNCiAgICAgICAgbmV3IFNldChzLml0ZW1zLm1hcChpdGVtID0+IGl0ZW0uaWQpKS5zaXplICE9PSBzLml0ZW1zLmxlbmd0aCkgdGhyb3cgbmV3IEVycm9yKCfoo4XlpIflvZLlsZ7ml6Dms5XmoLjlr7knKTsNCiAgICBjb25zdCBvdXRmaXRzID0gcy5pdGVtcy5maWx0ZXIoaXRlbSA9PiBpdGVtLnNsb3QgPT09ICdvdXRmaXQnICYmICF1c2VkLmhhcyhpdGVtLmlkKSk7DQogICAgaWYgKG91dGZpdHMuc29tZShpdGVtID0+ICFOdW1iZXIuaXNTYWZlSW50ZWdlcihpdGVtLmlkKSB8fCBpdGVtLmlkIDw9IDAgfHwgIW9iamVjdFN0YXRlKGl0ZW0uYm9udXMpIHx8DQogICAgICAgIE9iamVjdC5lbnRyaWVzKGl0ZW0uYm9udXMpLnNvbWUoKFtrZXksbl0pID0+ICFbJ3N0cicsJ3BlcicsJ2VuZCcsJ2NoYScsJ2ludCcsJ2FnaScsJ2xjayddLmluY2x1ZGVzKGtleSkgfHwgIU51bWJlci5pc0Zpbml0ZShuKSB8fCBuIDwgMCkpKSB7DQogICAgICB0aHJvdyBuZXcgRXJyb3IoJ+acjeijheWxnuaAp+aXoOazleaguOWvuScpOw0KICAgIH0NCiAgICBjb25zdCBjaG9pY2VzID0gW107DQogICAgZm9yIChjb25zdCBwIG9mIHBvb2wpIHsNCiAgICAgIGNvbnN0IHJvb20gPSBzLnJvb21zLmZpbmQociA9PiByLmlkID09PSBwLnJvb21JZCAmJiBzdGFmZlJvb21UeXBlcy5pbmNsdWRlcyhyLnR5cGUpKTsNCiAgICAgIGlmICghcm9vbSB8fCBwLm91dGZpdElkICE9PSBudWxsICYmICFzLml0ZW1zLnNvbWUoaXRlbSA9PiBpdGVtLmlkID09PSBwLm91dGZpdElkICYmIGl0ZW0uc2xvdCA9PT0gJ291dGZpdCcpKSBjb250aW51ZTsNCiAgICAgIGNvbnN0IHdvcmtlcnMgPSBzLnJlc2lkZW50cy5maWx0ZXIob3RoZXIgPT4gb3RoZXIucm9vbUlkID09PSByb29tLmlkICYmIG90aGVyLmRlYWRBdCA9PT0gbnVsbCAmJiBvdGhlci5hd2F5ID09PSBudWxsICYmIG90aGVyLmFkdWx0QXQgPD0gbS5ub3cpOw0KICAgICAgaWYgKHdvcmtlcnMuaW5kZXhPZihwKSA+PSByb29tLndpZHRoKjIpIGNvbnRpbnVlOw0KICAgICAgY29uc3QgcmVzb3VyY2UgPSBzaGVsdGVyUm9vbXNbcm9vbS50eXBlXVsxXSwgY3VycmVudCA9IHNoZWx0ZXJXb3JrZXJSYXRlKHMsbS5ub3csbS52aWV3LmVudixwLHJvb20pOw0KICAgICAgaWYgKCFjdXJyZW50KSBjb250aW51ZTsNCiAgICAgIGZvciAoY29uc3QgaXRlbSBvZiBvdXRmaXRzKSB7DQogICAgICAgIGNvbnN0IGdhaW4gPSBzaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYsey4uLnAsb3V0Zml0SWQ6aXRlbS5pZH0scm9vbSktY3VycmVudDsNCiAgICAgICAgaWYgKGdhaW4gPD0gMWUtNikgY29udGludWU7DQogICAgICAgIGNvbnN0IHByaW9yaXR5ID0gT2JqZWN0Lmhhc093bihtLmRlbWFuZCxyZXNvdXJjZSkgJiYgbS5wcm9kdWN0aW9uW3Jlc291cmNlXSA8IG0uZGVtYW5kW3Jlc291cmNlXSoxLjIgPyAyIDogcmVzb3VyY2UgPT09ICdzY3JhcCcgPyAxIDogMDsNCiAgICAgICAgY2hvaWNlcy5wdXNoKHtraW5kOidlcXVpcCcsaWQ6cC5pZCxpdGVtOml0ZW0uaWQsZnJvbUl0ZW06cC5vdXRmaXRJZCxyb29tOnAucm9vbUlkLGZyb206cC5yb29tSWQsbmFtZTpwLm5hbWUscmVzb3VyY2UsDQogICAgICAgICAgcmVhc29uOmDnqb/miLTpl7Lnva7mnI3oo4XvvIzlop7liqAke3NoZWx0ZXJSZXNvdXJjZXNbcmVzb3VyY2VdfeS6p+WHumAsZ2Fpbixwcmlvcml0eX0pOw0KICAgICAgfQ0KICAgIH0NCiAgICBjaG9pY2VzLnNvcnQoKGEsYikgPT4gYi5wcmlvcml0eS1hLnByaW9yaXR5IHx8IChNYXRoLmFicyhiLmdhaW4tYS5nYWluKSA+IDFlLTYgPyBiLmdhaW4tYS5nYWluIDogMCkgfHwgYS5pZC1iLmlkIHx8IGEuaXRlbS1iLml0ZW0pOw0KICAgIGNvbnN0IHJlc3VsdD1zaGVsdGVyRmluZEdlYXIobSxjaG9pY2VzKSxjaG9pY2U9cmVzdWx0LmNob2ljZXNbMF07DQogICAgcmV0dXJuIGNob2ljZT97Li4uY2hvaWNlLHJlYXNvbjpgJHtyZXN1bHQuY29tcGxldGU/J+aVtOaJueavlOi+g+mXsue9ruacjeijhSc6J+acieeVjOavlOi+g+mXsue9ruacjeijhSd977yM5aKe5YqgJHtzaGVsdGVyUmVzb3VyY2VzW2Nob2ljZS5yZXNvdXJjZV195Lqn5Ye6YCwNCiAgICAgIGdlYXJDb21wYXJpc29uOntjb21wbGV0ZTpyZXN1bHQuY29tcGxldGUsbm9kZXM6cmVzdWx0Lm5vZGVzLGNvdW50OnJlc3VsdC5jaG9pY2VzLmxlbmd0aCwNCiAgICAgICAgYmVmb3JlOm0ucHJvZHVjdGlvbixhZnRlcjpyZXN1bHQucHJvZHVjdGlvbn19Om51bGw7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckZpbmRHZWFyKG0sY2hvaWNlcyxtYXhOb2Rlcz0yMDAwMCkgew0KICAgIC8vIOWQjOaXtuavlOi+g+aJgOaciemXsue9ruiho+acje+8jOmBv+WFjeWkmuWxnuaAp+acjeWFiOiiq+acieabv+S7o+iho+acjeeahOWyl+S9jeWNoOeUqOOAgg0KICAgIC8vIOavj+S9jeWxheawkeiHs+WkmuS4gOS7tuOAgeavj+S7tuiHs+WkmuS4gOS6uu+8m+WPqui/lOWbnuS4i+S4gOatpe+8jOehruiupOWQjuaMieaWsOW/q+eFp+mHjeaWsOavlOi+g+OAgg0KICAgIGNvbnN0IGtleXM9Wy4uLk9iamVjdC5rZXlzKG0uZGVtYW5kKSwnc2NyYXAnXSxieVBlcnNvbj1uZXcgTWFwKCk7DQogICAgZm9yKGNvbnN0IGMgb2YgY2hvaWNlcyl7aWYoIWJ5UGVyc29uLmhhcyhjLmlkKSlieVBlcnNvbi5zZXQoYy5pZCxbXSk7YnlQZXJzb24uZ2V0KGMuaWQpLnB1c2goYyk7fQ0KICAgIGNvbnN0IHdvcmtlcnM9Wy4uLmJ5UGVyc29uLnZhbHVlcygpXS5zb3J0KChhLGIpPT5hLmxlbmd0aC1iLmxlbmd0aHx8Y2hvaWNlcy5pbmRleE9mKGFbMF0pLWNob2ljZXMuaW5kZXhPZihiWzBdKSk7DQogICAgY29uc3QgcHJvZHVjdGlvbj17Li4ubS5wcm9kdWN0aW9ufSx1c2VkPW5ldyBTZXQoKSxwZW9wbGU9bmV3IFNldCgpLHNlbGVjdGVkPVtdOw0KICAgIGZvcihjb25zdCBjIG9mIGNob2ljZXMpaWYoIXVzZWQuaGFzKGMuaXRlbSkmJiFwZW9wbGUuaGFzKGMuaWQpKXsNCiAgICAgIHNlbGVjdGVkLnB1c2goYyk7dXNlZC5hZGQoYy5pdGVtKTtwZW9wbGUuYWRkKGMuaWQpO3Byb2R1Y3Rpb25bYy5yZXNvdXJjZV0rPWMuZ2FpbjsNCiAgICB9DQogICAgY29uc3Qgc25hcHNob3Q9KCk9Pih7Y2hvaWNlczpbLi4uc2VsZWN0ZWRdLHByb2R1Y3Rpb246ey4uLnByb2R1Y3Rpb259LHNjb3JlOnNoZWx0ZXJBbGxvY2F0aW9uU2NvcmUocHJvZHVjdGlvbixtLmRlbWFuZCksY2hhbmdlczpzZWxlY3RlZC5sZW5ndGh9KTsNCiAgICBsZXQgYmVzdD1zbmFwc2hvdCgpLG5vZGVzPTAsbGltaXRlZD1mYWxzZTsNCiAgICBpZih3b3JrZXJzLmxlbmd0aD4xNilyZXR1cm4gey4uLmJlc3QsY29tcGxldGU6ZmFsc2Usbm9kZXN9Ow0KICAgIGNvbnN0IHN1ZmZpeD1BcnJheS5mcm9tKHtsZW5ndGg6d29ya2Vycy5sZW5ndGgrMX0sKCk9Pk9iamVjdC5mcm9tRW50cmllcyhrZXlzLm1hcChrPT5baywwXSkpKTsNCiAgICBmb3IobGV0IGk9d29ya2Vycy5sZW5ndGgtMTtpPj0wO2ktLSlmb3IoY29uc3QgayBvZiBrZXlzKQ0KICAgICAgc3VmZml4W2ldW2tdPXN1ZmZpeFtpKzFdW2tdK01hdGgubWF4KDAsLi4ud29ya2Vyc1tpXS5maWx0ZXIoYz0+Yy5yZXNvdXJjZT09PWspLm1hcChjPT5jLmdhaW4pKTsNCiAgICBPYmplY3QuYXNzaWduKHByb2R1Y3Rpb24sbS5wcm9kdWN0aW9uKTtzZWxlY3RlZC5sZW5ndGg9MDt1c2VkLmNsZWFyKCk7DQogICAgZnVuY3Rpb24gdmlzaXQoaW5kZXgpew0KICAgICAgaWYobm9kZXM+PW1heE5vZGVzKXtsaW1pdGVkPXRydWU7cmV0dXJuO31ub2RlcysrOw0KICAgICAgY29uc3QgY2FuZGlkYXRlPXtzY29yZTpzaGVsdGVyQWxsb2NhdGlvblNjb3JlKHByb2R1Y3Rpb24sbS5kZW1hbmQpLGNoYW5nZXM6c2VsZWN0ZWQubGVuZ3RofTsNCiAgICAgIGlmKHNoZWx0ZXJBbGxvY2F0aW9uQ29tcGFyZShjYW5kaWRhdGUsYmVzdCk+MCliZXN0PXNuYXBzaG90KCk7DQogICAgICBpZihpbmRleD09PXdvcmtlcnMubGVuZ3RoKXJldHVybjsNCiAgICAgIGNvbnN0IG9wdGltaXN0aWM9T2JqZWN0LmZyb21FbnRyaWVzKGtleXMubWFwKGs9PltrLHByb2R1Y3Rpb25ba10rc3VmZml4W2luZGV4XVtrXV0pKTsNCiAgICAgIGlmKHNoZWx0ZXJBbGxvY2F0aW9uQ29tcGFyZSh7c2NvcmU6c2hlbHRlckFsbG9jYXRpb25TY29yZShvcHRpbWlzdGljLG0uZGVtYW5kKSxjaGFuZ2VzOnNlbGVjdGVkLmxlbmd0aH0sYmVzdCk8PTApcmV0dXJuOw0KICAgICAgZm9yKGNvbnN0IGMgb2Ygd29ya2Vyc1tpbmRleF0pew0KICAgICAgICBpZih1c2VkLmhhcyhjLml0ZW0pKWNvbnRpbnVlOw0KICAgICAgICB1c2VkLmFkZChjLml0ZW0pO3NlbGVjdGVkLnB1c2goYyk7cHJvZHVjdGlvbltjLnJlc291cmNlXSs9Yy5nYWluOw0KICAgICAgICB2aXNpdChpbmRleCsxKTsNCiAgICAgICAgcHJvZHVjdGlvbltjLnJlc291cmNlXS09Yy5nYWluO3NlbGVjdGVkLnBvcCgpO3VzZWQuZGVsZXRlKGMuaXRlbSk7DQogICAgICAgIGlmKGxpbWl0ZWQpcmV0dXJuOw0KICAgICAgfQ0KICAgICAgdmlzaXQoaW5kZXgrMSk7DQogICAgfQ0KICAgIHZpc2l0KDApOw0KICAgIGJlc3QuY2hvaWNlcy5zb3J0KChhLGIpPT5jaG9pY2VzLmluZGV4T2YoYSktY2hvaWNlcy5pbmRleE9mKGIpKTsNCiAgICByZXR1cm4gey4uLmJlc3QsY29tcGxldGU6IWxpbWl0ZWQsbm9kZXN9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJTd2FwU2VxdWVuY2VzKGEsYikgew0KICAgIGNvbnN0IG1vdmUgPSAocCxyb29tKSA9PiAoe2lkOnAuaWQscm9vbX0pOw0KICAgIGlmIChhLnJvb20gPT09IG51bGwpIHJldHVybiBbW21vdmUoYixudWxsKSxtb3ZlKGEsYi5yb29tKV1dOw0KICAgIHJldHVybiBbDQogICAgICBbbW92ZShiLGEucm9vbSksbW92ZShhLGIucm9vbSldLA0KICAgICAgW21vdmUoYSxudWxsKSxtb3ZlKGIsYS5yb29tKSxtb3ZlKGEsYi5yb29tKV0sDQogICAgICBbbW92ZShiLG51bGwpLG1vdmUoYSxiLnJvb20pLG1vdmUoYixhLnJvb20pXQ0KICAgIF07DQogIH0NCiAgLy8g5qih5ouf5q+P5LiA5q2l55qE5oi/6Ze05a656YeP5LiO5L6b5bqU77yb5LiN6IO95a6J5YWo6IW+5L2N55qE5ruh5ZGY5oi/6Ze05L+d55WZ5Y6f5a6J5o6S44CCDQogIGZ1bmN0aW9uIHNoZWx0ZXJTd2FwUHJvamVjdGlvbihtLG1vdmVzLGZ1dHVyZVN1cHBseSA9IGZhbHNlLGFsbG93U2hvcnRhZ2VzID0gZmFsc2UpIHsNCiAgICBjb25zdCBzID0gbS5zdGF0ZSwgYXNzaWduZWQgPSBuZXcgTWFwKHMucmVzaWRlbnRzLm1hcChwID0+IFtwLmlkLHAucm9vbUlkXSkpLCBwcm9qZWN0ZWQgPSB7Li4uKG0uYWN0dWFsUHJvZHVjdGlvbiB8fCBtLnByb2R1Y3Rpb24pfTsNCiAgICBjb25zdCBkZW1hbmQgPSBmdXR1cmVTdXBwbHkgJiYgbS5jdXJyZW50RGVtYW5kID8gbS5jdXJyZW50RGVtYW5kIDogbS5kZW1hbmQ7DQogICAgY29uc3Qgb3V0cHV0ID0gcm9vbSA9PiAhcm9vbSB8fCAhc2hlbHRlclJvb21zW3Jvb20udHlwZV1bMV0gPyAwIDogcy5yZXNpZGVudHMuZmlsdGVyKHAgPT4NCiAgICAgIGFzc2lnbmVkLmdldChwLmlkKT09PXJvb20uaWQgJiYgcC5kZWFkQXQ9PT1udWxsICYmIHAuYXdheT09PW51bGwgJiYgcC5hZHVsdEF0PD1tLm5vdykuc2xpY2UoMCxyb29tLndpZHRoKjIpDQogICAgICAucmVkdWNlKChzdW0scCk9PnN1bStzaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYscCxyb29tKSwwKTsNCiAgICBmb3IgKGNvbnN0IG1vdmUgb2YgbW92ZXMpIHsNCiAgICAgIGNvbnN0IHAgPSBzLnJlc2lkZW50cy5maW5kKHAgPT4gcC5pZCA9PT0gbW92ZS5pZCksIG9sZCA9IHMucm9vbXMuZmluZChyID0+IHIuaWQgPT09IGFzc2lnbmVkLmdldChtb3ZlLmlkKSk7DQogICAgICBjb25zdCByb29tID0gbW92ZS5yb29tID09PSBudWxsID8gbnVsbCA6IHMucm9vbXMuZmluZChyID0+IHIuaWQgPT09IG1vdmUucm9vbSk7DQogICAgICBpZiAoIXAgfHwgbW92ZS5yb29tICE9PSBudWxsICYmICghcm9vbSB8fCAhc3RhZmZSb29tVHlwZXMuaW5jbHVkZXMocm9vbS50eXBlKSB8fCByb29tLmJ1aWx0QXQgPiBtLm5vdyB8fA0KICAgICAgICAgIHJvb20uaW5jaWRlbnQgfHwgcm9vbS51bnBvd2VyZWQgfHwgcm9vbS51cGdyYWRlQXQgIT09IG51bGwgfHwNCiAgICAgICAgICBzLnJlc2lkZW50cy5maWx0ZXIob3RoZXIgPT4gb3RoZXIuaWQgIT09IHAuaWQgJiYgb3RoZXIuZGVhZEF0ID09PSBudWxsICYmIG90aGVyLmFkdWx0QXQgPD0gbS5ub3cgJiYgYXNzaWduZWQuZ2V0KG90aGVyLmlkKSA9PT0gcm9vbS5pZCkubGVuZ3RoID49IHNoZWx0ZXJTdGFmZkNhcGFjaXR5KG0scm9vbSxwLmlkKSkpIHJldHVybiBudWxsOw0KICAgICAgY29uc3QgZmxvb3I9T2JqZWN0LmZyb21FbnRyaWVzKE9iamVjdC5rZXlzKGRlbWFuZCkubWFwKGs9PltrLGFsbG93U2hvcnRhZ2VzP01hdGgubWluKHByb2plY3RlZFtrXSxkZW1hbmRba10qMS4yKTpkZW1hbmRba10qMS4yXSkpOw0KICAgICAgY29uc3QgYWZmZWN0ZWQ9Wy4uLm5ldyBTZXQoW29sZCxyb29tXS5maWx0ZXIoQm9vbGVhbikpXSxiZWZvcmU9YWZmZWN0ZWQubWFwKG91dHB1dCk7DQogICAgICBhc3NpZ25lZC5zZXQocC5pZCxtb3ZlLnJvb20pOw0KICAgICAgYWZmZWN0ZWQuZm9yRWFjaCgocixpKT0+e2NvbnN0IHJlc291cmNlPXNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdO2lmKHJlc291cmNlKXByb2plY3RlZFtyZXNvdXJjZV0rPW91dHB1dChyKS1iZWZvcmVbaV07fSk7DQogICAgICBpZiAoIU9iamVjdC5rZXlzKGRlbWFuZCkuZXZlcnkoa2V5ID0+IHByb2plY3RlZFtrZXldID49IGZsb29yW2tleV0tMWUtOSkpIHJldHVybiBudWxsOw0KICAgIH0NCiAgICByZXR1cm4gcHJvamVjdGVkOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJBbGxvY2F0aW9uU2NvcmUocHJvZHVjdGlvbixkZW1hbmQpIHsNCiAgICBjb25zdCBrZXlzPU9iamVjdC5rZXlzKGRlbWFuZCk7DQogICAgcmV0dXJuIHtnYXA6a2V5cy5yZWR1Y2UoKHN1bSxrKT0+c3VtK01hdGgubWF4KDAsZGVtYW5kW2tdKjEuMi1wcm9kdWN0aW9uW2tdKS9NYXRoLm1heCgxLGRlbWFuZFtrXSoxLjIpLDApLA0KICAgICAgc2NyYXA6cHJvZHVjdGlvbi5zY3JhcCxiYXNpYzprZXlzLnJlZHVjZSgoc3VtLGspPT5zdW0rcHJvZHVjdGlvbltrXSwwKX07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckFsbG9jYXRpb25Db21wYXJlKGEsYikgew0KICAgIGZvcihjb25zdCBba2V5LGRpcmVjdGlvbl0gb2YgW1snZ2FwJywtMV0sWydzY3JhcCcsMV0sWydiYXNpYycsMV1dKSB7DQogICAgICBjb25zdCBkZWx0YT0oYS5zY29yZVtrZXldLWIuc2NvcmVba2V5XSkqZGlyZWN0aW9uOw0KICAgICAgaWYoTWF0aC5hYnMoZGVsdGEpPjFlLTYpcmV0dXJuIGRlbHRhOw0KICAgIH0NCiAgICByZXR1cm4gYi5jaGFuZ2VzLWEuY2hhbmdlczsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQWxsb2NhdGlvbkZ1dHVyZVN1cHBseShtKSB7DQogICAgcmV0dXJuIEJvb2xlYW4obS5jdXJyZW50RGVtYW5kJiZPYmplY3Qua2V5cyhtLmRlbWFuZCkuc29tZShrPT5tLnByb2R1Y3Rpb25ba108bS5kZW1hbmRba10qMS4yLTFlLTkpKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyQWxsb2NhdGlvbkltcHJvdmVzKGJlZm9yZSxhZnRlcikgew0KICAgIHJldHVybiBiZWZvcmUuZ2FwLWFmdGVyLmdhcD4xZS02IHx8IE1hdGguYWJzKGJlZm9yZS5nYXAtYWZ0ZXIuZ2FwKTw9MWUtNiAmJg0KICAgICAgKGFmdGVyLnNjcmFwLWJlZm9yZS5zY3JhcD4xIHx8IE1hdGguYWJzKGFmdGVyLnNjcmFwLWJlZm9yZS5zY3JhcCk8MWUtNiYmYWZ0ZXIuYmFzaWMtYmVmb3JlLmJhc2ljPjEpOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJBbGxvY2F0aW9uT3V0cHV0KG0sdGFyZ2V0cykgew0KICAgIGNvbnN0IGFzc2lnbmVkPW5ldyBNYXAodGFyZ2V0cy5tYXAocD0+W3AuaWQscC5yb29tXSkpLHM9bS5zdGF0ZTsNCiAgICBjb25zdCBwcm9kdWN0aW9uPXsuLi5tLnByb2R1Y3Rpb24scG93ZXI6MCxmb29kOjAsd2F0ZXI6MCxzY3JhcDowfTsNCiAgICBmb3IoY29uc3Qgcm9vbSBvZiBzLnJvb21zLmZpbHRlcihyPT5zdGFmZlJvb21UeXBlcy5pbmNsdWRlcyhyLnR5cGUpKSkgew0KICAgICAgY29uc3Qgd29ya2Vycz1zLnJlc2lkZW50cy5maWx0ZXIocD0+KGFzc2lnbmVkLmhhcyhwLmlkKT9hc3NpZ25lZC5nZXQocC5pZCk6cC5yb29tSWQpPT09cm9vbS5pZCYmDQogICAgICAgIHAuZGVhZEF0PT09bnVsbCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdykuc2xpY2UoMCxyb29tLndpZHRoKjIpOw0KICAgICAgcHJvZHVjdGlvbltzaGVsdGVyUm9vbXNbcm9vbS50eXBlXVsxXV0rPXdvcmtlcnMucmVkdWNlKChzdW0scCk9PnN1bStzaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYscCxyb29tKSwwKTsNCiAgICB9DQogICAgcmV0dXJuIHByb2R1Y3Rpb247DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckFsbG9jYXRpb25Nb3ZlcyhtLHRhcmdldHMpIHsNCiAgICBjb25zdCBwZW9wbGU9dGFyZ2V0cy5maWx0ZXIodD0+bS5zdGF0ZS5yZXNpZGVudHMuc29tZShwPT5wLmlkPT09dC5pZCYmcC5yb29tSWQhPT10LnJvb20pKTsNCiAgICBjb25zdCBhc3NpZ25lZD1uZXcgTWFwKG0uc3RhdGUucmVzaWRlbnRzLm1hcChwPT5bcC5pZCxwLnJvb21JZF0pKSx2aXNpdGVkPW5ldyBTZXQoKTsNCiAgICBjb25zdCByZXNpZGVudHM9bS5zdGF0ZS5yZXNpZGVudHMubWFwKHA9Pih7Li4ucH0pKSxieUlkPW5ldyBNYXAocmVzaWRlbnRzLm1hcChwPT5bcC5pZCxwXSkpOw0KICAgIGNvbnN0IHN0YXRlPXsuLi5tLnN0YXRlLHJlc2lkZW50c307DQogICAgY29uc3QgZnV0dXJlU3VwcGx5PXNoZWx0ZXJBbGxvY2F0aW9uRnV0dXJlU3VwcGx5KG0pOw0KICAgIGxldCBhdHRlbXB0cz0wOw0KICAgIGZ1bmN0aW9uIHZpc2l0KG1vdmVzLHByb2R1Y3Rpb24pIHsNCiAgICAgIGlmKCsrYXR0ZW1wdHM+MjAwMClyZXR1cm4gbnVsbDsNCiAgICAgIGlmKHBlb3BsZS5ldmVyeShwPT5hc3NpZ25lZC5nZXQocC5pZCk9PT1wLnJvb20pKXJldHVybiBtb3ZlczsNCiAgICAgIGlmKG1vdmVzLmxlbmd0aD49cGVvcGxlLmxlbmd0aCoyKXJldHVybiBudWxsOw0KICAgICAgY29uc3Qga2V5PXBlb3BsZS5tYXAocD0+YCR7cC5pZH06JHthc3NpZ25lZC5nZXQocC5pZCl9YCkuam9pbignLCcpOw0KICAgICAgaWYodmlzaXRlZC5oYXMoa2V5KSlyZXR1cm4gbnVsbDt2aXNpdGVkLmFkZChrZXkpOw0KICAgICAgY29uc3QgcGVuZGluZz1wZW9wbGUuZmlsdGVyKHA9PmFzc2lnbmVkLmdldChwLmlkKSE9PXAucm9vbSk7DQogICAgICBjb25zdCBvcHRpb25zPVsuLi5wZW5kaW5nLC4uLnBlbmRpbmcuZmlsdGVyKHA9PmFzc2lnbmVkLmdldChwLmlkKSE9PW51bGwmJnAucm9vbSE9PW51bGwmJg0KICAgICAgICBwZW5kaW5nLnNvbWUob3RoZXI9Pm90aGVyLmlkIT09cC5pZCYmb3RoZXIucm9vbT09PWFzc2lnbmVkLmdldChwLmlkKSkpLm1hcChwPT4oe2lkOnAuaWQscm9vbTpudWxsfSkpXTsNCiAgICAgIGZvcihjb25zdCBtb3ZlIG9mIG9wdGlvbnMpIHsNCiAgICAgICAgY29uc3QgcGF0aD1bLi4ubW92ZXMse2lkOm1vdmUuaWQscm9vbTptb3ZlLnJvb219XTsNCiAgICAgICAgLy8g5bey5qC46L+H55qE5YmN57yA5LiN5LuO5aS06YeN5pS+77yb5LuF5Zyo56eB5pyJ5b+r54Wn5LiK6aqM6K+B5LiL5LiA5q2l77yM5Zue5rqv5pe25oGi5aSN5bKX5L2N44CCDQogICAgICAgIGNvbnN0IGFmdGVyPXNoZWx0ZXJTd2FwUHJvamVjdGlvbih7Li4ubSxzdGF0ZSxhY3R1YWxQcm9kdWN0aW9uOnByb2R1Y3Rpb259LFttb3ZlXSxmdXR1cmVTdXBwbHksdHJ1ZSk7DQogICAgICAgIGlmKCFhZnRlciljb250aW51ZTsNCiAgICAgICAgY29uc3Qgb2xkPWFzc2lnbmVkLmdldChtb3ZlLmlkKTthc3NpZ25lZC5zZXQobW92ZS5pZCxtb3ZlLnJvb20pO2J5SWQuZ2V0KG1vdmUuaWQpLnJvb21JZD1tb3ZlLnJvb207DQogICAgICAgIGNvbnN0IHJlc3VsdD12aXNpdChwYXRoLGFmdGVyKTthc3NpZ25lZC5zZXQobW92ZS5pZCxvbGQpO2J5SWQuZ2V0KG1vdmUuaWQpLnJvb21JZD1vbGQ7DQogICAgICAgIGlmKHJlc3VsdClyZXR1cm4gcmVzdWx0Ow0KICAgICAgfQ0KICAgICAgcmV0dXJuIG51bGw7DQogICAgfQ0KICAgIHJldHVybiB2aXNpdChbXSx7Li4uKG0uYWN0dWFsUHJvZHVjdGlvbnx8bS5wcm9kdWN0aW9uKX0pOw0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJHcmVlZHlBbGxvY2F0aW9uKG0scm9vbXMsd29ya2VycyxzbG90cyxiYXNlLGZsb29ycyxiZWZvcmUsbWF4Q2hlY2tzPTUwMDApIHsNCiAgICBjb25zdCBrZXlzPU9iamVjdC5rZXlzKG0uZGVtYW5kKSxyZXNvdXJjZXM9cm9vbXMubWFwKHI9PnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdKSxyZXNvdXJjZU9mPWo9PnJlc291cmNlc1tqXTsNCiAgICBjb25zdCBsZWZ0PXNsb3RzLnNsaWNlKCkscHJvZHVjdGlvbj17Li4uYmFzZX0sYXNzaWduZWQ9d29ya2Vycy5tYXAoKCk9PnVuZGVmaW5lZCk7DQogICAgLy8gT25seSB0aGUgbW92ZWQgd29ya2VyIGNoYW5nZXMgdGhpcyB0aWUtYnJlYWsgY291bnQuIFJlY291bnRpbmcgdGhlIGVudGlyZQ0KICAgIC8vIHJvc3RlciBmb3IgZXZlcnkgdGVudGF0aXZlIG1vdmUgbWFkZSB0aGUgYm91bmRlZCAyMDAtcGVyc29uIHNlYXJjaCBjb3N0bHkuDQogICAgbGV0IGNoYW5nZXM9MDsNCiAgICBjb25zdCBjaGFuZ2VkPShpLGopPT5qIT09dW5kZWZpbmVkJiYoKGo9PT1udWxsP251bGw6cm9vbXNbal0uaWQpIT09d29ya2Vyc1tpXS5wLnJvb21JZCk7DQogICAgY29uc3QgcGxhY2U9KGksaik9Pnthc3NpZ25lZFtpXT1qO2NoYW5nZXMrPU51bWJlcihjaGFuZ2VkKGksaikpO2lmKGohPT1udWxsKXtsZWZ0W2pdLS07cHJvZHVjdGlvbltyZXNvdXJjZU9mKGopXSs9d29ya2Vyc1tpXS5yYXRlc1tqXTt9fTsNCiAgICBjb25zdCB1bnBsYWNlPWk9Pntjb25zdCBqPWFzc2lnbmVkW2ldO2NoYW5nZXMtPU51bWJlcihjaGFuZ2VkKGksaikpO2lmKGohPT1udWxsJiZqIT09dW5kZWZpbmVkKXtsZWZ0W2pdKys7cHJvZHVjdGlvbltyZXNvdXJjZU9mKGopXS09d29ya2Vyc1tpXS5yYXRlc1tqXTt9YXNzaWduZWRbaV09dW5kZWZpbmVkO307DQogICAgY29uc3Qgc2NyYXBSYXRlPWk9Pk1hdGgubWF4KDAsLi4ucm9vbXMubWFwKChyLGopPT5sZWZ0W2pdPjAmJnJlc291cmNlT2Yoaik9PT0nc2NyYXAnP3dvcmtlcnNbaV0ucmF0ZXNbal06MCkpOw0KICAgIC8vIOWfuuehgOS+m+e7memAkOmhueihpeWIsOmcgOaxgjEuMuWAje+8m+avj+asoeihpeacgOe8uueahOS4gOmhue+8jOmAieWvueivpemhueS6p+eOh+ebuOWvueWbnuaUtuS6p+eOh+acgOmrmOeahOS6uu+8jOWwkeWNoOWbnuaUtuiDveaJi+OAgg0KICAgIGZvcig7Oyl7DQogICAgICBjb25zdCBuZWVkPWtleXMuZmlsdGVyKGs9PnByb2R1Y3Rpb25ba108bS5kZW1hbmRba10qMS4yLTFlLTkpDQogICAgICAgIC5zb3J0KChhLGIpPT5wcm9kdWN0aW9uW2FdL01hdGgubWF4KDFlLTksbS5kZW1hbmRbYV0pLXByb2R1Y3Rpb25bYl0vTWF0aC5tYXgoMWUtOSxtLmRlbWFuZFtiXSkpOw0KICAgICAgbGV0IGJlc3Q9bnVsbDsNCiAgICAgIGZvcihjb25zdCBrIG9mIG5lZWQpew0KICAgICAgICB3b3JrZXJzLmZvckVhY2goKHcsaSk9PnsNCiAgICAgICAgICBpZihhc3NpZ25lZFtpXSE9PXVuZGVmaW5lZClyZXR1cm47DQogICAgICAgICAgY29uc3Qgb3Bwb3J0dW5pdHk9c2NyYXBSYXRlKGkpOw0KICAgICAgICAgIHJvb21zLmZvckVhY2goKHIsaik9PnsNCiAgICAgICAgICAgIGlmKGxlZnRbal08PTB8fHJlc291cmNlT2YoaikhPT1rfHwhKHcucmF0ZXNbal0+MCkpcmV0dXJuOw0KICAgICAgICAgICAgY29uc3QgdmFsdWU9dy5yYXRlc1tqXS9NYXRoLm1heCgxZS02LG9wcG9ydHVuaXR5KTsNCiAgICAgICAgICAgIGlmKCFiZXN0fHx2YWx1ZT5iZXN0LnZhbHVlKzFlLTl8fE1hdGguYWJzKHZhbHVlLWJlc3QudmFsdWUpPD0xZS05JiZ3LnJhdGVzW2pdPndvcmtlcnNbYmVzdC5pXS5yYXRlc1tiZXN0LmpdKWJlc3Q9e2ksaix2YWx1ZX07DQogICAgICAgICAgfSk7DQogICAgICAgIH0pOw0KICAgICAgICBpZihiZXN0KWJyZWFrOw0KICAgICAgfQ0KICAgICAgaWYoIWJlc3QpYnJlYWs7DQogICAgICBwbGFjZShiZXN0LmksYmVzdC5qKTsNCiAgICB9DQogICAgLy8g5YW25L2Z5Lq65oyJ5Zue5pS25Lqn546H5LuO6auY5Yiw5L2O6L+b5Zue5pS25oi/77yM5Zue5pS25ruh5ZGY5ZCO5YaN6L+b5pS255uK5pyA6auY55qE5YW25LuW56m65L2N77yM5ZCm5YiZ5LyR5oGv44CCDQogICAgY29uc3QgcmVzdFJhdGVzPXdvcmtlcnMubWFwKCh3LGkpPT5hc3NpZ25lZFtpXT09PXVuZGVmaW5lZD9zY3JhcFJhdGUoaSk6MCk7DQogICAgY29uc3QgcmVzdD13b3JrZXJzLm1hcCgodyxpKT0+aSkuZmlsdGVyKGk9PmFzc2lnbmVkW2ldPT09dW5kZWZpbmVkKS5zb3J0KChhLGIpPT5yZXN0UmF0ZXNbYl0tcmVzdFJhdGVzW2FdfHx3b3JrZXJzW2FdLnAuaWQtd29ya2Vyc1tiXS5wLmlkKTsNCiAgICBmb3IoY29uc3QgaSBvZiByZXN0KXsNCiAgICAgIGNvbnN0IG9wZW49cm9vbXMubWFwKChyLGopPT5qKS5maWx0ZXIoaj0+bGVmdFtqXT4wJiZ3b3JrZXJzW2ldLnJhdGVzW2pdPjApOw0KICAgICAgY29uc3Qgc2NyYXA9b3Blbi5maWx0ZXIoaj0+cmVzb3VyY2VPZihqKT09PSdzY3JhcCcpLHBvb2w9c2NyYXAubGVuZ3RoP3NjcmFwOm9wZW47DQogICAgICBwbGFjZShpLHBvb2wubGVuZ3RoP3Bvb2wucmVkdWNlKChhLGIpPT53b3JrZXJzW2ldLnJhdGVzW2JdPndvcmtlcnNbaV0ucmF0ZXNbYV0/YjphKTpudWxsKTsNCiAgICB9DQogICAgY29uc3QgZXZhbHVhdGU9KCk9Pih7c2NvcmU6c2hlbHRlckFsbG9jYXRpb25TY29yZShwcm9kdWN0aW9uLG0uZGVtYW5kKSxjaGFuZ2VzfSk7DQogICAgY29uc3QgdmFsaWQ9KCk9PmtleXMuZXZlcnkoaz0+cHJvZHVjdGlvbltrXT49Zmxvb3JzW2tdLTFlLTkpOw0KICAgIC8vIOWxgOmDqOaUueWWhO+8muWNleS6uuaUueWyl++8iOWQq+S8keaBr++8ieaIluS4pOS6uuS6kuaNou+8jOWPquaOpeWPl+S4peagvOabtOWlveeahOaVtOS9k+ivhOWIhuOAgg0KICAgIGxldCBjdXJyZW50PWV2YWx1YXRlKCksY2hlY2tzPTA7DQogICAgZm9yKGxldCBwYXNzPTA7cGFzczx3b3JrZXJzLmxlbmd0aCpyb29tcy5sZW5ndGgmJmNoZWNrczxtYXhDaGVja3M7cGFzcysrKXsNCiAgICAgIGxldCBpbXByb3ZlZD1mYWxzZTsNCiAgICAgIGZvcihsZXQgaT0wO2k8d29ya2Vycy5sZW5ndGgmJiFpbXByb3ZlZCYmY2hlY2tzPG1heENoZWNrcztpKyspew0KICAgICAgICBjb25zdCBmcm9tPWFzc2lnbmVkW2ldOw0KICAgICAgICBmb3IoY29uc3QgaiBvZiBbLi4ucm9vbXMubWFwKChyLGopPT5qKSxudWxsXSl7DQogICAgICAgICAgaWYoY2hlY2tzPj1tYXhDaGVja3MpYnJlYWs7DQogICAgICAgICAgaWYoaj09PWZyb218fGohPT1udWxsJiZsZWZ0W2pdPD0wKWNvbnRpbnVlOw0KICAgICAgICAgIGNoZWNrcysrOw0KICAgICAgICAgIHVucGxhY2UoaSk7cGxhY2UoaSxqKTsNCiAgICAgICAgICBjb25zdCBuZXh0PWV2YWx1YXRlKCk7DQogICAgICAgICAgaWYodmFsaWQoKSYmc2hlbHRlckFsbG9jYXRpb25Db21wYXJlKG5leHQsY3VycmVudCk+MWUtNil7Y3VycmVudD1uZXh0O2ltcHJvdmVkPXRydWU7YnJlYWs7fQ0KICAgICAgICAgIHVucGxhY2UoaSk7cGxhY2UoaSxmcm9tKTsNCiAgICAgICAgfQ0KICAgICAgICBmb3IobGV0IGs9aSsxO2s8d29ya2Vycy5sZW5ndGgmJiFpbXByb3ZlZCYmY2hlY2tzPG1heENoZWNrcztrKyspew0KICAgICAgICAgIGNvbnN0IGE9YXNzaWduZWRbaV0sYj1hc3NpZ25lZFtrXTsNCiAgICAgICAgICBpZihhPT09Yiljb250aW51ZTsNCiAgICAgICAgICBjaGVja3MrKzsNCiAgICAgICAgICB1bnBsYWNlKGkpO3VucGxhY2Uoayk7cGxhY2UoaSxiKTtwbGFjZShrLGEpOw0KICAgICAgICAgIGNvbnN0IG5leHQ9ZXZhbHVhdGUoKTsNCiAgICAgICAgICBpZih2YWxpZCgpJiZzaGVsdGVyQWxsb2NhdGlvbkNvbXBhcmUobmV4dCxjdXJyZW50KT4xZS02KXtjdXJyZW50PW5leHQ7aW1wcm92ZWQ9dHJ1ZTticmVhazt9DQogICAgICAgICAgdW5wbGFjZShpKTt1bnBsYWNlKGspO3BsYWNlKGksYSk7cGxhY2UoayxiKTsNCiAgICAgICAgfQ0KICAgICAgfQ0KICAgICAgaWYoIWltcHJvdmVkKWJyZWFrOw0KICAgIH0NCiAgICBpZighdmFsaWQoKXx8IXNoZWx0ZXJBbGxvY2F0aW9uSW1wcm92ZXMoYmVmb3JlLnNjb3JlLGN1cnJlbnQuc2NvcmUpKXJldHVybiBudWxsOw0KICAgIHJldHVybiB7Li4uY3VycmVudCxsb2NhbENoZWNrczpjaGVja3MscHJvZHVjdGlvbjp7Li4ucHJvZHVjdGlvbn0sdGFyZ2V0czp3b3JrZXJzLm1hcCgodyxpKT0+KHtpZDp3LnAuaWQscm9vbTphc3NpZ25lZFtpXT09PW51bGw/bnVsbDpyb29tc1thc3NpZ25lZFtpXV0uaWR9KSl9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJGaW5kQWxsb2NhdGlvbihtLHBvb2wsbWF4Tm9kZXM9NTAwMDApIHsNCiAgICAvLyDlpKfpmLXlrrnku43ov5DooYzmnInnlYzotKrlv4PkuI7kuqTmjaLvvJsxNuS6uuS7hemZkOWItuaMh+aVsOaQnOe0ou+8jOS4jeiDvei3s+i/h+WFqOmDqOWPr+iwg+S6uuWRmOOAgg0KICAgIGlmKCFwb29sLmxlbmd0aClyZXR1cm4ge3BsYW46bnVsbCxjb21wbGV0ZTpmYWxzZSxyZWFzb246J25vLWNhbmRpZGF0ZXMnLG5vZGVzOjB9Ow0KICAgIC8vIEEgZmFpbGVkIHNlYXJjaCBpcyByZXVzYWJsZSB3aGlsZSBpdHMgYWN0dWFsIGlucHV0cyBhcmUgdW5jaGFuZ2VkLiBJbnZlbnRvcnkNCiAgICAvLyBjb2xsZWN0aW9uIGFuZCB3YWxsLWNsb2NrIHBhc3NhZ2UgZG8gbm90IGVudGVyIHRoaXMgcHJvZHVjdGlvbi1vbmx5IHNlYXJjaC4NCiAgICAvLyBVc2UgY3VycmVudCByYXRlcy9hdmFpbGFiaWxpdHkgc28gYWR1bHRob29kLCBjb21wbGV0aW9uIGFuZCBldmVudCBib3VuZGFyaWVzDQogICAgLy8gaW52YWxpZGF0ZSBpdCBldmVuIHdoZW4gdGhlIHVuZGVybHlpbmcgdGltZXN0YW1wIGZpZWxkcyBoYXZlIG5vdCBjaGFuZ2VkLg0KICAgIGNvbnN0IHNlYXJjaEtleT1KU09OLnN0cmluZ2lmeShbbS52aWV3LnZhdWx0Tm8sbWF4Tm9kZXMsbS5kZW1hbmQsbS5jdXJyZW50RGVtYW5kLG0ucHJvZHVjdGlvbixtLmFjdHVhbFByb2R1Y3Rpb24sDQogICAgICBtLnJlc2VydmVkUmVzaWRlbnRzLG0udHJhaW5pbmdEZXN0aW5hdGlvbnMscG9vbC5tYXAocD0+W3AuaWQscC5yb29tSWQsbS5zdGF0ZS5yb29tcy5tYXAocj0+c2hlbHRlcldvcmtlclJhdGUobS5zdGF0ZSxtLm5vdyxtLnZpZXcuZW52LHAscikpXSksDQogICAgICBtLnN0YXRlLnJvb21zLm1hcChyPT5bci5pZCxyLnR5cGUsci53aWR0aCxyLmxldmVsLHIuYnVpbHRBdDw9bS5ub3csci51cGdyYWRlQXQsci5pbmNpZGVudCxyLnVucG93ZXJlZF0pLA0KICAgICAgbS5zdGF0ZS5yZXNpZGVudHMubWFwKHA9PltwLmlkLHAucm9vbUlkLHAuZGVhZEF0LHAuYXdheSxwLmFkdWx0QXQ8PW0ubm93LA0KICAgICAgICBtLnN0YXRlLnJvb21zLm1hcChyPT5zaGVsdGVyV29ya2VyUmF0ZShtLnN0YXRlLG0ubm93LG0udmlldy5lbnYscCxyKSldKV0pOw0KICAgIGNvbnN0IHByZXZpb3VzPXNoZWx0ZXJGaW5kQWxsb2NhdGlvbi5sYXN0Tm9QbGFuOw0KICAgIGlmKHByZXZpb3VzPy5rZXk9PT1zZWFyY2hLZXkpcmV0dXJuIHsuLi5wcmV2aW91cy5yZXN1bHQsbm9kZXM6MCxjYWNoZWROb2RlczpwcmV2aW91cy5yZXN1bHQubm9kZXMscmV1c2VkOnRydWV9Ow0KICAgIHNoZWx0ZXJGaW5kQWxsb2NhdGlvbi5sYXN0Tm9QbGFuPW51bGw7DQogICAgY29uc3Qgcz1tLnN0YXRlLGtleXM9T2JqZWN0LmtleXMobS5kZW1hbmQpLHJlc291cmNlcz1bLi4ua2V5cywnc2NyYXAnXTsNCiAgICBjb25zdCByb29tcz1zLnJvb21zLmZpbHRlcihyPT5zdGFmZlJvb21UeXBlcy5pbmNsdWRlcyhyLnR5cGUpJiZyLmJ1aWx0QXQ8PW0ubm93JiYhci5pbmNpZGVudCYmIXIudW5wb3dlcmVkJiZyLnVwZ3JhZGVBdD09PW51bGwpOw0KICAgIC8vIOafkOi1hOa6kOeahOWFqOmDqOWPr+eUn+S6p+aIv+mXtOW3sua7oe+8jOS4lOaXoOS6uuiDveWuieWFqOemu+Wyl+aXtu+8jOWFtuS7luaIv+mXtOaXoOazleWFiOihpeS6p+iFvuS9jeOAgg0KICAgIC8vIOWwhui/meS6m+W/heeVmeS6uuWRmOWbuuWumu+8jOmBv+WFjeS4jeWPr+aJp+ihjOeahOmrmOaUtuebiuaOkuWIl+aMpOaOieWPr+aJp+ihjOWAmemAie+8m+acieWQjOexu+epuuWyl+aXtuS4jeiDveWbuuWumuOAgg0KICAgIGNvbnN0IGxvY2tlZD1uZXcgU2V0KCksZnV0dXJlU3VwcGx5PXNoZWx0ZXJBbGxvY2F0aW9uRnV0dXJlU3VwcGx5KG0pOw0KICAgIGZvcihjb25zdCByZXNvdXJjZSBvZiBrZXlzKSB7DQogICAgICBjb25zdCBzYW1lPXJvb21zLmZpbHRlcihyPT5zaGVsdGVyUm9vbXNbci50eXBlXVsxXT09PXJlc291cmNlKSxyb29tSWRzPW5ldyBTZXQoc2FtZS5tYXAocj0+ci5pZCkpOw0KICAgICAgaWYoIXNhbWUubGVuZ3RofHxzYW1lLnNvbWUocj0+cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAucm9vbUlkPT09ci5pZCYmcC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93KS5sZW5ndGg8c2hlbHRlclN0YWZmQ2FwYWNpdHkobSxyKSkpY29udGludWU7DQogICAgICBjb25zdCByZXNpZGVudHM9cG9vbC5maWx0ZXIocD0+cm9vbUlkcy5oYXMocC5yb29tSWQpKTsNCiAgICAgIGlmKHJlc2lkZW50cy5sZW5ndGgmJiFyZXNpZGVudHMuc29tZShwPT5zaGVsdGVyU3dhcFByb2plY3Rpb24obSxbe2lkOnAuaWQscm9vbTpudWxsfV0sZnV0dXJlU3VwcGx5LHRydWUpKSlyZXNpZGVudHMuZm9yRWFjaChwPT5sb2NrZWQuYWRkKHAuaWQpKTsNCiAgICB9DQogICAgY29uc3QgYWRqdXN0YWJsZT1wb29sLmZpbHRlcihwPT4hbG9ja2VkLmhhcyhwLmlkKSksaWRzPW5ldyBTZXQoYWRqdXN0YWJsZS5tYXAocD0+cC5pZCkpOw0KICAgIGlmKCFhZGp1c3RhYmxlLmxlbmd0aClyZXR1cm4ge3BsYW46bnVsbCxjb21wbGV0ZTp0cnVlLHJlYXNvbjonbm8tc2FmZS1zZXF1ZW5jZScsbm9kZXM6MH07DQogICAgY29uc3Qgc2xvdHM9cm9vbXMubWFwKHI9Pk1hdGgubWF4KDAsc2hlbHRlclN0YWZmQ2FwYWNpdHkobSxyKS1zLnJlc2lkZW50cy5maWx0ZXIocD0+IWlkcy5oYXMocC5pZCkmJnAucm9vbUlkPT09ci5pZCYmcC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93KS5sZW5ndGgpKTsNCiAgICBjb25zdCB3b3JrZXJzPWFkanVzdGFibGUubWFwKHA9Pih7cCxyYXRlczpyb29tcy5tYXAocj0+c2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAscikpfSkpOw0KICAgIHdvcmtlcnMuc29ydCgoYSxiKT0+TWF0aC5tYXgoMCwuLi5iLnJhdGVzKS1NYXRoLm1heCgwLC4uLmEucmF0ZXMpfHxhLnAuaWQtYi5wLmlkKTsNCiAgICBjb25zdCBzdWZmaXg9QXJyYXkuZnJvbSh7bGVuZ3RoOndvcmtlcnMubGVuZ3RoKzF9LCgpPT5PYmplY3QuZnJvbUVudHJpZXMocmVzb3VyY2VzLm1hcChrPT5baywwXSkpKTsNCiAgICBmb3IobGV0IGk9d29ya2Vycy5sZW5ndGgtMTtpPj0wO2ktLSlmb3IoY29uc3QgayBvZiByZXNvdXJjZXMpc3VmZml4W2ldW2tdPXN1ZmZpeFtpKzFdW2tdKw0KICAgICAgTWF0aC5tYXgoMCwuLi5yb29tcy5tYXAoKHIsaik9PnNsb3RzW2pdPjAmJnNoZWx0ZXJSb29tc1tyLnR5cGVdWzFdPT09az93b3JrZXJzW2ldLnJhdGVzW2pdOjApKTsNCiAgICBjb25zdCBiZWZvcmU9e3Njb3JlOnNoZWx0ZXJBbGxvY2F0aW9uU2NvcmUobS5wcm9kdWN0aW9uLG0uZGVtYW5kKSxjaGFuZ2VzOjB9Ow0KICAgIGNvbnN0IHByb2R1Y3Rpb249c2hlbHRlclByb2R1Y3Rpb25XaXRob3V0KG0sWy4uLmlkc10pLGZsb29ycz1PYmplY3QuZnJvbUVudHJpZXMoa2V5cy5tYXAoaz0+W2ssTWF0aC5taW4obS5wcm9kdWN0aW9uW2tdLG0uZGVtYW5kW2tdKjEuMildKSk7DQogICAgY29uc3QgY2FuZGlkYXRlcz1bXSxhc3NpZ25tZW50cz1bXTsNCiAgICBsZXQgbm9kZXM9MCxsaW1pdGVkPXdvcmtlcnMubGVuZ3RoPjE2Ow0KICAgIGZ1bmN0aW9uIHZpc2l0KGluZGV4LGNoYW5nZXMpIHsNCiAgICAgIGlmKCsrbm9kZXM+bWF4Tm9kZXMpe2xpbWl0ZWQ9dHJ1ZTtyZXR1cm47fQ0KICAgICAgaWYoa2V5cy5zb21lKGs9PnByb2R1Y3Rpb25ba10rc3VmZml4W2luZGV4XVtrXTxmbG9vcnNba10tMWUtOSkpcmV0dXJuOw0KICAgICAgY29uc3Qgb3B0aW1pc3RpYz1PYmplY3QuZnJvbUVudHJpZXMocmVzb3VyY2VzLm1hcChrPT5bayxwcm9kdWN0aW9uW2tdK3N1ZmZpeFtpbmRleF1ba11dKSk7DQogICAgICBjb25zdCBib3VuZD1jYW5kaWRhdGVzLmxlbmd0aD09PTg/Y2FuZGlkYXRlcy5hdCgtMSk6YmVmb3JlOw0KICAgICAgaWYoc2hlbHRlckFsbG9jYXRpb25Db21wYXJlKHtzY29yZTpzaGVsdGVyQWxsb2NhdGlvblNjb3JlKG9wdGltaXN0aWMsbS5kZW1hbmQpLGNoYW5nZXM6MH0sYm91bmQpPC0xZS02KXJldHVybjsNCiAgICAgIGlmKGluZGV4PT09d29ya2Vycy5sZW5ndGgpIHsNCiAgICAgICAgY29uc3Qgc2NvcmU9c2hlbHRlckFsbG9jYXRpb25TY29yZShwcm9kdWN0aW9uLG0uZGVtYW5kKTsNCiAgICAgICAgaWYoIXNoZWx0ZXJBbGxvY2F0aW9uSW1wcm92ZXMoYmVmb3JlLnNjb3JlLHNjb3JlKSlyZXR1cm47DQogICAgICAgIGNvbnN0IGNhbmRpZGF0ZT17c2NvcmUsY2hhbmdlcyxwcm9kdWN0aW9uOnsuLi5wcm9kdWN0aW9ufSx0YXJnZXRzOndvcmtlcnMubWFwKCh3LGkpPT4oe2lkOncucC5pZCxyb29tOmFzc2lnbm1lbnRzW2ldfSkpfTsNCiAgICAgICAgY2FuZGlkYXRlcy5wdXNoKGNhbmRpZGF0ZSk7Y2FuZGlkYXRlcy5zb3J0KChhLGIpPT5zaGVsdGVyQWxsb2NhdGlvbkNvbXBhcmUoYixhKSk7aWYoY2FuZGlkYXRlcy5sZW5ndGg+OCljYW5kaWRhdGVzLnBvcCgpO3JldHVybjsNCiAgICAgIH0NCiAgICAgIGNvbnN0IHdvcmtlcj13b3JrZXJzW2luZGV4XTsNCiAgICAgIGNvbnN0IGNob2ljZXM9cm9vbXMubWFwKChyLGopPT4oe3Jvb206cixpbmRleDpqLHJhdGU6d29ya2VyLnJhdGVzW2pdfSkpLmZpbHRlcihjPT5zbG90c1tjLmluZGV4XT4wKTsNCiAgICAgIGNob2ljZXMuc29ydCgoYSxiKT0+TnVtYmVyKGIucm9vbS5pZD09PXdvcmtlci5wLnJvb21JZCktTnVtYmVyKGEucm9vbS5pZD09PXdvcmtlci5wLnJvb21JZCl8fGIucmF0ZS1hLnJhdGV8fGEucm9vbS5pZC1iLnJvb20uaWQpOw0KICAgICAgY2hvaWNlcy5wdXNoKHtyb29tOm51bGwsaW5kZXg6LTEscmF0ZTowfSk7DQogICAgICBmb3IoY29uc3QgY2hvaWNlIG9mIGNob2ljZXMpIHsNCiAgICAgICAgY29uc3QgcmVzb3VyY2U9Y2hvaWNlLnJvb20mJnNoZWx0ZXJSb29tc1tjaG9pY2Uucm9vbS50eXBlXVsxXTsNCiAgICAgICAgYXNzaWdubWVudHNbaW5kZXhdPWNob2ljZS5yb29tPy5pZD8/bnVsbDsNCiAgICAgICAgaWYoY2hvaWNlLnJvb20pe3Nsb3RzW2Nob2ljZS5pbmRleF0tLTtwcm9kdWN0aW9uW3Jlc291cmNlXSs9Y2hvaWNlLnJhdGU7fQ0KICAgICAgICB2aXNpdChpbmRleCsxLGNoYW5nZXMrTnVtYmVyKGFzc2lnbm1lbnRzW2luZGV4XSE9PXdvcmtlci5wLnJvb21JZCkpOw0KICAgICAgICBpZihjaG9pY2Uucm9vbSl7c2xvdHNbY2hvaWNlLmluZGV4XSsrO3Byb2R1Y3Rpb25bcmVzb3VyY2VdLT1jaG9pY2UucmF0ZTt9DQogICAgICAgIGlmKGxpbWl0ZWQpYnJlYWs7DQogICAgICB9DQogICAgfQ0KICAgIGlmKCFsaW1pdGVkKXZpc2l0KDAsMCk7DQogICAgLy8g5pCc57Si5Y+v6IO95Zyo5om+5Yiw5Y+v5omn6KGM5pa55qGI5YmN6L6+5Yiw6K6h566X5LiK6ZmQ44CC5Y+m5Lul6LSq5b+D5Yqg5bGA6YOo5Lqk5o2i6KGl5LiA5Liq5YCZ6YCJ77ya5YWI5oyJ5py65Lya5oiQ5pys6KGl6Laz5Z+656GA5L6b57uZ77yMDQogICAgLy8g5YW25L2Z5Lq65LyY5YWI5Zue5pS277yM5YaN6YCQ5Lq65pS55bKX5oiW5Lik5Lik5LqS5o2i55u05Yiw5LiN5YaN5pS55ZaE77yb5LuN6aG75ruh6Laz55u45ZCM5L6b5bqU5bqV57q/44CB5pS55ZaE5p2h5Lu25ZKM5a6J5YWo6LCD5bKX6aG65bqP44CCDQogICAgY29uc3QgZ3JlZWR5PXNoZWx0ZXJHcmVlZHlBbGxvY2F0aW9uKG0scm9vbXMsd29ya2VycyxzbG90cyxwcm9kdWN0aW9uLGZsb29ycyxiZWZvcmUpOw0KICAgIGlmKGdyZWVkeSYmIWNhbmRpZGF0ZXMuc29tZShjPT5jLnRhcmdldHMuZXZlcnkoKHQsaSk9PnQucm9vbT09PWdyZWVkeS50YXJnZXRzW2ldLnJvb20pKSkNCiAgICAgIGNhbmRpZGF0ZXMucHVzaChncmVlZHkpLGNhbmRpZGF0ZXMuc29ydCgoYSxiKT0+c2hlbHRlckFsbG9jYXRpb25Db21wYXJlKGIsYSkpOw0KICAgIGZvcihjb25zdCBjYW5kaWRhdGUgb2YgY2FuZGlkYXRlcykgew0KICAgICAgY29uc3QgdGFyZ2V0cz1jYW5kaWRhdGUudGFyZ2V0cy5maWx0ZXIodD0+cG9vbC5zb21lKHA9PnAuaWQ9PT10LmlkJiZwLnJvb21JZCE9PXQucm9vbSkpLnNvcnQoKGEsYik9PmEuaWQtYi5pZCk7DQogICAgICBjb25zdCBtb3Zlcz1zaGVsdGVyQWxsb2NhdGlvbk1vdmVzKG0sdGFyZ2V0cyk7DQogICAgICBpZihtb3ZlcylyZXR1cm4ge3BsYW46e3RhcmdldHMsbW92ZXMscHJvZHVjdGlvbjpjYW5kaWRhdGUucHJvZHVjdGlvbn0sY29tcGxldGU6IWxpbWl0ZWQsbm9kZXM6TWF0aC5taW4obm9kZXMsbWF4Tm9kZXMpLA0KICAgICAgICBsb2NhbENoZWNrczpncmVlZHk/LmxvY2FsQ2hlY2tzPz8wLGJlZm9yZTptLnByb2R1Y3Rpb24scmVhc29uOidwbGFuJ307DQogICAgfQ0KICAgIGNvbnN0IHJlc3VsdD17cGxhbjpudWxsLGNvbXBsZXRlOiFsaW1pdGVkLG5vZGVzOk1hdGgubWluKG5vZGVzLG1heE5vZGVzKSxyZWFzb246Y2FuZGlkYXRlcy5sZW5ndGg/J25vLXNhZmUtc2VxdWVuY2UnOmxpbWl0ZWQ/J3NlYXJjaC1saW1pdCc6J25vLWltcHJvdmVtZW50J307DQogICAgc2hlbHRlckZpbmRBbGxvY2F0aW9uLmxhc3ROb1BsYW49e2tleTpzZWFyY2hLZXkscmVzdWx0OnsuLi5yZXN1bHR9fTtyZXR1cm4gcmVzdWx0Ow0KICB9DQogIGZ1bmN0aW9uIHBsYW5TaGVsdGVyQWxsb2NhdGlvbihtLHBvb2wpIHsNCiAgICBjb25zdCByZXN1bHQ9c2hlbHRlckZpbmRBbGxvY2F0aW9uKG0scG9vbCk7DQogICAgaWYoIXJlc3VsdC5wbGFuKXJldHVybiB7cGxhbjpudWxsLG5vdGU6cmVzdWx0LnJlYXNvbj09PSduby1zYWZlLXNlcXVlbmNlJz8n5om+5Yiw55qE5aKe5Lqn5pa55qGI5bCa5peg5Y+v5a6J5YWo5omn6KGM55qE6LCD5bKX6aG65bqP77yM5pys6L2u5L+d55WZ5Y6f5bKX5L2N44CCJzoNCiAgICAgIHJlc3VsdC5yZWFzb249PT0nc2VhcmNoLWxpbWl0Jz8n5pys6L2u5pyJ55WM5q+U6L6D5pyq5om+5Yiw5Y+v5omn6KGM55qE5pu05LyY5YiG6YWN77yb5pyq56m35bC95YWo6YOo5o6S5YiX77yM5LiN5Luj6KGo5bey57uP5pyA5LyY44CCJzoNCiAgICAgIHJlc3VsdC5yZWFzb249PT0nbm8tY2FuZGlkYXRlcyc/J+W9k+WJjeayoeacieespuWQiOiwg+Wyl+adoeS7tueahOWxheawkeOAgic6J+acrOi9ruacquaJvuWIsOaUtuebiuabtOmrmOS4lOWPr+WuieWFqOaJp+ihjOeahOS6uuWRmOWIhumFjeOAgid9Ow0KICAgIGNvbnN0IHt0YXJnZXRzLG1vdmVzfT1yZXN1bHQucGxhbixmdXR1cmVTdXBwbHk9c2hlbHRlckFsbG9jYXRpb25GdXR1cmVTdXBwbHkobSksZGVtYW5kPWZ1dHVyZVN1cHBseT9tLmN1cnJlbnREZW1hbmQ6bS5kZW1hbmQ7DQogICAgY29uc3Qgc3VwcGx5Rmxvb3I9T2JqZWN0LmZyb21FbnRyaWVzKE9iamVjdC5rZXlzKGRlbWFuZCkubWFwKGs9PltrLE1hdGgubWluKChtLmFjdHVhbFByb2R1Y3Rpb258fG0ucHJvZHVjdGlvbilba10sZGVtYW5kW2tdKjEuMildKSk7DQogICAgY29uc3Qgc3dhcD17aWQ6Y3J5cHRvLnJhbmRvbVVVSUQoKSxhdDpEYXRlLm5vdygpLGtpbmQ6J2FsbG9jYXRpb24nLHBlb3BsZTp0YXJnZXRzLm1hcCh0PT4oe2lkOnQuaWQscm9vbTptLnN0YXRlLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT10LmlkKS5yb29tSWR9KSksDQogICAgICB0YXJnZXRzLG1vdmVzLHN0ZXA6MCxmdXR1cmVTdXBwbHksc3VwcGx5Rmxvb3J9Ow0KICAgIHNhdmVTaGVsdGVyKHsuLi5zaGVsdGVyU3RhdGUsc3dhcH0pOw0KICAgIGxvZy5hZGQoJ3NoZWx0ZXItb3B0aW1pemF0aW9uJywn5oyJ5pW05L2T5Lqn5Ye65a6J5o6S5Lq65ZGY5YiG6YWNJywNCiAgICAgIHtzdGVwczptb3Zlcy5sZW5ndGgscGVvcGxlOnRhcmdldHMubGVuZ3RoLHNlYXJjaENvbXBsZXRlOnJlc3VsdC5jb21wbGV0ZSxjb21wYXJlZDpyZXN1bHQubm9kZXMsbG9jYWxDaGVja3M6cmVzdWx0LmxvY2FsQ2hlY2tzLGJlZm9yZTpyZXN1bHQuYmVmb3JlLGFmdGVyOnJlc3VsdC5wbGFuLnByb2R1Y3Rpb24sDQogICAgICAgIGFzc2lnbm1lbnRzOnRhcmdldHMubWFwKHQ9Pih7aWQ6dC5pZCxmcm9tOnN3YXAucGVvcGxlLmZpbmQocD0+cC5pZD09PXQuaWQpLnJvb20sdG86dC5yb29tfSkpLGZ1dHVyZVN1cHBseSwNCiAgICAgICAgc2NyYXBHYWluOnJlc3VsdC5wbGFuLnByb2R1Y3Rpb24uc2NyYXAtbS5wcm9kdWN0aW9uLnNjcmFwLA0KICAgICAgICBzdXBwbHlHYWluOk9iamVjdC5rZXlzKG0uZGVtYW5kKS5yZWR1Y2UoKHN1bSxrKT0+c3VtK01hdGgubWF4KDAsbS5kZW1hbmRba10qMS4yLW0ucHJvZHVjdGlvbltrXSktTWF0aC5tYXgoMCxtLmRlbWFuZFtrXSoxLjItcmVzdWx0LnBsYW4ucHJvZHVjdGlvbltrXSksMCl9KTsNCiAgICByZXR1cm4ge3BsYW46c3dhcH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclN3YXBTdGVwKG0sZWxpZ2libGUpIHsNCiAgICBsZXQgc3dhcCA9IHNoZWx0ZXJTdGF0ZS5zd2FwOw0KICAgIGlmICghc3dhcCkgcmV0dXJuIG51bGw7DQogICAgY29uc3QgdmFsaWRSb29tID0gcm9vbSA9PiByb29tID09PSBudWxsIHx8IE51bWJlci5pc1NhZmVJbnRlZ2VyKHJvb20pICYmIHJvb20gPiAwOw0KICAgIGNvbnN0IGFsbG9jYXRpb249c3dhcC5raW5kPT09J2FsbG9jYXRpb24nOw0KICAgIGNvbnN0IHZhbGlkQWxsb2NhdGlvbiA9ICgpID0+IG9iamVjdFN0YXRlKHN3YXAuc3VwcGx5Rmxvb3IpJiZPYmplY3Qua2V5cyhtLmRlbWFuZCkuZXZlcnkoaz0+TnVtYmVyLmlzRmluaXRlKHN3YXAuc3VwcGx5Rmxvb3Jba10pJiZzd2FwLnN1cHBseUZsb29yW2tdPj0wKSYmDQogICAgICBBcnJheS5pc0FycmF5KHN3YXAudGFyZ2V0cykmJnN3YXAudGFyZ2V0cy5sZW5ndGg9PT1zd2FwLnBlb3BsZS5sZW5ndGgmJg0KICAgICAgbmV3IFNldChzd2FwLnBlb3BsZS5tYXAocD0+cC5pZCkpLnNpemU9PT1zd2FwLnBlb3BsZS5sZW5ndGgmJm5ldyBTZXQoc3dhcC50YXJnZXRzLm1hcChwPT5wPy5pZCkpLnNpemU9PT1zd2FwLnBlb3BsZS5sZW5ndGgmJg0KICAgICAgc3dhcC50YXJnZXRzLmV2ZXJ5KHQ9PnQmJnN3YXAucGVvcGxlLnNvbWUocD0+cC5pZD09PXQuaWQpJiZ2YWxpZFJvb20odC5yb29tKSkmJg0KICAgICAgc3dhcC5tb3Zlcy5sZW5ndGg+MCYmc3dhcC5tb3Zlcy5sZW5ndGg8PXN3YXAucGVvcGxlLmxlbmd0aCoyJiZzd2FwLm1vdmVzLmV2ZXJ5KG1vdmU9Pm1vdmUmJnN3YXAucGVvcGxlLnNvbWUocD0+cC5pZD09PW1vdmUuaWQpJiZ2YWxpZFJvb20obW92ZS5yb29tKSkmJg0KICAgICAgc3dhcC50YXJnZXRzLmV2ZXJ5KHRhcmdldD0+Wy4uLnN3YXAubW92ZXNdLnJldmVyc2UoKS5maW5kKG1vdmU9Pm1vdmUuaWQ9PT10YXJnZXQuaWQpPy5yb29tPT09dGFyZ2V0LnJvb20pOw0KICAgIGlmICghb2JqZWN0U3RhdGUoc3dhcCkgfHwgdHlwZW9mIHN3YXAuaWQgIT09ICdzdHJpbmcnIHx8ICFOdW1iZXIuaXNGaW5pdGUoc3dhcC5hdCkgfHwNCiAgICAgICAgIShzd2FwLmtpbmQ9PT11bmRlZmluZWR8fGFsbG9jYXRpb24pIHx8DQogICAgICAgICEoc3dhcC5mdXR1cmVTdXBwbHkgPT09IHVuZGVmaW5lZCB8fCB0eXBlb2Ygc3dhcC5mdXR1cmVTdXBwbHkgPT09ICdib29sZWFuJykgfHwNCiAgICAgICAgIShzd2FwLnByZXBhcmVGYW1pbHkgPT09IHVuZGVmaW5lZCB8fCBBcnJheS5pc0FycmF5KHN3YXAucHJlcGFyZUZhbWlseSkgJiYgc3dhcC5wcmVwYXJlRmFtaWx5Lmxlbmd0aCA9PT0gMyAmJg0KICAgICAgICAgIHN3YXAucHJlcGFyZUZhbWlseS5ldmVyeShpZCA9PiBOdW1iZXIuaXNTYWZlSW50ZWdlcihpZCkgJiYgaWQgPiAwKSAmJiBzd2FwLnByZXBhcmVGYW1pbHlbMF0gPCBzd2FwLnByZXBhcmVGYW1pbHlbMV0pIHx8DQogICAgICAgIC8vIDE25Y+q6ZmQ5Yi25oyH5pWw5pCc57Si77yb5YWo5ZGY5ZCO5aSH55Sf5oiQ55qE5oyB5LmF5YyW5pa55qGI6aG76KaG55uW5ri45oiP5LiK6ZmQMjAw5Lq644CCDQogICAgICAgICFBcnJheS5pc0FycmF5KHN3YXAucGVvcGxlKSB8fCAoYWxsb2NhdGlvbiA/IHN3YXAucGVvcGxlLmxlbmd0aDwxfHxzd2FwLnBlb3BsZS5sZW5ndGg+MjAwIDogc3dhcC5wZW9wbGUubGVuZ3RoIT09MikgfHwNCiAgICAgICAgc3dhcC5wZW9wbGUuc29tZShwID0+ICFwIHx8ICFOdW1iZXIuaXNTYWZlSW50ZWdlcihwLmlkKSB8fCBwLmlkIDw9IDAgfHwgIXZhbGlkUm9vbShwLnJvb20pKSB8fA0KICAgICAgICAhQXJyYXkuaXNBcnJheShzd2FwLm1vdmVzKSB8fCAoYWxsb2NhdGlvbiA/ICF2YWxpZEFsbG9jYXRpb24oKSA6DQogICAgICAgICAgc3dhcC5wZW9wbGVbMF0uaWQ9PT1zd2FwLnBlb3BsZVsxXS5pZCB8fCBzd2FwLnBlb3BsZVsxXS5yb29tPT09bnVsbCB8fCBzd2FwLnBlb3BsZVswXS5yb29tPT09c3dhcC5wZW9wbGVbMV0ucm9vbSB8fA0KICAgICAgICAgICFzaGVsdGVyU3dhcFNlcXVlbmNlcyguLi5zd2FwLnBlb3BsZSkuc29tZShzZXF1ZW5jZSA9PiBKU09OLnN0cmluZ2lmeShzZXF1ZW5jZSkgPT09IEpTT04uc3RyaW5naWZ5KHN3YXAubW92ZXMpKSkgfHwNCiAgICAgICAgIU51bWJlci5pc0ludGVnZXIoc3dhcC5zdGVwKSB8fCBzd2FwLnN0ZXAgPCAwIHx8IHN3YXAuc3RlcCA+IHN3YXAubW92ZXMubGVuZ3RoKSB0aHJvdyBuZXcgRXJyb3IoJ+aNouS9jeiusOW9leaXoOazleaguOWvuScpOw0KICAgIGlmIChzd2FwLnByZXBhcmVGYW1pbHkgJiYgSlNPTi5zdHJpbmdpZnkoc3dhcC5wcmVwYXJlRmFtaWx5KSAhPT0gSlNPTi5zdHJpbmdpZnkobS5wcmVwYXJlRmFtaWx5KSkgew0KICAgICAgaG9sZFNoZWx0ZXJTdGFmZign5Y6f5a625bqt55qE6L+U5a6/6IiN5p2h5Lu25bey5pS55Y+Y77yM5Y+W5raI5Ymp5L2Z5o6l5pu/5o2i5L2N77yM5L+d55WZ5b2T5YmN5bKX5L2NJyk7IHJldHVybiBudWxsOw0KICAgIH0NCiAgICBjb25zdCBtYXRjaGVzID0gc3RlcCA9PiB7DQogICAgICBjb25zdCBleHBlY3RlZCA9IG5ldyBNYXAoc3dhcC5wZW9wbGUubWFwKHAgPT4gW3AuaWQscC5yb29tXSkpOw0KICAgICAgZm9yIChjb25zdCBtb3ZlIG9mIHN3YXAubW92ZXMuc2xpY2UoMCxzdGVwKSkgZXhwZWN0ZWQuc2V0KG1vdmUuaWQsbW92ZS5yb29tKTsNCiAgICAgIHJldHVybiBzd2FwLnBlb3BsZS5ldmVyeShwID0+IG0uc3RhdGUucmVzaWRlbnRzLnNvbWUoY3VycmVudCA9PiBjdXJyZW50LmlkID09PSBwLmlkICYmIGN1cnJlbnQucm9vbUlkID09PSBleHBlY3RlZC5nZXQocC5pZCkpKTsNCiAgICB9Ow0KICAgIGlmIChzd2FwLnN0ZXAgPCBzd2FwLm1vdmVzLmxlbmd0aCAmJiBtYXRjaGVzKHN3YXAuc3RlcCsxKSkgew0KICAgICAgc3dhcCA9IHsuLi5zd2FwLHN0ZXA6c3dhcC5zdGVwKzF9OyBzYXZlU2hlbHRlcih7Li4uc2hlbHRlclN0YXRlLHN3YXB9KTsNCiAgICB9IGVsc2UgaWYgKCFtYXRjaGVzKHN3YXAuc3RlcCkpIHsNCiAgICAgIGhvbGRTaGVsdGVyU3RhZmYoJ+aNouS9jeacn+mXtOS6uuWRmOWyl+S9jeW3suaUueWPmO+8jOacrOi9ruWBnOatouiwg+aVtO+8jOS/neeVmeeOsOacieWuieaOkicpOyByZXR1cm4gbnVsbDsNCiAgICB9DQogICAgaWYgKHN3YXAuc3RlcCA9PT0gc3dhcC5tb3Zlcy5sZW5ndGgpIHsNCiAgICAgIHNhdmVTaGVsdGVyKHsuLi5zaGVsdGVyU3RhdGUsc3dhcDpudWxsfSk7DQogICAgICBsb2cuYWRkKCdzaGVsdGVyLW9wdGltaXphdGlvbicsYWxsb2NhdGlvbj8n5pys6L2u5Lq65ZGY5YiG6YWN5pa55qGI5bey5a6M5oiQJzon5ruh5ZGY5oi/6Ze05Lq65ZGY5LyY5YyW5bey5a6M5oiQJyx7c3RlcHM6c3dhcC5tb3Zlcy5sZW5ndGh9KTsgcmV0dXJuIG51bGw7DQogICAgfQ0KICAgIGlmKGFsbG9jYXRpb24pIHsNCiAgICAgIC8vIOeUqOW9k+WJjeWxnuaAp+mHjeeul+WOn+Wyl+S9jeS4juebruagh+Wyl+S9je+8m+S4remAlOaaguaXtuS8keaBr+eahOS9juS6p+mHj+S4jeiDveW9k+S9nOWinuebiuWfuuWHhuOAgg0KICAgICAgY29uc3QgYmVmb3JlPXNoZWx0ZXJBbGxvY2F0aW9uT3V0cHV0KG0sc3dhcC5wZW9wbGUpLGFmdGVyPXNoZWx0ZXJBbGxvY2F0aW9uT3V0cHV0KG0sc3dhcC50YXJnZXRzKTsNCiAgICAgIGlmKCFPYmplY3Qua2V5cyhtLmRlbWFuZCkuZXZlcnkoaz0+YWZ0ZXJba10+PU1hdGgubWluKGJlZm9yZVtrXSxtLmRlbWFuZFtrXSoxLjIpLTFlLTkpfHwNCiAgICAgICAgICAhc2hlbHRlckFsbG9jYXRpb25JbXByb3ZlcyhzaGVsdGVyQWxsb2NhdGlvblNjb3JlKGJlZm9yZSxtLmRlbWFuZCksc2hlbHRlckFsbG9jYXRpb25TY29yZShhZnRlcixtLmRlbWFuZCkpKSB7DQogICAgICAgIGhvbGRTaGVsdGVyU3RhZmYoJ+S6uuWRmOWxnuaAp+aIlumcgOaxguW3suWPmOWMlu+8jOWOn+WIhumFjeW3suaXoOaYjuehruWinuebiu+8m+acrOi9ruWBnOatouiwg+Wyl++8jOS4i+S4gOi9rumHjeaWsOivhOS8sCcpO3JldHVybiBudWxsOw0KICAgICAgfQ0KICAgIH0NCiAgICBpZiAoIXNoZWx0ZXJPcHRpbWl6ZSB8fCBhbGxvY2F0aW9uJiZPYmplY3Qua2V5cyhtLmRlbWFuZCkuc29tZShrPT4obS5hY3R1YWxQcm9kdWN0aW9ufHxtLnByb2R1Y3Rpb24pW2tdPHN3YXAuc3VwcGx5Rmxvb3Jba10tMWUtOSkgfHwgc3dhcC5wZW9wbGUuc29tZShwID0+IHsNCiAgICAgIGNvbnN0IGN1cnJlbnQgPSBtLnN0YXRlLnJlc2lkZW50cy5maW5kKGN1cnJlbnQgPT4gY3VycmVudC5pZCA9PT0gcC5pZCk7DQogICAgICByZXR1cm4gIWN1cnJlbnQgfHwgIWVsaWdpYmxlKGN1cnJlbnQpOw0KICAgIH0pIHx8ICFzaGVsdGVyU3dhcFByb2plY3Rpb24obSxzd2FwLm1vdmVzLnNsaWNlKHN3YXAuc3RlcCksc3dhcC5mdXR1cmVTdXBwbHksYWxsb2NhdGlvbikpIHsNCiAgICAgIGhvbGRTaGVsdGVyU3RhZmYoJ+aNouS9jeaJgOmcgOS+m+W6lOOAgeS6uuWRmOaIluaIv+mXtOadoeS7tuW3suWPmOWMlu+8jOacrOi9ruWBnOatouiwg+aVtCcpOyByZXR1cm4gbnVsbDsNCiAgICB9DQogICAgY29uc3QgbW92ZSA9IHN3YXAubW92ZXNbc3dhcC5zdGVwXSwgcCA9IG0uc3RhdGUucmVzaWRlbnRzLmZpbmQocCA9PiBwLmlkID09PSBtb3ZlLmlkKTsNCiAgICByZXR1cm4ge2lkOnAuaWQscm9vbTptb3ZlLnJvb20sZnJvbTpwLnJvb21JZCxuYW1lOnAubmFtZSwNCiAgICAgIHJlYXNvbjpgJHthbGxvY2F0aW9uPyfmjInmlbTkvZPkuqflh7rosIPmlbTlspfkvY0nOnN3YXAucHJlcGFyZUZhbWlseSA/ICfkuLrljp/lrrbluq3ov5Tlrr/oiI3lronmjpLmjqXmm78nIDogc3dhcC5mdXR1cmVTdXBwbHkgPyAn6KGl6Laz5pyq5p2l5L6b5bqU77yM5LyY5YyW5ruh5ZGY5bKX5L2NJyA6ICfkvJjljJbmu6HlkZjlspfkvY0nfe+8iCR7c3dhcC5zdGVwKzF9LyR7c3dhcC5tb3Zlcy5sZW5ndGh977yJYH07DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckZhbWlseVN1cHBseVByZXNlcnZlZChtLG1vdmVzKSB7DQogICAgaWYoIW0uZmFtaWx5U3VwcGxpZXM/Lmxlbmd0aClyZXR1cm4gdHJ1ZTsNCiAgICBjb25zdCBzPW0uc3RhdGUsa2V5cz1PYmplY3Qua2V5cyhtLmRlbWFuZCk7DQogICAgY29uc3Qgcm93cz1tb3Zlcy5tYXAobW92ZT0+ew0KICAgICAgY29uc3QgcD1zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1tb3ZlLmlkKSxmcm9tPXMucm9vbXMuZmluZChyPT5yLmlkPT09cC5yb29tSWQpLHRvPXMucm9vbXMuZmluZChyPT5yLmlkPT09bW92ZS5yb29tKTsNCiAgICAgIHJldHVybiB7aWQ6cC5pZCxmcm9tOmZyb20mJnNoZWx0ZXJSb29tc1tmcm9tLnR5cGVdWzFdLHRvOnRvJiZzaGVsdGVyUm9vbXNbdG8udHlwZV1bMV0sDQogICAgICAgIGxvc3M6ZnJvbT9zaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYscCxmcm9tKTowLGdhaW46dG8/c2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAsdG8pOjB9Ow0KICAgIH0pOw0KICAgIGNvbnN0IGFmdGVyPXN1cHBseT0+ew0KICAgICAgY29uc3Qgb3V0cHV0PXsuLi5zdXBwbHkucHJvZHVjdGlvbn07DQogICAgICBmb3IoY29uc3Qgcm93IG9mIHJvd3MpaWYoIXN1cHBseS5yZXNlcnZlZFJlc2lkZW50cz8uaW5jbHVkZXMocm93LmlkKSl7DQogICAgICAgIGlmKHJvdy5mcm9tKW91dHB1dFtyb3cuZnJvbV0tPXJvdy5sb3NzO2lmKHJvdy50bylvdXRwdXRbcm93LnRvXSs9cm93LmdhaW47DQogICAgICB9DQogICAgICByZXR1cm4gb3V0cHV0Ow0KICAgIH07DQogICAgY29uc3Qgb3duPWFmdGVyKG0pOw0KICAgIC8vIOS4gOatpeWPr+WujOaIkOW9k+WJjeWutuW6reS+m+e7meaXtuWFgeiuuOWPluiIje+8m+acquWujOaIkOeahOWxgOmDqOWHhuWkh+S4jeiDveS4juWPpuS4gOWutuW6reS6kuebuOaSpOmUgOOAgg0KICAgIGlmKGtleXMuZXZlcnkoaz0+b3duW2tdPj1tLmRlbWFuZFtrXSoxLjItMWUtOSkpcmV0dXJuIHRydWU7DQogICAgcmV0dXJuIG0uZmFtaWx5U3VwcGxpZXMuZXZlcnkoc3VwcGx5PT57DQogICAgICBjb25zdCBvdXRwdXQ9YWZ0ZXIoc3VwcGx5KTsNCiAgICAgIHJldHVybiBrZXlzLmV2ZXJ5KGs9Pm91dHB1dFtrXT49TWF0aC5taW4oc3VwcGx5LnByb2R1Y3Rpb25ba10sc3VwcGx5LmRlbWFuZFtrXSoxLjIpLTFlLTkpOw0KICAgIH0pOw0KICB9DQogIGZ1bmN0aW9uIHBsYW5TaGVsdGVyU3dhcChtLHBvb2wscHJldmlldz1mYWxzZSkgew0KICAgIGNvbnN0IGtleXMgPSBPYmplY3Qua2V5cyhtLmRlbWFuZCksIGZ1dHVyZVN1cHBseSA9IEJvb2xlYW4obS5jdXJyZW50RGVtYW5kICYmIGtleXMuc29tZShrZXkgPT4gbS5wcm9kdWN0aW9uW2tleV0gPCBtLmRlbWFuZFtrZXldKjEuMi0xZS05KSk7DQogICAgY29uc3QgZGVtYW5kID0gZnV0dXJlU3VwcGx5ID8gbS5jdXJyZW50RGVtYW5kIDogbS5kZW1hbmQ7DQogICAgaWYgKCFzaGVsdGVyT3B0aW1pemUgfHwgIWtleXMuZXZlcnkoa2V5ID0+IChtLmFjdHVhbFByb2R1Y3Rpb24gfHwgbS5wcm9kdWN0aW9uKVtrZXldID49IGRlbWFuZFtrZXldKjEuMi0xZS05KSkgcmV0dXJuIG51bGw7DQogICAgY29uc3QgZ2FwID0gb3V0cHV0ID0+IGtleXMucmVkdWNlKChuLGtleSkgPT4gbitNYXRoLm1heCgwLG0uZGVtYW5kW2tleV0qMS4yLW91dHB1dFtrZXldKSwwKTsNCiAgICBjb25zdCBiZWZvcmVHYXAgPSBnYXAobS5wcm9kdWN0aW9uKTsNCiAgICBsZXQgYmVzdCA9IG51bGw7DQogICAgY29uc3QgcyA9IG0uc3RhdGUsIGF2YWlsYWJsZSA9IHAgPT4gcC5yb29tSWQgPT09IG51bGwgfHwgcy5yb29tcy5zb21lKHIgPT4gci5pZCA9PT0gcC5yb29tSWQgJiYgc3RhZmZSb29tVHlwZXMuaW5jbHVkZXMoci50eXBlKSAmJg0KICAgICAgci5idWlsdEF0IDw9IG0ubm93ICYmICFyLmluY2lkZW50ICYmICFyLnVucG93ZXJlZCAmJiByLnVwZ3JhZGVBdCA9PT0gbnVsbCk7DQogICAgY29uc3Qgd29ya2VycyA9IHBvb2wuZmlsdGVyKGF2YWlsYWJsZSk7DQogICAgY29uc3Qgcm9vbXMgPSBuZXcgTWFwKHMucm9vbXMubWFwKHIgPT4gW3IuaWQscl0pKSwgb2NjdXBpZWQgPSBuZXcgTWFwKCksIHJhdGVzID0gbmV3IE1hcCgpOw0KICAgIGZvciAoY29uc3QgcCBvZiBzLnJlc2lkZW50cykgaWYgKHAuZGVhZEF0ID09PSBudWxsICYmIHAuYWR1bHRBdCA8PSBtLm5vdykgb2NjdXBpZWQuc2V0KHAucm9vbUlkLChvY2N1cGllZC5nZXQocC5yb29tSWQpfHwwKSsxKTsNCiAgICBjb25zdCByYXRlID0gKHAscm9vbSkgPT4gew0KICAgICAgaWYgKCFyb29tIHx8IG0ucmVzZXJ2ZWRSZXNpZGVudHM/LmluY2x1ZGVzKHAuaWQpKSByZXR1cm4gMDsNCiAgICAgIGNvbnN0IGtleSA9IGAke3AuaWR9OiR7cm9vbS50eXBlfToke3Jvb20ubGV2ZWx9YDsNCiAgICAgIGlmICghcmF0ZXMuaGFzKGtleSkpIHJhdGVzLnNldChrZXksc2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAscm9vbSkpOw0KICAgICAgcmV0dXJuIHJhdGVzLmdldChrZXkpOw0KICAgIH07DQogICAgZm9yIChjb25zdCBhIG9mIHdvcmtlcnMpIGZvciAoY29uc3QgYiBvZiB3b3JrZXJzKSB7DQogICAgICBpZiAoYS5pZCA9PT0gYi5pZCB8fCBiLnJvb21JZCA9PT0gbnVsbCB8fCBhLnJvb21JZCA9PT0gYi5yb29tSWQpIGNvbnRpbnVlOw0KICAgICAgY29uc3QgdGFyZ2V0ID0gcm9vbXMuZ2V0KGIucm9vbUlkKSwgc291cmNlID0gcm9vbXMuZ2V0KGEucm9vbUlkKTsNCiAgICAgIGlmIChvY2N1cGllZC5nZXQodGFyZ2V0LmlkKSAhPT0gdGFyZ2V0LndpZHRoKjIpIGNvbnRpbnVlOw0KICAgICAgLy8g5YWI562b5pyA57uI5pS255uK77yM5YaN5qih5ouf6IW+5L2N44CC6KGl5pyq5p2l5L6b5bqU5pe25Y+v5bCR5Lqn5bqf5paZ77yM5L2G5LiN6IO95omp5aSn5Lu75L2V5Z+656GA6LWE5rqQ57y65Y+j44CCDQogICAgICBjb25zdCBjaGFuZ2UgPSB7cG93ZXI6MCxmb29kOjAsd2F0ZXI6MCxzY3JhcDowfTsNCiAgICAgIGlmIChzb3VyY2UpIGNoYW5nZVtzaGVsdGVyUm9vbXNbc291cmNlLnR5cGVdWzFdXSs9cmF0ZShiLHNvdXJjZSktcmF0ZShhLHNvdXJjZSk7DQogICAgICBjaGFuZ2Vbc2hlbHRlclJvb21zW3RhcmdldC50eXBlXVsxXV0rPXJhdGUoYSx0YXJnZXQpLXJhdGUoYix0YXJnZXQpOw0KICAgICAgY29uc3Qgc2NyYXAgPSBjaGFuZ2Uuc2NyYXAsIGJhc2ljID0gY2hhbmdlLnBvd2VyK2NoYW5nZS5mb29kK2NoYW5nZS53YXRlcjsNCiAgICAgIGNvbnN0IGFmdGVyID0gT2JqZWN0LmZyb21FbnRyaWVzKGtleXMubWFwKGtleSA9PiBba2V5LG0ucHJvZHVjdGlvbltrZXldK2NoYW5nZVtrZXldXSkpLCBzdXBwbHlHYWluID0gYmVmb3JlR2FwLWdhcChhZnRlcik7DQogICAgICBpZiAoZnV0dXJlU3VwcGx5ID8gc3VwcGx5R2FpbiA8PSAxZS02IDogIShzY3JhcCA+IDEgfHwgTWF0aC5hYnMoc2NyYXApIDwgMWUtNiAmJiBiYXNpYyA+IDEpKSBjb250aW51ZTsNCiAgICAgIGlmICgha2V5cy5ldmVyeShrZXkgPT4gYWZ0ZXJba2V5XSA+PSAoZnV0dXJlU3VwcGx5ID8gTWF0aC5taW4obS5wcm9kdWN0aW9uW2tleV0sbS5kZW1hbmRba2V5XSoxLjIpIDogbS5kZW1hbmRba2V5XSoxLjIpLTFlLTkpKSBjb250aW51ZTsNCiAgICAgIC8vIOWwmuS4jeiDveiuqeacrOWutuW6reecn+ato+i/lOWuv+iIjeeahOWxgOmDqOaOpeabv++8jOS4jeW+l+aSpOmUgOWPpuS4gOW+hei/lOWutuW6reW3suacieeahOS+m+W6lOWHhuWkh+OAgg0KICAgICAgLy8g5ZCm5YiZ5Lik5a+557y66aOf54mp55qE54i25q+N5Lya5LqS5o2i5YeA5rC05bKX5L2N77yM5Y+M5pa56YO95rKh5pyJ5Ye655Sf6L+b5bGV77yb6IO95LiA5qyh6KGl6b2Q5pys5a625bqt5pe25LuN5YWB6K645Y+W6IiN44CCDQogICAgICBpZighc2hlbHRlckZhbWlseVN1cHBseVByZXNlcnZlZChtLFt7aWQ6YS5pZCxyb29tOmIucm9vbUlkfSx7aWQ6Yi5pZCxyb29tOmEucm9vbUlkfV0pKWNvbnRpbnVlOw0KICAgICAgY29uc3QgcGVvcGxlID0gW2EsYl0ubWFwKHAgPT4gKHtpZDpwLmlkLHJvb206cC5yb29tSWR9KSk7DQogICAgICBmb3IgKGNvbnN0IG1vdmVzIG9mIHNoZWx0ZXJTd2FwU2VxdWVuY2VzKC4uLnBlb3BsZSkpIHsNCiAgICAgICAgaWYgKCFzaGVsdGVyU3dhcFByb2plY3Rpb24obSxtb3ZlcyxmdXR1cmVTdXBwbHkpKSBjb250aW51ZTsNCiAgICAgICAgaWYgKCFiZXN0IHx8IHN1cHBseUdhaW4gPiBiZXN0LnN1cHBseUdhaW4rMWUtNiB8fCBNYXRoLmFicyhzdXBwbHlHYWluLWJlc3Quc3VwcGx5R2FpbikgPCAxZS02ICYmDQogICAgICAgICAgICAoc2NyYXAgPiBiZXN0LnNjcmFwKzFlLTYgfHwgTWF0aC5hYnMoc2NyYXAtYmVzdC5zY3JhcCkgPCAxZS02ICYmDQogICAgICAgICAgICAgIChiYXNpYyA+IGJlc3QuYmFzaWMrMWUtNiB8fCBNYXRoLmFicyhiYXNpYy1iZXN0LmJhc2ljKSA8IDFlLTYgJiYgbW92ZXMubGVuZ3RoIDwgYmVzdC5tb3Zlcy5sZW5ndGgpKSkgew0KICAgICAgICAgIGJlc3QgPSB7cGVvcGxlLG1vdmVzLHNjcmFwLGJhc2ljLHN1cHBseUdhaW59Ow0KICAgICAgICB9DQogICAgICB9DQogICAgfQ0KICAgIGlmICghYmVzdCkgcmV0dXJuIG51bGw7DQogICAgaWYocHJldmlldylyZXR1cm4gYmVzdDsNCiAgICBjb25zdCBzd2FwID0ge2lkOmNyeXB0by5yYW5kb21VVUlEKCksYXQ6RGF0ZS5ub3coKSxwZW9wbGU6YmVzdC5wZW9wbGUsbW92ZXM6YmVzdC5tb3ZlcyxzdGVwOjAsZnV0dXJlU3VwcGx5LA0KICAgICAgLi4uKG0ucHJlcGFyZUZhbWlseSA/IHtwcmVwYXJlRmFtaWx5Om0ucHJlcGFyZUZhbWlseX0gOiB7fSl9Ow0KICAgIHNhdmVTaGVsdGVyKHsuLi5zaGVsdGVyU3RhdGUsc3dhcH0pOw0KICAgIGxvZy5hZGQoJ3NoZWx0ZXItb3B0aW1pemF0aW9uJyxmdXR1cmVTdXBwbHkgPyAn5byA5aeL5ruh5ZGY5bKX5L2N6LCD5pW077yM6KGl6Laz5pyq5p2l5L6b5bqUJyA6ICflvIDlp4vmu6HlkZjmiL/pl7TkurrlkZjkvJjljJYnLA0KICAgICAge3N0ZXBzOnN3YXAubW92ZXMubGVuZ3RoLHNjcmFwR2FpbjpiZXN0LnNjcmFwLGZ1dHVyZVN1cHBseSxzdXBwbHlHYWluOmJlc3Quc3VwcGx5R2FpbiwNCiAgICAgICAgLi4uKG0ucHJlcGFyZUZhbWlseSA/IHtwcmVwYXJlRmFtaWx5Om0ucHJlcGFyZUZhbWlseX0gOiB7fSl9KTsNCiAgICByZXR1cm4gc3dhcDsNCiAgfQ0KICBmdW5jdGlvbiByZW1lbWJlclNoZWx0ZXJGYW1pbGllcyhtKSB7DQogICAgY29uc3QgcyA9IG0uc3RhdGUsIHN0b3JlZCA9IHNoZWx0ZXJTdGF0ZS5mYW1pbGllcyB8fCBbXTsNCiAgICBpZiAoIUFycmF5LmlzQXJyYXkoc3RvcmVkKSB8fCBzdG9yZWQuc29tZShmID0+ICFmIHx8ICFbZi5hLGYuYixmLnJvb21dLmV2ZXJ5KHggPT4gTnVtYmVyLmlzU2FmZUludGVnZXIoeCkgJiYgeCA+IDApIHx8IGYuYSA9PT0gZi5iKSB8fA0KICAgICAgICBuZXcgU2V0KHN0b3JlZC5mbGF0TWFwKGYgPT4gW2YuYSxmLmJdKSkuc2l6ZSAhPT0gc3RvcmVkLmxlbmd0aCoyKSB0aHJvdyBuZXcgRXJyb3IoJ+mFjeWvueiusOW9leaXoOazleaguOWvuScpOw0KICAgIGxldCBmYW1pbGllcyA9IHN0b3JlZC5maWx0ZXIoZiA9PiBbZi5hLGYuYl0uZXZlcnkoaWQgPT4gew0KICAgICAgY29uc3QgcCA9IHMucmVzaWRlbnRzLmZpbmQocCA9PiBwLmlkID09PSBpZCk7DQogICAgICAvLyDlgJLkuIvku43lj6/mlZHlm57vvJvlj6rmnInlsYXmsJHorrDlvZXmtojlpLHmiJblhbPns7vmmI7noa7mlLnlj5jml7bmiY3lj5bmtojlt7LorrDkvY/nmoTlrrbluq3jgIINCiAgICAgIHJldHVybiBwICYmICghcC5yb21hbmNlIHx8IHAucm9tYW5jZS5wYXJ0bmVySWQgPT09IChpZCA9PT0gZi5hID8gZi5iIDogZi5hKSk7DQogICAgfSkpOw0KICAgIGNvbnN0IGNhbmRpZGF0ZXMgPSBzLnJlc2lkZW50cy5maWx0ZXIocCA9PiBwLnJvbWFuY2UpLm1hcChwID0+IFtwLmlkLHAucm9tYW5jZS5wYXJ0bmVySWRdKTsNCiAgICBmb3IgKGNvbnN0IGNoaWxkIG9mIHMucmVzaWRlbnRzKSBpZiAoY2hpbGQucGFyZW50cy5sZW5ndGggPT09IDIgJiYNCiAgICAgICAgIShzaGVsdGVyU3RhdGUucGFpciYmY2hpbGQucGFyZW50cy5ldmVyeShpZD0+W3NoZWx0ZXJTdGF0ZS5wYWlyLmEsc2hlbHRlclN0YXRlLnBhaXIuYl0uaW5jbHVkZXMoaWQpKSkpIGNhbmRpZGF0ZXMucHVzaChjaGlsZC5wYXJlbnRzKTsNCiAgICBmb3IgKGNvbnN0IGlkcyBvZiBjYW5kaWRhdGVzKSB7DQogICAgICBjb25zdCBbYSxiXSA9IGlkcy5tYXAoaWQgPT4gcy5yZXNpZGVudHMuZmluZChwID0+IHAuaWQgPT09IGlkKSk7DQogICAgICBpZiAoIWEgfHwgIWIgfHwgYS5pZCA9PT0gYi5pZCB8fCBhLnJvb21JZCAhPT0gYi5yb29tSWQgfHwgYS5kZWFkQXQgIT09IG51bGwgfHwgYi5kZWFkQXQgIT09IG51bGwgfHwNCiAgICAgICAgICBhLmF3YXkgIT09IG51bGwgfHwgYi5hd2F5ICE9PSBudWxsIHx8IGEuYWR1bHRBdCA+IG0ubm93IHx8IGIuYWR1bHRBdCA+IG0ubm93IHx8DQogICAgICAgICAgYS5yb21hbmNlICYmIGEucm9tYW5jZS5wYXJ0bmVySWQgIT09IGIuaWQgfHwgYi5yb21hbmNlICYmIGIucm9tYW5jZS5wYXJ0bmVySWQgIT09IGEuaWQpIGNvbnRpbnVlOw0KICAgICAgY29uc3Qgcm9vbSA9IHMucm9vbXMuZmluZChyID0+IHIuaWQgPT09IGEucm9vbUlkICYmIHIudHlwZSA9PT0gJ3F1YXJ0ZXJzJyk7DQogICAgICBpZiAoIXJvb20gfHwgZmFtaWxpZXMuc29tZShmID0+IFtmLmEsZi5iXS5pbmNsdWRlcyhhLmlkKSB8fCBbZi5hLGYuYl0uaW5jbHVkZXMoYi5pZCkpKSBjb250aW51ZTsNCiAgICAgIGZhbWlsaWVzLnB1c2goe2E6TWF0aC5taW4oYS5pZCxiLmlkKSxiOk1hdGgubWF4KGEuaWQsYi5pZCkscm9vbTpyb29tLmlkfSk7DQogICAgfQ0KICAgIC8vIOW+heS6p+iusOW9leW3suehruiupOeItuavje+8jOemu+W8gOWuv+iIjeW3peS9nOaIluaOoumZqeWQjuS7jeiusOS9j+WOn+WutuW6re+8jOS4jeimgeaxguS4pOS6uuatpOWIu+WQjOaIv+OAgg0KICAgIGZvcihjb25zdCBiaXJ0aCBvZiBzLmJpcnRocyl7DQogICAgICBjb25zdCBpZHM9c2hlbHRlckJpcnRoUGFyZW50cyhzLGJpcnRoKTsNCiAgICAgIGlmKGlkcyYmcy5yb29tcy5zb21lKHI9PnIuaWQ9PT1iaXJ0aC5yb29tSWQmJnIudHlwZT09PSdxdWFydGVycycpJiYNCiAgICAgICAgICAhZmFtaWxpZXMuc29tZShmPT5bZi5hLGYuYl0uc29tZShpZD0+aWRzLmluY2x1ZGVzKGlkKSkpJiYNCiAgICAgICAgICBpZHMuZXZlcnkoKGlkLGkpPT57Y29uc3QgcD1zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1pZCk7cmV0dXJuICFwLnJvbWFuY2V8fHAucm9tYW5jZS5wYXJ0bmVySWQ9PT1pZHNbMS1pXTt9KSkNCiAgICAgICAgZmFtaWxpZXMucHVzaCh7YTpNYXRoLm1pbiguLi5pZHMpLGI6TWF0aC5tYXgoLi4uaWRzKSxyb29tOmJpcnRoLnJvb21JZH0pOw0KICAgIH0NCiAgICBmYW1pbGllcy5zb3J0KChhLGIpID0+IGEuYS1iLmEpOw0KICAgIGlmIChKU09OLnN0cmluZ2lmeShmYW1pbGllcykgIT09IEpTT04uc3RyaW5naWZ5KHN0b3JlZCkpIHNhdmVTaGVsdGVyKHsuLi5zaGVsdGVyU3RhdGUsZmFtaWxpZXN9KTsNCiAgICByZXR1cm4gZmFtaWxpZXM7DQogIH0NCiAgY29uc3QgZmFtaWx5S2V5ID0gKGEsYikgPT4gW2EsYl0uc29ydCgoeCx5KT0+eC15KS5qb2luKCc6Jyk7DQogIGZ1bmN0aW9uIHBvcHVsYXRpb25CdWRnZXQobSxmYW1pbGllcyxleGNsdWRlID0gJycpIHsNCiAgICBjb25zdCBzID0gbS5zdGF0ZSwgcmVzZXJ2ZWQgPSBuZXcgTWFwKCk7DQogICAgY29uc3QgYWRkID0gKGEsYikgPT4geyBpZiAoIXNoZWx0ZXJGYW1pbHlFeHBlY3RpbmcocyxhLGIpKSByZXNlcnZlZC5zZXQoZmFtaWx5S2V5KGEsYiksW2EsYl0pOyB9Ow0KICAgIGZvciAoY29uc3QgcCBvZiBzLnJlc2lkZW50cykgaWYgKHAuZGVhZEF0ID09PSBudWxsICYmIHAucm9tYW5jZSkgYWRkKHAuaWQscC5yb21hbmNlLnBhcnRuZXJJZCk7DQogICAgZm9yIChjb25zdCBmIG9mIGZhbWlsaWVzKSB7DQogICAgICBjb25zdCBwYWlyID0gW2YuYSxmLmJdLm1hcChpZCA9PiBzLnJlc2lkZW50cy5maW5kKHAgPT4gcC5pZCA9PT0gaWQpKTsNCiAgICAgIGlmIChwYWlyLmV2ZXJ5KHAgPT4gcCAmJiBwLmRlYWRBdCA9PT0gbnVsbCAmJiAhKHAuZmFtaWx5Q29vbGRvd25VbnRpbCA+IG0ubm93KSkgJiYgcGFpci5zb21lKHAgPT4gcC5yb29tSWQgPT09IGYucm9vbSkpIGFkZChmLmEsZi5iKTsNCiAgICB9DQogICAgY29uc3QgcGxhbiA9IHNoZWx0ZXJTdGF0ZS5wYWlyOw0KICAgIGlmIChwbGFuICYmICFwbGFuLnJlbGVhc2UpIGFkZChwbGFuLmEscGxhbi5iKTsNCiAgICByZXNlcnZlZC5kZWxldGUoZXhjbHVkZSk7DQogICAgY29uc3QgbGl2aW5nID0gcy5yZXNpZGVudHMuZmlsdGVyKHAgPT4gcC5kZWFkQXQgPT09IG51bGwpLmxlbmd0aCwgcmVjb3ZlcmluZyA9IHNoZWx0ZXJSZWNvdmVyaW5nUG9wdWxhdGlvbihzKTsNCiAgICByZXR1cm4ge2xpdmluZyxyZWNvdmVyaW5nLHJlc2VydmVkLGZ1dHVyZTpsaXZpbmcrcmVjb3ZlcmluZytzLmJpcnRocy5sZW5ndGgrcmVzZXJ2ZWQuc2l6ZSxsaW1pdDpNYXRoLm1pbihzaGVsdGVyUG9wdWxhdGlvblRhcmdldCA/PyAwLG0ucG9wdWxhdGlvbkNhcCl9Ow0KICB9DQogIGZ1bmN0aW9uIHBvcHVsYXRpb25Ib3VzaW5nU3VwcGx5KG0sZmFtaWxpZXMscGFpcikgew0KICAgIGNvbnN0IGJ1ZGdldCA9IHBvcHVsYXRpb25CdWRnZXQobSxmYW1pbGllcyxmYW1pbHlLZXkocGFpclswXS5pZCxwYWlyWzFdLmlkKSksIGZ1dHVyZSA9IGJ1ZGdldC5mdXR1cmUrMTsNCiAgICAvLyDpooTnlZnmiYDmnInlt7LlronmjpLlrrbluq3nprvlspflkI7nmoTkuqfph4/vvIzku6Xlj4rlhL/nq6XjgIHlpJblh7ov5YCS5LiL5bGF5rCR5oGi5aSN5ZKM5paw55Sf5YS/5oiQ5bm05ZCO55qE5Y+j57Ku44CCDQogICAgY29uc3QgYWJzZW50ID0gbmV3IFNldChbLi4uYnVkZ2V0LnJlc2VydmVkLnZhbHVlcygpXS5mbGF0KCkuY29uY2F0KHBhaXIubWFwKHAgPT4gcC5pZCkpKTsNCiAgICBjb25zdCBwcm9qZWN0ZWQgPSBzaGVsdGVyUHJvZHVjdGlvbldpdGhvdXQobSxhYnNlbnQpOw0KICAgIGNvbnN0IGdyb3d0aCA9IHNoZWx0ZXJHcm93dGhOZWVkcyhtKS5kZW1hbmQ7DQogICAgY29uc3QgZGVtYW5kID0gey4uLmdyb3d0aCxmb29kOk1hdGgubWF4KGdyb3d0aC5mb29kLGZ1dHVyZSksd2F0ZXI6TWF0aC5tYXgoZ3Jvd3RoLndhdGVyLGZ1dHVyZSl9Ow0KICAgIHJldHVybiB7cHJvZHVjdGlvbjpwcm9qZWN0ZWQsZGVtYW5kLHJlc2VydmVkUmVzaWRlbnRzOlsuLi5hYnNlbnRdLA0KICAgICAgYWxsb3dlZDpmdXR1cmUgPD0gYnVkZ2V0LmxpbWl0ICYmIE9iamVjdC5rZXlzKGRlbWFuZCkuZXZlcnkoayA9PiBtLnN0YXRlLnJlc291cmNlc1trXSA+PSBkZW1hbmRba10qMil9Ow0KICB9DQogIGZ1bmN0aW9uIHBvcHVsYXRpb25QYWlyaW5nQ29udGV4dChtLGZhbWlsaWVzLGVsaWdpYmxlKSB7DQogICAgY29uc3Qgcz1tLnN0YXRlOw0KICAgIGNvbnN0IHJvb21SZWFkeT1yPT5yPy50eXBlPT09J3F1YXJ0ZXJzJyYmci5idWlsdEF0PD1tLm5vdyYmci51cGdyYWRlQXQ9PT1udWxsJiYhci5pbmNpZGVudCYmIXIudW5wb3dlcmVkJiYNCiAgICAgICFzLmJpcnRocy5zb21lKGI9PmIucm9vbUlkPT09ci5pZCkmJiFzLnJlc2lkZW50cy5zb21lKHA9PnAuZGVhZEF0PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdyYmcC5yb29tSWQ9PT1yLmlkKTsNCiAgICBjb25zdCByZXBsYWNlYWJsZT1uZXcgU2V0KGZhbWlsaWVzLmZpbHRlcihmPT5yb29tUmVhZHkocy5yb29tcy5maW5kKHI9PnIuaWQ9PT1mLnJvb20pKSYmDQogICAgICBbZi5hLGYuYl0uZXZlcnkoaWQ9PnMucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PWlkKSkmJg0KICAgICAgIXMucmVzaWRlbnRzLnNvbWUocD0+W2YuYSxmLmJdLmluY2x1ZGVzKHAuaWQpJiZwLnJvbWFuY2V8fHAucm9tYW5jZSYmW2YuYSxmLmJdLmluY2x1ZGVzKHAucm9tYW5jZS5wYXJ0bmVySWQpKSYmDQogICAgICAhc2hlbHRlckZhbWlseUV4cGVjdGluZyhzLGYuYSxmLmIpKSk7DQogICAgY29uc3Qgcm9vbXM9cy5yb29tcy5maWx0ZXIocj0+cm9vbVJlYWR5KHIpJiZmYW1pbGllcy5maWx0ZXIoZj0+Zi5yb29tPT09ci5pZCkuZXZlcnkoZj0+cmVwbGFjZWFibGUuaGFzKGYpKSkNCiAgICAgIC5zb3J0KChhLGIpPT5OdW1iZXIoZmFtaWxpZXMuc29tZShmPT5mLnJvb209PT1hLmlkKSktTnVtYmVyKGZhbWlsaWVzLnNvbWUoZj0+Zi5yb29tPT09Yi5pZCkpfHxhLmlkLWIuaWQpOw0KICAgIGNvbnN0IGNhbmRpZGF0ZXM9cy5yZXNpZGVudHMuZmlsdGVyKHA9PmVsaWdpYmxlKHApJiZwLmhhcHBpbmVzcz49NTAmJg0KICAgICAgKHAucm9vbUlkPT09bnVsbHx8cy5yb29tcy5zb21lKHI9PnIuaWQ9PT1wLnJvb21JZCYmc3RhZmZSb29tVHlwZXMuaW5jbHVkZXMoci50eXBlKSkpJiYNCiAgICAgICFwLnJvbWFuY2UmJiEocC5mYW1pbHlDb29sZG93blVudGlsPm0ubm93KSYmIXMuYmlydGhzLnNvbWUoYj0+c2hlbHRlckJpcnRoUGFyZW50cyhzLGIpPy5pbmNsdWRlcyhwLmlkKSkmJg0KICAgICAgIWZhbWlsaWVzLnNvbWUoZj0+W2YuYSxmLmJdLmluY2x1ZGVzKHAuaWQpJiYhcmVwbGFjZWFibGUuaGFzKGYpKSkuc29ydCgoYSxiKT0+YS5pZC1iLmlkKTsNCiAgICByZXR1cm4ge3JlcGxhY2VhYmxlLHJvb21zLGNhbmRpZGF0ZXMsdW5yZWxhdGVkOnBvcHVsYXRpb25LaW5zaGlwKHMpfTsNCiAgfQ0KICBmdW5jdGlvbiBwb3B1bGF0aW9uUGFpcmluZ0Nob2ljZShtLGZhbWlsaWVzLGNvbnRleHQscGFpcixhc3Nlc3NtZW50LHJlY29uc2lkZXI9ZmFsc2UpIHsNCiAgICByZXR1cm4gY29udGV4dC5yb29tcy5tYXAocm9vbT0+KHtyb29tLHJlcGxhY2VkRmFtaWxpZXM6ZmFtaWxpZXMuZmlsdGVyKGY9PmYucm9vbT09PXJvb20uaWR8fFtmLmEsZi5iXS5zb21lKGlkPT5wYWlyLnNvbWUocD0+cC5pZD09PWlkKSkpfSkpDQogICAgICAuZmluZChjPT4oIXJlY29uc2lkZXJ8fGMucmVwbGFjZWRGYW1pbGllcy5sZW5ndGgpJiZjLnJlcGxhY2VkRmFtaWxpZXMuZXZlcnkoZj0+ew0KICAgICAgICBjb25zdCBwcmV2aW91cz1zaGVsdGVyUGFyZW50QXNzZXNzbWVudChtLFtmLmEsZi5iXS5tYXAoaWQ9Pm0uc3RhdGUucmVzaWRlbnRzLmZpbmQocD0+cC5pZD09PWlkKSkpOw0KICAgICAgICAvLyDkuI7lrp7pmYXphY3lr7nlhbHnlKgyMCXmjaLlsYrpl6jmp5vvvIzlpIfkvpvnu5nkuI3og73kuLrml6Dms5XmiafooYznmoTmm7/mjaLpooTmlK/jgIINCiAgICAgICAgcmV0dXJuIGNvbnRleHQucmVwbGFjZWFibGUuaGFzKGYpJiZwcmV2aW91cyYmYXNzZXNzbWVudC5zY29yZT5wcmV2aW91cy5zY29yZSoxLjIrMWUtNjsNCiAgICAgIH0pKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUG9wdWxhdGlvblByZXBhcmF0aW9uKG0sZmFtaWxpZXMsY2FtcGFpZ249bnVsbCkgew0KICAgIGNvbnN0IGJ1ZGdldD1wb3B1bGF0aW9uQnVkZ2V0KG0sZmFtaWxpZXMpOw0KICAgIGlmKGJ1ZGdldC5mdXR1cmU+PWJ1ZGdldC5saW1pdClyZXR1cm4gYnVkZ2V0LmZ1dHVyZTsNCiAgICBpZihidWRnZXQuZnV0dXJlPT09YnVkZ2V0LmxpdmluZytidWRnZXQucmVjb3ZlcmluZylyZXR1cm4gYnVkZ2V0LmZ1dHVyZSsxOw0KICAgIGlmKHNoZWx0ZXJTdGFmZkhvbGR8fHNoZWx0ZXJQZW5kaW5nfHxzaGVsdGVyU3RhdGUucGFpcnx8Y2FtcGFpZ24/LmRlZmVuc2U/LmJ1c3kpcmV0dXJuIGJ1ZGdldC5mdXR1cmU7DQogICAgLy8g5LiA5L2N5a626ZW/5bey5Zue5a6/6IiN5oiW5Lik5Lq65q2j5Zyo562J572R56uZ56Gu6K6k5pe277yM5YWI5a6M5oiQ6K+l6aKE57qm44CCDQogICAgLy8g5LiN6IO95o+Q5YmN5Li65LiL5LiA5a+55aKe5Yqg5Y+j57Ku6Zeo5qeb77yM5Y+N6L+H5p2l6Zi75aGe5b2T5YmN56ys5LqM5L2N5a626ZW/6L+U5bKX44CCDQogICAgaWYoZmFtaWxpZXMuc29tZShmPT5idWRnZXQucmVzZXJ2ZWQuaGFzKGZhbWlseUtleShmLmEsZi5iKSkmJltmLmEsZi5iXS5zb21lKGlkPT4NCiAgICAgIG0uc3RhdGUucmVzaWRlbnRzLnNvbWUocD0+cC5pZD09PWlkJiYocC5yb29tSWQhPT1mLnJvb218fCFwLnJvbWFuY2UpKSkpKXJldHVybiBidWRnZXQuZnV0dXJlOw0KICAgIC8vIOW3suWHuueUn+aIkOS6uuWFiOiQveWunuWwseS4mu+8jOWGjeS4uumihOe6puS5i+WklueahOS4gOWvueWkh+S+m+e7me+8m+mBv+WFjeihpeWyl+i/h+eoi+S4reWPjeWkjeaUueaNouWOn+W3peeoi+Wkh+aWmeOAgg0KICAgIGlmKHNoZWx0ZXJEb3JtV29ya2VycyhtLGNhbXBhaWdufHx7fSkubGVuZ3RoKXJldHVybiBidWRnZXQuZnV0dXJlOw0KICAgIGNvbnN0IHM9bS5zdGF0ZSxyZXNlcnZlZD1uZXcgU2V0KFsuLi4oY2FtcGFpZ24/LnJlc2VydmVkfHxbXSksLi4uKGNhbXBhaWduPy5kYWlseVJlc2VydmVkfHxbXSksDQogICAgICAuLi5bLi4uYnVkZ2V0LnJlc2VydmVkLnZhbHVlcygpXS5mbGF0KCksLi4uKHNoZWx0ZXJTdGF0ZS5zd2FwPy5wZW9wbGV8fFtdKS5tYXAocD0+cC5pZCldKTsNCiAgICBjb25zdCBjb250ZXh0PXBvcHVsYXRpb25QYWlyaW5nQ29udGV4dChtLGZhbWlsaWVzLHA9PnsNCiAgICAgIGNvbnN0IHI9cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1wLnJvb21JZCksaGVhbHRoPXNoZWx0ZXJIZWFsdGgocCk7DQogICAgICByZXR1cm4gcC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiZoZWFsdGg/LmhwPj0uNipoZWFsdGg/Lm1heCYmDQogICAgICAgICFyZXNlcnZlZC5oYXMocC5pZCkmJnNoZWx0ZXJOYW1lVW5pcXVlKHMscCkmJg0KICAgICAgICAocC5yb29tSWQ9PT1udWxsfHxyJiZyLmJ1aWx0QXQ8PW0ubm93JiZyLnVwZ3JhZGVBdD09PW51bGwmJiFyLmluY2lkZW50JiYhci51bnBvd2VyZWQpOw0KICAgIH0pOw0KICAgIGlmKCFjb250ZXh0LnJvb21zLmxlbmd0aClyZXR1cm4gYnVkZ2V0LmZ1dHVyZTsNCiAgICBjb25zdCB7Y2FuZGlkYXRlcyx1bnJlbGF0ZWR9PWNvbnRleHQ7DQogICAgZm9yKGxldCBpPTA7aTxjYW5kaWRhdGVzLmxlbmd0aDtpKyspZm9yKGxldCBqPWkrMTtqPGNhbmRpZGF0ZXMubGVuZ3RoO2orKyl7DQogICAgICBjb25zdCBwYWlyPVtjYW5kaWRhdGVzW2ldLGNhbmRpZGF0ZXNbal1dLGtleT1mYW1pbHlLZXkocGFpclswXS5pZCxwYWlyWzFdLmlkKTsNCiAgICAgIGlmKCF1bnJlbGF0ZWQoLi4ucGFpcil8fChzaGVsdGVyU3RhdGUucGFpckJsb2Nrc3x8W10pLnNvbWUoYj0+Yi51bnRpbD5EYXRlLm5vdygpJiZmYW1pbHlLZXkoYi5hLGIuYik9PT1rZXkpKWNvbnRpbnVlOw0KICAgICAgY29uc3Qgb2xkPWZhbWlsaWVzLmZpbmQoZj0+ZmFtaWx5S2V5KGYuYSxmLmIpPT09a2V5KTsNCiAgICAgIGNvbnN0IGFzc2Vzc21lbnQ9c2hlbHRlclBhcmVudEFzc2Vzc21lbnQobSxwYWlyKTsNCiAgICAgIGlmKG9sZCYmY29udGV4dC5yb29tcy5zb21lKHI9PnIuaWQ9PT1vbGQucm9vbSl8fGFzc2Vzc21lbnQmJnBvcHVsYXRpb25QYWlyaW5nQ2hvaWNlKG0sZmFtaWxpZXMsY29udGV4dCxwYWlyLGFzc2Vzc21lbnQpKQ0KICAgICAgICByZXR1cm4gYnVkZ2V0LmZ1dHVyZSsxOw0KICAgIH0NCiAgICByZXR1cm4gYnVkZ2V0LmZ1dHVyZTsNCiAgfQ0KICBmdW5jdGlvbiBwb3B1bGF0aW9uQ2FuSG91c2UobSxmYW1pbGllcyxwYWlyKSB7DQogICAgY29uc3Qgc3VwcGx5ID0gcG9wdWxhdGlvbkhvdXNpbmdTdXBwbHkobSxmYW1pbGllcyxwYWlyKTsNCiAgICByZXR1cm4gc3VwcGx5LmFsbG93ZWQgJiYgT2JqZWN0LmtleXMoc3VwcGx5LmRlbWFuZCkuZXZlcnkoayA9PiBzdXBwbHkucHJvZHVjdGlvbltrXSA+PSBzdXBwbHkuZGVtYW5kW2tdKjEuMi0xZS05KTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUG9wdWxhdGlvbkRpYWdub3N0aWNzKG0sY2FtcGFpZ24pIHsNCiAgICBjb25zdCBzPW0uc3RhdGUsZmFtaWxpZXM9c2hlbHRlclN0YXRlLmZhbWlsaWVzfHxbXSxidWRnZXQ9cG9wdWxhdGlvbkJ1ZGdldChtLGZhbWlsaWVzKTsNCiAgICBjb25zdCByZXNlcnZlZD1uZXcgU2V0KFsuLi4oY2FtcGFpZ24/LnJlc2VydmVkfHxbXSksLi4uKGNhbXBhaWduPy5kYWlseVJlc2VydmVkfHxbXSldKTsNCiAgICByZXR1cm4ge3RhcmdldDpzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxwb3B1bGF0aW9uOmJ1ZGdldC5saXZpbmcsZnV0dXJlOmJ1ZGdldC5mdXR1cmUsY2FwYWNpdHk6bS5wb3B1bGF0aW9uQ2FwLA0KICAgICAgZmFtaWxpZXM6ZmFtaWxpZXMubWFwKGY9PnsNCiAgICAgICAgY29uc3QgcGFpcj1bZi5hLGYuYl0ubWFwKGlkPT5zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1pZCkpLHJvb209cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1mLnJvb20pLHJlYXNvbnM9W107DQogICAgICAgIGNvbnN0IHBlb3BsZT1wYWlyLm1hcCgocCxpKT0+ew0KICAgICAgICAgIGlmKCFwKXtyZWFzb25zLnB1c2goYOWxheawkSR7W2YuYSxmLmJdW2ldfei1hOaWmee8uuWksWApO3JldHVybiB7aWQ6W2YuYSxmLmJdW2ldfTt9DQogICAgICAgICAgY29uc3QgaGVhbHRoPXNoZWx0ZXJIZWFsdGgocCksY29vbGRvd249TWF0aC5tYXgoMCxNYXRoLmNlaWwoKChwLmZhbWlseUNvb2xkb3duVW50aWx8fDApLW0ubm93KS82MDAwMCkpOw0KICAgICAgICAgIGlmKHAuYXdheSE9PW51bGwpcmVhc29ucy5wdXNoKGAke3AubmFtZX3lpJblh7rlsJrmnKrlm57lrrZgKTsNCiAgICAgICAgICBpZihwLmRlYWRBdCE9PW51bGwpcmVhc29ucy5wdXNoKGAke3AubmFtZX3lgJLkuItgKTsNCiAgICAgICAgICBpZihwLmFkdWx0QXQ+bS5ub3cpcmVhc29ucy5wdXNoKGAke3AubmFtZX3lsJrmnKrmiJDlubRgKTsNCiAgICAgICAgICBpZighaGVhbHRofHxoZWFsdGguaHA8LjYqaGVhbHRoLm1heClyZWFzb25zLnB1c2goYCR7cC5uYW1lfeWBpeW6t+acqui+vuWIsOiwg+Wyl+adoeS7tmApOw0KICAgICAgICAgIGlmKCFzaGVsdGVyUmVzaWRlbnRJZGVudGl0eShzLHApKXJlYXNvbnMucHVzaChgJHtwLm5hbWV977yIJHtwLmlkfe+8ieWnk+WQjeOAgeetiee6p+OAgeWxnuaAp+WPiuaIv+mXtOS4jeiDveWUr+S4gOWumuS9jWApOw0KICAgICAgICAgIGlmKHAuaGFwcGluZXNzPDUwKXJlYXNvbnMucHVzaChgJHtwLm5hbWV95b+D5oOFJHtwLmhhcHBpbmVzc33vvIzpnIDoh7PlsJE1MGApOw0KICAgICAgICAgIGlmKGNvb2xkb3duKXJlYXNvbnMucHVzaChgJHtwLm5hbWV955Sf6IKy5Ya35Y2057qmJHtjb29sZG93bn3liIbpkp9gKTsNCiAgICAgICAgICBpZihyZXNlcnZlZC5oYXMocC5pZCkpcmVhc29ucy5wdXNoKGAke3AubmFtZX3nlLHlhbbku5boh6rliqjku7vliqHpooTnlZlgKTsNCiAgICAgICAgICBjb25zdCBwb3N0PXMucm9vbXMuZmluZChyPT5yLmlkPT09cC5yb29tSWQpOw0KICAgICAgICAgIGlmKHAucm9vbUlkIT09Zi5yb29tJiZwb3N0JiYhc3RhZmZSb29tVHlwZXMuaW5jbHVkZXMocG9zdC50eXBlKSlyZWFzb25zLnB1c2goYCR7cC5uYW1lfeW9k+WJjeeJueauiuWyl+S9jSR7cG9zdC50eXBlfemcgOWFiOe7k+adn+WAvOePrWApOw0KICAgICAgICAgIGlmKHBvc3QmJihwb3N0LmJ1aWx0QXQ+bS5ub3d8fHBvc3QudXBncmFkZUF0IT09bnVsbHx8cG9zdC5pbmNpZGVudCkpcmVhc29ucy5wdXNoKGAke3AubmFtZX3lvZPliY3miL/pl7Tku43lnKjmlr3lt6XmiJbmnInkuovku7ZgKTsNCiAgICAgICAgICByZXR1cm4ge2lkOnAuaWQscm9vbTpwLnJvb21JZCxhd2F5OnAuYXdheT8ua2luZHx8bnVsbCxoYXBwaW5lc3M6cC5oYXBwaW5lc3MsY29vbGRvd25NaW51dGVzOmNvb2xkb3duLA0KICAgICAgICAgICAgaHA6aGVhbHRoPy5ocD8/bnVsbCxtYXhIcDpoZWFsdGg/Lm1heD8/bnVsbCxyb21hbmNlOkJvb2xlYW4ocC5yb21hbmNlKX07DQogICAgICAgIH0pOw0KICAgICAgICBpZighcm9vbXx8cm9vbS50eXBlIT09J3F1YXJ0ZXJzJylyZWFzb25zLnB1c2goJ+WOn+Wuv+iIjeS4jeWtmOWcqCcpOw0KICAgICAgICBlbHNlIHsNCiAgICAgICAgICBpZihyb29tLmJ1aWx0QXQ+bS5ub3d8fHJvb20udXBncmFkZUF0IT09bnVsbClyZWFzb25zLnB1c2goJ+WOn+Wuv+iIjeS7jeWcqOaWveW3pScpOw0KICAgICAgICAgIGlmKHJvb20uaW5jaWRlbnR8fHJvb20udW5wb3dlcmVkKXJlYXNvbnMucHVzaCgn5Y6f5a6/6IiN5pyJ5LqL5Lu25oiW5YGc55S1Jyk7DQogICAgICAgICAgY29uc3Qgb3RoZXJzPXMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwmJnAuYWR1bHRBdDw9bS5ub3cmJnAucm9vbUlkPT09cm9vbS5pZCYmIVtmLmEsZi5iXS5pbmNsdWRlcyhwLmlkKSk7DQogICAgICAgICAgaWYob3RoZXJzLmxlbmd0aClyZWFzb25zLnB1c2goYOWOn+Wuv+iIjeaciSR7b3RoZXJzLmxlbmd0aH3lkI3lhbbku5bmiJDkurrljaDlspdgKTsNCiAgICAgICAgfQ0KICAgICAgICBjb25zdCBleHBlY3Rpbmc9cy5iaXJ0aHMuc29tZShiPT5iLnJvb21JZD09PWYucm9vbSkscm9tYW5jZT1wYWlyLnNvbWUocD0+cD8ucm9tYW5jZSk7DQogICAgICAgIGlmKGV4cGVjdGluZylyZWFzb25zLnB1c2goJ+WOn+Wuv+iIjeW3suacieW+heS6pycpOw0KICAgICAgICBjb25zdCBzdXBwbHk9cGFpci5ldmVyeShCb29sZWFuKT9wb3B1bGF0aW9uSG91c2luZ1N1cHBseShtLGZhbWlsaWVzLHBhaXIpOm51bGw7DQogICAgICAgIGlmKHN1cHBseSl7DQogICAgICAgICAgaWYoIXN1cHBseS5hbGxvd2VkKXJlYXNvbnMucHVzaCgn5paw5aKe5ZCN6aKd44CB5bqK5L2N5oiW5Lik5bCP5pe25bqT5a2Y5YKo5aSH5LiN6LazJyk7DQogICAgICAgICAgZm9yKGNvbnN0IGsgb2YgT2JqZWN0LmtleXMoc3VwcGx5LmRlbWFuZCkpaWYoc3VwcGx5LnByb2R1Y3Rpb25ba108c3VwcGx5LmRlbWFuZFtrXSoxLjItMWUtOSkNCiAgICAgICAgICAgIHJlYXNvbnMucHVzaChg5Lik5Lq656a75bKX5ZCOJHtzaGVsdGVyUmVzb3VyY2VzW2tdfeaXtuS6pyR7c3VwcGx5LnByb2R1Y3Rpb25ba10udG9GaXhlZCgxKX0vJHsoc3VwcGx5LmRlbWFuZFtrXSoxLjIpLnRvRml4ZWQoMSl977yM6ZyA5YWI5o6l5pu/5oiW5omp5LqnYCk7DQogICAgICAgIH0NCiAgICAgICAgcmV0dXJuIHthOmYuYSxiOmYuYixyb29tOmYucm9vbSxwZW9wbGUsZXhwZWN0aW5nLHJvbWFuY2UscmVhc29ucyxwYXJlbnRBc3Nlc3NtZW50OnNoZWx0ZXJQYXJlbnRBc3Nlc3NtZW50KG0scGFpciksDQogICAgICAgICAgb3RoZXJBZHVsdHM6cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdyYmcC5yb29tSWQ9PT1mLnJvb20mJiFbZi5hLGYuYl0uaW5jbHVkZXMocC5pZCkpDQogICAgICAgICAgICAubWFwKHA9Pih7aWQ6cC5pZCxuYW1lOnAubmFtZSxwYXJlbnRzOnAucGFyZW50c30pKSwNCiAgICAgICAgICBlZmZlY3RpdmVMaW1pdDpidWRnZXQubGltaXQsZnV0dXJlV2l0aFBhaXI6cG9wdWxhdGlvbkJ1ZGdldChtLGZhbWlsaWVzLGZhbWlseUtleShmLmEsZi5iKSkuZnV0dXJlKzEsDQogICAgICAgICAgcmVzZXJ2ZWRSZXNpZGVudHM6c3VwcGx5Py5yZXNlcnZlZFJlc2lkZW50c3x8W10sDQogICAgICAgICAgc3VwcGx5OnN1cHBseT9PYmplY3QuZnJvbUVudHJpZXMoT2JqZWN0LmtleXMoc3VwcGx5LmRlbWFuZCkubWFwKGs9PltrLHthZnRlcjpzdXBwbHkucHJvZHVjdGlvbltrXSxyZXF1aXJlZDpzdXBwbHkuZGVtYW5kW2tdKjEuMiwNCiAgICAgICAgICAgIHByb2R1Y3Rpb25TaG9ydGZhbGw6TWF0aC5tYXgoMCxzdXBwbHkuZGVtYW5kW2tdKjEuMi1zdXBwbHkucHJvZHVjdGlvbltrXSksc3RvY2s6bS5zdGF0ZS5yZXNvdXJjZXNba10sc3RvY2tSZXF1aXJlZDpzdXBwbHkuZGVtYW5kW2tdKjIsDQogICAgICAgICAgICBzdG9ja1Nob3J0ZmFsbDpNYXRoLm1heCgwLHN1cHBseS5kZW1hbmRba10qMi1tLnN0YXRlLnJlc291cmNlc1trXSl9XSkpOm51bGx9Ow0KICAgICAgfSl9Ow0KICB9DQogIGZ1bmN0aW9uIHNoZWx0ZXJEb3JtV29ya2VycyhtLGNhbXBhaWduKSB7DQogICAgaWYoc2hlbHRlclN0YWZmTW9kZT09PSdvZmYnfHxzaGVsdGVyU3RhZmZIb2xkfHxjYW1wYWlnbi5kZWZlbnNlPy5idXN5KXJldHVybiBbXTsNCiAgICBjb25zdCBzPW0uc3RhdGUsZmFtaWxpZXM9c2hlbHRlclN0YXRlLmZhbWlsaWVzfHxbXSxyZXNlcnZlZD1uZXcgU2V0KFsuLi4oY2FtcGFpZ24ucmVzZXJ2ZWR8fFtdKSwuLi4oY2FtcGFpZ24uZGFpbHlSZXNlcnZlZHx8W10pXSk7DQogICAgY29uc3QgZXhwZWN0aW5nPW5ldyBTZXQocy5iaXJ0aHMuZmxhdE1hcChiPT5zaGVsdGVyQmlydGhQYXJlbnRzKHMsYil8fFtdKSk7DQogICAgY29uc3QgdW5rbm93blJvb21zPW5ldyBTZXQocy5iaXJ0aHMuZmlsdGVyKGI9PiFzaGVsdGVyQmlydGhQYXJlbnRzKHMsYikpLm1hcChiPT5iLnJvb21JZCkpOw0KICAgIGZvcihjb25zdCBmIG9mIGZhbWlsaWVzKWlmKHVua25vd25Sb29tcy5oYXMoZi5yb29tKSl7cmVzZXJ2ZWQuYWRkKGYuYSk7cmVzZXJ2ZWQuYWRkKGYuYik7fQ0KICAgIGNvbnN0IHBvcHVsYXRpb249cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCkubGVuZ3RoK3MuYmlydGhzLmxlbmd0aCtzaGVsdGVyUmVjb3ZlcmluZ1BvcHVsYXRpb24ocyk7DQogICAgY29uc3QgbGltaXQ9c2hlbHRlclN0YWZmTW9kZT09PSdwb3B1bGF0aW9uJz9NYXRoLm1pbihzaGVsdGVyUG9wdWxhdGlvblRhcmdldD8/MCxtLnBvcHVsYXRpb25DYXApOm0ucG9wdWxhdGlvbkNhcDsNCiAgICBjb25zdCBkb3JtUm9vbXM9bmV3IFNldChzLnJvb21zLmZpbHRlcihyPT5yLnR5cGU9PT0ncXVhcnRlcnMnJiZyLmJ1aWx0QXQ8PW0ubm93JiZyLnVwZ3JhZGVBdD09PW51bGwmJiFyLmluY2lkZW50JiYhci51bnBvd2VyZWQpLm1hcChyPT5yLmlkKSk7DQogICAgcmV0dXJuIHMucmVzaWRlbnRzLmZpbHRlcihwPT5kb3JtUm9vbXMuaGFzKHAucm9vbUlkKSYmcC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiYhcmVzZXJ2ZWQuaGFzKHAuaWQpJiYNCiAgICAgICghcC5yb21hbmNlfHxleHBlY3RpbmcuaGFzKHAuaWQpKSYmDQogICAgICBzaGVsdGVySGVhbHRoKHApPy5ocD49LjYqc2hlbHRlckhlYWx0aChwKT8ubWF4JiZ0eXBlb2YgcC5uYW1lPT09J3N0cmluZycmJnNoZWx0ZXJOYW1lVW5pcXVlKHMscCkmJg0KICAgICAgLy8g5a625bqt5YWz57O75L+d55WZ77yM5LiN562J5LqO57uI6Lqr5o6S6Zmk5bCx5Lia77yb5bey56Gu6K6k5b6F5Lqn5oiW5Ya35Y205Lit55qE54i25q+N5Lmf6ZyA6KaB55yf5a6e5bKX5L2N44CCDQogICAgICAoIWZhbWlsaWVzLnNvbWUoZj0+W2YuYSxmLmJdLmluY2x1ZGVzKHAuaWQpKXx8ZXhwZWN0aW5nLmhhcyhwLmlkKXx8cC5mYW1pbHlDb29sZG93blVudGlsPm0ubm93fHxwb3B1bGF0aW9uPj1saW1pdCkmJg0KICAgICAgIXVua25vd25Sb29tcy5oYXMocC5yb29tSWQpKQ0KICAgICAgLm1hcChwPT5wLmlkKTsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUmVzdGluZ1dvcmtlcnMobSxjYW1wYWlnbikgew0KICAgIGlmKHNoZWx0ZXJTdGFmZk1vZGU9PT0nb2ZmJ3x8c2hlbHRlclN0YWZmSG9sZHx8Y2FtcGFpZ24uZGVmZW5zZT8uYnVzeSlyZXR1cm4gW107DQogICAgcmV0dXJuIG0uc3RhdGUucmVzaWRlbnRzLmZpbHRlcihwPT5wLnJvb21JZD09PW51bGwmJnAuZGVhZEF0PT09bnVsbCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdyYmIXAucm9tYW5jZSYmDQogICAgICAhY2FtcGFpZ24ucmVzZXJ2ZWQ/LmluY2x1ZGVzKHAuaWQpJiYhY2FtcGFpZ24uZGFpbHlSZXNlcnZlZD8uaW5jbHVkZXMocC5pZCkmJg0KICAgICAgc2hlbHRlckhlYWx0aChwKT8uaHA+PS42KnNoZWx0ZXJIZWFsdGgocCk/Lm1heCYmdHlwZW9mIHAubmFtZT09PSdzdHJpbmcnJiZzaGVsdGVyTmFtZVVuaXF1ZShtLnN0YXRlLHApKS5tYXAocD0+cC5pZCk7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlcldvcmtzaG9wUHJlcGFyYXRpb24obSxjYW1wYWlnbixvcmlnaW5hbCkgew0KICAgIGlmKCFvcmlnaW5hbHx8b3JpZ2luYWwua2luZCE9PSd1cGdyYWRlJ3x8b3JpZ2luYWwudHlwZT09PSd3b3Jrc2hvcCd8fG9yaWdpbmFsLmJsb2Nrcy5sZW5ndGh8fG9yaWdpbmFsLnByaW9yaXR5PDIwfHxvcmlnaW5hbC5wcmlvcml0eT49NzB8fA0KICAgICAgICAhc2hlbHRlckNvbnN0cnVjdGlvbi51cGdyYWRlfHxzaGVsdGVyUGVuZGluZ3x8c2hlbHRlclN0YWZmTW9kZT09PSdvZmYnfHxzaGVsdGVyU3RhZmZIb2xkfHxjYW1wYWlnbi5kZWZlbnNlPy5idXN5fHwNCiAgICAgICAgY2FtcGFpZ24ucG9wdWxhdGlvbkZhbWlseVN1cHBseXx8c2hlbHRlclN0YXRlLnBhaXJ8fHNoZWx0ZXJTdGF0ZS5zd2FwfHwNCiAgICAgICAgbS5zdGF0ZS5yb29tcy5zb21lKHI9PnIuaW5jaWRlbnR8fHIuYnVpbHRBdD5tLm5vd3x8ci51cGdyYWRlQXQhPT1udWxsKSlyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBzPW0uc3RhdGUsdGFyZ2V0PXtzY3JhcDpvcmlnaW5hbC5jb3N0LnNjcmFwK3NoZWx0ZXJDb25zdHJ1Y3Rpb24uc2NyYXBSZXNlcnZlLA0KICAgICAgcGFydHM6b3JpZ2luYWwuY29zdC5wYXJ0cytzaGVsdGVyQ29uc3RydWN0aW9uLnBhcnRzUmVzZXJ2ZX07DQogICAgLy8g5Lq65Y+j5qih5byP5YWI5a6M5oiQ5pys6Zi25q615Lq65Y+j5ZKM5oiQ5bm05a2Q5aWz5bCx5Lia77yM5YaN5oqK5a+M5L2Z5bu66K6+6LWE6YeR55So5LqO5aSH5paZ5o+Q6YCf44CCDQogICAgLy8g5pep5pyf5Y+j57KuL+Wyl+S9jeS4juW3peWdiuWFseeUqOmihOeul++8jOWNleS4qumhueebruecgeaXtuS4jeiDveS7peW7tuWQjuS6uuWPo+eUn+S6p+WKm+S4uuS7o+S7t+OAgg0KICAgIGlmKHNoZWx0ZXJTdGFmZk1vZGU9PT0ncG9wdWxhdGlvbicmJihzLnJlc2lkZW50cy5maWx0ZXIocD0+cC5kZWFkQXQ9PT1udWxsKS5sZW5ndGg8c2hlbHRlclBvcHVsYXRpb25UYXJnZXR8fA0KICAgICAgICBzLmJpcnRocy5sZW5ndGh8fHMucmVzaWRlbnRzLnNvbWUocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ+bS5ub3cpfHwNCiAgICAgICAgY2FtcGFpZ24udW5lbXBsb3llZFJlc2lkZW50cz8ubGVuZ3RofHxjYW1wYWlnbi5yZXN0aW5nUmVzaWRlbnRzPy5sZW5ndGgpKXJldHVybiBudWxsOw0KICAgIGlmKCFvcmlnaW5hbC5jb3N0LnBhcnRzfHxzLnJlc291cmNlcy5wYXJ0cz49dGFyZ2V0LnBhcnRzfHwhKG0ucHJvZHVjdGlvbi5wYXJ0cz4wKSlyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBiYXNlbGluZT1zaGVsdGVyTWF0ZXJpYWxGb3JlY2FzdChtKSh0YXJnZXQpLmhvdXJzOw0KICAgIGlmKGJhc2VsaW5lPT09bnVsbHx8YmFzZWxpbmU8PTEvNilyZXR1cm4gbnVsbDsNCiAgICBjb25zdCBkZW1hbmQ9c2hlbHRlckdyb3d0aE5lZWRzKG0pLmRlbWFuZCx1c2VkPXNoZWx0ZXJDb25zdHJ1Y3Rpb25TcGVudChzaGVsdGVyU3RhdGUsc2hlbHRlclBlbmRpbmcsRGF0ZS5ub3coKSk7DQogICAgbGV0IGJlc3Q9bnVsbDsNCiAgICBmb3IoY29uc3QgciBvZiBzLnJvb21zLmZpbHRlcihyPT5yLnR5cGU9PT0nd29ya3Nob3AnJiZyLmxldmVsPT09MSYmIXIudW5wb3dlcmVkKSl7DQogICAgICBjb25zdCByb3c9bS5yb29tcy5maW5kKHJvdz0+cm93LmlkPT09ci5pZCksd29ya2Vycz1zLnJlc2lkZW50cy5maWx0ZXIocD0+cC5yb29tSWQ9PT1yLmlkJiZwLmRlYWRBdD09PW51bGwmJnAuYXdheT09PW51bGwmJnAuYWR1bHRBdDw9bS5ub3cpOw0KICAgICAgLy8g5Y+q5o+Q6auY5bey57uP5ruh5bKX55qE6Ieq5Yqo5bel5Z2K77yb56m65bKX5YWI6KGl5ZGY77yM5Lq65bel5bel5Z2K5ZKM5rKh5pyJ5a6e6ZmF5Lqn5Ye655qE56m65oi/5LiN5o6l566h44CCDQogICAgICBpZighcm93Py5yYXRlfHx3b3JrZXJzLmxlbmd0aCE9PXIud2lkdGgqMnx8d29ya2Vycy5zb21lKHA9Pg0KICAgICAgICAgICFzaGVsdGVyU3RhdGUuY2FtcGFpZ24/LnJvbGVzLnNvbWUocm9sZT0+cm9sZS5pZD09PXAuaWQmJnJvbGUucm9vbT09PXIuaWQmJnJvbGUucm9sZT09PSd3b3Jrc2hvcCcpfHwNCiAgICAgICAgICBzaGVsdGVySGVhbHRoKHApPy5ocDwuOSpzaGVsdGVySGVhbHRoKHApPy5tYXgpKWNvbnRpbnVlOw0KICAgICAgY29uc3QgY29zdD17c2NyYXA6TWF0aC5jZWlsKHNoZWx0ZXJCdWlsZFJ1bGVzLndvcmtzaG9wWzFdKnIud2lkdGgqMi41KSxwYXJ0czowfSxob3Vycz1yLndpZHRoOw0KICAgICAgY29uc3QgcHJvamVjdD17a2luZDondXBncmFkZScsdHlwZTond29ya3Nob3AnLGlkOnIuaWQsbGV2ZWw6Mixwcmlvcml0eTpvcmlnaW5hbC5wcmlvcml0eS0uMSxob3Vycyxjb3N0LA0KICAgICAgICB0aXRsZTpg5YWI5bCG56ysICR7ci5mbG9vcn0g5bGC5bel5Z2K5Y2H6IezIDIg57qn77yM57yp55+t5b2T5YmN5bel56iL5aSH5paZYCwNCiAgICAgICAgYmVuZWZpdDpg5oyJ546w5pyJ5ruh5bKX5Lq65ZGY5o+Q6auYNTAl6Zu25Lu25Lqn6IO977yb5pW06Ze05pa95belICR7aG91cnN9IOWwj+aXtu+8jOacn+mXtOWBnOS6p++8m+WOn+W3peeoi+adkOaWmemcgOaxgue7p+e7reS/neeVmWAsDQogICAgICAgIGJsb2NrczpbXSxzaG9ydGFnZTp7c2NyYXA6MCxwYXJ0czowfSxzYXZlSG91cnM6MH07DQogICAgICBpZihzaGVsdGVyQ29uc3RydWN0aW9uQWxsb3dhbmNlKHByb2plY3QsbSxzaGVsdGVyQ29uc3RydWN0aW9uLHNoZWx0ZXJTdGF0ZSxzaGVsdGVyUGVuZGluZyxEYXRlLm5vdygpKXx8DQogICAgICAgICAgdXNlZC5zY3JhcCtjb3N0LnNjcmFwK29yaWdpbmFsLmNvc3Quc2NyYXA+c2hlbHRlckNvbnN0cnVjdGlvbi5zY3JhcExpbWl0fHwNCiAgICAgICAgICB1c2VkLnBhcnRzK29yaWdpbmFsLmNvc3QucGFydHM+c2hlbHRlckNvbnN0cnVjdGlvbi5wYXJ0c0xpbWl0fHwNCiAgICAgICAgICBtLnByb2R1Y3Rpb24ucG93ZXI8KGRlbWFuZC5wb3dlcityLndpZHRoKSoxLjItMWUtOXx8DQogICAgICAgICAgT2JqZWN0LmtleXMoZGVtYW5kKS5zb21lKGs9PnMucmVzb3VyY2VzW2tdPDIqKGRlbWFuZFtrXSsoaz09PSdwb3dlcic/ci53aWR0aDowKSkpKWNvbnRpbnVlOw0KICAgICAgY29uc3QgYmF0Y2g9cm93LmJhdGNoKjEuNSxmZWVkPTYqTWF0aC5tYXgoMCxNYXRoLmNlaWwoKHRhcmdldC5wYXJ0cy1zLnJlc291cmNlcy5wYXJ0cykvYmF0Y2gpKmJhdGNoLXJvdy5zdG9yZWQpOw0KICAgICAgaWYocy5yZXNvdXJjZXMuc2NyYXA8Y29zdC5zY3JhcCt0YXJnZXQuc2NyYXArZmVlZCljb250aW51ZTsNCiAgICAgIGNvbnN0IHN0b2NrPXNoZWx0ZXJQbGFubmluZ1N0b2NrKG0pO3N0b2NrLnJlc291cmNlcy5zY3JhcC09Y29zdC5zY3JhcDsNCiAgICAgIGlmKCFzaGVsdGVyQWR2YW5jZVBsYW5uaW5nU3RvY2sobSxzdG9jayxob3VycyxyLmlkKSljb250aW51ZTsNCiAgICAgIGNvbnN0IHVwZ3JhZGVkPXN0b2NrLnJvb21zLmZpbmQocm9vbT0+cm9vbS5pZD09PXIuaWQpO3VwZ3JhZGVkLnJhdGUqPTEuNTt1cGdyYWRlZC5iYXRjaCo9MS41Ow0KICAgICAgY29uc3QgYmVmb3JlPXNoZWx0ZXJDYXBhY2l0eShzLnJvb21zLmZpbHRlcihyb29tPT5yb29tLmJ1aWx0QXQ8PW0ubm93KSxzLmxlZ2FjeT8ucGVya3M/LnN0b3JhZ2V8fDApOw0KICAgICAgY29uc3QgYWZ0ZXI9c2hlbHRlckNhcGFjaXR5KHMucm9vbXMuZmlsdGVyKHJvb209PnJvb20uYnVpbHRBdDw9bS5ub3cpLm1hcChyb29tPT5yb29tLmlkPT09ci5pZD97Li4ucm9vbSxsZXZlbDoyfTpyb29tKSxzLmxlZ2FjeT8ucGVya3M/LnN0b3JhZ2V8fDApOw0KICAgICAgZm9yKGNvbnN0IGsgb2YgT2JqZWN0LmtleXMoc3RvY2suY2Fwcykpc3RvY2suY2Fwc1trXSs9YWZ0ZXIuY2Fwc1trXS1iZWZvcmUuY2Fwc1trXTsNCiAgICAgIHN0b2NrLmRlbWFuZC5wb3dlcis9ci53aWR0aDsNCiAgICAgIHdoaWxlKChzdG9jay5yZXNvdXJjZXMucGFydHM8dGFyZ2V0LnBhcnRzLTFlLTl8fHN0b2NrLnJlc291cmNlcy5zY3JhcDx0YXJnZXQuc2NyYXAtMWUtOSkmJnN0b2NrLmhvdXJzPDcyJiYhc3RvY2suZmFpbHVyZSkNCiAgICAgICAgc2hlbHRlckFkdmFuY2VQbGFubmluZ1N0b2NrKG0sc3RvY2ssMS82KTsNCiAgICAgIGlmKHN0b2NrLmZhaWx1cmV8fHN0b2NrLmhvdXJzPj03Mnx8YmFzZWxpbmUtc3RvY2suaG91cnM8MS82LTFlLTkpY29udGludWU7DQogICAgICBjb25zdCBjaG9pY2U9e29yaWdpbmFsLHByb2plY3QsYmFzZWxpbmVIb3VyczpiYXNlbGluZSx0b3RhbEhvdXJzOnN0b2NrLmhvdXJzLHNhdmVkSG91cnM6YmFzZWxpbmUtc3RvY2suaG91cnN9Ow0KICAgICAgaWYoIWJlc3R8fGNob2ljZS50b3RhbEhvdXJzPGJlc3QudG90YWxIb3VycyliZXN0PWNob2ljZTsNCiAgICB9DQogICAgY29uc3QgZXhwYW5zaW9uPXNoZWx0ZXJXb3Jrc2hvcEJ1aWxkUHJlcGFyYXRpb24obSxjYW1wYWlnbixvcmlnaW5hbCx0YXJnZXQsYmFzZWxpbmUsdXNlZCk7DQogICAgcmV0dXJuIGV4cGFuc2lvbiYmKCFiZXN0fHxleHBhbnNpb24udG90YWxIb3VyczxiZXN0LnRvdGFsSG91cnMtMWUtOSk/ZXhwYW5zaW9uOmJlc3Q7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlcldvcmtzaG9wQnVpbGRQcmVwYXJhdGlvbihtLGNhbXBhaWduLG9yaWdpbmFsLHRhcmdldCxiYXNlbGluZSx1c2VkKSB7DQogICAgaWYoIXNoZWx0ZXJDb25zdHJ1Y3Rpb24uYnVpbGQpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgcz1tLnN0YXRlLHdvcmtzaG9wcz1zLnJvb21zLmZpbHRlcihyPT5yLnR5cGU9PT0nd29ya3Nob3AnKTsNCiAgICAvLyDnjrDmnInnqbrkvY3lhYjkuqTnu5nmma7pgJrooaXlkZjvvJvlj6rlnKjnjrDmnInoh6rliqjlt6XlnYrlhajpg6jmraPluLjmu6Hlspfml7bpop3lpJbmipXotYTjgIINCiAgICBpZighd29ya3Nob3BzLmxlbmd0aHx8d29ya3Nob3BzLnNvbWUocj0+ci51bnBvd2VyZWR8fA0KICAgICAgICAhKG0ucm9vbXMuZmluZChyb3c9PnJvdy5pZD09PXIuaWQpPy5yYXRlPjApfHwNCiAgICAgICAgcy5yZXNpZGVudHMuZmlsdGVyKHA9PnAucm9vbUlkPT09ci5pZCYmcC5kZWFkQXQ9PT1udWxsJiZwLmF3YXk9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiYNCiAgICAgICAgICBzaGVsdGVySGVhbHRoKHApPy5ocD49Ljkqc2hlbHRlckhlYWx0aChwKT8ubWF4JiYNCiAgICAgICAgICBzaGVsdGVyU3RhdGUuY2FtcGFpZ24/LnJvbGVzLnNvbWUocm9sZT0+cm9sZS5pZD09PXAuaWQmJnJvbGUucm9vbT09PXIuaWQmJnJvbGUucm9sZT09PSd3b3Jrc2hvcCcpKS5sZW5ndGghPT1yLndpZHRoKjIpKXJldHVybiBudWxsOw0KICAgIC8vIOWkjeeUqOato+W8j+W7uumAoOinhOWIkueahOino+mUgeOAgeWPs+S+p+S9jee9ruOAgeWQiOW5tuWBj+WlveOAgemAoOS7t+OAgeWuuemHj+S4juS+m+eUteagoemqjOOAgg0KICAgIC8vIOatpOWkhOWPquavlOi+g+W3suacieepuuS9je+8m+acquefpeS4i+aMluW3peacn+S4jeiDveWGkuWFheehruWumueahOaPkOmAn+aXtumXtOOAgg0KICAgIGNvbnN0IHJlcXVlc3Q9e3R5cGU6J3dvcmtzaG9wJyxwcmlvcml0eTpvcmlnaW5hbC5wcmlvcml0eS0uMSxyb2xlOid3b3Jrc2hvcCcsc3RhdDonaW50JyxiZW5lZml0OifmianlhYXlvZPliY3lt6XnqIvnmoTpm7bku7bkuqfog73vvIzlrozlt6XlkI7mjInlrp7pmYXkurrmiYvooaXlkZgnfTsNCiAgICBjb25zdCBwcm9qZWN0PXNoZWx0ZXJEZXZlbG9wbWVudFBsYW4obSxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCx7Li4uY2FtcGFpZ24sd29ya3Nob3BQcmVwYXJhdGlvbjpudWxsLA0KICAgICAgcHJvamVjdHM6Wy4uLihjYW1wYWlnbi5wcm9qZWN0c3x8W10pLHJlcXVlc3RdfSxudWxsKS5jYW5kaWRhdGVzLmZpbmQoYz0+Yy5raW5kPT09J2J1aWxkJyYmYy50eXBlPT09J3dvcmtzaG9wJyk7DQogICAgaWYoIXByb2plY3R8fHNoZWx0ZXJDb25zdHJ1Y3Rpb25BbGxvd2FuY2UocHJvamVjdCxtLHNoZWx0ZXJDb25zdHJ1Y3Rpb24sc2hlbHRlclN0YXRlLHNoZWx0ZXJQZW5kaW5nLERhdGUubm93KCkpfHwNCiAgICAgICAgdXNlZC5zY3JhcCtwcm9qZWN0LmNvc3Quc2NyYXArb3JpZ2luYWwuY29zdC5zY3JhcD5zaGVsdGVyQ29uc3RydWN0aW9uLnNjcmFwTGltaXR8fA0KICAgICAgICB1c2VkLnBhcnRzK29yaWdpbmFsLmNvc3QucGFydHM+c2hlbHRlckNvbnN0cnVjdGlvbi5wYXJ0c0xpbWl0KXJldHVybiBudWxsOw0KICAgIGNvbnN0IHByZXZpZXc9ey4uLm0udmlldyxzdGF0ZTp7Li4ucyxyZXNvdXJjZXM6ey4uLnMucmVzb3VyY2VzLHNjcmFwOnMucmVzb3VyY2VzLnNjcmFwLXByb2plY3QuY29zdC5zY3JhcH0sDQogICAgICByb29tczpzLnJvb21zLm1hcChyPT4oey4uLnJ9KSkscmVzaWRlbnRzOnMucmVzaWRlbnRzLm1hcChwPT4oey4uLnB9KSl9fTsNCiAgICBjb25zdCBwcz1wcmV2aWV3LnN0YXRlLGxlZnQ9cHMucm9vbXMuZmluZChyPT5yLmZsb29yPT09cHJvamVjdC5mbG9vciYmci5jb2wrci53aWR0aD09PXByb2plY3QuY29sJiZyLnR5cGU9PT0nd29ya3Nob3AnJiZyLmxldmVsPT09MSYmci53aWR0aDwzKTsNCiAgICBsZXQgcm9vbUlkOw0KICAgIGlmKGxlZnQpe2xlZnQud2lkdGgrKztyb29tSWQ9bGVmdC5pZDt9DQogICAgZWxzZSB7DQogICAgICByb29tSWQ9TWF0aC5tYXgoLi4ucHMucm9vbXMubWFwKHI9PnIuaWQpKSsxOw0KICAgICAgcHMucm9vbXMucHVzaCh7Li4ud29ya3Nob3BzWzBdLGlkOnJvb21JZCxmbG9vcjpwcm9qZWN0LmZsb29yLGNvbDpwcm9qZWN0LmNvbCx3aWR0aDoxLGxldmVsOjEsc3RvcmVkOjAsYnVpbHRBdDptLm5vdyx1cGdyYWRlQXQ6bnVsbH0pOw0KICAgIH0NCiAgICBjb25zdCByZWNvcmQ9ey4uLnNoZWx0ZXJTdGF0ZS5jYW1wYWlnbixyb2xlczpbLi4uKHNoZWx0ZXJTdGF0ZS5jYW1wYWlnbj8ucm9sZXN8fFtdKV19LHdvcmtlcnM9W107DQogICAgY29uc3QgY2ZnPXsuLi5zaGVsdGVyQ2FtcGFpZ24sd29ya3Nob3A6dHJ1ZSxwYXJ0c1RhcmdldDp0YXJnZXQucGFydHMsd29ya3Nob3BQcm9qZWN0Om9yaWdpbmFsLmlkLA0KICAgICAgd29ya3Nob3BTY3JhcFJlc2VydmU6dGFyZ2V0LnNjcmFwLHBhcnRzUmVzZXJ2ZTpzaGVsdGVyQ29uc3RydWN0aW9uLnBhcnRzUmVzZXJ2ZX07DQogICAgLy8g55So5ZCM5LiA6KGl5ZGY6KeE5YiZ6YCQ5Liq6aKE5ryU77yM6IGU5ZCI5qC45a+55L6b5paZ44CB5pel55uu5qCH44CB5Y6f5bel56iL5pyA5ZCO5LiA5ZCN55Sf5Lqn6ICF5ZKM56a75bKX5L6b5bqU44CCDQogICAgLy8g5Y+q5L+u5pS55Ymv5pys77yM5YCZ6YCJ5bel5Lq65Zyo5a6e6ZmF5a6M5bel5YmN57un57ut5Y6f5bKX55Sf5Lqn44CCDQogICAgZm9yKGxldCBpPTA7aTwyO2krKyl7DQogICAgICBjb25zdCBwbGFubmVkPXNoZWx0ZXJDYW1wYWlnblBsYW4oc2hlbHRlck1vZGVsKHByZXZpZXcpLGNmZyxyZWNvcmQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQpOw0KICAgICAgaWYocGxhbm5lZC5hY3Rpb25zLnNvbWUoYT0+YS5yb2xlPT09J3dvcmtzaG9wLXJlbGVhc2UnKSlyZXR1cm4gbnVsbDsNCiAgICAgIGNvbnN0IGFjdGlvbj1wbGFubmVkLmFjdGlvbnMuZmluZChhPT5hLnJvbGU9PT0nd29ya3Nob3AnJiZhLnJvb209PT1yb29tSWQpOw0KICAgICAgaWYoIWFjdGlvbilicmVhazsNCiAgICAgIHBzLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1hY3Rpb24uaWQpLnJvb21JZD1yb29tSWQ7d29ya2Vycy5wdXNoKGFjdGlvbi5pZCk7DQogICAgICByZWNvcmQucm9sZXM9cmVjb3JkLnJvbGVzLmZpbHRlcihyPT5yLmlkIT09YWN0aW9uLmlkKS5jb25jYXQoe2lkOmFjdGlvbi5pZCxyb29tOnJvb21JZCxyb2xlOid3b3Jrc2hvcCcsYXQ6bS5ub3d9KTsNCiAgICB9DQogICAgaWYoIXdvcmtlcnMubGVuZ3RoKXJldHVybiBudWxsOw0KICAgIGNvbnN0IGFmdGVyPXNoZWx0ZXJNb2RlbChwcmV2aWV3KSxkZW1hbmQ9c2hlbHRlckdyb3d0aE5lZWRzKGFmdGVyKS5kZW1hbmQ7DQogICAgaWYoT2JqZWN0LmtleXMoZGVtYW5kKS5zb21lKGs9PmFmdGVyLnByb2R1Y3Rpb25ba108ZGVtYW5kW2tdKjEuMi0xZS05fHxzLnJlc291cmNlc1trXTwyKmRlbWFuZFtrXSkpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgb3JpZ2luYWxQb3dlcj0ob3JpZ2luYWwudHlwZT09PSdwb3dlcic/MDpzaGVsdGVyUm9vbXNbb3JpZ2luYWwudHlwZV1bMV0/MTouNSkqcy5yb29tcy5maW5kKHI9PnIuaWQ9PT1vcmlnaW5hbC5pZCkud2lkdGg7DQogICAgaWYoYWZ0ZXIucHJvZHVjdGlvbi5wb3dlcjwoZGVtYW5kLnBvd2VyK29yaWdpbmFsUG93ZXIpKjEuMi0xZS05fHxzLnJlc291cmNlcy5wb3dlcjwyKihkZW1hbmQucG93ZXIrb3JpZ2luYWxQb3dlcikpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgc3RvY2s9c2hlbHRlclBsYW5uaW5nU3RvY2sobSk7c3RvY2sucmVzb3VyY2VzLnNjcmFwLT1wcm9qZWN0LmNvc3Quc2NyYXA7DQogICAgaWYoIXNoZWx0ZXJBZHZhbmNlUGxhbm5pbmdTdG9jayhtLHN0b2NrLHByb2plY3QuaG91cnMpKXJldHVybiBudWxsOw0KICAgIC8vIOWujOW3peaJjeW6lOeUqOaWsOWuuemHj+OAgeWQiOW5tuaJuemHj+WSjOiwg+Wyl+WQjueahOWQhOaIv+S6p+mAn++8jOaWveW3peWIu+S7jeS9v+eUqOWOn+Wyl+S9jeS6p+mAn+OAgg0KICAgIGZvcihjb25zdCByb3cgb2YgYWZ0ZXIucm9vbXMuZmlsdGVyKHI9PnIuYmF0Y2g+MCkpew0KICAgICAgY29uc3QgZXhpc3Rpbmc9c3RvY2sucm9vbXMuZmluZChyPT5yLmlkPT09cm93LmlkKTsNCiAgICAgIGlmKGV4aXN0aW5nKXtleGlzdGluZy5yYXRlPXJvdy5yYXRlO2V4aXN0aW5nLmJhdGNoPXJvdy5iYXRjaDt9DQogICAgICBlbHNlIHN0b2NrLnJvb21zLnB1c2goe2lkOnJvdy5pZCxyZXNvdXJjZTpyb3cucmVzb3VyY2UscmF0ZTpyb3cucmF0ZSxiYXRjaDpyb3cuYmF0Y2gsc3RvcmVkOjAsDQogICAgICAgIGF1dG9tYXRpYzpyb3cuYXV0b21hdGljLHRpY2s6c3RvY2suaG91cnMrMS82fSk7DQogICAgfQ0KICAgIHN0b2NrLmNhcHM9ey4uLmFmdGVyLmNhcHN9O3N0b2NrLmRlbWFuZD17Li4uZGVtYW5kfTsNCiAgICB3aGlsZSgoc3RvY2sucmVzb3VyY2VzLnBhcnRzPHRhcmdldC5wYXJ0cy0xZS05fHxzdG9jay5yZXNvdXJjZXMuc2NyYXA8dGFyZ2V0LnNjcmFwLTFlLTkpJiZzdG9jay5ob3Vyczw3MiYmIXN0b2NrLmZhaWx1cmUpDQogICAgICBzaGVsdGVyQWR2YW5jZVBsYW5uaW5nU3RvY2sobSxzdG9jaywxLzYpOw0KICAgIGlmKHN0b2NrLmZhaWx1cmV8fHN0b2NrLmhvdXJzPj03Mnx8YmFzZWxpbmUtc3RvY2suaG91cnM8MS82LTFlLTkpcmV0dXJuIG51bGw7DQogICAgcHJvamVjdC5nYWluPWFmdGVyLnByb2R1Y3Rpb24ucGFydHMtbS5wcm9kdWN0aW9uLnBhcnRzOw0KICAgIHByb2plY3Quc3RyYXRlZ3k9ey4uLnJlcXVlc3QscGVyc29uOndvcmtlcnNbMF0sd29ya2Vyc307DQogICAgcHJvamVjdC5iZW5lZml0Kz1g77yb5bey5qC45a+5ICR7d29ya2Vycy5sZW5ndGh9IOWQjeWujOW3peWQjuWPr+WuieWFqOaOpeWyl+eahOaIkOS6uu+8jOaWveW3peacn+mXtOe7p+e7reWOn+Wyl+eUn+S6p2A7DQogICAgLy8g6aKE5ryU5bey5ZCM5pe25qC45a+55paw5bel5Z2K5LiO5Y6f5Y2H57qn55So55S177yb5pmu6YCa6LCD5bKX5Lmf6aG75L+d55WZ55u45ZCM5L2Z6YeP77yM5LiN6IO95Y+q55yL5Yiw5LiL5LiA6Ze05bel5Z2K44CCDQogICAgcmV0dXJuIHtvcmlnaW5hbCxwcm9qZWN0LHdvcmtlcnMscG93ZXJSZXNlcnZlOjErb3JpZ2luYWxQb3dlcixiYXNlbGluZUhvdXJzOmJhc2VsaW5lLHRvdGFsSG91cnM6c3RvY2suaG91cnMsc2F2ZWRIb3VyczpiYXNlbGluZS1zdG9jay5ob3Vyc307DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlckNvbnN0cnVjdGlvblBvd2VyUHJlcGFyYXRpb24obSxjYW1wYWlnbikgew0KICAgIGNvbnN0IG1hdGVyaWFsPWNhbXBhaWduLm1hdGVyaWFsczsNCiAgICAvLyDmma7pgJrmjaLkvY3kuI3lj5bmtojlt7Lnu4/noa7orqTnmoTooaXnlLXlt6XnqIvvvIzlkKbliJnkuIvkuIDmraXot7Plm57nvLrnlLXnmoTljp/lt6XnqIvvvIwNCiAgICAvLyDpm7bku7bnm67moIflvZLpm7bmkqTmjonlt6XlnYrvvIzkvpvnlLXpnIDmsYLmlLnlj5jlj4jlj5bmtojmjaLkvY3vvIzpmo/lkI7ph43lpI3mi5vlm57lt6XkurrjgIINCiAgICAvLyDku4XmjqXnu63lkIzotKblj7fjgIHlkIznrYnnuqfnm67moIfjgIHlkIzmiL/pl7TnmoTljp/nlLXnq5nljYfnuqfvvJvlrrbluq3mjaLkvY3lkozmlrDlt6XnqIvku43nrYnlvoXjgIINCiAgICBjb25zdCByZXRhaW5lZFBvd2VyPWNhbXBhaWduLmxldmVsSW52ZXN0bWVudFN3YXAmJnZhbGlkU2hlbHRlck1hdGVyaWFscyhtYXRlcmlhbCkmJg0KICAgICAgbWF0ZXJpYWwudmF1bHRObz09PW0udmlldy52YXVsdE5vJiZtYXRlcmlhbC50eXBlPT09J3Bvd2VyJyYmDQogICAgICBtYXRlcmlhbC5maW5hbFRhcmdldD09PXNoZWx0ZXJSZXNvbHZlZExldmVsVGFyZ2V0KG0sc2hlbHRlckxldmVsVGFyZ2V0KSYmDQogICAgICBtYXRlcmlhbC50YXJnZXRMZXZlbD09PU1hdGgubWluKG1hdGVyaWFsLmZpbmFsVGFyZ2V0LG0udmlldy5wcm9ncmVzcy5sZXZlbCsxKSYmDQogICAgICBtLnN0YXRlLnJvb21zLnNvbWUocj0+ci5pZD09PW1hdGVyaWFsLmlkJiZyLnR5cGU9PT1tYXRlcmlhbC50eXBlJiZyLmxldmVsKzE9PT1tYXRlcmlhbC5sZXZlbCk7DQogICAgaWYoc2hlbHRlclN0YWZmTW9kZT09PSdvZmYnfHxzaGVsdGVyU3RhZmZIb2xkfHxzaGVsdGVyU3RhdGUucGFpcnx8c2hlbHRlclN0YXRlLnN3YXAmJiFyZXRhaW5lZFBvd2VyfHxjYW1wYWlnbi5kZWZlbnNlPy5idXN5KXJldHVybiBudWxsOw0KICAgIGNvbnN0IHM9bS5zdGF0ZSxhY3RpdmU9cj0+ciYmci5idWlsdEF0PD1tLm5vdyYmci51cGdyYWRlQXQ9PT1udWxsJiYhci5pbmNpZGVudCYmIXIudW5wb3dlcmVkOw0KICAgIGNvbnN0IHJvb21zPXMucm9vbXMuZmlsdGVyKHI9PnIudHlwZT09PSdwb3dlcicpOw0KICAgIC8vIOepuuWyl+S6pOe7meeOsOacieS6uuWRmOinhOWIku+8m+W3suW8gOW3peWPkeeUteWFiOetiee7k+aenO+8jOS4jemHjeWkjeW7uuaIv+OAgg0KICAgIGlmKHJvb21zLnNvbWUocj0+ci5idWlsdEF0Pm0ubm93fHxyLnVwZ3JhZGVBdCE9PW51bGx8fHIuaW5jaWRlbnR8fHIudW5wb3dlcmVkfHxhY3RpdmUocikmJg0KICAgICAgICBzLnJlc2lkZW50cy5maWx0ZXIocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiZwLnJvb21JZD09PXIuaWQpLmxlbmd0aDxyLndpZHRoKjIpKXJldHVybiBudWxsOw0KICAgIGNvbnN0IGRlbWFuZD1zaGVsdGVyR3Jvd3RoTmVlZHMobSkuZGVtYW5kOw0KICAgIGNvbnN0IGxhcmdlc3RFeHRyYT1NYXRoLm1heCgxLC4uLnMucm9vbXMuZmlsdGVyKHI9PiFbJ3Bvd2VyJywnZG9vcicsJ2VsZXZhdG9yJ10uaW5jbHVkZXMoci50eXBlKSYmci5sZXZlbDwzKQ0KICAgICAgLm1hcChyPT4oc2hlbHRlclJvb21zW3IudHlwZV1bMV0/MTouNSkqci53aWR0aCkpOw0KICAgIGlmKG0ucHJvZHVjdGlvbi5wb3dlcj49KGRlbWFuZC5wb3dlcitsYXJnZXN0RXh0cmEpKjEuMi0xZS05KXJldHVybiBudWxsOw0KICAgIGNvbnN0IHByb2plY3Q9c2hlbHRlckRldmVsb3BtZW50UGxhbihtLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LGNhbXBhaWduLHNoZWx0ZXJMZXZlbFRhcmdldCkubmV4dC5wcm9qZWN0Ow0KICAgIGNvbnN0IGV4dHJhPXNoZWx0ZXJDb25zdHJ1Y3Rpb25Qb3dlclJlc2VydmUocHJvamVjdCxtLHNoZWx0ZXJDb25zdHJ1Y3Rpb24sc2hlbHRlclN0YXRlLHNoZWx0ZXJQZW5kaW5nLERhdGUubm93KCkpOw0KICAgIGlmKCFleHRyYXx8bS5wcm9kdWN0aW9uLnBvd2VyPj0oZGVtYW5kLnBvd2VyK2V4dHJhKSoxLjItMWUtOSlyZXR1cm4gbnVsbDsNCiAgICBjb25zdCByZXNlcnZlZD1uZXcgU2V0KFsuLi4oY2FtcGFpZ24ucmVzZXJ2ZWR8fFtdKSwuLi4oY2FtcGFpZ24uZGFpbHlSZXNlcnZlZHx8W10pXSksZG9ub3JzPVtdOw0KICAgIGNvbnN0IGh5cG90aGV0aWNhbD17dHlwZToncG93ZXInLHdpZHRoOjEsbGV2ZWw6MSxidWlsdEF0OjAsdXBncmFkZUF0Om51bGwsaW5jaWRlbnQ6bnVsbCx1bnBvd2VyZWQ6ZmFsc2V9Ow0KICAgIGNvbnN0IHBvb2w9cy5yZXNpZGVudHMuZmlsdGVyKHA9PnAuZGVhZEF0PT09bnVsbCYmcC5hd2F5PT09bnVsbCYmcC5hZHVsdEF0PD1tLm5vdyYmIXAucm9tYW5jZSYmDQogICAgICAhcmVzZXJ2ZWQuaGFzKHAuaWQpJiZzaGVsdGVySGVhbHRoKHApPy5ocD49LjYqc2hlbHRlckhlYWx0aChwKT8ubWF4JiZzaGVsdGVyTmFtZVVuaXF1ZShzLHApJiYNCiAgICAgIChwLnJvb21JZD09PW51bGx8fGNhbXBhaWduLnVuZW1wbG95ZWRSZXNpZGVudHM/LmluY2x1ZGVzKHAuaWQpfHwNCiAgICAgICAgcy5yb29tcy5zb21lKHI9PnIuaWQ9PT1wLnJvb21JZCYmYWN0aXZlKHIpJiZbJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddLmluY2x1ZGVzKHIudHlwZSkpKSk7DQogICAgZm9yKGNvbnN0IHAgb2YgcG9vbC5zb3J0KChhLGIpPT5zaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYsYixoeXBvdGhldGljYWwpLQ0KICAgICAgICBzaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYsYSxoeXBvdGhldGljYWwpfHxhLmlkLWIuaWQpKXsNCiAgICAgIGNvbnN0IGlkcz1bLi4uZG9ub3JzLHAuaWRdLGFmdGVyPXNoZWx0ZXJQcm9kdWN0aW9uV2l0aG91dChtLGlkcyk7DQogICAgICBpZihzaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYscCxoeXBvdGhldGljYWwpPjAmJnNoZWx0ZXJEZXBhcnR1cmVTYWZlKG0saWRzKSYmDQogICAgICAgICAgT2JqZWN0LmtleXMoZGVtYW5kKS5ldmVyeShrPT5hZnRlcltrXT49ZGVtYW5kW2tdKjEuMi0xZS05KSlkb25vcnMucHVzaChwLmlkKTsNCiAgICAgIGlmKGRvbm9ycy5sZW5ndGg9PT0yKWJyZWFrOw0KICAgIH0NCiAgICByZXR1cm4gZG9ub3JzLmxlbmd0aHx8cm9vbXMuc29tZShyPT5hY3RpdmUocikmJnIubGV2ZWw8Myk/e2V4dHJhLGRvbm9yc306bnVsbDsNCiAgfQ0KICBmdW5jdGlvbiBzaGVsdGVyUG9wdWxhdGlvbkZhbWlseVN1cHBseUNvbnRleHQobSxjYW1wYWlnbixwb2xpY3k9e3NoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyU3RhdGUsc2hlbHRlclBvcHVsYXRpb25UYXJnZXR9KSB7DQogICAgY29uc3Qge3NoZWx0ZXJTdGFmZk1vZGU6bW9kZSxzaGVsdGVyU3RhZmZIb2xkOmhlbGQsc2hlbHRlclN0YXRlOnN0YXRlLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0OnRhcmdldH09cG9saWN5Ow0KICAgIGlmKG1vZGUhPT0ncG9wdWxhdGlvbid8fGhlbGR8fHN0YXRlLnBhaXJ8fHN0YXRlLnN3YXB8fGNhbXBhaWduLmRlZmVuc2U/LmJ1c3kpcmV0dXJuIG51bGw7DQogICAgY29uc3Qgcz1tLnN0YXRlLGZhbWlsaWVzPXN0YXRlLmZhbWlsaWVzfHxbXSxyZXNlcnZlZD1uZXcgU2V0KFsuLi4oY2FtcGFpZ24ucmVzZXJ2ZWR8fFtdKSwuLi4oY2FtcGFpZ24uZGFpbHlSZXNlcnZlZHx8W10pXSk7DQogICAgY29uc3QgaG9tZT1wPT5wJiZwLmRlYWRBdD09PW51bGwmJnAuYXdheT09PW51bGwmJnAuYWR1bHRBdDw9bS5ub3c7DQogICAgY29uc3QgYWN0aXZlPXI9PnImJnIuYnVpbHRBdDw9bS5ub3cmJnIudXBncmFkZUF0PT09bnVsbCYmIXIuaW5jaWRlbnQmJiFyLnVucG93ZXJlZDsNCiAgICAvLyDorq3nu4PlsZ7mgKflt7Lmu6HnmoTlsYXmsJHkuZ/lj6/mjqXmm7/vvJvljoblj7LmiYvliqjlronmjpLkuI3lupTmiorml6DmlLbnm4rorq3nu4PmsLjkuYXplIHkvY/jgIINCiAgICBjb25zdCBwb3B1bGF0aW9uPXMucmVzaWRlbnRzLmZpbHRlcihwPT5wLmRlYWRBdD09PW51bGwpLmxlbmd0aCtzLmJpcnRocy5sZW5ndGgrc2hlbHRlclJlY292ZXJpbmdQb3B1bGF0aW9uKHMpOw0KICAgIGlmKHBvcHVsYXRpb24+PU1hdGgubWluKHRhcmdldD8/MCxtLnBvcHVsYXRpb25DYXApKXJldHVybiBudWxsOw0KICAgIGNvbnN0IG1hbmFnZWQ9cD0+ew0KICAgICAgY29uc3Qgcm9vbT1zLnJvb21zLmZpbmQocj0+ci5pZD09PXAucm9vbUlkKTsNCiAgICAgIGlmKHAucm9vbUlkPT09bnVsbClyZXR1cm4gdHJ1ZTsNCiAgICAgIGlmKCFhY3RpdmUocm9vbSkpcmV0dXJuIGZhbHNlOw0KICAgICAgaWYoc3RhZmZSb29tVHlwZXMuaW5jbHVkZXMocm9vbS50eXBlKSlyZXR1cm4gdHJ1ZTsNCiAgICAgIGlmKHNoZWx0ZXJUcmFpbmluZ0NvbXBsZXRlKHMscCkpcmV0dXJuIHRydWU7DQogICAgICBpZihyb29tLnR5cGUhPT0ncXVhcnRlcnMnfHxzLmJpcnRocy5zb21lKGI9PmIucm9vbUlkPT09cm9vbS5pZCYmIXNoZWx0ZXJCaXJ0aFBhcmVudHMocyxiKSkpcmV0dXJuIGZhbHNlOw0KICAgICAgaWYocy5iaXJ0aHMuc29tZShiPT4oc2hlbHRlckJpcnRoUGFyZW50cyhzLGIpfHxbXSkuaW5jbHVkZXMocC5pZCkpKXJldHVybiB0cnVlOw0KICAgICAgY29uc3QgZj1mYW1pbGllcy5maW5kKGY9PltmLmEsZi5iXS5pbmNsdWRlcyhwLmlkKSk7DQogICAgICBpZihmPy5yb29tPT09cm9vbS5pZClyZXR1cm4gcC5mYW1pbHlDb29sZG93blVudGlsPm0ubm93fHxwb3B1bGF0aW9uPj1NYXRoLm1pbih0YXJnZXQsbS5wb3B1bGF0aW9uQ2FwKTsNCiAgICAgIHJldHVybiBwLnBhcmVudHM/Lmxlbmd0aD09PTImJiFzLnJlc2lkZW50cy5zb21lKGNoaWxkPT5jaGlsZC5wYXJlbnRzPy5pbmNsdWRlcyhwLmlkKSkmJiFwLmZhbWlseUNvb2xkb3duVW50aWw7DQogICAgfTsNCiAgICBjb25zdCBhdmFpbGFibGU9cD0+aG9tZShwKSYmc2hlbHRlckhlYWx0aChwKT8uaHA+PS42KnNoZWx0ZXJIZWFsdGgocCk/Lm1heCYmDQogICAgICAhcmVzZXJ2ZWQuaGFzKHAuaWQpJiYhcC5yb21hbmNlJiZ0eXBlb2YgcC5uYW1lPT09J3N0cmluZycmJnNoZWx0ZXJOYW1lVW5pcXVlKHMscCkmJg0KICAgICAgbWFuYWdlZChwKSYmDQogICAgICAhcy5iaXJ0aHMuc29tZShiPT4hc2hlbHRlckJpcnRoUGFyZW50cyhzLGIpJiZmYW1pbGllcy5zb21lKGY9PmYucm9vbT09PWIucm9vbUlkJiZbZi5hLGYuYl0uaW5jbHVkZXMocC5pZCkpKTsNCiAgICBjb25zdCByZWFkeT1mYW1pbGllcy5maWx0ZXIoZj0+ew0KICAgICAgY29uc3QgcGFpcj1bZi5hLGYuYl0ubWFwKGlkPT5zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1pZCkpLHJvb209cy5yb29tcy5maW5kKHI9PnIuaWQ9PT1mLnJvb20pOw0KICAgICAgcmV0dXJuIHJvb20/LnR5cGU9PT0ncXVhcnRlcnMnJiZhY3RpdmUocm9vbSkmJiFzLmJpcnRocy5zb21lKGI9PmIucm9vbUlkPT09cm9vbS5pZCkmJg0KICAgICAgICBwYWlyLmV2ZXJ5KHA9PmhvbWUocCkmJiFyZXNlcnZlZC5oYXMocC5pZCkmJnNoZWx0ZXJIZWFsdGgocCk/LmhwPj0uNipzaGVsdGVySGVhbHRoKHApPy5tYXgmJg0KICAgICAgICAgIHAuaGFwcGluZXNzPj01MCYmIXAucm9tYW5jZSYmIShwLmZhbWlseUNvb2xkb3duVW50aWw+bS5ub3cpJiYocC5yb29tSWQ9PT1mLnJvb218fGF2YWlsYWJsZShwKSkpJiYNCiAgICAgICAgcGFpci5zb21lKHA9PnAucm9vbUlkIT09Zi5yb29tKSYmIXMucmVzaWRlbnRzLnNvbWUocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiZwLnJvb21JZD09PWYucm9vbSYmIVtmLmEsZi5iXS5pbmNsdWRlcyhwLmlkKSk7DQogICAgfSk7DQogICAgcmV0dXJuIHJlYWR5Lmxlbmd0aD97cyxmYW1pbGllcyxob21lLGFjdGl2ZSxhdmFpbGFibGUscmVhZHl9Om51bGw7DQogIH0NCiAgZnVuY3Rpb24gc2hlbHRlclBvcHVsYXRpb25GYW1pbHlTdXBwbHkobSxjYW1wYWlnbikgew0KICAgIGNvbnN0IGNvbnRleHQ9c2hlbHRlclBvcHVsYXRpb25GYW1pbHlTdXBwbHlDb250ZXh0KG0sY2FtcGFpZ24pOw0KICAgIGlmKCFjb250ZXh0KXJldHVybiBudWxsOw0KICAgIGNvbnN0IHtzLGZhbWlsaWVzLGhvbWUsYWN0aXZlLGF2YWlsYWJsZSxyZWFkeX09Y29udGV4dDsNCiAgICBjb25zdCBmYW1pbHlTdXBwbGllcz1yZWFkeS5tYXAoZj0+cG9wdWxhdGlvbkhvdXNpbmdTdXBwbHkobSxmYW1pbGllcyxbZi5hLGYuYl0ubWFwKGlkPT5zLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1pZCkpKSkuZmlsdGVyKHN1cHBseT0+c3VwcGx5LmFsbG93ZWQpOw0KICAgIGxldCBzZWxlY3RlZD1udWxsOw0KICAgIGZvcihjb25zdCBmIG9mIHJlYWR5KXsNCiAgICAgIGNvbnN0IHBhaXI9W2YuYSxmLmJdLm1hcChpZD0+cy5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09aWQpKSxzdXBwbHk9cG9wdWxhdGlvbkhvdXNpbmdTdXBwbHkobSxmYW1pbGllcyxwYWlyKTsNCiAgICAgIGlmKCFzdXBwbHkuYWxsb3dlZCljb250aW51ZTsNCiAgICAgIC8vIOWFiOaBouWkjeeOsOacieS+m+W6lOOAguWutuW6reaJqeS6p+WPquWkhOeQhuW9k+WJjeWkn+eUqOOAgeS4pOS6uuemu+Wyl+WQjuaOpeabv+WuuemHj+S4jei2s+eahOaWreeCueOAgg0KICAgICAgaWYoIU9iamVjdC5rZXlzKHN1cHBseS5kZW1hbmQpLmV2ZXJ5KGs9Pm0ucHJvZHVjdGlvbltrXT49c3VwcGx5LmRlbWFuZFtrXSoxLjItMWUtOSkpY29udGludWU7DQogICAgICBjb25zdCBhYnNlbnQ9bmV3IFNldChzdXBwbHkucmVzZXJ2ZWRSZXNpZGVudHMpLHBvb2w9cy5yZXNpZGVudHMuZmlsdGVyKHA9PmF2YWlsYWJsZShwKSYmIWFic2VudC5oYXMocC5pZCkpOw0KICAgICAgY29uc3QgbW9kZWw9ey4uLm0sLi4uc3VwcGx5LGN1cnJlbnREZW1hbmQ6bS5kZW1hbmQsYWN0dWFsUHJvZHVjdGlvbjptLnByb2R1Y3Rpb24sZmFtaWx5U3VwcGxpZXN9Ow0KICAgICAgbGV0IHByZXBhcmF0aW9uUG9zc2libGU7DQogICAgICBjb25zdCBjYW5QcmVwYXJlPSgpPT57DQogICAgICAgIGlmKHByZXBhcmF0aW9uUG9zc2libGUhPT11bmRlZmluZWQpcmV0dXJuIHByZXBhcmF0aW9uUG9zc2libGU7DQogICAgICAgIGNvbnN0IHRhcmdldHM9cy5yb29tcy5maWx0ZXIocj0+YWN0aXZlKHIpJiZzdGFmZlJvb21UeXBlcy5pbmNsdWRlcyhyLnR5cGUpJiYNCiAgICAgICAgICBzLnJlc2lkZW50cy5maWx0ZXIocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiZwLnJvb21JZD09PXIuaWQpLmxlbmd0aDxyLndpZHRoKjIpOw0KICAgICAgICBmb3IoY29uc3QgciBvZiB0YXJnZXRzKXsNCiAgICAgICAgICBjb25zdCByZXNvdXJjZT1zaGVsdGVyUm9vbXNbci50eXBlXVsxXTtpZihyZXNvdXJjZSE9PSdzY3JhcCcmJiEoc3VwcGx5LnByb2R1Y3Rpb25bcmVzb3VyY2VdPHN1cHBseS5kZW1hbmRbcmVzb3VyY2VdKjEuMi0xZS05KSljb250aW51ZTsNCiAgICAgICAgICBmb3IoY29uc3QgcCBvZiBwb29sKXsNCiAgICAgICAgICAgIGlmKHAucm9vbUlkPT09ci5pZCljb250aW51ZTsNCiAgICAgICAgICAgIGNvbnN0IGFmdGVyPXNoZWx0ZXJQcm9kdWN0aW9uV2l0aG91dChtb2RlbCxbcC5pZF0pLGdhaW49c2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAscik7DQogICAgICAgICAgICBpZighKGdhaW4tKHN1cHBseS5wcm9kdWN0aW9uW3Jlc291cmNlXS1hZnRlcltyZXNvdXJjZV0pPjEmJnNoZWx0ZXJEZXBhcnR1cmVTYWZlKG0sW3AuaWRdKSYmDQogICAgICAgICAgICAgICAgT2JqZWN0LmtleXMoc3VwcGx5LmRlbWFuZCkuZXZlcnkoaz0+YWZ0ZXJba10+PU1hdGgubWluKHN1cHBseS5wcm9kdWN0aW9uW2tdLHN1cHBseS5kZW1hbmRba10qMS4yKS0xZS05KSkpY29udGludWU7DQogICAgICAgICAgICBpZighc2hlbHRlckZhbWlseVN1cHBseVByZXNlcnZlZChtb2RlbCxbe2lkOnAuaWQscm9vbTpyLmlkfV0pKWNvbnRpbnVlOw0KICAgICAgICAgICAgaWYocmVzb3VyY2UhPT0nc2NyYXAnKXJldHVybiBwcmVwYXJhdGlvblBvc3NpYmxlPXRydWU7DQogICAgICAgICAgICAvLyDloavlm57mlLbnqbrlspfmnKzouqvkuI3ooaXlj6Pnsq7vvJvlj6rmnInmraTmraXnoa7lrp7miZPlvIDlkI7nu63lronlhajmjqXmm7/ml7bvvIzmiY3mmoLnvJPlrrbluq3miankuqfjgIINCiAgICAgICAgICAgIC8vIOS+i+WmguWuv+iIjeaIkOW5tOWtkOWls+WFiOWwseS4muWQjuWPr+WPguS4jua7oeWRmOaNouS9jeOAgumihOiniOS4jeiwg+Wyl+OAgeS4jeS/neWtmOiuoeWIkuOAgg0KICAgICAgICAgICAgLy8g5bey5Zyo55Sf5LqnL+S8keaBr+eahOS6uuacrOadpeWwseWPr+WPguS4juS4i+mdoueahOebtOaOpeaNouS9je+8jOaXoOmcgOmAkOS6uuWGjemihOa8lOS4gOasoeWwseS4muOAgg0KICAgICAgICAgICAgaWYoIXMucm9vbXMuc29tZShyb29tPT5yb29tLmlkPT09cC5yb29tSWQmJnJvb20udHlwZT09PSdxdWFydGVycycpKWNvbnRpbnVlOw0KICAgICAgICAgICAgY29uc3QgbmV4dD1zaGVsdGVyTW9kZWwoey4uLm0udmlldyxzdGF0ZTp7Li4ucyxyZXNpZGVudHM6cy5yZXNpZGVudHMubWFwKG90aGVyPT5vdGhlci5pZD09PXAuaWQ/ey4uLm90aGVyLHJvb21JZDpyLmlkfTpvdGhlcil9fSk7DQogICAgICAgICAgICBjb25zdCBuZXh0U3VwcGx5PXBvcHVsYXRpb25Ib3VzaW5nU3VwcGx5KG5leHQsZmFtaWxpZXMscGFpcik7DQogICAgICAgICAgICBjb25zdCBuZXh0RmFtaWxpZXM9cmVhZHkubWFwKGY9PnBvcHVsYXRpb25Ib3VzaW5nU3VwcGx5KG5leHQsZmFtaWxpZXMsW2YuYSxmLmJdLm1hcChpZD0+bmV4dC5zdGF0ZS5yZXNpZGVudHMuZmluZChwPT5wLmlkPT09aWQpKSkpLmZpbHRlcihzdXBwbHk9PnN1cHBseS5hbGxvd2VkKTsNCiAgICAgICAgICAgIGlmKHBsYW5TaGVsdGVyU3dhcCh7Li4ubmV4dCwuLi5uZXh0U3VwcGx5LGN1cnJlbnREZW1hbmQ6bmV4dC5kZW1hbmQsYWN0dWFsUHJvZHVjdGlvbjpuZXh0LnByb2R1Y3Rpb24sZmFtaWx5U3VwcGxpZXM6bmV4dEZhbWlsaWVzfSwNCiAgICAgICAgICAgICAgICBuZXh0LnN0YXRlLnJlc2lkZW50cy5maWx0ZXIoYXZhaWxhYmxlKSx0cnVlKSlyZXR1cm4gcHJlcGFyYXRpb25Qb3NzaWJsZT10cnVlOw0KICAgICAgICAgIH0NCiAgICAgICAgfQ0KICAgICAgICByZXR1cm4gcHJlcGFyYXRpb25Qb3NzaWJsZT1Cb29sZWFuKHBsYW5TaGVsdGVyU3dhcChtb2RlbCxzLnJlc2lkZW50cy5maWx0ZXIoYXZhaWxhYmxlKSx0cnVlKSk7DQogICAgICB9Ow0KICAgICAgY29uc3QgcmVzb3VyY2VzPXt9Ow0KICAgICAgZm9yKGNvbnN0IFtyZXNvdXJjZSxuZWVkXSBvZiBPYmplY3QuZW50cmllcyhzdXBwbHkuZGVtYW5kKSl7DQogICAgICAgIGlmKHN1cHBseS5wcm9kdWN0aW9uW3Jlc291cmNlXT49bmVlZCoxLjItMWUtOSljb250aW51ZTsNCiAgICAgICAgY29uc3QgdHlwZT1zdGFmZlJvb21UeXBlcy5maW5kKHR5cGU9PnNoZWx0ZXJSb29tc1t0eXBlXVsxXT09PXJlc291cmNlKSxyb29tcz1zLnJvb21zLmZpbHRlcihyPT5yLnR5cGU9PT10eXBlJiZhY3RpdmUocikpOw0KICAgICAgICBjb25zdCBoeXBvdGhldGljYWw9e3R5cGUsd2lkdGg6MSxsZXZlbDoxLGJ1aWx0QXQ6MCx1cGdyYWRlQXQ6bnVsbCxpbmNpZGVudDpudWxsLHVucG93ZXJlZDpmYWxzZX07DQogICAgICAgIC8vIOWNlei1hOa6kOS4iueVjO+8muaKiuWFqOmDqOWPr+iwg+S6uuWRmOeahOacgOS9s+S6p+eOh+mFjee7meacgOS9s+Wyl+S9je+8jOavj+S6uuWPquiuoeS4gOasoeOAgg0KICAgICAgICAvLyDkuIrnlYzkuI3otrPor7TmmI7lspfkvY3kuI3otrPvvJvkuIrnlYzlpJ/nlKjkvYbmsqHmnInlronlhajkuqTmjqXmraXpqqTml7bvvIzlj6bor4TkvLDov4fmuKHkuqfog73jgIINCiAgICAgICAgY29uc3QgY2FwYWNpdHlGb3I9KGNoYW5nZWQscGVvcGxlPXBvb2wpPT57DQogICAgICAgICAgY29uc3QgaWRzPW5ldyBTZXQocGVvcGxlLm1hcChwPT5wLmlkKSkscmF0ZXM9cGVvcGxlLm1hcChwPT5zaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYscCxoeXBvdGhldGljYWwpKS5zb3J0KChhLGIpPT5iLWEpOw0KICAgICAgICAgIGxldCBmaXhlZD0wO2NvbnN0IHNsb3RzPVtdOw0KICAgICAgICAgIGZvcihjb25zdCBvcmlnaW5hbCBvZiByb29tcyl7DQogICAgICAgICAgICBjb25zdCByPW9yaWdpbmFsLmlkPT09Y2hhbmdlZD8uaWQ/Y2hhbmdlZDpvcmlnaW5hbDsNCiAgICAgICAgICAgIGNvbnN0IG9jY3VwYW50cz1zLnJlc2lkZW50cy5maWx0ZXIocD0+cC5kZWFkQXQ9PT1udWxsJiZwLmFkdWx0QXQ8PW0ubm93JiZwLnJvb21JZD09PXIuaWQmJiFhYnNlbnQuaGFzKHAuaWQpJiYhaWRzLmhhcyhwLmlkKSk7DQogICAgICAgICAgICBmaXhlZCs9b2NjdXBhbnRzLmZpbHRlcihob21lKS5zbGljZSgwLHIud2lkdGgqMikucmVkdWNlKChuLHApPT5uK3NoZWx0ZXJXb3JrZXJSYXRlKHMsbS5ub3csbS52aWV3LmVudixwLHIpLDApOw0KICAgICAgICAgICAgZm9yKGxldCBpPW9jY3VwYW50cy5sZW5ndGg7aTxyLndpZHRoKjI7aSsrKXNsb3RzLnB1c2goWzAsMSwxLjUsMi4xXVtyLmxldmVsXSk7DQogICAgICAgICAgfQ0KICAgICAgICAgIHJldHVybiBmaXhlZCtzbG90cy5zb3J0KChhLGIpPT5iLWEpLnJlZHVjZSgobixmYWN0b3IsaSk9Pm4rZmFjdG9yKihyYXRlc1tpXXx8MCksMCk7DQogICAgICAgIH07DQogICAgICAgIGNvbnN0IGNhcGFjaXR5PWNhcGFjaXR5Rm9yKCksdHJhbnNpdGlvbj1jYXBhY2l0eT49bmVlZCoxLjItMWUtOTsNCiAgICAgICAgLy8g5pyA57uI5a656YeP6Laz5aSf5LiU5Lq65ZGY5qih5Z2X5LuN6IO95a6J5YWo5o6o6L+b5pe25YWI6LCD5bKX77yb6aKE6KeI5LiN5L+d5a2Y6K6w5b2V44CB5LiN5Y+R5Ye65pON5L2c44CCDQogICAgICAgIGlmKHRyYW5zaXRpb24mJmNhblByZXBhcmUoKSlyZXR1cm4gbnVsbDsNCiAgICAgICAgY29uc3QgZG9ub3JzPVtdOw0KICAgICAgICBmb3IoY29uc3QgcCBvZiBbLi4ucG9vbF0uc29ydCgoYSxiKT0+c2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LGIsaHlwb3RoZXRpY2FsKS1zaGVsdGVyV29ya2VyUmF0ZShzLG0ubm93LG0udmlldy5lbnYsYSxoeXBvdGhldGljYWwpfHxhLmlkLWIuaWQpKXsNCiAgICAgICAgICBpZihzLnJvb21zLnNvbWUocj0+ci5pZD09PXAucm9vbUlkJiZyLnR5cGU9PT10eXBlKSljb250aW51ZTsNCiAgICAgICAgICBjb25zdCBpZHM9Wy4uLmRvbm9ycyxwLmlkXSxhZnRlcj1zaGVsdGVyUHJvZHVjdGlvbldpdGhvdXQobW9kZWwsaWRzKTsNCiAgICAgICAgICBpZihzaGVsdGVyRGVwYXJ0dXJlU2FmZShtLGlkcykmJk9iamVjdC5rZXlzKHN1cHBseS5kZW1hbmQpLmV2ZXJ5KGs9Pms9PT1yZXNvdXJjZXx8YWZ0ZXJba10+PXN1cHBseS5kZW1hbmRba10qMS4yLTFlLTkpKWRvbm9ycy5wdXNoKHAuaWQpOw0KICAgICAgICAgIGlmKGRvbm9ycy5sZW5ndGg9PT0yKWJyZWFrOw0KICAgICAgICB9DQogICAgICAgIHJlc291cmNlc1tyZXNvdXJjZV09e3R5cGUsY2FwYWNpdHksbmVlZDpuZWVkKjEuMixkb25vcnMsdHJhbnNpdGlvbiwNCiAgICAgICAgICBnYWluOmRvbm9ycy5yZWR1Y2UoKG4saWQpPT5uK3NoZWx0ZXJXb3JrZXJSYXRlKHMsbS5ub3csbS52aWV3LmVudixzLnJlc2lkZW50cy5maW5kKHA9PnAuaWQ9PT1pZCksaHlwb3RoZXRpY2FsKSwwKSwNCiAgICAgICAgICB1cGdyYWRlczpyb29tcy5maWx0ZXIocj0+ci5sZXZlbDwzJiZzaGVsdGVyT3B0aW1pemUpLm1hcChyPT4oe2lkOnIuaWQsY2FwYWNpdHk6dHJhbnNpdGlvbj8NCiAgICAgICAgICAgIHN1cHBseS5wcm9kdWN0aW9uW3Jlc291cmNlXStzLnJlc2lkZW50cy5maWx0ZXIocD0+aG9tZShwKSYmcC5yb29tSWQ9PT1yLmlkJiYhYWJzZW50LmhhcyhwLmlkKSkuc2xpY2UoMCxyLndpZHRoKjIpDQogICAgICAgICAgICAgIC5yZWR1Y2UoKG4scCk9Pm4rc2hlbHRlcldvcmtlclJhdGUocyxtLm5vdyxtLnZpZXcuZW52LHAsciksMCkqKFswLDEsMS41LDIuMV1bci5sZXZlbCsxXS9bMCwxLDEuNSwyLjFdW3IubGV2ZWxdLTEpOg0KICAgICAgICAgICAgY2FwYWNpdHlGb3Ioey4uLnIsbGV2ZWw6ci5sZXZlbCsxfSxwb29sLmZpbHRlcihwPT5kb25vcnMuaW5jbHVkZXMocC5pZCl8fHJvb21zLnNvbWUocm9vbT0+cm9vbS5pZD09PXAucm9vbUlkKSkpfSkpLA0KICAgICAgICAgIHBlbmRpbmc6cy5yb29tcy5maWx0ZXIocj0+c3RhZmZSb29tVHlwZXMuaW5jbHVkZXMoci50eXBlKSYmKHIuYnVpbHRBdD5tLm5vd3x8ci51cGdyYWRlQXQhPT1udWxsKSkubWFwKHI9PnIuaWQpfTsNCiAgICAgIH0NCiAgICAgIC8vIOacieWFtuS7luWOn+WutuW6reWwmuWPr+eUqOeOsOacieWyl+S9jeaOpeabv+aXtu+8jOWFiOiuqeS6uuWRmOinhOWIkuWkhOeQhu+8jOmBv+WFjeS4uuesrOS4gOWvueaKouWFiOiKsei0ueOAgg0KICAgICAgaWYoIU9iamVjdC5rZXlzKHJlc291cmNlcykubGVuZ3RoKXJldHVybiBudWxsOw0KICAgICAgc2VsZWN0ZWQ/Pz17ZmFtaWx5OltNYXRoLm1pbihmLmEsZi5iKSxNYXRoLm1heChmLmEsZi5iKSxmLnJvb21dLHJlc291cmNlc307DQogICAgfQ0KICAgIHJldHVybiBzZWxlY3RlZDsNCiAgfQ0KCiAgZnVuY3Rpb24gc2hlbHRlckhlYWx0aChwKSB7DQogICAgaWYoIVtwLmhwLHAueHAscC5zdGF0cz8uZW5kXS5ldmVyeShuPT5OdW1iZXIuaXNGaW5pdGUobikmJm4+PTApKXJldHVybiBudWxsOw0KICAgIGNvbnN0IG1heD1NYXRoLnJvdW5kKDEwMCsoTWF0aC5taW4oNTAsMStNYXRoLmZsb29yKE1hdGguc3FydChNYXRoLm1heCgwLHAueHApLzMpKSktMSkqKDIrLjUqcC5zdGF0cy5lbmQpKTsNCiAgICByZXR1cm4gTnVtYmVyLmlzRmluaXRlKG1heCkmJm1heD4wJiZwLmhwPD1tYXg/e2hwOnAuaHAsbWF4LGNyaXRpY2FsOnAuaHA8bWF4LzJ9Om51bGw7DQogIH0KbGV0IHNoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxzaGVsdGVyT3B0aW1pemUsc2hlbHRlclN0YXRlOwpjb25zdCBzYXZlU2hlbHRlcj0oKT0+e3Rocm93IEVycm9yKCJSZWFkLW9ubHkgZmFtaWx5IHByZXZpZXcgY2Fubm90IHNhdmUgc3RhdGUiKTt9OwpmdW5jdGlvbiBpbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKGVuZHBvaW50LG1vZGVsLHJvdXRlcyxmYW1pbHlTdXBwbHk9bnVsbCkgewogIGVuZHBvaW50Lm9ubWVzc2FnZT0oe2RhdGF9KT0+ewogICAgdHJ5ewogICAgICBpZihkYXRhLmtpbmQ9PT0nbmF0aXZlLWZhbWlseS1zdXBwbHknKXsKICAgICAgICBpZighZmFtaWx5U3VwcGx5KXRocm93IEVycm9yKCdGYW1pbHktc3VwcGx5IGtlcm5lbCB1bmF2YWlsYWJsZScpOwogICAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6ZGF0YS5raW5kLHN1cHBseTpmYW1pbHlTdXBwbHkoZGF0YSl9KTtyZXR1cm47CiAgICAgIH0KICAgICAgY29uc3QgcmVzdWx0PXJvdXRlcyhtb2RlbChkYXRhLnZpZXcpLGRhdGEub3B0aW9ucyxkYXRhLnRhcmdldFNjb3JlLGRhdGEuZmlyc3QsZGF0YS5wbGFubmluZyk7CiAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6J25hdGl2ZS1sZXZlbC1yb3V0ZXMnLHJvdXRlczpyZXN1bHR9KTsKICAgIH1jYXRjaChlKXtlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxlcnJvcjpTdHJpbmcoZT8ubWVzc2FnZT8/ZSl9KTt9CiAgfTsKfQppbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKHNlbGYsc2hlbHRlck1vZGVsLHNoZWx0ZXJMZXZlbFJvdXRlcyxkYXRhPT57Cih7c2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGV9PWRhdGEucG9saWN5KTsKcmV0dXJuIHNoZWx0ZXJQb3B1bGF0aW9uRmFtaWx5U3VwcGx5KHNoZWx0ZXJNb2RlbChkYXRhLnZpZXcpLGRhdGEuY2FtcGFpZ24pOwp9KTsK"),c=>c.charCodeAt(0)));
+  // END GENERATED SHELTER PLANNING WORKER
+  let shelterBackgroundPlanner = null;
+  function shelterPlanningContext(m) {
+    return {enabled:shelterEnabled&&shelterOptimize&&shelterStaffMode!=='off'&&!shelterStaffHold&&
+        !shelterState.swap&&!shelterState.pair&&!m.state.rooms.some(r=>r.incident),
+      window:shelterState.developmentWindow,pending:shelterPending,
+      schedule:{vaultNo:m.view.vaultNo,campaign:shelterState.campaign,families:shelterState.families,
+        pair:shelterState.pair,swap:shelterState.swap,constructionLedger:shelterState.constructionLedger},
+      construction:{build:shelterConstruction.build,upgrade:shelterConstruction.upgrade,dig:shelterConstruction.dig,
+        scrapLimit:shelterConstruction.scrapLimit,partsLimit:shelterConstruction.partsLimit},
+      safety:{scrap:shelterConstruction.scrapReserve,parts:shelterConstruction.partsReserve},
+      settings:[shelterStaffMode,shelterPopulationTarget,shelterLevelTarget,shelterCampaign,shelterGear,shelterOptimize],
+      readAt:shelterRead?.at??Date.now(),readStartedAt:shelterRead?.startedAt??Date.now()};
+  }
+  let shelterLevelPlanner=null;
+  function shelterBackgroundLevelRoutes(m,options,targetScore,first,planning) {
+    if(!shelterEnabled||shelterPending||accountStopReason()){
+      shelterLevelPlanner?.invalidate();return {routes:[],status:'disabled'};
+    }
+    shelterLevelPlanner??=createShelterLevelPlanning({source:shelterLevelWorkerSource,onUpdate:status=>{
+      shelterCampaignSchedule.cache=null;
+      log.add('shelter-level-planning','后台等级路线比较完成，开工仍核对当前条件',
+        {status:status.status,routes:status.routes.length,error:status.error});schedule();
+    }});
+    const context=[shelterConstruction,shelterStaffMode,shelterPopulationTarget,shelterLevelTarget,
+      shelterCampaign,shelterGear,shelterOptimize,shelterStaffHold,shelterState.pair,shelterState.swap,
+      shelterState.constructionLedger];
+    const status=shelterLevelPlanner.request({view:m.view,options,targetScore,first,planning},context);
+    if(status.status!=='ready')return {routes:[],status:status.status};
+    const routes=status.snapshotAt===m.now?status.routes:status.routes.flatMap(route=>{
+      // Replay only the proposed sequence at the current clock. This checks all
+      // costs, batches, pauses and staffing again, without another branching search.
+      const checked=shelterLevelRoutes(m,options,targetScore,first,{...planning,routeSteps:route.steps.map(s=>s.project)});
+      const end=checked.find(r=>r.steps.length===route.steps.length&&r.complete===route.complete);
+      return end?[end]:[];
+    });
+    return {routes,status:'ready',jobId:status.id,snapshotAt:status.snapshotAt};
+  }
+  let shelterFamilyPlanner=null;
+  function shelterBackgroundFamilySupply(m,campaign) {
+    if(!shelterEnabled||shelterPending||accountStopReason()||shelterStaffMode!=='population'||shelterStaffHold||
+        shelterState.pair||shelterState.swap||campaign.defense?.busy||!shelterState.families?.length||
+        Object.entries(shelterGrowthNeeds(m).demand).some(([k,need])=>m.production[k]<need*1.2-1e-9)){
+      shelterFamilyPlanner?.invalidate();return {status:'ready',supply:null};
+    }
+    const policy={shelterStaffMode,shelterStaffHold,shelterPopulationTarget,shelterOptimize,
+      shelterState:{families:shelterState.families,pair:shelterState.pair,swap:shelterState.swap}};
+    // Reuse the native eligibility check before paying serialization/Worker startup.
+    // No expensive swap search runs here; a full target or no ready family needs none.
+    if(!shelterPopulationFamilySupplyContext(m,campaign,policy)){
+      shelterFamilyPlanner?.invalidate();return {status:'ready',supply:null};
+    }
+    shelterFamilyPlanner??=createShelterLevelPlanning({source:shelterLevelWorkerSource,onUpdate:status=>{
+      shelterCampaignSchedule.cache=null;
+      log.add('shelter-family-planning','后台家庭供给比较完成，调岗和建设仍核对当前快照',
+        {status:status.status,jobId:status.id,family:status.supply?.family??null,error:status.error});schedule();
+    }});
+    const context=[policy,shelterConstruction,shelterCampaign,shelterGear,shelterLevelTarget];
+    return shelterFamilyPlanner.request({kind:'native-family-supply',view:m.view,policy,
+      campaign:{reserved:campaign.reserved,dailyReserved:campaign.dailyReserved,defense:{busy:Boolean(campaign.defense?.busy)}}},context);
+  }
+  function shelterStartBackgroundPlanning(m) {
+    const context=shelterPlanningContext(m);
+    if(!context.enabled||context.pending){shelterBackgroundPlanner?.invalidate();return;}
+    if(!context.window||context.window.end<=m.now){
+      context.window={start:m.now,end:m.now+168*3600000};
+      saveShelter({...shelterState,developmentWindow:context.window});
+    }
+    if(!shelterBackgroundPlanner)shelterBackgroundPlanner=createShelterNativePlanning({
+      client:createShelterPlanningClient({source:shelterPlanningWorkerSource,onUpdate:status=>{
+        log.add('shelter-planning','后台调岗比较完成，实际提交仍按当前状态核对',{
+          status:status.status,outcome:status.result?.body.outcome??null,
+          selected:status.result?.body.selected?.firstCandidate??null,budget:status.result?.body.budget??null,
+          error:status.error});schedule();
+      }})});
+    shelterBackgroundPlanner.update(m.view,context);
+  }
+  function shelterBackgroundAssignment(m,allowed) {
+    const chosen=shelterBackgroundPlanner?.choose(m.view,shelterPlanningContext(m),allowed)??null;
+    if(chosen||shelterWork||!allowed.length)return chosen;
+    const status=shelterBackgroundPlanner?.status();
+    // Yield only the ordinary production decision, for at most 1.5 seconds. Urgent
+    // supply/family/defense and already opened native windows have earlier priority.
+    return status?.status==='running'&&Date.now()-status.startedAt<1500?
+      {kind:'development-wait',reason:'后台正在比较普通增产岗位'}:null;
+  }
   let shelterReadFailures = 0;
   let shelterWatchController = null, shelterWatchAt = 0, shelterWatchRaid = null, shelterWatchFailures = 0;
   let shelterRaidTrace = null;
@@ -4473,19 +8157,47 @@
       (1+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*.01)*(1+.03*(s.legacy?.perks?.production || 0))*
       Math.min(150,Math.max(100,...events.map(e => e.percent)))/100;
   }
-  function shelterStoredProjection(s,r,now,env,cap) {
+  function shelterResidentIdentity(s,p,names=null) {
+    const normalize=value=>typeof value==='string'?value.normalize('NFKC').replace(/\s+/g,' ').trim():'';
+    const name=q=>names?.get(q)??normalize(q?.name);
+    const level=q=>Number.isFinite(q?.xp)&&q.xp>=0?Math.min(50,1+Math.floor(Math.sqrt(q.xp/3))):null;
+    const keys=['str','per','end','cha','int','agi','lck'],labels=['力量','感知','耐力','魅力','智力','敏捷','幸运'];
+    const stats=q=>keys.every(k=>Number.isInteger(q?.stats?.[k])&&q.stats[k]>=0)?keys.map(k=>q.stats[k]):null;
+    const location=q=>{
+      if(q.away!==null||q.deadAt!==null)return null;
+      if(q.roomId===null)return {row:'闲着',detail:'在休息'};
+      const r=s.rooms.find(r=>r.id===q.roomId),names={power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',
+        quarters:'宿舍',storage:'仓库',medbay:'医务室',workshop:'工坊',training:'训练室',radio:'电台',armory:'武器工坊',tailor:'服装工坊',door:'大门'};
+      if(!r||!names[r.type]||!Number.isInteger(r.floor)||!Number.isInteger(r.width))return null;
+      if(r.type==='training'&&!keys.includes(r.trainStat))return null;
+      const name=names[r.type]+(r.type==='training'?`·${labels[keys.indexOf(r.trainStat)]}`:'')+(r.width>1?` ×${r.width}`:'');
+      return {row:normalize(`${r.floor} 层 ${name}`),detail:normalize(`在${name}（${r.floor} 层）`)};
+    };
+    if(!p||!name(p)||level(p)===null||s.residents.filter(q=>q.id===p.id).length!==1)return null;
+    const proof={id:p.id,name:name(p),level:level(p),stats:stats(p),location:location(p),fields:[]};
+    let matches=s.residents.filter(q=>name(q)===proof.name);
+    if(matches.length===1)return proof;
+    proof.fields.push('level');matches=matches.filter(q=>level(q)===proof.level);
+    if(matches.length===1)return proof;
+    if(proof.stats){proof.fields.push('stats');matches=matches.filter(q=>JSON.stringify(stats(q))===JSON.stringify(proof.stats));}
+    if(matches.length===1)return proof;
+    if(proof.location){proof.fields.push('location');matches=matches.filter(q=>location(q)?.row===proof.location.row);}
+    return matches.length===1?proof:null;
+  }
+  function shelterStoredProjection(s,r,now,env,cap,bounds={}) {
     const [,resource,,batchBase]=shelterRooms[r.type],batch=(batchBase || 0)*r.width*[0,1,1.5,2.1][r.level];
     const elapsed=Math.max(0,now-s.lastSettledAt),steps=Math.floor(Math.min(86400000,elapsed)/600000);
     const nextTickAt=s.lastSettledAt+(Math.floor(elapsed/600000)+1)*600000;
     const result={stored:resource?r.stored:0,autoCollected:0,scrapConsumed:0,nextTickAt};
     if(!resource || !steps)return result;
-    // Public page's ty(): 10-minute ticks, at most 24 hours, rate sampled at the start of that window.
+    // Public page's tw(): 10-minute ticks, at most 24 hours, rate sampled at the start of that window.
     const from=Math.max(s.lastSettledAt,now-86400000);
     const workers=s.residents.filter(p=>p.roomId===r.id && p.away===null && p.deadAt===null && p.adultAt<=from).slice(0,r.width*2);
     const increment=workers.reduce((sum,p)=>sum+shelterWorkerRate(s,from,env,p,r),0)/6;
     const automatic=(s.handies || []).some(h=>h.floor===r.floor),maxStored=4*batch;
-    let scrap=s.resources.scrap,capacity=cap-s.resources[resource];
+    let scrap=bounds.scrapBudget??s.resources.scrap,capacity=bounds.capacityBudget??(cap-s.resources[resource]);
     for(let i=0;i<steps;i++) {
+      const beforeStored=result.stored,beforeCollected=result.autoCollected,beforeScrap=result.scrapConsumed,beforeFeed=scrap,beforeCapacity=capacity;
       if(increment>0) {
         let made=Math.min(increment,Math.max(0,maxStored-result.stored));
         if(r.type==='workshop') {made=Math.min(made,scrap/6);scrap-=6*made;result.scrapConsumed+=6*made;}
@@ -4496,19 +8208,73 @@
         if(collected>0){result.stored=Math.max(0,result.stored-collected);capacity-=collected;result.autoCollected+=collected;}
       }
       if(increment<=0 && !automatic)break;
+      // 本次投影的产速、供料和可收容量均固定；一整刻没有变化后，后续刻也不会自行解锁。
+      if(result.stored===beforeStored&&result.autoCollected===beforeCollected&&result.scrapConsumed===beforeScrap&&scrap===beforeFeed&&capacity===beforeCapacity)break;
     }
     return result;
   }
-  function shelterFutureCollection(m,afterMs=0) {
-    const amounts={},automatic={};
-    for(const room of m.state.rooms.filter(r=>r.builtAt<=m.now+afterMs)) {
-      const [,resource,,batchBase]=shelterRooms[room.type];if(!resource)continue;
-      const batch=batchBase*room.width*[0,1,1.5,2.1][room.level];
-      const projected=shelterStoredProjection(m.state,room,m.now+afterMs,m.view.env,m.caps[resource]);
-      amounts[room.id]=Math.floor(projected.stored/batch+1e-9)*batch;
-      automatic[resource]=(automatic[resource] || 0)+projected.autoCollected;
+  function shelterSharedProjection(s,now,env,caps) {
+    const rooms=new Map(),amounts={},automatic={},totals={},uncertainRooms=[];
+    const built=s.rooms.filter(r=>r.builtAt<=now),elapsed=Math.max(0,now-s.lastSettledAt);
+    const active=Math.floor(Math.min(86400000,elapsed)/600000)>0;
+    const rows=built.map(room=>{
+      const [,resource,,base]=shelterRooms[room.type],batch=(base||0)*room.width*[0,1,1.5,2.1][room.level];
+      const native=shelterStoredProjection(s,room,now,env,caps[resource]);
+      const maximum=resource&&active?shelterStoredProjection(s,room,now,env,caps[resource],
+        {scrapBudget:Number.MAX_SAFE_INTEGER,capacityBudget:Number.MAX_SAFE_INTEGER}):native;
+      return {room,resource,batch,native,maximum,robot:(s.handies||[]).some(h=>h.floor===room.floor)};
+    });
+    const feedDemand=rows.reduce((n,r)=>n+r.maximum.scrapConsumed,0);
+    const incomingScrap=rows.filter(r=>r.resource==='scrap').reduce((n,r)=>n+r.maximum.autoCollected,0);
+    const feedUpper=Math.min(feedDemand,s.resources.scrap+incomingScrap);
+    const autoPotential={};
+    for(const r of rows)if(r.resource)autoPotential[r.resource]=(autoPotential[r.resource]||0)+r.maximum.autoCollected;
+    for(const row of rows){
+      const {room,resource,batch,native,maximum,robot}=row;
+      if(!resource){rooms.set(room.id,{...native,storedUpper:native.stored,projectionUncertain:false});continue;}
+      // The page estimates each room independently; it does not establish server processing order.
+      // Lower bounds leave other rooms their maximum demand. Upper bounds are for capacity checks,
+      // never inventory credits. They need not all be attainable in the same processing order.
+      const feedLow=room.type==='workshop'?Math.max(0,s.resources.scrap-(feedDemand-maximum.scrapConsumed)):0;
+      const ownFeedUpper=room.type==='workshop'?Math.min(maximum.scrapConsumed,s.resources.scrap+incomingScrap):0;
+      const free=Math.max(0,caps[resource]-s.resources[resource]);
+      const autoHigh=robot?Math.min(maximum.autoCollected,Math.floor(free+(resource==='scrap'?feedUpper:0))):0;
+      const capacityLow=Math.max(0,free-((autoPotential[resource]||0)-maximum.autoCollected));
+      const lower=room.type==='workshop'||robot?shelterStoredProjection(s,room,now,env,caps[resource],
+        {scrapBudget:feedLow,capacityBudget:capacityLow}):native;
+      const feedUncertain=room.type==='workshop'&&ownFeedUpper>lower.scrapConsumed+1e-9;
+      const autoUncertain=robot&&(autoHigh>lower.autoCollected+1e-9||incomingScrap>0&&feedUncertain);
+      let stored=lower.stored,storedUpper=native.stored;
+      if(feedUncertain&&!robot){
+        storedUpper=shelterStoredProjection(s,room,now,env,caps[resource],{scrapBudget:ownFeedUpper}).stored;
+      }else if(robot&&(feedUncertain||autoUncertain)){
+        const producedLow=room.type==='workshop'?lower.scrapConsumed/6:
+          Math.max(0,lower.stored+lower.autoCollected-room.stored);
+        const producedHigh=room.type==='workshop'?ownFeedUpper/6:
+          Math.max(0,maximum.stored+maximum.autoCollected-room.stored);
+        stored=Math.max(0,room.stored+producedLow-autoHigh);
+        storedUpper=Math.min(Math.max(room.stored,4*batch),room.stored+producedHigh);
+      }
+      const uncertain=storedUpper>stored+1e-9;
+      const result={...lower,stored,storedUpper,autoCollected:autoHigh,scrapConsumedUpper:ownFeedUpper,
+        projectionUncertain:uncertain,projectionReason:uncertain?(feedUncertain?'shared-feed':'shared-capacity'):null};
+      rooms.set(room.id,result);if(uncertain)uncertainRooms.push(room.id);
+      amounts[room.id]=Math.floor(storedUpper/batch+1e-9)*batch;
+      totals[resource]=(totals[resource]||0)+amounts[room.id];
+      automatic[resource]=(automatic[resource]||0)+autoHigh;
     }
-    return {amounts,automatic};
+    for(const resource of Object.keys(automatic))automatic[resource]=Math.min(automatic[resource],
+      Math.max(0,Math.floor(caps[resource]-s.resources[resource]+(resource==='scrap'?feedUpper:0))));
+    if(totals.parts!==undefined){
+      const stored=rows.filter(r=>r.resource==='parts').reduce((n,r)=>n+r.room.stored,0);
+      totals.parts=Math.min(totals.parts,stored+feedUpper/6);
+    }
+    return {rooms,amounts,automatic,totals,scrapConsumedUpper:feedUpper,uncertainRooms};
+  }
+  function shelterFutureCollection(m,afterMs=0) {
+    const {amounts,automatic,totals,scrapConsumedUpper,uncertainRooms}=
+      shelterSharedProjection(m.state,m.now+afterMs,m.view.env,m.caps);
+    return {amounts,automatic,totals,scrapConsumedUpper,uncertainRooms};
   }
   function shelterCapacity(rooms,storagePerk,extraStorage=0) {
     const storage=rooms.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width*r.level,extraStorage);
@@ -4551,6 +8317,7 @@
     if (atHome.some(p => !finite(p.adultAt) || !finite(p.xp) || !finite(p.happiness) ||
         !['str','per','end','cha','int','agi','lck'].every(key => finite(p.stats?.[key])))) throw new Error('避难所居民数据不完整');
     const production = Object.fromEntries(Object.keys(shelterResources).map(k => [k,0]));
+    const shared=shelterSharedProjection(s,now,view.env,caps);
     const rooms = built.map(r => {
       const [stat,resource,base,batchBase] = shelterRooms[r.type];
       const workers = atHome.filter(p => p.roomId === r.id && p.adultAt <= now).slice(0,r.width*2);
@@ -4562,13 +8329,14 @@
         production[resource] += rate;
       }
       const batch = resource ? batchBase*r.width*multiplier(r) : 0;
-      const projected=shelterStoredProjection(s,r,now,view.env,caps[resource]);
+      const projected=shared.rooms.get(r.id);
       return { id:r.id, resource, rate, batch, ...projected, automatic:(s.handies || []).some(h=>h.floor===r.floor), workers:workers.length };
     });
     const mouths = atHome.reduce((n,p) => n+(p.adultAt <= now ? 1 : .5),0);
     const power = built.reduce((n,r) => n+(['door','elevator','power'].includes(r.type) ? 0 :
       (shelterRooms[r.type][1] ? 1 : .5)*r.width*r.level),0);
-    return { view, state:s, now, ...capacity, rooms, production, demand:{power,food:mouths,water:mouths} };
+    return { view, state:s, now, ...capacity, rooms, production, demand:{power,food:mouths,water:mouths},
+      projection:{uncertainRooms:shared.uncertainRooms,scrapConsumedUpper:shared.scrapConsumedUpper} };
   }
   function shelterProductionWithout(m,ids) {
     const absent=new Set(ids),reserved=new Set(m.reservedResidents || []),s=m.state,projected={...m.production};
@@ -4630,7 +8398,7 @@
     return Array.isArray(ids)&&ids.length===2&&ids[0]!==ids[1]&&ids.every(id=>Number.isSafeInteger(id)&&id>0&&
       s.residents.some(p=>p.id===id))?ids:null;
   }
-  function shelterGrowthNeeds(m) {
+  function shelterGrowthNeeds(m,preparation=null,target=null,operational=false) {
     const s=m.state,now=m.now,living=s.residents.filter(p=>p.deadAt===null);
     const population=living.length+s.births.length, recovering=shelterRecoveringPopulation(s);
     const construction=s.rooms.filter(r=>r.type!=='elevator'&&(r.builtAt>now||r.upgradeAt!==null));
@@ -4641,6 +8409,13 @@
     const committedPower=construction.reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:
       (shelterRooms[r.type][1]?1:.5)*r.width*(r.builtAt>now?r.level:r.level<3?1:0)),0);
     const demand={power:m.demand.power+committedPower,food:Math.max(m.demand.food,futureMouths),water:Math.max(m.demand.water,futureMouths)};
+    // 只接纳实际阶段和已建床位内的一批准备口粮；人员、备料和工程共享这份需求。
+    if(Number.isSafeInteger(preparation)&&preparation>futureMouths&&
+        preparation<=Math.min(Number.isInteger(target)&&target>=2&&target<=200?target:0,m.populationCap)){
+      // 备料是达到准备目标的前置：未达到的准备量不能反过来禁止制造补水升级所需的零件。
+      // 已取得的准备余量仍须保护；已承诺人口与在建工程的硬需求始终不降低。
+      for(const k of ['food','water'])demand[k]=Math.max(demand[k],operational?Math.min(preparation,m.production[k]/1.2):preparation);
+    }
     return {population,recovering,construction,pairs,futureMouths,committedPower,demand};
   }
   function shelterPopulationStage(m,target,continuous,state={},pending=null) {
@@ -4649,6 +8424,12 @@
     const next=valid?Math.min(200,target<30?30:(Math.floor(Math.max(target,living.length)/10)+1)*10):null;
     const result={continuous,target,nextTarget:next,population:living.length,future:growth.futureMouths,
       children:living.filter(p=>p.adultAt>m.now).map(p=>p.id),unemployed:[],blocks:[],ready:false,status:'fixed'};
+    const familyIds=new Set((state.families||[]).flatMap(f=>[f.a,f.b]));
+    result.unemployed=living.filter(p=>p.adultAt<=m.now&&p.away===null&&p.parents?.length===2&&
+      !familyIds.has(p.id)&&!s.residents.some(child=>child.parents?.includes(p.id))&&
+      (p.roomId===null||s.rooms.some(r=>r.id===p.roomId&&(r.type==='quarters'||
+        shelterRooms[r.type]?.[1]&&(r.builtAt>m.now||r.upgradeAt!==null||r.incident||r.unpowered||
+          !(shelterWorkerRate(s,m.now,m.view.env,p,r)>0)))))).map(p=>p.id);
     if(!continuous)return {...result,message:`固定人口上限 ${target??'未设置'} 人，不自动提高。`};
     if(!valid)return {...result,status:'invalid',message:'持续人口增长等待有效的阶段目标（2～200）。'};
     if(target===200)return {...result,status:'limit',message:'人口阶段目标已到200人的现有支持上限，继续落实成年就业与供应。'};
@@ -4658,12 +8439,6 @@
     if(growth.recovering)result.blocks.push(`${growth.recovering}名倒下居民尚待恢复`);
     if(s.births.length||growth.pairs.size||living.some(p=>p.romance))result.blocks.push('本阶段仍有待产或培养感情中的家庭');
     if(result.children.length)result.blocks.push(`${result.children.length}名儿童尚未成年`);
-    const familyIds=new Set((state.families||[]).flatMap(f=>[f.a,f.b]));
-    result.unemployed=living.filter(p=>p.adultAt<=m.now&&p.away===null&&p.parents?.length===2&&
-      !familyIds.has(p.id)&&!s.residents.some(child=>child.parents?.includes(p.id))&&
-      (p.roomId===null||s.rooms.some(r=>r.id===p.roomId&&(r.type==='quarters'||
-        shelterRooms[r.type]?.[1]&&(r.builtAt>m.now||r.upgradeAt!==null||r.incident||r.unpowered||
-          !(shelterWorkerRate(s,m.now,m.view.env,p,r)>0)))))).map(p=>p.id);
     if(result.unemployed.length)result.blocks.push(`${result.unemployed.length}名成年子女尚未落实有效生产岗位`);
     if(s.rooms.some(r=>r.incident))result.blocks.push('避难所事件尚未结束');
     for(const [resource,need] of Object.entries(growth.demand)){
@@ -4861,8 +8636,6 @@
     const minimum=cfg.guardResidents??2,percent=cfg.guardPowerPercent??50;
     if(!shelterDefenseEnabled(cfg)||population<15&&!checkFuturePopulation)return {active:false,allowed:true};
     const adults=s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now),out=new Set(departures);
-    const name=p=>String(p.name).normalize('NFKC').replace(/\s+/g,' ').trim();
-    const names=new Map();for(const p of s.residents)names.set(name(p),(names.get(name(p))||0)+1);
     let total=0,kept=0,count=0,unknown=false;
     const residents=[];
     for(const original of adults){
@@ -4871,7 +8644,7 @@
       const power=shelterDefensePower(s,p);if(power===null)unknown=true;else total+=power;
       const hp=shelterHealth(p),room=s.rooms.find(r=>r.id===p.roomId);
       const available=p.away===null&&!out.has(p.id)&&hp&&hp.hp>=.7*hp.max&&
-        !record.defenseManual?.includes(p.id)&&names.get(name(p))===1&&
+        !record.defenseManual?.includes(p.id)&&Boolean(shelterResidentIdentity(s,p))&&
         (p.roomId===null||room&&room.builtAt<=m.now&&!room.incident);
       if(available&&power!==null){count++;kept+=power;residents.push(p.id);}
     }
@@ -4881,12 +8654,72 @@
       note:`留守检查：${count}/${minimum} 名健康在家成人，力量与武器指标 ${kept.toFixed(1)}/${required.toFixed(1)}（全体成人含外出者的${percent}%）`+
         `${unknown?'；部分装备无法核对':''}。${allowed?'满足当前留守设置，平时可正常生产':'不足时暂缓新出发，继续可行的治疗、生产与建设'}；指标不是实际每轮伤害或必胜保证。`};
   }
+  function shelterDefenseReturn(m,cfg,record,entry) {
+    // Ordinary recovery may replan; independent emergency actions keep the existing
+    // unresolved-request isolation contract. Never turn a receipt gap into a free move.
+    if(!cfg.development||record.pending)return null;
+    const s=m.state,now=m.now,p=s.residents.find(p=>p.id===entry.id),hp=p&&shelterHealth(p);
+    if(!p||!hp||hp.hp<.6*hp.max)return null;
+    const original=s.rooms.find(r=>r.id===entry.from),role=(record.roles||[]).find(r=>r.id===p.id&&r.room===entry.from);
+    const familyHeld=(record.familyReserved||[]).includes(p.id)||p.romance&&!shelterFamilyExpecting(s,p.id,p.romance.partnerId)||
+      s.births.some(b=>!shelterBirthParents(s,b)&&(b.roomId===entry.from||
+        (record.families||[]).some(f=>f.room===b.roomId&&[f.a,f.b].includes(p.id))));
+    // Preserve an actual family, useful special duty or an unfinished training promise.
+    // Missing training progress/purpose is handled by the normal historical-role review.
+    const trainingFinished=role?.role==='training'&&(p.stats[role.stat]>role.base||
+      Number.isFinite(role.until)&&now>=role.until||Number.isFinite(role.windowEnd)&&now>=role.windowEnd||!cfg.training);
+    const specialHeld=original?.type==='training'&&!trainingFinished||
+      original?.type==='workshop'&&cfg.workshop&&(cfg.partsTarget===undefined||s.resources.parts<cfg.partsTarget)||
+      original?.type==='medbay'&&(s.resources.stimpak<(cfg.reserve??0)+1||s.residents.some(q=>{
+        const h=shelterHealth(q);return q.deadAt===null&&q.away===null&&h&&h.hp<.9*h.max;}))||
+      original?.type==='radio'&&cfg.radio;
+    if(familyHeld||specialHeld)return null;
+    const supplyKeys=['power','food','water'],demand=shelterGrowthNeeds(m).demand;
+    const active=r=>r&&r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
+    const basic=r=>['power','diner','water','scrap'].includes(r?.type);
+    const reserved=(room,id)=>new Set([
+      ...(record.defense||[]).filter(d=>d.id!==id&&d.from===room.id&&s.residents.some(q=>q.id===d.id&&q.deadAt===null&&q.away===null&&
+        [d.room,null].includes(q.roomId))).map(d=>d.id),
+      ...(record.roles||[]).filter(r=>r.id!==id&&r.purpose==='production'&&r.destination===room.id&&
+        s.residents.some(q=>q.id===r.id&&q.deadAt===null&&(q.roomId===r.room||
+          (record.defense||[]).some(d=>d.id===q.id&&d.from===r.room)))).map(r=>r.id)
+    ]);
+    const available=r=>{
+      if(!active(r)||!basic(r))return false;
+      const occupants=new Set(s.residents.filter(q=>q.id!==p.id&&q.deadAt===null&&q.adultAt<=now&&q.roomId===r.id).map(q=>q.id));
+      for(const id of reserved(r,p.id))occupants.add(id);
+      return occupants.size<r.width*2;
+    };
+    const without=shelterProductionWithout(m,[p.id]);
+    const candidates=s.rooms.filter(available).map(room=>{
+      const production={...without},resource=shelterRooms[room.type][1];
+      production[resource]+=shelterWorkerRate(s,now,m.view.env,p,room);
+      const shortages=supplyKeys.map(k=>Math.max(0,1-production[k]/Math.max(1e-9,demand[k]*1.2))).sort((a,b)=>b-a);
+      return {room:room.id,production,shortages};
+    }).filter(c=>supplyKeys.every(k=>c.production[k]+1e-9>=Math.min(m.production[k],demand[k]*1.2)));
+    const destination=trainingFinished&&role.purpose==='production'?role.destination:null;
+    const compare=(a,b)=>{
+      for(let i=0;i<3;i++)if(Math.abs(a.shortages[i]-b.shortages[i])>1e-9)return a.shortages[i]-b.shortages[i];
+      // Keep a valid return promise when supplies tie; avoid free cross-resource weights.
+      const rank=c=>c.room===destination?0:c.room===entry.from?1:c.room===p.roomId?2:
+        s.rooms.find(r=>r.id===c.room)?.type==='scrap'?3:4;
+      return rank(a)-rank(b)||a.room-b.room;
+    };
+    candidates.sort(compare);const best=candidates[0];
+    if(!best)return {wait:true,reason:'战后原用途失效，当前无不恶化基础供应的可用生产岗，保留恢复记录'};
+    return {room:best.room,settled:best.room===p.roomId,
+      reason:best.room===entry.from?'战后重新核对供应与席位，原生产岗仍合适':
+        best.room===destination?'战后训练已完成或到期，直接兑现原生产返岗目标':
+        '战后按当前基础供应和已预留席位重新就业，不等待失效原岗位',
+      recovery:{original:entry.from,destination:best.room,trainingFinished:Boolean(trainingFinished),
+        demand,productionBefore:{...m.production},productionAfter:best.production}};
+  }
   function shelterDefensePlan(m,cfg,record={}) {
-    const s=m.state,now=m.now,actions=[],notes=[],reserved=new Set(),journal=record.defense||[];
+    const s=m.state,now=m.now,actions=[],notes=[],settled=[],reserved=new Set(),journal=record.defense||[];
     const raids=s.rooms.filter(r=>r.incident?.kind==='raiders'),active=raids.length>0;
     const enabled=shelterDefenseEnabled(cfg),name=p=>String(p.name).normalize('NFKC').replace(/\s+/g,' ').trim();
-    if(!enabled)return {active,busy:false,actions,notes,reserved:journal.map(r=>r.id)};
-    const home=p=>p.deadAt===null&&p.away===null&&p.adultAt<=now&&s.residents.filter(o=>name(o)===name(p)).length===1;
+    if(!enabled)return {active,busy:false,actions,notes,settled,reserved:journal.map(r=>r.id)};
+    const home=p=>p.deadAt===null&&p.away===null&&p.adultAt<=now&&Boolean(shelterResidentIdentity(s,p));
     const healthy=p=>shelterHealth(p)?.hp>=.7*shelterHealth(p)?.max;
     const assign=(p,room,role,from)=>({kind:'assign',id:p.id,name:name(p),room,from:p.roomId,targets:[p.id,room],role,original:from,
       reason:role==='defense'?'临时增援掠夺者事件，记录原岗位，结束后恢复':'掠夺者已离开原房间，恢复本脚本安排的原岗位'});
@@ -4898,6 +8731,12 @@
         if(healthy(p))actions.push(assign(p,raids[0].id,'defense',entry.from));
         else notes.push(`${name(p)}血量不足70%，保留原岗记录，暂不追击。`);
         continue;
+      }
+      const recovery=shelterDefenseReturn(m,cfg,record,entry);
+      if(recovery){
+        if(recovery.wait){notes.push(`${name(p)}：${recovery.reason}。`);continue;}
+        if(recovery.settled){settled.push(p.id);reserved.delete(p.id);continue;}
+        actions.push({...assign(p,recovery.room,'defense-release',entry.from),reason:recovery.reason,recovery:recovery.recovery});continue;
       }
       const origin=s.rooms.find(r=>r.id===entry.from);
       if(entry.from!==null&&(!origin||origin.builtAt>now||origin.upgradeAt!==null||origin.incident||origin.unpowered||
@@ -4923,7 +8762,7 @@
         if(!defenders.length&&!actions.some(a=>a.room===room.id))notes.push('暂无可调动的健康成年防守人选，请手动处理当前掠夺者。');
       }
     }
-    return {active,busy:active||actions.length>0,actions,notes,reserved:[...reserved]};
+    return {active,busy:active||actions.length>0,actions,notes,settled,reserved:[...reserved]};
   }
   function shelterParentAssessment(m,pair) {
     const keys=['str','per','end','cha','int','agi','lck'];
@@ -4950,12 +8789,119 @@
     const weight=stat==='cha'?2:stat==='end'?1.5:stat==='int'?1.2:1+pressure;
     return {stat,base,hours,value:weight/hours};
   }
+  function shelterStaffCapacity(m,room,id=null) {
+    const held=new Set((m.trainingDestinations||[]).filter(d=>d.room===room.id&&d.id!==id&&
+      m.state.residents.some(p=>p.id===d.id&&p.deadAt===null&&p.roomId!==room.id)).map(d=>d.id));
+    return Math.max(0,room.width*2-held.size);
+  }
+  function shelterTrainingReturn(m,p,room,horizonHours=168,commitments={}) {
+    const s=m.state,now=m.now,stat=room?.trainStat,base=p?.stats?.[stat];
+    const result={id:p?.id,trainingRoom:room?.id,stat,base,target:base+1,horizonHours,eligible:false,reason:'unknown-training',options:[]};
+    const resource={str:'power',per:'water',end:'scrap',agi:'food',int:'parts'}[stat];
+    const active=r=>r&&r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
+    if(room?.type!=='training'||!active(room)||!Number.isInteger(base)||base<0||base>10||
+        !Number.isFinite(horizonHours)||horizonHours<=0||horizonHours>168)return result;
+    if(base===10)return {...result,reason:'attribute-maxed'};
+    const incumbent=p.roomId===room.id,progress=incumbent?p.training:0,perk=s.legacy?.perks?.training??0;
+    if(!Number.isFinite(progress)||progress<0||progress>1||!Number.isInteger(perk)||perk<0||perk>10||
+        !Number.isInteger(room.level)||room.level<1||room.level>3)return result;
+    if(p.deadAt!==null||p.away!==null||p.adultAt>now)return {...result,reason:'resident-unavailable'};
+    const occupants=s.residents.filter(q=>q.deadAt===null&&q.adultAt<=now&&q.roomId===room.id);
+    if(incumbent?!occupants.slice(0,room.width*2).some(q=>q.id===p.id):occupants.length>=room.width*2)
+      return {...result,reason:'training-capacity'};
+    // 原生进度每十分钟结算；新入室多留一轮调岗/结算余量，既有进度按最近结算时点推进。
+    const ticks=Math.ceil(Math.max(0,1-progress)*(base+1)/(room.level*(1+.05*perk))*6-1e-9);
+    if(incumbent&&(!Number.isFinite(s.lastSettledAt)||s.lastSettledAt>now))return result;
+    const settled=incumbent?s.lastSettledAt:now;
+    const anchor=incumbent?settled+Math.ceil((Math.max(settled,room.builtAt,p.adultAt)-settled)/600000)*600000:now;
+    const finishAt=anchor+(ticks+(incumbent?0:1))*600000;
+    if(finishAt<=now)return {...result,reason:'awaiting-training-settlement',finishAt};
+    const hours=(finishAt-now)/3600000;
+    if(!resource)return {...result,reason:'requires-family-or-combat-benefit',hours,finishAt,progress};
+    const original=s.rooms.find(r=>r.id===p.roomId),oldResource=shelterRooms[original?.type]?.[1];
+    if(oldResource&&oldResource!==resource)return {...result,reason:'cross-resource-opportunity',hours,finishAt,oldResource,resource};
+    const partsStock=s.resources.parts+m.rooms.filter(r=>r.resource==='parts'&&r.batch>0)
+      .reduce((n,r)=>n+Math.floor(r.stored/r.batch+1e-9)*r.batch,0);
+    const partsNeed=resource==='parts'?Math.max(0,(commitments.partsTarget??0)-partsStock-(commitments.partsReserved||0)):Infinity;
+    if(resource==='parts'&&(!Number.isFinite(commitments.partsTarget)||partsNeed<=0))
+      return {...result,reason:'no-parts-purpose',hours,finishAt,resource};
+    if(resource==='parts'&&commitments.partsTarget>m.caps.parts)
+      return {...result,reason:'parts-target-capacity',hours,finishAt,resource};
+    const scrapAvailable=Math.max(0,s.resources.scrap-(commitments.scrapReserve||0)-(commitments.scrapReserved||0));
+    const demand=shelterGrowthNeeds(m).demand,after=shelterProductionWithout(m,[p.id]);
+    const supply=shelterConstructionSupply(m,[p.id],demand,after);
+    if(!supply.safe)return {...result,reason:'supply-uncovered',hours,finishAt,resource};
+    const end=now+horizonHours*3600000,events=m.view.env?.events||[];
+    const integrate=(person,target,from,to)=>{
+      if(to<=from)return 0;
+      const cuts=[from,...events.filter(e=>e.kind==='production').flatMap(e=>[e.startsAt,e.endsAt]).filter(t=>t>from&&t<to),to].sort((a,b)=>a-b);
+      return cuts.slice(0,-1).reduce((sum,t,i)=>sum+shelterWorkerRate(s,t,m.view.env,person,target)*(cuts[i+1]-t)/3600000,0);
+    };
+    const upgraded={...p,stats:{...p.stats,[stat]:base+1}};
+    const partsRooms=resource==='parts'?s.rooms.filter(r=>active(r)&&r.type==='workshop').map(r=>{
+      const batch=m.rooms.find(row=>row.id===r.id)?.batch||0;
+      const workers=s.residents.filter(q=>q.deadAt===null&&q.away===null&&q.adultAt<=now&&q.roomId===r.id).slice(0,r.width*2)
+        .filter(q=>q.id!==p.id&&!(commitments.departures||[]).includes(q.id));
+      return {room:r,batch,remainder:batch>0?r.stored-Math.floor(r.stored/batch+1e-9)*batch:0,
+        background:workers.reduce((n,q)=>n+integrate(q,r,now,end),0)};
+    }):[];
+    for(const target of s.rooms.filter(r=>active(r)&&shelterRooms[r.type]?.[1]===resource&&
+      (commitments.destination===undefined||r.id===commitments.destination)&&
+      s.residents.filter(q=>q.id!==p.id&&q.deadAt===null&&q.adultAt<=now&&q.roomId===r.id).length+
+        (commitments.destinations||[]).filter(d=>d.id!==p.id&&d.room===r.id).length<r.width*2)){
+      const rawBefore=integrate(p,target,now,end),rawTrained=integrate(upgraded,target,Math.min(finishAt,end),end);
+      // 零件只计当前实际缺口；供料沿用工坊的现有库存规则，未来总产量不能覆盖已承诺工程。
+      const batch=m.rooms.find(r=>r.id===target.id)?.batch||0;
+      const remainder=resource==='parts'&&batch>0?(target.stored-Math.floor(target.stored/batch+1e-9)*batch):0;
+      const made=amount=>resource==='parts'?Math.min(partsNeed,partsRooms.reduce((n,row)=>n+(row.batch>0?
+        Math.floor((row.remainder+row.background+(row.room.id===target.id?amount:0)+1e-9)/row.batch)*row.batch:0),0)):amount;
+      const before=made(rawBefore),trained=made(rawTrained);
+      const lost=integrate(p,target,now,Math.min(finishAt,end)),delta=trained-before;
+      const beforeRate=shelterWorkerRate(s,now,m.view.env,p,target),afterRate=shelterWorkerRate(s,now,m.view.env,upgraded,target);
+      let paybackHours=null;
+      if(delta>0){
+        let lo=Math.min(finishAt,end),hi=end;
+        for(let i=0;i<32;i++){
+          const mid=(lo+hi)/2;
+          if(integrate(upgraded,target,finishAt,mid)>=integrate(p,target,now,mid))hi=mid;else lo=mid;
+        }
+        paybackHours=(hi-now)/3600000;
+      }
+      const feed=resource==='parts'?Math.max(0,Math.ceil(trained/batch)*batch-remainder)*6:0;
+      const feedKnown=resource!=='parts'||batch>0&&scrapAvailable+1e-9>=feed;
+      result.options.push({room:target.id,resource,beforeRate,afterRate,gainRate:afterRate-beforeRate,
+        lostProduction:lost,directProduction:before,trainedProduction:trained,delta,paybackHours,
+        scrapFeed:feed,feedKnown,partsCommitment:resource==='parts'?trained:0});
+    }
+    result.options.sort((a,b)=>b.delta-a.delta||a.room-b.room);
+    const best=result.options.find(o=>o.feedKnown)||result.options[0];
+    return {...result,resource,hours,progress,finishAt,best:best||null,
+      eligible:Boolean(best&&best.delta>1e-6&&best.feedKnown),
+      reason:!best?'no-productive-destination':!best.feedKnown?'parts-feed-unfunded':best.delta<=1e-6?'no-payback-in-window':'productive-payback',
+      assumptions:['按当前属性、等级和心情比较单格；已知生产活动按起止分段，不假定其持续七天',
+        '目标岗位需一直可用；未计未来自然等级/心情变化，不将不同资源直接相加']};
+  }
+  function shelterWorkshopFeeding(m,target) {
+    const s=m.state,now=m.now,rooms=m.rooms.filter(r=>r.resource==='parts'&&r.batch>0);
+    const stocked=s.resources.parts+rooms.reduce((n,r)=>n+Math.floor(r.stored/r.batch+1e-9)*r.batch,0);
+    const shortage=Math.max(0,(target||0)-stocked);
+    const working=rooms.filter(r=>s.rooms.some(room=>room.id===r.id&&room.builtAt<=now&&
+      room.upgradeAt===null&&!room.incident&&!room.unpowered)),staffed=working.filter(r=>r.workers>0);
+    const feeding=staffed.length?staffed:working.filter(r=>{
+      const room=s.rooms.find(room=>room.id===r.id);
+      return s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).length<room.width*2;
+    }).slice(0,1);
+    const roomFeed=r=>Math.max(0,Math.ceil(shortage/r.batch)*r.batch-(r.stored-Math.floor(r.stored/r.batch+1e-9)*r.batch));
+    const feed=shortage>0?6*(feeding.length?feeding.reduce((n,r)=>n+roomFeed(r),0):Math.ceil(shortage/3)*3):0;
+    const nextTickStock=s.resources.parts+working.reduce((n,r)=>n+Math.floor((r.stored+r.rate/6)/r.batch+1e-9)*r.batch,0);
+    return {shortage,working,feeding,roomFeed,feed,nextTickStock};
+  }
   function shelterCampaignPlan(m,cfg={},record={},target=14) {
-    const s=m.state,now=m.now,notes=[],reserved=new Set(),actions=[],projects=[],roles=record.roles||[];
-    const enabled=['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>r.purpose==='parent');
+    const s=m.state,now=m.now,notes=[],reserved=new Set(),actions=[],projects=[],roles=[...(record.roles||[])];
+    const enabled=cfg.development||['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>['parent','production'].includes(r.purpose));
     const workshopWorkers=roles.filter(r=>r.role==='workshop'&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>r.id);
     const result={enabled,notes,reserved:[],dailyReserved:[],dailyProduction:[],actions,projects,events:[],partsReserve:cfg.partsReserve||0,workshopWorkers,
-      materials:record.materials,populationPreparation:record.populationPreparation??null,constructionPolicy:record.constructionPolicy,
+      materials:record.materials,populationPreparation:record.populationPreparation??null,constructionPolicy:record.constructionPolicy,trainingDestinations:[],adoptions:[],
       populationDefense:{enabled:shelterDefenseEnabled(cfg),guard:null,supply:{...m.production}}};
     const daily=cfg.dailyGoals?shelterDailyGoals(m):null;result.dailyGoals=daily;
     if(daily)notes.push(...daily.notes);
@@ -4967,12 +8913,21 @@
     const normalized=x=>String(x??'').normalize('NFKC').replace(/\s+/g,' ').trim();
     const nameOK=p=>typeof p.name==='string'&&normalized(p.name)&&s.residents.filter(o=>normalized(o.name)===normalized(p.name)).length===1;
     const active=r=>r&&r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-    const home=p=>p.deadAt===null&&p.away===null&&p.adultAt<=now&&nameOK(p)&&shelterHealth(p);
+    // 单次纯规划不改居民、房间或身份；多次筛选复用同一核对结果，下一次规划重新核对。
+    const homeChecks=new Map(),identityNames=new Map(s.residents.map(p=>[p,typeof p.name==='string'?normalized(p.name):'']));
+    const home=p=>{
+      if(!homeChecks.has(p))homeChecks.set(p,p.deadAt===null&&p.away===null&&p.adultAt<=now&&shelterResidentIdentity(s,p,identityNames)&&shelterHealth(p));
+      return homeChecks.get(p);
+    };
     const expecting=new Set(s.births.flatMap(b=>shelterBirthParents(s,b)||[]));
     const parentIds=new Set((record.families||[]).flatMap(f=>[f.a,f.b]));
     const protectedIds=new Set(s.residents.filter(p=>p.romance&&!shelterFamilyExpecting(s,p.id,p.romance.partnerId)).flatMap(p=>[p.id,p.romance.partnerId]));
-    for(const b of s.births)if(!shelterBirthParents(s,b))for(const p of s.residents)if(p.roomId===b.roomId)protectedIds.add(p.id);
+    for(const b of s.births)if(!shelterBirthParents(s,b)){
+      for(const p of s.residents)if(p.roomId===b.roomId)protectedIds.add(p.id);
+      for(const f of record.families||[])if(f.room===b.roomId){protectedIds.add(f.a);protectedIds.add(f.b);}
+    }
     for(const id of record.familyReserved||[])protectedIds.add(id);
+    const purposeProtectedIds=new Set(protectedIds);
     for(const id of cfg.workshopFamilyReady||[])if(!roles.some(r=>r.id===id&&r.purpose==='parent'))protectedIds.add(id);
     if(daily){
       const midnight=Date.parse(`${s.daily.day}T00:00:00+08:00`)+86400000;
@@ -4997,12 +8952,28 @@
         if(forecast<goal.remaining)notes.push(`按当前产速到零点前可整批领取 ${forecast} ${shelterResources[resource]}，仍差 ${goal.remaining-forecast}；需要增产或其他符合网站计数的来源，不能按连续产量视为可完成。`);
       }
     }
+    const historicalTraining=[];
+    if(cfg.development&&!record.pending)for(const p of s.residents){
+      const room=s.rooms.find(r=>r.id===p.roomId);
+      if(!home(p)||purposeProtectedIds.has(p.id)||!active(room))continue;
+      const previous=roles.find(r=>r.id===p.id&&r.room===p.roomId);
+      if(previous){
+        if(previous.role==='training'&&previous.purpose===undefined)roles.splice(roles.indexOf(previous),1);
+        else continue;
+      }
+      if(room.type==='training')historicalTraining.push(p);
+      else {
+        const role={medbay:'medical',workshop:'workshop',radio:'radio'}[room.type];
+        if(role)roles.push({id:p.id,room:p.roomId,role,at:now,historical:true});
+      }
+    }
+    result.workshopWorkers=roles.filter(r=>r.role==='workshop'&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>r.id);
     const owned=p=>roles.find(r=>r.id===p.id&&r.room===p.roomId);
     const available=p=>home(p)&&!protectedIds.has(p.id)&&shelterCombat(s,p)!==null&&
       (p.roomId===null||active(s.rooms.find(r=>r.id===p.roomId))&&
         (['power','diner','water','scrap'].includes(s.rooms.find(r=>r.id===p.roomId).type)||Boolean(owned(p))||
-          s.rooms.find(r=>r.id===p.roomId).type==='quarters'&&(expecting.has(p.id)||cfg.parentTraining&&parentIds.has(p.id)&&p.familyCooldownUntil>now)));
-    const pool=s.residents.filter(available),growth=shelterGrowthNeeds(m),demand=growth.demand;
+          s.rooms.find(r=>r.id===p.roomId).type==='quarters'&&(cfg.development||expecting.has(p.id)||cfg.parentTraining&&parentIds.has(p.id)&&p.familyCooldownUntil>now)));
+    const pool=s.residents.filter(available),growth=shelterGrowthNeeds(m,record.populationPreparation,target,true),demand=growth.demand;
     const departures=new Map(),combatValues=new Map(),loadouts=new Map(),gearReserved=new Set(),gearOptions=new Map();
     const loadout=team=>{
       const ordered=[...team].sort((a,b)=>a.id-b.id),key=ordered.map(p=>p.id).join(',')+'|'+[...gearReserved].join(',');
@@ -5098,26 +9069,80 @@
       actions.push({kind:'quest-claim',targets:[q.id],team:q.team,title:normalized(`${q.snapshot.title} · ${team.map(p=>p.name).join('、')}`),reason:'领取归来废土小队并释放人员'});
     }
     if(healing)actions.push(healing);
+    let trainingScrapReserved=0,trainingPartsReserved=0;
+    const trainingCommitments=(extra={})=>({destinations:result.trainingDestinations,departures:projectedIds(),partsTarget:cfg.partsTarget,
+      scrapReserve:Math.max(cfg.workshopScrapReserve||0,record.constructionPolicy?.scrapReserve||0),
+      scrapReserved:trainingScrapReserved,partsReserved:trainingPartsReserved,...extra});
+    const reserveTraining=(id,destination,assessment)=>{
+      result.trainingDestinations.push({id,room:destination});
+      trainingScrapReserved+=assessment?.best?.scrapFeed||0;trainingPartsReserved+=assessment?.best?.partsCommitment||0;
+    };
+    // 历史手动训练按真实剩余进度选择用途；纯规划只返回接管意图，外层核对后持久化固定期限。
+    const adoptedDestinations=roles.filter(r=>r.purpose==='production'&&r.until>now&&
+      s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>({id:r.id,room:r.destination}));
+    for(const p of historicalTraining){
+      const room=s.rooms.find(r=>r.id===p.roomId),assessment=shelterTrainingReturn(m,p,room,168,
+        trainingCommitments({destinations:adoptedDestinations}));
+      if(['unknown-training','awaiting-training-settlement'].includes(assessment.reason)){
+        reserve(p);notes.push(`${normalized(p.name)}历史训练属性、进度或结算尚待核对，保留当前格，不假设进度为零。`);continue;
+      }
+      if(!healthy(p)){reserve(p);continue;}
+      let adopted=null;
+      if(cfg.training&&cfg.parentTraining&&parentIds.has(p.id)&&p.familyCooldownUntil>now&&
+          p.stats[room.trainStat]<cfg.trainTarget&&assessment.finishAt<=p.familyCooldownUntil)
+        adopted={id:p.id,room:room.id,role:'training',at:now,stat:room.trainStat,base:p.stats[room.trainStat],purpose:'parent',until:p.familyCooldownUntil};
+      else if(cfg.training&&assessment.eligible&&p.stats[room.trainStat]<cfg.trainTarget)
+        adopted={id:p.id,room:room.id,role:'training',at:now,stat:room.trainStat,base:p.stats[room.trainStat],purpose:'production',
+          until:assessment.finishAt+600000,windowEnd:now+168*3600000,destination:assessment.best.room};
+      if(adopted){roles.push(adopted);result.adoptions.push(adopted);
+        if(adopted.destination)adoptedDestinations.push({id:adopted.id,room:adopted.destination});continue;}
+      if(cfg.training&&cfg.workshop&&room.trainStat==='int'&&cfg.partsTarget===undefined){reserve(p);continue;}
+      actions.push(assign(p,assessment.best?s.rooms.find(r=>r.id===assessment.best.room):null,'training-release',
+        `历史训练重新评估：${assessment.reason}，结束当前用途并交回生产与人口调度`));
+    }
     // 练成一格再轮换；已有进度不按固定时长中断，避免未知的换岗重置规则损失训练。
     for(const role of roles){
       const p=s.residents.find(p=>p.id===role.id),r=p&&s.rooms.find(r=>r.id===p.roomId);
-      if(!p||!home(p)||role.room!==p.roomId)continue;
-      if(role.role==='training'&&(cfg.training||role.purpose==='parent')){
+      if(!p||!home(p)||purposeProtectedIds.has(p.id)||role.room!==p.roomId)continue;
+      if(role.role==='training'&&(cfg.training||['parent','production'].includes(role.purpose))){
+        if(role.purpose==='production'){
+          const assessment=shelterTrainingReturn(m,p,r,Math.min(168,Math.max(1/6,(role.windowEnd-now)/3600000)),
+            trainingCommitments({destination:role.destination}));
+          const completed=p.stats[role.stat]>role.base,expired=now>=role.until;
+          const destination=s.rooms.find(d=>d.id===role.destination);
+          const expectedResource={str:'power',per:'water',end:'scrap',agi:'food',int:'parts'}[role.stat];
+          const seat=active(destination)&&shelterRooms[destination.type]?.[1]===expectedResource&&
+            occupied(destination)+result.trainingDestinations.filter(d=>d.room===role.destination).length<destination.width*2;
+          const awaitingParts=role.stat==='int'&&cfg.workshop&&cfg.partsTarget===undefined;
+          if(!cfg.training||!cfg.development||completed||expired||now>=role.windowEnd||r?.trainStat!==role.stat||
+              p.stats[role.stat]<role.base||!active(r)||!seat||!safe([...projectedIds(),p.id])||
+              !assessment.eligible&&!awaitingParts&&assessment.reason!=='unknown-training'&&assessment.reason!=='awaiting-training-settlement'){
+            actions.push(assign(p,seat?destination:null,'training-release',completed?'生产训练完成一格，按实际供给与空岗返岗':
+              expired?'生产训练到达最晚返岗时间，结束本轮投入并重评':'生产训练用途、回报或供应发生变化，释放人员重新分配'));
+          }else{reserve(p);reserveTraining(p.id,role.destination,assessment);result.events.push(Math.max(1,role.until-now));}
+          continue;
+        }
         const parent=role.purpose==='parent',due=parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||
           now>=role.until||!(p.familyCooldownUntil>now));
         if(due||p.stats[role.stat]>role.base||p.stats[role.stat]>=(parent?cfg.trainTarget:daily?.goals.some(g=>g.key==='train'&&!g.claimed&&g.remaining)?10:cfg.trainTarget)||!active(r)||!safe([p.id]))
           actions.push(assign(p,null,'training-release',parent?'父母本轮训练完成、冷却到期或供应变化，交回人口与生产调度':'训练轮次结束，释放人选回到探险和生产候选池'));
         else {reserve(p);if(parent)result.events.push(role.until-now);}
       }
+      else if(cfg.development&&!cfg[role.role]&&['medical','workshop','radio'].includes(role.role)){
+        if(role.role==='medical'&&(wounded.length||s.resources.stimpak<cfg.reserve+1))reserve(p);
+        else actions.push(assign(p,null,`${role.role}-release`,'当前未启用此岗位用途，释放历史值班并重新分配'));
+      }
       else if(cfg[role.role]&&!safe([]))actions.push(assign(p,null,`${role.role}-release`,'基础供应失去余量，释放自动值班人选供生产接替'));
     }
-    const specialCandidate=(stat,extraSafe)=>pool.filter(p=>!reserved.has(p.id)&&healthy(p)&&(!owned(p)||owned(p).role==='radio')&&safe([...projectedIds(),p.id])&&(!extraSafe||extraSafe(p)))
+    const specialCandidate=(stat,extraSafe,minimumHealth=.9)=>pool.filter(p=>!reserved.has(p.id)&&shelterHealth(p).hp>=minimumHealth*shelterHealth(p).max&&(!owned(p)||owned(p).role==='radio')&&safe([...projectedIds(),p.id])&&(!extraSafe||extraSafe(p)))
       .sort((a,b)=>b.stats[stat]-a.stats[stat]||loss([a.id])-loss([b.id])||a.id-b.id)[0];
     const supportVacancy=r=>r&&s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).length<r.width*2;
     const support=(type,stat,need,role,priority,extraSafe,fill=false)=>{
       const rooms=s.rooms.filter(r=>r.type===type),working=rooms.filter(active),managed=roles.filter(r=>r.role===role);
       if(!need){for(const rr of managed){const p=s.residents.find(p=>p.id===rr.id&&p.roomId===rr.room&&home(p));
-        if(p&&!actions.some(a=>a.id===p.id&&a.role===`${role}-release`))actions.push(assign(p,null,`${role}-release`,'当前值班条件不再满足，释放自动安排的人手'));}return;}
+        const room=p&&s.rooms.find(r=>r.id===p.roomId);
+        if(p&&!purposeProtectedIds.has(p.id)&&room?.builtAt<=now&&room.upgradeAt===null&&!room.incident&&
+            !actions.some(a=>a.id===p.id&&a.role===`${role}-release`))actions.push(assign(p,null,`${role}-release`,'当前值班条件不再满足，释放值班人手重新分配'));}return;}
       const staffed=working.filter(r=>s.residents.some(p=>home(p)&&p.roomId===r.id));
       const choices=fill?[...staffed,...working.filter(r=>!staffed.includes(r))]:staffed.length?staffed:working;
       // 外出成人仍占原生岗位；先填已有值班房，再使用其他已完工的空房。
@@ -5126,7 +9151,8 @@
         if(!fill||!choices.some(supportVacancy))return;
       }
       const room=choices.find(supportVacancy);
-      const p=specialCandidate(stat,p=>!extraSafe||extraSafe(p,room));if(!p){notes.push(`${shelterBuildRules[type][0]}暂缺可安全离岗的值班人选。`);return;}
+      // Development manufacturing uses the ordinary staffing health threshold; leaving home still requires 90%.
+      const p=specialCandidate(stat,p=>!extraSafe||extraSafe(p,room),cfg.development&&role==='workshop'?.6:.9);if(!p){notes.push(`${shelterBuildRules[type][0]}暂缺可安全离岗的值班人选。`);return;}
       reserve(p);
       if(room)actions.push(assign(p,room,role,`安排${shelterBuildRules[type][0]}值班，补足综合发展缺口`));
       else if(!rooms.length)projects.push({type,priority,person:p.id,stat,role,benefit:`已为${shelterBuildRules[type][0]}预留可安全离岗人选，建成后自动安排`});
@@ -5150,19 +9176,11 @@
       notes.push(`医疗补给目标 ${medicalTarget} 支（保留 ${cfg.reserve}）；${supplyTrips?'含两次探险携针':'当前不为新探险额外囤针'}${wounded.length?'；仍有伤员，保留医疗值班':'。'}`);
     }
     if(cfg.workshop){
-      const rooms=m.rooms.filter(r=>r.resource==='parts'&&r.batch>0);
-      const stocked=s.resources.parts+rooms.reduce((n,r)=>n+Math.floor(r.stored/r.batch+1e-9)*r.batch,0);
-      const shortage=Math.max(0,(cfg.partsTarget||0)-stocked);
-      const working=rooms.filter(r=>active(s.rooms.find(room=>room.id===r.id))),staffed=working.filter(r=>r.workers>0);
       // 只差一个零件也要把所在房间凑满一批；同一轮保留的工坊均需有完批供料。
-      const feeding=staffed.length?staffed:working.filter(r=>supportVacancy(s.rooms.find(room=>room.id===r.id))).slice(0,1);
-      const roomFeed=r=>Math.max(0,Math.ceil(shortage/r.batch)*r.batch-(r.stored-Math.floor(r.stored/r.batch+1e-9)*r.batch));
-      const feed=shortage>0?6*(feeding.length?feeding.reduce((n,r)=>n+roomFeed(r),0):
-        Math.ceil(shortage/3)*3):0;
+      const {shortage,working,feeding,roomFeed,feed,nextTickStock}=shelterWorkshopFeeding(m,cfg.partsTarget);
       const funded=s.resources.scrap+1e-9>=(cfg.workshopScrapReserve||0)+feed;
       // 下一生产刻即可凑齐整批时保持现岗；否则利用现有工坊的空位缩短备料等待。
       // 不为补员另开工坊，仍共享整批供料、本金保留及联合离岗供应检查。
-      const nextTickStock=s.resources.parts+working.reduce((n,r)=>n+Math.floor((r.stored+r.rate/6)/r.batch+1e-9)*r.batch,0);
       const preservesProject=(p,targetRoom)=>{
         if(targetRoom&&!feeding.some(r=>r.id===targetRoom.id)){
           const row=working.find(r=>r.id===targetRoom.id);
@@ -5219,6 +9237,33 @@
     }
     const train=(limit,build)=>{
       if(!cfg.training)return;
+      if(cfg.development){
+        // 发展模式以一格生产回报选训练，不继续固定偏向三项战斗属性。
+        // 初轮只用已有房间；需要新建/升级的成本交由发展路线统一比较。
+        // A confirmed return must reach a new settlement before another investment.
+        // Reading the same positions again (or refreshing) is not productive work.
+        const candidates=fighters().filter(p=>!(record.trainingRest||[]).some(r=>r.id===p.id&&
+          (!Number.isFinite(s.lastSettledAt)||s.lastSettledAt<=r.at))&&safe([...projectedIds(),p.id]));
+        const options=candidates.flatMap(p=>s.rooms.filter(r=>r.type==='training'&&active(r)&&
+          occupied(r)+(trainingSeats.get(r.id)||0)<r.width*2&&p.stats[r.trainStat]<trainingTarget).flatMap(r=>{
+          const a=shelterTrainingReturn(m,p,r,168,trainingCommitments());
+          return a.eligible&&(a.resource!=='parts'||cfg.workshop&&cfg.partsTarget>0)?[{p,r,a}]:[];
+        }));
+        options.sort((a,b)=>a.a.best.paybackHours-b.a.best.paybackHours||trainingAt(a.p)-trainingAt(b.p)||a.p.id-b.p.id||a.r.id-b.r.id);
+        let count=0;
+        for(const {p,r} of options){
+          if(count>=limit)break;
+          if(reserved.has(p.id)||!safe([...projectedIds(),p.id])||occupied(r)+(trainingSeats.get(r.id)||0)>=r.width*2)continue;
+          const a=shelterTrainingReturn(m,p,r,168,trainingCommitments());
+          if(!a.eligible)continue;
+          reserve(p);trainingSeats.set(r.id,(trainingSeats.get(r.id)||0)+1);count++;
+          reserveTraining(p.id,a.best.room,a);
+          actions.push({...assign(p,r,'training',`生产训练一格：预计${a.hours.toFixed(2)}小时完成，${a.best.paybackHours.toFixed(1)}小时回本，七天净增${a.best.delta.toFixed(1)}${shelterResources[a.resource]}`),
+            purpose:'production',until:a.finishAt+600000,windowEnd:now+168*3600000,destination:a.best.room,assessment:a});
+        }
+        if(!count)notes.push('生产训练：当前无已有空位且七天内回报为正的单格方案，继续生产；未知家庭/战斗收益不折算为确定产量。');
+        return;
+      }
       const candidates=fighters().filter(p=>safe([...projectedIds(),p.id])&&['end','str','agi'].some(k=>p.stats[k]<trainingTarget))
         .sort((a,b)=>trainingAt(a)-trainingAt(b)||combatOrder(a,b));
       let count=0;
@@ -5254,7 +9299,7 @@
       else if(s.resources.stimpak<cfg.stimpaks+cfg.reserve)notes.push('治疗针不足携带量及保留量，先补充医务室产出。');
       else for(let i=0;i<free;i++){
         const effectiveLuck=p=>{const outfit=s.items.find(i=>i.id===p.outfitId);return Math.min(17,(p.stats.lck||0)+(outfit?.bonus?.lck||0));};
-        const p=fighters().sort((a,b)=>combat(b)-combat(a)||effectiveLuck(b)-effectiveLuck(a)||loss([a.id])-loss([b.id])||a.id-b.id)
+        const p=fighters().filter(nameOK).sort((a,b)=>combat(b)-combat(a)||effectiveLuck(b)-effectiveLuck(a)||loss([a.id])-loss([b.id])||a.id-b.id)
           .find(p=>safe([...projectedIds(),p.id])&&guarded([p],loadout([p])));if(!p)break;
         if(s.resources.stimpak-cfg.stimpaks*i<cfg.stimpaks+cfg.reserve)break;
         reserve(p);
@@ -5269,7 +9314,8 @@
     if(cfg.quests){
       if(typeof week!=='string'||!week||!Array.isArray(quests)||!Array.isArray(s.weekly?.completed))notes.push('本周任务身份或完成记录不完整，暂缓出发。');
       else if(s.quests.length<2){
-        const all=fighters(),low=[...all].sort((a,b)=>loss([a.id])-loss([b.id])||combatOrder(a,b));
+        // 外出控件仍只有姓名，与居民详情可用的组合身份不同。
+        const all=fighters().filter(nameOK),low=[...all].sort((a,b)=>loss([a.id])-loss([b.id])||combatOrder(a,b));
         const shortlist=[...new Map([...all.slice(0,12),...low.slice(0,8)].map(p=>[p.id,p])).values()];
         let best=null,unknownRewards=0;
         const noGainQuests=new Set();
@@ -5352,6 +9398,7 @@
       if(goal)projects.push({...goal,type:'elevator',priority:40,
         benefit:`${goal.benefit}；到第${goal.milestone}层累计下挖需${goal.totalScrap}废料，逐层重评，不因有空地取消里程碑`});
     }
+    result.adoptions=result.adoptions.filter(r=>reserved.has(r.id)&&!actions.some(a=>a.id===r.id&&a.role==='training-release'));
     result.reserved=[...reserved];
     result.populationDefense.supply=projection(projectedIds());
     notes.unshift(`普通探险位 ${s.explorers.length}/${slots}；综合计划预留 ${reserved.size} 人。周任务最低成功率 ${cfg.chance}%，每任务每周最多 ${cfg.attempts} 次，出发间隔至少6小时。`);
@@ -5372,7 +9419,8 @@
         (r.from===null||positive(r.from))&&at(r.at))&&new Set(v.defense.map(r=>r.id)).size===v.defense.length)&&
       (v.defenseManual===undefined||Array.isArray(v.defenseManual)&&v.defenseManual.length<=200&&v.defenseManual.every(positive))&&
       v.roles.every(r=>positive(r.id)&&positive(r.room)&&at(r.at)&&['training','radio','medical','workshop'].includes(r.role)&&
-        (r.role!=='training'||(r.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at:
+        (r.role!=='training'||(r.purpose==='production'?['str','per','end','agi','int'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
+          at(r.windowEnd)&&r.windowEnd>r.at&&positive(r.destination):r.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at:
           r.purpose===undefined&&['str','end','agi'].includes(r.stat))&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10))&&
       new Set(v.roles.map(r=>r.id)).size===v.roles.length&&
       v.trips.every(r=>positive(r.id)&&positive(r.resident)&&at(r.at)&&Number.isFinite(r.hours)&&r.hours>=0&&r.hours<=24&&
@@ -5396,7 +9444,8 @@
     if(p.kind==='craft')return t.length===2&&positive(t[0])&&t[1]===0&&choice.cost?.scrap===80&&choice.cost.parts===0;
     if(p.kind==='assign')return ['medical','radio','training','workshop','medical-release','radio-release','training-release','workshop-release','defense','defense-release'].includes(choice.role)&&
       (!choice.role.startsWith('defense')||choice.original===null||positive(choice.original))&&
-      (choice.role!=='training'||(choice.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(choice.stat)&&
+      (choice.role!=='training'||(choice.purpose==='production'?['str','per','end','agi','int'].includes(choice.stat)&&
+        Number.isFinite(choice.until)&&choice.until>p.before.serverTime&&Number.isFinite(choice.windowEnd)&&choice.windowEnd>p.before.serverTime&&positive(choice.destination):choice.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(choice.stat)&&
         Number.isFinite(choice.until)&&choice.until>p.before.serverTime:choice.purpose===undefined&&['str','end','agi'].includes(choice.stat))&&
         Number.isFinite(choice.base)&&choice.base>=0&&choice.base<10);
     return p.kind==='equip'&&choice.role==='combatGear';
@@ -5468,28 +9517,28 @@
   }
   function shelterAdvancePlanningStock(m,p,hours,paused=null) {
     // 以整批领取估算攒料；现有在建工程未来增产暂不提前计入，避免拿未兑现产能支付下一笔。
-    const end=p.hours+hours;
+    const end=p.hours+hours,{min,max,floor}=Math,demandKeys=Object.keys(p.demand),resourceKeys=Object.keys(p.resources);
     while(p.hours<end-1e-9){
-      const next=Math.min(end,...p.rooms.map(r=>r.tick>p.hours+1e-9?r.tick:p.hours+1/6));
+      let next=end;
+      for(const r of p.rooms)next=min(next,r.tick>p.hours+1e-9?r.tick:p.hours+1/6);
       const elapsed=next-p.hours;
-      for(const k of Object.keys(p.demand))p.resources[k]-=p.demand[k]*elapsed;
+      for(const k of demandKeys)p.resources[k]-=p.demand[k]*elapsed;
       p.hours=next;
       for(const r of p.rooms){
         if(r.tick>next+1e-9)continue;
         r.tick=next+1/6;
         if(r.id!==paused){
-          let made=Math.max(0,Math.min(r.rate/6,4*r.batch-r.stored));
-          if(r.resource==='parts'){made=Math.min(made,Math.max(0,p.resources.scrap)/6);p.resources.scrap-=6*made;}
+          let made=max(0,min(r.rate/6,4*r.batch-r.stored));
+          if(r.resource==='parts'){made=min(made,max(0,p.resources.scrap)/6);p.resources.scrap-=6*made;}
           r.stored+=made;
         }
-        const amount=Math.floor((r.stored+1e-9)/r.batch)*r.batch;
+        const amount=floor((r.stored+1e-9)/r.batch)*r.batch;
         // 手动收取不能拆批；已有管家按公开规则只代收整数空位，仍共享同一份库存容量。
-        const available=Math.max(0,p.caps[r.resource]-p.resources[r.resource]);
-        const take=r.automatic?Math.min(amount,Math.floor(available)):amount<=available+1e-9?amount:0;
-        p.resources[r.resource]+=take;r.stored-=take;
+        const available=max(0,p.caps[r.resource]-p.resources[r.resource]);
+        const take=r.automatic?min(amount,floor(available)):amount<=available+1e-9?amount:0;
+        p.resources[r.resource]+=take;r.stored=max(0,r.stored-take);
       }
-      const failed=Object.keys(p.resources).find(k=>p.resources[k]<-.001);
-      if(failed){p.failure=`${shelterResources[failed]}在等待期间不足`;return false;}
+      for(const k of resourceKeys)if(p.resources[k]<-.001){p.failure=`${shelterResources[k]}在等待期间不足`;return false;}
     }
     return true;
   }
@@ -5520,15 +9569,26 @@
     const time=c.saveHours<1?`${Math.ceil(c.saveHours*60-1e-8)} 分钟`:`${c.saveHours.toFixed(1)} 小时`;
     return `材料按现有库存、整批产出和工坊供料估计约 ${time}后可攒齐；以每十分钟持续收取、产能不变且无其他支出为前提，不含施工、预算或页面等待`;
   }
-  function shelterLevelRoutes(m,options,targetScore,first=null) {
+  function shelterLevelSearchBudget(m,options,deep=true) {
+    const maxProjects=deep?8:3,beamWidth=deep?8:6,horizonHours=deep?168:72;
+    // 已在途的全部分数也计入乐观上界；不按库存或工期推断更低上界。
+    // 后继只会新建一格、升级现有/最多三格合并房、或下挖三分。
+    const maxGain=Math.max(3,...m.state.rooms.map(r=>r.width),...options.map(c=>c.levelGain||0));
+    return {maxProjects,beamWidth,horizonHours,maxGain,
+      scoreUpperBound:shelterLevelProgress(m).committed+maxProjects*maxGain};
+  }
+  function shelterLevelRoutes(m,options,targetScore,first=null,planning={}) {
     const progress=shelterLevelProgress(m);if(!progress)return [];
+    const deep=planning.deep!==false,{maxProjects,beamWidth,horizonHours}=shelterLevelSearchBudget(m,options,deep);
     const unique=[...new Map(options.filter(c=>c.levelGain>0&&Number.isFinite(c.hours)&&c.hours>0&&
-      !c.blocks.length).map(c=>[`${c.kind}:${c.id??`${c.floor}:${c.col}`}`,c])).values()].slice(0,12);
+      !c.blocks.length).map(c=>[`${c.kind}:${c.id??`${c.floor}:${c.col}`}`,c])).values()].slice(0,deep?Infinity:12);
     const due=shelterLevelEvents(m),storagePerk=m.state.legacy?.perks?.storage??0;
     const initial={...shelterPlanningStock(m),steps:[],gain:0,cost:0,itemCap:m.itemCap,
-      capacityRooms:m.state.rooms.filter(r=>r.builtAt<=m.now).map(r=>({...r})),mergedIds:[]};
+      capacityRooms:m.state.rooms.filter(r=>r.builtAt<=m.now).map(r=>({...r})),mergedIds:[],
+      residents:m.state.residents.map(p=>({...p})),materialMoves:[]};
     const clone=p=>({...p,resources:{...p.resources},caps:{...p.caps},demand:{...p.demand},rooms:p.rooms.map(r=>({...r})),
-      capacityRooms:p.capacityRooms.map(r=>({...r})),mergedIds:[...p.mergedIds],steps:[...p.steps]});
+      capacityRooms:p.capacityRooms.map(r=>({...r})),mergedIds:[...p.mergedIds],steps:[...p.steps],
+      residents:p.residents.map(r=>({...r})),materialMoves:[...p.materialMoves]});
     const advance=(p,hours,paused=null)=>shelterAdvancePlanningStock(m,p,hours,paused);
     const stillNeeded=(p,c)=>c.levelInvestment||!c.storageDemand||
       c.storageDemand.equipment&&m.state.items.length>=.9*p.itemCap||
@@ -5537,37 +9597,163 @@
     const score=p=>progress.score+p.gain+due.filter(e=>e.at<=m.now+p.hours*3600000).reduce((n,e)=>n+e.gain,0);
     const rank=(a,b)=>Number(score(b)>=targetScore)-Number(score(a)>=targetScore)||
       (score(a)>=targetScore?a.hours-b.hours:a.hours/Math.max(1,score(a)-progress.score)-b.hours/Math.max(1,score(b)-progress.score))||a.cost-b.cost;
-    let beam=[initial];const results=[];
-    for(let depth=0;depth<3;depth++){
+    const quoteUpgrade=(p,r,template)=>{
+      const {economics:oldEconomics,layout,...base}=template,level=r.level+1,hours=r.width*(level===2?1:3);
+      const cost={scrap:Math.ceil(shelterBuildRules[r.type][1]*r.width*(level===2?2.5:6)),parts:level===3?15*r.width:0};
+      const rate=p.rooms.find(row=>row.id===r.id)?.rate||0,gain=rate*([0,1,1.5,2.1][level]/[0,1,1.5,2.1][r.level]-1);
+      const materialScrap=cost.scrap+6*cost.parts,lostScrap=rate*hours;
+      return {...base,kind:'upgrade',type:r.type,id:r.id,level,levelGain:r.width,hours,cost,gain,
+        ...(r.type==='scrap'&&gain>0?{economics:{gain,materialScrap,lostScrap,paybackHours:hours+(materialScrap+lostScrap)/gain}}:{}),
+        shortage:Object.fromEntries(Object.entries(cost).map(([k,v])=>[k,Math.max(0,Math.ceil(v-p.resources[k]))])),
+        title:`第 ${r.floor} 层${shelterBuildRules[r.type][0]}升至 ${level} 级`,
+        benefit:`按前项完工后的 ${r.width} 格房间重新核算；施工 ${hours} 小时，增加 ${r.width} 等级分${rate>0?'，施工期间停产':''}`,blocks:[]};
+    };
+    const candidates=p=>{
+      const choices=[];
+      for(const original of unique){
+        if(original.kind==='upgrade'){
+          const r=p.capacityRooms.find(r=>r.id===original.id),before=m.state.rooms.find(r=>r.id===original.id);
+          if(!r||r.level>=3||r.upgradeAt!==null)continue;
+          choices.push(r.level===before.level&&r.width===before.width?original:quoteUpgrade(p,r,original));
+        }else if(original.kind==='build'){
+          const used=p.steps.some(step=>step.project.kind==='build'&&step.project.type===original.type);
+          // Production builds need an independently bound new worker set; never reuse the first build's workers.
+          if(used&&!(original.type==='storage'&&original.levelInvestment))continue;
+          if(!p.capacityRooms.some(r=>r.floor===original.floor&&r.col<=original.col&&r.col+r.width>original.col))choices.push(original);
+          else if(original.type==='storage'&&original.levelInvestment){
+            for(let floor=1;floor<=m.state.depth;floor++){
+              if(!p.capacityRooms.some(r=>r.floor===floor&&r.col<=1&&r.col+r.width>1))continue;
+              let col=2;
+              while(col<8){const r=p.capacityRooms.find(r=>r.floor===floor&&r.col===col);if(!r)break;col+=r.width;}
+              if(col>=8||p.capacityRooms.some(r=>r.floor===floor&&r.col<8&&r.col+r.width>col))continue;
+              const cells=p.capacityRooms.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width,0);
+              choices.push({...original,floor,col,cost:{scrap:Math.ceil(shelterBuildRules.storage[1]*(1+.2*cells)),parts:0},
+                title:`第 ${floor} 层右侧新建一格仓库`});
+            }
+          }
+        }else if(!p.steps.some(step=>step.project.kind===original.kind))choices.push(original);
+      }
+      for(const r of p.capacityRooms.filter(r=>typeof r.id==='string'&&r.type==='storage'&&r.level<3)){
+        const original=unique.find(c=>c.kind==='build'&&c.type==='storage'&&c.levelInvestment);
+        if(original)choices.push(quoteUpgrade(p,r,original));
+      }
+      // A build can merge into a root storage that had no upgrade quote in this read.
+      for(const id of p.mergedIds){
+        const r=p.capacityRooms.find(r=>r.id===id);
+        if(!r||r.type!=='storage'||r.level>=3||choices.some(c=>c.kind==='upgrade'&&c.id===id))continue;
+        const original=unique.find(c=>c.kind==='build'&&c.type==='storage'&&c.levelInvestment);
+        if(original)choices.push(quoteUpgrade(p,r,original));
+      }
+      // A root level-one upgrade can unlock the later, zero-parts construction
+      // alternative. Generate it from the completed layout instead of requiring
+      // the same build to have been a legal root candidate already.
+      if(planning.allowLevelInvestment&&p.steps.length&&planning.campaign?.constructionPolicy?.build!==false&&
+          !choices.some(c=>c.kind==='build'&&c.type==='storage')&&
+          !choices.some(c=>c.kind==='upgrade'&&p.capacityRooms.find(r=>r.id===c.id)?.level===1)){
+        for(let floor=1;floor<=m.state.depth;floor++){
+          if(!p.capacityRooms.some(r=>r.floor===floor&&r.col<=1&&r.col+r.width>1))continue;
+          let col=2;
+          while(col<8){const r=p.capacityRooms.find(r=>r.floor===floor&&r.col===col);if(!r)break;col+=r.width;}
+          if(col>=8||p.capacityRooms.some(r=>r.floor===floor&&r.col<8&&r.col+r.width>col))continue;
+          const cells=p.capacityRooms.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width,0);
+          const cost={scrap:Math.ceil(shelterBuildRules.storage[1]*(1+.2*cells)),parts:0};
+          choices.push({kind:'build',type:'storage',floor,col,cost,hours:1/6,levelGain:1,levelInvestment:true,priority:28,
+            shortage:{scrap:Math.max(0,Math.ceil(cost.scrap-p.resources.scrap)),parts:0},blocks:[],
+            title:`第 ${floor} 层右侧新建一格仓库`,benefit:'前项完工后已有安全一级升级已用尽，将本项纳入同一完整达级路线比较'});
+        }
+      }
+      return [...new Map(choices.map(c=>[`${c.kind}:${c.id??`${c.floor}:${c.col}`}:${c.level??0}`,c])).values()];
+    };
+    const materialCache=new Map();let materialPlannerCalls=0,materialCacheHits=0;
+    const prepareParts=(p,c)=>{
+      if(!deep||!planning.campaign||p.resources.parts>=c.cost.parts||p.rooms.some(r=>r.resource==='parts'&&r.rate>0))return;
+      const reserved=[...new Set([...(planning.campaign.reserved||[]),...(planning.campaign.dailyReserved||[])])];
+      const roles=[];
+      const virtualIds=new Map(p.capacityRooms.filter(r=>typeof r.id==='string').map((r,i)=>
+        [r.id,Math.max(0,...m.state.rooms.map(r=>r.id))+1+i]));
+      const projectedResidents=()=>p.residents.map(person=>({...person,roomId:virtualIds.get(person.roomId)??person.roomId}));
+      for(let i=0;i<8;i++){
+        const view={...m.view,serverTime:m.now+p.hours*3600000,state:{...m.state,resources:{...p.resources},
+          residents:projectedResidents(),rooms:p.capacityRooms.map(r=>({...r,id:virtualIds.get(r.id)??r.id,
+            stored:p.rooms.find(row=>row.id===r.id)?.stored||0}))}};
+        // Cache only within this search. All other model/configuration fields
+        // are fixed here; include every field the projected branches can change.
+        // The target ID only protects its existing producers. Empty targets
+        // with the same costs impose exactly the same staffing constraints.
+        const protectedProject=p.residents.some(r=>r.roomId===c.id)?c.id:null;
+        const key=planning.materialCache===false?null:JSON.stringify([p.hours,p.resources,p.capacityRooms,
+          p.rooms.map(r=>[r.id,r.stored]),p.residents.map(r=>[r.id,r.roomId]),roles,protectedProject,c.cost]);
+        let action;
+        if(key!==null&&materialCache.has(key)){action=materialCache.get(key);materialCacheHits++;}
+        else {
+          const current=shelterModel(view),policy=planning.campaign.constructionPolicy||{};
+          const planned=shelterCampaignPlan(current,{...campaignDefaults,workshop:true,development:true,
+            partsTarget:c.cost.parts+(policy.partsReserve||0),partsReserve:policy.partsReserve||0,
+            workshopScrapReserve:c.cost.scrap+(policy.scrapReserve||0),workshopProject:c.id},
+            {roles,familyReserved:reserved,constructionPolicy:policy,populationPreparation:planning.campaign.populationPreparation},planning.populationTarget);
+          materialPlannerCalls++;
+          const choice=planned.actions.find(a=>a.role==='workshop'&&p.capacityRooms.some(r=>r.id===a.room));
+          action=choice?{id:choice.id,room:choice.room}:null;
+          if(key!==null){if(materialCache.size>=256)materialCache.delete(materialCache.keys().next().value);materialCache.set(key,action);}
+        }
+        if(!action)break;
+        const person=p.residents.find(person=>person.id===action.id),before=person.roomId;
+        if(!advance(p,1/6))return;
+        person.roomId=action.room;roles.push({id:person.id,room:action.room,role:'workshop',at:view.serverTime});
+        p.materialMoves.push({id:person.id,from:before,room:action.room,atHours:p.hours});
+        const after=shelterModel({...view,state:{...view.state,residents:projectedResidents()}});
+        for(const row of after.rooms){const existing=p.rooms.find(r=>r.id===row.id);if(existing){existing.rate=row.rate;existing.batch=row.batch;}}
+      }
+    };
+    let beam=[initial],expanded=0,truncated=false,beamTruncated=false,depthTruncated=false,bestHours=Infinity;const results=[];
+    for(let depth=0;depth<maxProjects;depth++){
       const next=[];
-      for(const old of beam)for(const c of unique){
-        if(!old.steps.length&&first&&(c.kind!==first.kind||c.id!==first.id))continue;
-        if(old.mergedIds.includes(c.id))continue;
-        if(old.steps.some(x=>c.kind==='build'&&x.project.kind==='build'||c.id!=null&&x.project.id===c.id))continue;
+      outer:for(const old of beam)for(const c of deep?candidates(old):unique){
+        if(planning.routeSteps){
+          const required=planning.routeSteps[depth];
+          if(!required||['kind','id','type','floor','col','level'].some(k=>required[k]!==c[k]))continue;
+        }
+        if(expanded>=2000){truncated=true;break outer;}expanded++;
+        if(!old.steps.length&&first&&['kind','id','type','floor','col','level'].some(k=>Object.hasOwn(first,k)&&first[k]!==c[k]))continue;
+        if(!deep&&(old.mergedIds.includes(c.id)||old.steps.some(x=>c.kind==='build'&&x.project.kind==='build'||c.id!=null&&x.project.id===c.id)))continue;
+        // Every later action takes nonnegative time. Once a whole route is known,
+        // a prefix already slower than that finish cannot beat it by adding work.
+        if(deep&&old.hours+c.hours>bestHours+1e-9)continue;
         // 原候选只代表当前需求；前项消费或扩容后，已解除的满仓压力不能继续充当增分理由。
         if(!stillNeeded(old,c))continue;
         const p=clone(old),room=p.rooms.find(r=>r.id===c.id);
-        while((p.resources.scrap<c.cost.scrap||p.resources.parts<c.cost.parts)&&p.hours<72){if(!advance(p,1/6)){p.hours=73;break;}}
-        if(p.hours>=72||!stillNeeded(p,c))continue;
+        if(c.cost.scrap>p.caps.scrap||c.cost.parts>p.caps.parts)continue;
+        prepareParts(p,c);if(p.failure)continue;
+        // No construction has started yet: waiting cannot create a missing
+        // resource with neither a producer nor enough existing whole batches.
+        if(['scrap','parts'].some(k=>p.resources[k]<c.cost[k]&&
+            !p.rooms.some(r=>r.resource===k&&r.rate>0)&&
+            p.resources[k]+p.rooms.filter(r=>r.resource===k).reduce((n,r)=>n+Math.floor((r.stored+1e-9)/r.batch)*r.batch,0)<c.cost[k]-1e-9))continue;
+        while((p.resources.scrap<c.cost.scrap||p.resources.parts<c.cost.parts)&&p.hours<horizonHours&&(!deep||p.hours+c.hours<=bestHours+1e-9)){
+          if(!advance(p,1/6)){p.hours=horizonHours+1;break;}}
+        if(p.resources.scrap<c.cost.scrap||p.resources.parts<c.cost.parts)continue;
+        if(p.hours>=horizonHours||!stillNeeded(p,c))continue;
         if(room&&Object.keys(p.demand).some(k=>k===room.resource&&p.resources[k]<(p.demand[k]-p.rooms.filter(r=>r!==room&&r.resource===k).reduce((n,r)=>n+r.rate,0))*c.hours))continue;
         p.resources.scrap-=c.cost.scrap;p.resources.parts-=c.cost.parts;
         const started=p.hours;
-        if(!advance(p,c.hours,c.kind==='upgrade'?c.id:null)||p.hours>72)continue;
+        if(!advance(p,c.hours,c.kind==='upgrade'?c.id:null)||p.hours>horizonHours)continue;
         // 容量仅在本项模拟完工后增加；前后分别取整，不能提前借用容量或改写真实库存。
         const beforeCapacity=shelterCapacity(p.capacityRooms,storagePerk);
         let mergedId=null;
-        if(c.kind==='upgrade')p.capacityRooms.find(r=>r.id===c.id).level++;
+        const upgradedRoom=c.kind==='upgrade'?p.capacityRooms.find(r=>r.id===c.id):null,oldLevel=upgradedRoom?.level;
+        if(upgradedRoom)upgradedRoom.level++;
         else if(c.kind==='build'){
           const left=p.capacityRooms.find(r=>r.floor===c.floor&&r.col+r.width===c.col&&r.type===c.type&&
             r.level===1&&r.width<3&&r.upgradeAt===null&&(c.type!=='training'||r.trainStat===c.trainStat));
-          if(left){left.width++;p.mergedIds.push(left.id);mergedId=left.id;}
-          else p.capacityRooms.push({id:`new:${c.floor}:${c.col}`,type:c.type,floor:c.floor,col:c.col,width:1,level:1,trainStat:c.trainStat,upgradeAt:null});
+          if(left){left.width++;if(!p.mergedIds.includes(left.id))p.mergedIds.push(left.id);mergedId=left.id;}
+          else p.capacityRooms.push({id:`new:${c.floor}:${c.col}`,type:c.type,floor:c.floor,col:c.col,width:1,level:1,trainStat:c.trainStat,
+            builtAt:m.now+p.hours*3600000,stored:0,upgradeAt:null,incident:null,unpowered:false});
         }
         const afterCapacity=shelterCapacity(p.capacityRooms,storagePerk);
         for(const k of Object.keys(p.caps))p.caps[k]+=afterCapacity.caps[k]-beforeCapacity.caps[k];
         p.itemCap+=afterCapacity.itemCap-beforeCapacity.itemCap;
         if(room&&c.kind==='upgrade'){
-          const oldRoom=m.state.rooms.find(r=>r.id===c.id),ratio=[0,1,1.5,2.1][oldRoom.level+1]/[0,1,1.5,2.1][oldRoom.level];
+          const ratio=[0,1,1.5,2.1][oldLevel+1]/[0,1,1.5,2.1][oldLevel];
           room.rate*=ratio;room.batch*=ratio;
         }else if(c.kind==='build'&&shelterRooms[c.type][1]){
           const joined=p.rooms.find(r=>r.id===mergedId);
@@ -5575,14 +9761,28 @@
           else if(c.gain>0)p.rooms.push({id:`new:${c.floor}:${c.col}`,resource:shelterRooms[c.type][1],
             rate:c.gain,batch:shelterRooms[c.type][3],stored:0,automatic:(m.state.handies||[]).some(h=>h.floor===c.floor),tick:p.hours+1/6});
         }
-        if(c.type!=='power'&&c.kind!=='dig')p.demand.power+=(shelterRooms[c.type][1]?1:.5)*(c.kind==='upgrade'?m.state.rooms.find(r=>r.id===c.id).width:1);
+        if(c.type!=='power'&&c.kind!=='dig')p.demand.power+=(shelterRooms[c.type][1]?1:.5)*(upgradedRoom?upgradedRoom.width:1);
         if(p.rooms.filter(r=>r.resource==='power').reduce((n,r)=>n+r.rate,0)<p.demand.power*1.2-1e-9)continue;
         p.gain+=c.levelGain;p.cost+=c.cost.scrap+6*c.cost.parts;p.steps.push({project:c,startHours:started,finishHours:p.hours});
-        results.push(p);if(score(p)<targetScore)next.push(p);
+        results.push(p);if(score(p)<targetScore)next.push(p);else bestHours=Math.min(bestHours,p.hours);
       }
-      beam=next.sort(rank).slice(0,6);if(!beam.length)break;
+      if(next.length>beamWidth)beamTruncated=true;
+      if(depth===maxProjects-1&&next.length)depthTruncated=true;
+      const ranked=next.filter(p=>!deep||p.hours<bestHours+1e-9).sort(rank);
+      if(deep){
+        // Preserve competing first investments instead of filling the beam with
+        // permutations of the same cheap prefix before they can reach the goal.
+        const firsts=new Set();beam=[];
+        for(const p of ranked){const c=p.steps[0].project,key=`${c.kind}:${c.id??`${c.floor}:${c.col}`}`;
+          if(!firsts.has(key)){firsts.add(key);beam.push(p);}if(beam.length===beamWidth)break;}
+        for(const p of ranked){if(beam.length===beamWidth)break;if(!beam.includes(p))beam.push(p);}
+      }else beam=ranked.slice(0,beamWidth);
+      if(!beam.length||truncated)break;
     }
-    return results.sort(rank).slice(0,3).map(p=>({kind:'projects',steps:p.steps,hours:p.hours,score:score(p),complete:score(p)>=targetScore,cost:p.cost}));
+    return results.sort(rank).slice(0,3).map(p=>({kind:'projects',steps:p.steps,hours:p.hours,score:score(p),complete:score(p)>=targetScore,cost:p.cost,
+      materialMoves:p.materialMoves,search:{expanded,limit:2000,maxProjects,beamWidth,horizonHours,
+        materialPlannerCalls,materialCacheHits,materialCacheEntries:materialCache.size,
+        truncated:truncated||beamTruncated||depthTruncated,budgetExhausted:truncated,beamTruncated,depthTruncated}}));
   }
   function shelterPopulationAdvice(m,target,finalLevel,campaign=null) {
     const progress=shelterLevelProgress(m),growth=shelterGrowthNeeds(m),future=growth.futureMouths;
@@ -5657,9 +9857,9 @@
   function shelterDevelopmentPlan(m,target=14,campaign=null,finalLevel=null) {
     const continuousLevel=finalLevel==='auto';
     finalLevel=shelterResolvedLevelTarget(m,finalLevel);
-    const s=m.state, now=m.now, candidates=[], notes=[], buildRequests=[], fmt=n=>Number(n.toFixed(1));
+    const s=m.state, now=m.now, candidates=[], rejectedLevel=[], notes=[], buildRequests=[], fmt=n=>Number(n.toFixed(1));
     const built=s.rooms.filter(r=>r.builtAt<=now), living=s.residents.filter(p=>p.deadAt===null);
-    const {population,recovering,construction,pairs,futureMouths,committedPower,demand}=shelterGrowthNeeds(m);
+    const {population,recovering,construction,pairs,futureMouths,committedPower,demand}=shelterGrowthNeeds(m,campaign?.populationPreparation,target);
     if(campaign?.powerPreparation){
       demand.power+=campaign.powerPreparation.extra;
       notes.push('下一工程仅缺供电，现有发电岗位已满；先按可安全调动的真实人手评估发电扩产，完工补员后再核对原工程。');
@@ -5674,13 +9874,21 @@
     const populationPreparation=campaign?.populationPreparation;
     if(Number.isSafeInteger(populationPreparation)&&populationPreparation>futureMouths&&
       populationPreparation<=Math.min(requestedTarget??0,m.populationCap)){
-      demand.food=Math.max(demand.food,populationPreparation);demand.water=Math.max(demand.water,populationPreparation);
       notes.push(`人口发展先为下一批 ${populationPreparation} 人准备成年口粮及20%余量；现有岗位无法补足时评估增产建设，不一次预支全部目标人口的资源。`);
     }
     if(pairs.size)notes.push(`已有 ${pairs.size} 对培养感情的家庭，另预留 ${pairs.size} 个出生名额、床位及成年口粮；转为待产后不重复预留。`);
     if(recovering)notes.push(`倒下居民 ${recovering} 人仍在名单中，已预留恢复后的床位与成年口粮；记录移除后才释放预留，当前产出和消耗不包含他们。`);
     const shortages=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9);
     const netScrap=m.production.scrap-6*m.production.parts;
+    if(campaign?.familySupplyPlanning){
+      const reason=campaign.familySupplyPlanning.status==='running'||campaign.familySupplyPlanning.status==='queued'?
+        '后台正在比较家庭接替与扩产；供给方案就绪后继续调岗和建设':
+        '家庭供给后台比较未完成，保留当前岗位与材料，稍后重新读取';
+      return {at:now,population,recovering,reservedBirths:pairs.size,requestedTarget,capacity:m.populationCap,committedCapacity,
+        target:wanted,netScrap,levelProgress:shelterLevelProgress(m),routes:[],populationAdvice:shelterPopulationAdvice(m,requestedTarget,finalLevel,campaign),
+        partsTarget:0,partsProject:null,notes:[...notes,reason],next:{kind:'family-planning',status:'wait',title:'等待家庭供给比较',reason},
+        retainedProject:null,levelSearch:null,rejectedLevel:[],candidateTotal:0,candidates:[]};
+    }
     const active=r=>r.builtAt<=now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
     // 临时备料不构成长驻产能；不能因安排工坊值班而改选工坊升级，再以无需零件为由撤回该人选。
     const productiveUpgrade=r=>(m.rooms.find(row=>row.id===r.id)?.rate||0)>0&&
@@ -5690,7 +9898,7 @@
       (p.roomId===null||campaign?.unemployedResidents?.includes(p.id))&&!p.romance&&
       Number.isFinite(p.hp)&&p.hp>=.6*Math.round(100+(Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))-1)*(2+.5*p.stats.end)));
     const dormWorkers=idle.filter(p=>p.roomId!==null);
-    if(dormWorkers.length)notes.push(`宿舍中 ${dormWorkers.length} 名未成家的健康成年子女可安排生产；现有岗位不足时纳入扩建人手，不必先调到休息。`);
+    if(dormWorkers.length)notes.push(`宿舍中 ${dormWorkers.length} 名可就业的健康成人可安排生产，包括已确认待产或冷却中的父母；现有岗位不足时纳入扩建人手，不必先调到休息。`);
     // Layout is advisory-only: old or incomplete snapshots must not stop collection/staffing.
     let layout=Number.isInteger(s.depth)&&s.depth>=1&&s.depth<=1000&&s.rooms.every(r=>
       Number.isInteger(r.floor)&&r.floor>=0&&r.floor<=s.depth&&Number.isInteger(r.col)&&r.col>=0&&r.col+r.width<=8);
@@ -5867,9 +10075,11 @@
       if(!vacancies&&available.length&&!canWait) {
         const hypothetical={type,width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
         const gain=available.map(p=>shelterWorkerRate(s,now,m.view.env,p,hypothetical)).sort((a,b)=>b-a).slice(0,2).reduce((n,v)=>n+v,0);
-        // 成年子女已能工作，但旧房升级不增加座位；先补真实缺少的岗位，再追等级分。
-        const employment=type==='scrap'&&available.some(p=>dormWorkers.includes(p))&&gain>0;
-        build(type,employment?24:priority,`${employment?'先为待就业成年子女增加生产岗位；':''}安排现有闲置成人后约增加 ${fmt(gain)} ${shelterResources[resource]}/小时；空房本身不增产`,gain,null,employment);
+        // 宿舍子女和休息中的可调成人都需要岗位；旧房升级不增加座位，不能因人在休息而退回普通追级。
+        const employment=type==='scrap'&&gain>0&&available.some(p=>dormWorkers.includes(p)||
+          p.roomId===null&&campaign?.restingResidents?.includes(p.id)&&
+          !campaign?.dailyReserved?.includes(p.id)&&shelterWorkerRate(s,now,m.view.env,p,hypothetical)>0);
+        build(type,employment?24:priority,`${employment?'先为待就业成人增加生产岗位；':''}安排现有闲置成人后约增加 ${fmt(gain)} ${shelterResources[resource]}/小时；空房本身不增产`,gain,null,employment);
       }
       if(!vacancies&&!idle.length&&deficit&&!built.some(r=>r.type===type)&&!pending.length)
         build(type,priority,'尚无可直接安排的健康闲置成人，先确认调岗人选；建成空房不会增加产量');
@@ -5904,8 +10114,14 @@
     }
     if(committedCapacity<wanted) {
       const benefit=`人口容量增加 ${Math.min(200,committedCapacity+4)-committedCapacity}，当前及施工后容量 ${m.populationCap}/${committedCapacity}，规划至少 ${wanted}；不加快培养感情`;
-      const housingPriority=committedCapacity-futureMouths>1?70:shortages.length?65:30;
-      if(housingPriority===70)notes.push(`已有及在建床位还可容纳 ${committedCapacity-futureMouths} 人，宿舍暂列后续；先提高废料产出，预期人口距容量只剩 1 人时提前扩容。`);
+      const spare=committedCapacity-futureMouths;
+      const supplyFirst=spare>0&&(shortages.length||Object.keys(campaign?.populationFamilySupply?.resources||{}).length);
+      const preparingPair=populationPreparation>futureMouths&&populationPreparation<=committedCapacity;
+      const housingPriority=spare>1||supplyFirst||preparingPair?70:shortages.length?65:spare<=0?20:30;
+      if(housingPriority===20)notes.push('已承诺人口用满现有及在建床位，供给已就绪；必要扩容先于普通等级工程备料，仍核对原建设预算。');
+      if(housingPriority===70)notes.push(`已有及在建床位还可容纳 ${spare} 人，宿舍暂列后续；`+
+        (supplyFirst||preparingPair?'先落实下一对父母及其供给，实际预约占用床位后再评估扩容，不因等级加分提前扩宿舍。':
+          '先提高废料产出，预期人口距容量只剩 1 人且供给就绪时提前扩容。'));
       build('quarters',housingPriority,benefit);
       const room=built.filter(r=>r.type==='quarters'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
       if(room)candidates.push(upgrade(room,housingPriority+1,`人口容量增加 ${Math.min(200,committedCapacity+2*room.width)-committedCapacity}；不加快培养感情`));
@@ -6030,10 +10246,10 @@
       const person=s.residents.find(p=>p.id===project.person),room={type:project.type,width:1,level:1,builtAt:0,upgradeAt:null,incident:null,unpowered:false};
       build(project.type,project.priority,project.benefit,person?shelterWorkerRate(s,now,m.view.env,person,room):0,project);
     }
-    const levelProgress=shelterLevelProgress(m),routes=[];
+    const levelProgress=shelterLevelProgress(m),routes=[];let levelSearch=null;
     const investmentStageReady=levelProgress&&Number.isInteger(finalLevel)&&finalLevel>levelProgress.level&&
       requestedTarget!==null&&population>=requestedTarget&&!recovering&&!s.births.length&&!pairs.size&&
-      !living.some(p=>p.adultAt>now)&&!campaign?.unemployedResidents?.length;
+      !living.some(p=>p.adultAt>now)&&!campaign?.unemployedResidents?.length&&!campaign?.restingResidents?.length;
     const investmentReady=investmentStageReady&&!campaign?.levelInvestmentHeld;
     const retainedInvestment=r=>investmentStageReady&&campaign?.levelInvestmentSwap&&validShelterMaterials(campaign.materials)&&
       campaign.materials.vaultNo===m.view.vaultNo&&campaign.materials.finalTarget===finalLevel&&
@@ -6041,6 +10257,18 @@
       campaign.materials.type===r.type&&campaign.materials.level===r.level+1;
     const canInvest=r=>(investmentReady||retainedInvestment(r))&&['quarters','storage'].includes(r.type)&&
       !living.some(p=>p.roomId===r.id)&&!s.births.some(b=>b.roomId===r.id);
+    // 保留已有低成本二级升级优先；只剩三级投入时，把现成空位的零件零消耗方案纳入同一条路线比较。
+    // 不为这项比较提前下挖，不撤销已经确认的备料，也不挤占人口、供应或接替建设。
+    if(investmentReady&&levelProgress.committed<levelProgress.next&&spots.length&&!construction.length&&!s.digging&&
+        !shortages.length&&!retainedFunding&&!campaign?.workshopWorkers?.length&&!campaign?.populationFamilySupply&&
+        !s.rooms.some(r=>r.incident||r.unpowered)&&
+        built.some(r=>active(r)&&r.level===2&&canInvest(r))&&
+        !built.some(r=>shelterBuildRules[r.type]&&active(r)&&r.level===1&&(canInvest(r)||productiveUpgrade(r)))&&
+        !buildRequests.some(c=>c.priority<28)&&!candidates.some(c=>c.priority<28)){
+      const start=candidates.length;
+      build('storage',28,'仅剩需零件的三级等级投入，比较现有空位新仓库：增加1等级分与容量，不停产、不消耗零件；不预支新楼层');
+      for(const c of candidates.slice(start))c.levelInvestment=true;
+    }
     // 先用已有安全房间；全部升满后按明确等级目标补仓库，不再等到90%满仓才继续发展。
     // 原生产/人口/容量需求、在途分数及施工仍优先；新仓库只增加容量与等级分。
     if(investmentReady&&levelProgress.committed<levelProgress.next&&!construction.length&&!s.digging&&
@@ -6078,7 +10306,7 @@
         title:`向下扩至第 ${s.depth+1} 层，推进第 ${milestone.milestone} 层${milestone.purpose==='region'?'区域解锁':'探险位'}`,cost:{scrap:cost,parts:0},
         benefit:milestone.benefit,blocks:[]});
     }
-    let levelWaiting=false,retainedMaterials=false;
+    let levelWaiting=false,retainedMaterials=false,retainedProject=null;
     if(levelProgress){
       if(continuousLevel)levelProgress.continuous=true;
       const pursuing=Number.isInteger(finalLevel)&&finalLevel>levelProgress.level;
@@ -6113,37 +10341,113 @@
           // 不新建空房凑分，不挪走住户；生育、恢复、换位和基础供应仍先处理。
           for(const r of built.filter(r=>shelterBuildRules[r.type]&&active(r)&&r.level<3)){
             const investment=canInvest(r),production=shelterRooms[r.type][1];
-            if(!investment&&(!production||!productiveUpgrade(r)))continue;
+            const inherited=['power','diner','water','scrap'].includes(r.type)&&materialCurrent&&
+              material.id===r.id&&material.type===r.type&&material.level===r.level+1;
+            if(!investment&&(!production||!productiveUpgrade(r))&&!inherited)continue;
             const c=upgrade(r,Math.max(6,locked.priority-.5),investment?
               `人口阶段完成，投入已有空${labels(r.type)}升级，增加 ${r.width} 等级分与容量；不增加产出或加快生育`:
               `增加 ${r.width} 等级分，并提高已有在岗人员产能，推进${targetLevel}级${locked.label}解锁`);
+            if(inherited&&['power','diner','water','scrap'].includes(r.type)&&!productiveUpgrade(r)){
+              c.requiresStaff=true;c.blocks.push('原工程暂无在岗生产者，先补员后重新核对');
+              c.benefit='已确认原工程需要先恢复真实生产者；补员前不计未来增产，也不开工';
+            }
             // 换位只暂停原工程开工，不撤销已经确认的备料；不得借此开始另一项等级投资。
             if(investment&&!investmentReady)c.blocks.push('先完成已确认的人员换位');
             // 已确认原工程可等待供电/施工名额；不能暂时过滤它，补电后又把备选替换回来。
             if(!c.blocks.length||investment||materialProject(c)&&c.blocks.every(reason=>
-                ['扩建后电力余量不足，先补发电','先等一个施工名额空出'].includes(reason)))
+                ['扩建后电力余量不足，先补发电','先等一个施工名额空出','原工程暂无在岗生产者，先补员后重新核对'].includes(reason)))
               options.push({...c,levelGain:r.width,...(investment?{levelInvestment:true}:{})});
           }
           for(const c of candidates.filter(c=>['build','upgrade','dig'].includes(c.kind)&&!c.blocks.length&&c.priority<70)){
             const gain=c.kind==='dig'?3:c.kind==='build'?1:s.rooms.find(r=>r.id===c.id)?.width;
-            const investment=c.kind==='upgrade'&&canInvest(s.rooms.find(r=>r.id===c.id));
+            const investment=c.levelInvestment||c.kind==='upgrade'&&canInvest(s.rooms.find(r=>r.id===c.id));
             if(gain)options.push({...c,levelGain:gain,...(investment?{levelInvestment:true}:{})});
           }
           const retained=options.find(materialProject);
-          if(pursuing)routes.push(...shelterLevelRoutes(m,options,targetScore,retained));
+          const deepRoutes=investmentReady&&!retained&&!shortages.length&&!campaign?.workshopWorkers?.length&&
+            !construction.length&&!s.digging&&!campaign?.populationFamilySupply;
+          const searchBudget=shelterLevelSearchBudget(m,options,deepRoutes);
+          // 有真实扩仓需求时，部分路线仍用于核对到齐与完工时间，继续保留这种有用途的比较。
+          if(pursuing&&deepRoutes&&!options.some(c=>c.storageDemand)&&searchBudget.scoreUpperBound<targetScore){
+            levelSearch={...searchBudget,targetScore,expanded:0,truncated:true,reason:'project-limit'};
+            notes.push(`当前最多搜索 ${searchBudget.maxProjects} 项工程，即使每项增加 ${searchBudget.maxGain} 分、全部在途兑现，也至多 ${searchBudget.scoreUpperBound}/${targetScore} 分；此搜索范围不足以组成完整路线，跳过必定无解的推演，继续核对独立用途。`);
+          }else if(pursuing){
+            const planning={deep:deepRoutes,allowLevelInvestment:deepRoutes,campaign,populationTarget:requestedTarget};
+            if(deepRoutes&&typeof shelterBackgroundLevelRoutes==='function'){
+              const background=shelterBackgroundLevelRoutes(m,options,targetScore,retained,planning);
+              routes.push(...background.routes);
+              if(background.status==='ready'){
+                levelSearch={...searchBudget,targetScore,reason:'background-ready',jobId:background.jobId,snapshotAt:background.snapshotAt};
+              }else{
+                levelSearch={...searchBudget,targetScore,expanded:0,truncated:true,reason:'background-'+background.status};
+                notes.push(['running','queued'].includes(background.status)?'后台正在比较完整等级路线，供给、防守和已有任务照常核对。':
+                  '后台等级比较未完成，本轮不据此投入纯等级工程；当前有用途的建设仍单独核对。');
+              }
+            }else routes.push(...shelterLevelRoutes(m,options,targetScore,retained,planning));
+          }
           options.sort((a,b)=>Number(Boolean(a.blocks.length))-Number(Boolean(b.blocks.length))||
             (a.cost.scrap+6*a.cost.parts)/Math.min(gap,a.levelGain)-(b.cost.scrap+6*b.cost.parts)/Math.min(gap,b.levelGain)||
             (a.hours||0)-(b.hours||0)||a.cost.scrap-b.cost.scrap);
-          const chosen=retained||routes.find(r=>r.steps.length)?.steps[0]?.project||options[0];
+          const completeRoute=routes.find(r=>r.complete&&r.steps.length);
+          // A cheap prefix is not a completed level route. Keep real capacity/supply
+          // work, but do not fill the remaining layout with an unproven point-only investment.
+          let independent=null;
+          if(pursuing&&deepRoutes&&!completeRoute&&!retained){
+            const rejected=new Set();
+            for(const c of [...options,...candidates].filter(c=>c.levelInvestment)){
+              const key=`${c.kind}:${c.id??`${c.floor}:${c.col}`}:${c.level??0}`;
+              if(rejected.has(key))continue;rejected.add(key);
+              const backgroundPending=['background-running','background-queued'].includes(levelSearch?.reason);
+              const reasons=[backgroundPending?'后台比较尚未完成，暂不投入纯等级工程':
+                levelSearch?.reason?.startsWith('background-')&&levelSearch.reason!=='background-ready'?
+                  '后台比较未完成，尚无覆盖下一等级的已核对完整路线':'本轮有界搜索未找到覆盖下一等级的完整路线'];
+              if(levelSearch?.reason==='project-limit')reasons.push(`最多 ${levelSearch.maxProjects} 项工程的乐观分数上界 ${levelSearch.scoreUpperBound} 仍低于 ${targetScore}；并非证明游戏中永远无法升级`);
+              if(!Number.isFinite(c.hours))reasons.push('工程工期尚未核对，不能把未知耗时记为零');
+              for(const k of ['scrap','parts'])if(Number.isSafeInteger(policy?.[`${k}Limit`])&&c.cost[k]>policy[`${k}Limit`])
+                reasons.push(`单笔需 ${c.cost[k]} ${shelterResources[k]}，超过24小时总额度 ${policy[`${k}Limit`]}；等待额度恢复也不足`);
+              rejectedLevel.push({project:c,reasons});
+            }
+            for(let i=candidates.length-1;i>=0;i--)if(candidates[i].levelInvestment)candidates.splice(i,1);
+            const forecast=shelterMaterialForecast(m);
+            const capacity=options.filter(c=>!c.blocks.length&&c.storageDemand)
+              .map(c=>({c,wait:forecast(c.cost).hours})).filter(x=>x.wait!==null)
+              .sort((a,b)=>a.wait+a.c.hours-b.wait-b.c.hours||a.c.cost.scrap-b.c.cost.scrap)[0]?.c;
+            independent=capacity?{...capacity,levelInvestment:false}:options.filter(c=>!c.blocks.length&&!c.levelInvestment&&c.economics?.gain>0)
+              .map(c=>({c,wait:forecast(c.cost).hours})).filter(x=>x.wait!==null&&x.wait+x.c.economics.paybackHours<=168)
+              .sort((a,b)=>a.wait+a.c.economics.paybackHours-b.wait-b.c.economics.paybackHours)[0]?.c;
+            notes.push((levelSearch?.reason?.startsWith('background-')&&levelSearch.reason!=='background-ready'?
+              '后台比较尚未完成':'本轮有界搜索未找到完整达级路线')+
+              '；不按最便宜一分追加仓库或空房升级，只保留有独立用途的工程、可回本增产或等待已知事件。');
+            for(const row of rejectedLevel.slice(0,8))if(row.reasons.length>1)
+              notes.push(`未选「${row.project.title}」：${row.reasons.slice(1).join('；')}。`);
+          }
+          const chosen=retained||completeRoute?.steps[0]?.project||(pursuing&&deepRoutes?independent:routes.find(r=>r.steps.length)?.steps[0]?.project||options[0]);
           if(retained){
-            retainedMaterials=true;
-            // 已确认在备料的工程先接续；保留新增岗位需求，完工后再优先安排，避免两项互抢工坊。
-            for(const c of candidates)if(c.employment)c.priority=Math.max(c.priority,Math.max(6,locked.priority-.5)+1);
-            notes.push(`接续已确认原工程「${retained.title}」；按材料缺口安排工坊，等待额度或换位时不因临时产速变化改换工程。条件或等级目标变化后重新核对。`);
+            retainedMaterials=true;retainedProject=retained;
+            // 就业扩建不需要零件，也不应因另一项升级备料而长期停摆。
+            // 两项本金、原供料和供电全部独立留足时允许先开就业工程；原工坊用途仍保留。
+            const parallelEmployment=c=>{
+              if(!policy||policy.pending||!c.employment||c.blocks.length||!['build','dig'].includes(c.kind)||!policy[c.kind])return false;
+              const request=c.kind==='dig'?buildRequests.find(r=>r.employment&&r.type===c.purpose?.type):null;
+              if(c.kind==='dig'&&(!request||!policy.build))return false;
+              const jobCost={scrap:c.cost.scrap+(request?.cost.scrap||0),parts:c.cost.parts+(request?.cost.parts||0)};
+              if(jobCost.parts!==0)return false;
+              const {feed}=shelterWorkshopFeeding(m,retained.cost.parts+(policy.partsReserve||0));
+              if(!['scrap','parts'].every(k=>Number.isFinite(policy[k+'Limit'])&&
+                  retained.cost[k]+jobCost[k]+(policy.spent?.[k]||0)<=policy[k+'Limit'])||
+                  retained.cost.scrap+jobCost.scrap+(policy.scrapReserve||0)+feed>s.resources.scrap)return false;
+              const room=s.rooms.find(r=>r.id===retained.id),type=request?.type||c.type;
+              const extra=(retained.type==='power'?0:room.width*(shelterRooms[retained.type][1]?1:.5))+
+                (type==='power'?0:shelterRooms[type][1]?1:.5);
+              return !powerCheck(extra).length&&s.resources.power>=2*(demand.power+extra);
+            };
+            for(const c of candidates)if(c.employment&&!parallelEmployment(c))
+              c.priority=Math.max(c.priority,Math.max(6,locked.priority-.5)+1);
+            notes.push(`接续已确认原工程「${retained.title}」；按材料缺口安排工坊，等待额度或换位时不因临时产速变化改换工程。就业扩建仅在两项本金、供料及供电独立留足时先行，原工坊用途继续保留。条件或等级目标变化后重新核对。`);
           }
           if(chosen){
             let priority=Math.max(6,locked.priority-.5);
-            if(pursuing&&routes.length&&chosen.type==='storage'){
+            if(pursuing&&(routes.length||levelSearch)&&chosen.type==='storage'){
               const alternatives=candidates.filter(c=>c.type==='storage'&&c.priority<70);
               if(alternatives.length>1){
                 // 同一扩仓需求沿用路线的整批攒料/施工比较，固定的新建优先级不能覆盖已选升级。
@@ -6155,7 +10459,7 @@
             candidates.push({...chosen,priority,levelTarget:targetLevel,
               title:`推进避难所 ${targetLevel} 级：${chosen.title}`,
               benefit:chosen.benefit+`；本项增加 ${chosen.levelGain} 分，当前仍差 ${targetScore-levelProgress.score} 分（待产及在建预计补 ${levelProgress.committed-levelProgress.score} 分），逐项完成后重评`});
-            if(chosen.levelInvestment)notes.push('等级优先：人口阶段及成年就业已完成，优先升级已有空宿舍或仓库；已有项目用尽后按等级需要补仓库。实际开工仍核对原24小时预算、保留量、供电与施工名额。');
+            if(chosen.levelInvestment)notes.push('等级投入：人口阶段及成年就业已完成，优先已有低成本升级；仅剩三级投入时比较现有空位的新仓库，已确认或在岗备料先接续。实际开工仍核对原24小时预算、保留量、供电与施工名额。');
             notes.push(pursuing?'按有限路线预计完成时间推进下一等级；候选不足以达标时先改善产能，每次结果确认后重算。':'先推进等级解锁'+locked.label+'，候选按所需材料/有效等级分比较；仍遵守供电、施工、库存与建设预算。');
           }
         }
@@ -6194,17 +10498,24 @@
           `已预留感情与待产人口，床位仍余 ${committedCapacity-futureMouths}；预期人口距容量只剩 1 人时再投入扩容`:'暂未发现必须立即投入的建设'};
     if(s.digging&&Number.isFinite(s.digging.doneAt)&&buildRequests.some(r=>r.employment)&&
         !retainedMaterials&&(!first||first.priority>=24))
-      next={status:'waiting',kind:'employment',title:'等待扩层完工后补成年子女生产岗位',
+      next={status:'waiting',kind:'employment',title:'等待扩层完工后补待就业成人生产岗位',
         reason:'岗位扩建仍有实际人选；保留后续建房资金，不在下挖期间另开普通升级备料占住下一轮，供给和家庭急需仍优先'};
     if(levelWaiting&&(next.status==='none'||next.status==='blocked'&&next.reason.includes('级解锁')||
         construction.length>0&&Object.keys(demand).some(k=>m.production[k]<demand[k]*1.2-1e-9)&&
         !validShelterMaterials(campaign?.materials)&&next.project?.kind==='upgrade'&&
         !next.project.levelTarget&&next.project.priority>=30))
       next={status:'waiting',kind:'level',title:'等待现有工程及新生儿增加等级分',reason:'预计分数已足够，完成后核对等级和新建筑解锁'};
+    if(investmentReady&&!shortages.length&&!retainedFunding&&!campaign?.workshopWorkers?.length&&!campaign?.populationFamilySupply&&
+        construction.some(r=>r.type==='storage'&&r.builtAt>now)&&next.project?.priority>=24&&
+        (next.project.levelInvestment||next.project.levelTarget||next.project.type==='workshop'))
+      next={status:'waiting',kind:'level',title:'等待新仓库完工后比较下一笔等级投入',
+        reason:'新仓库尚未完工，先核对实际容量、合并与可升级房间，不在十分钟建设期间重新启动旧三级投资的工坊备料'};
     if(levelProgress?.targetLevel&&!levelWaiting&&(next.status==='none'||next.status==='waiting'&&!waiting))
       next={status:'blocked',kind:'level',title:`推进避难所 ${levelProgress.targetLevel} 级仍缺可执行增分方案`,
         reason:`当前还差 ${Math.max(0,levelProgress.targetScore-levelProgress.committed)} 分，尚无可开工的有效增产升级或有用途的新建/下挖方案；`+
           shelterPopulationAdvice(m,requestedTarget,finalLevel,campaign)+(!layout?' 布局资料不完整，需先重新读取。':'')};
+    if(!next.project&&['background-running','background-queued'].includes(levelSearch?.reason))
+      next={status:'waiting',kind:'level-planning',title:'等待后台等级路线比较',reason:'后台仍在计算；供给、防守和已有任务照常核对，完成后按当前状态重评'};
     const stopped=built.find(r=>shelterRooms[r.type][1]&&r.upgradeAt===null&&(r.incident||r.unpowered)&&m.rooms.find(row=>row.id===r.id)?.workers>0);
     if(stopped)next={status:'restore',kind:'restore',type:stopped.type,title:`恢复${labels(stopped.type)}现有产能`,
       reason:stopped.incident?'现有值班房间因事件停产，先处理事件，再按恢复后的产量决定建设':
@@ -6229,7 +10540,7 @@
       populationAdvice:shelterPopulationAdvice(m,requestedTarget,finalLevel,campaign),
       partsTarget:partsShortages.length?s.resources.parts+Math.min(...partsShortages):levelPartsProject?levelPartsProject.cost.parts+partsReserve:0,
       partsProject:[...partsChoices].sort((a,b)=>a.cost.parts-b.cost.parts||compareProjects(a,b))[0]||levelPartsProject||null,
-      notes,next,candidateTotal:candidates.length,candidates:candidates.slice(0,8)};
+      notes,next,retainedProject,levelSearch,rejectedLevel:rejectedLevel.slice(0,8),candidateTotal:candidates.length,candidates:candidates.slice(0,8)};
   }
   function validShelterDevelopmentTrace(value) {
     const amount=n=>Number.isFinite(n)&&n>=0,integer=n=>Number.isSafeInteger(n)&&n>=0;
@@ -6239,7 +10550,7 @@
       Number.isFinite(s.netScrap)&&amount(s.partsRate)&&text(s.next)&&text(s.reason)&&
       (s.route===null||objectState(s.route)&&['wait','projects'].includes(s.route.kind)&&typeof s.route.complete==='boolean'&&
         amount(s.route.hours)&&integer(s.route.score)&&(s.route.expectedAt===null||amount(s.route.expectedAt))&&
-        Array.isArray(s.route.steps)&&s.route.steps.length<=3&&s.route.steps.every(x=>objectState(x)&&text(x.title)&&
+        Array.isArray(s.route.steps)&&s.route.steps.length<=8&&s.route.steps.every(x=>objectState(x)&&text(x.title)&&
           integer(x.scrap)&&integer(x.parts)&&amount(x.startHours)&&amount(x.finishHours)&&x.finishHours>=x.startHours));
     const stage=s=>objectState(s)&&integer(s.target)&&s.target>0&&(s.finalTarget===null||integer(s.finalTarget)&&s.finalTarget>0)&&
       snapshot(s.start)&&snapshot(s.latest)&&s.target>s.start.level&&s.latest.at>=s.start.at;
@@ -6369,11 +10680,17 @@
     const type=c.kind==='dig'?c.purpose?.type:c.type;
     if(!shelterRooms[type]||!shelterBuildRules[type]||type==='power')return 0;
     const powerBlock=(c.kind==='dig'?`目标${shelterBuildRules[type][0]}：`:'')+'扩建后电力余量不足，先补发电';
-    if((c.blocks||[]).some(reason=>reason!==powerBlock))return 0;
+    const material=state.campaign?.materials;
+    const retainedSwap=c.kind==='upgrade'&&c.levelInvestment&&validShelterMaterials(material)&&
+      material.vaultNo===m.view.vaultNo&&material.id===c.id&&material.type===c.type&&
+      material.level===c.level&&material.targetLevel===c.levelTarget;
+    // 已确认工程因换位暂缓开工时仍保留原供电需求，包括最后一步刚结束但本轮候选尚带等待标记时。
+    // 否则整体分配和双人换位按不同需求互相撤销；只保留准备条件，真实开工仍受原blocks限制。
+    if((c.blocks||[]).some(reason=>reason!==powerBlock&&
+        !(retainedSwap&&reason==='先完成已确认的人员换位')))return 0;
     // 只为已具备材料、额度及其他条件的近期工程准备供电；这不授权跳过真正开工时的电力检查。
     // 下挖自身不耗电，准备的是原规划明确的下一格房间；后续建房仍另查预算与实际条件。
     if(shelterConstructionAllowance({...c,blocks:[]},m,config,state,pending,now)){
-      const material=state.campaign?.materials;
       const working=m.rooms.filter(r=>r.resource==='parts'&&r.rate>0&&state.campaign?.roles.some(role=>
         role.role==='workshop'&&role.room===r.id&&m.state.residents.some(p=>p.id===role.id&&p.roomId===r.id&&p.away===null&&p.deadAt===null)));
       // 已确认在备料的原工程也要保留供电；否则一缺件就撤发电、工程失效又撤工坊，随后反向补回。
@@ -6874,6 +11191,11 @@
         if(shelterDefenseEnabled(shelterCampaign))shelterObserveRaid(model,'shelter');
         shelterReadFailures=0;
         if (!shelterState.vaultNo) saveShelter({ ...shelterState, vaultNo:view.vaultNo });
+        try{shelterStartBackgroundPlanning(model);}catch(error){
+          if(error?.code==='shelter-state-changed')throw error;
+          shelterBackgroundPlanner?.invalidate();
+          log.add('shelter-planning','后台比较未启动，继续当前人员管理',{error:String(error?.message??error)});
+        }
         const trace=shelterState.developmentTrace,progress=shelterLevelProgress(model),finalTarget=shelterResolvedLevelTarget(model,shelterLevelTarget);
         if(progress&&!model.state.rooms.some(r=>r.incident)&&(trace===undefined||validShelterDevelopmentTrace(trace)&&
           (trace.active?trace.active.latest.level!==progress.level||trace.active.finalTarget!==finalTarget:finalTarget>progress.level))){
@@ -6904,8 +11226,13 @@
   const staffRoomTypes = ['power','diner','water','scrap'];
   const staffRoomNames = { power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍' };
   function shelterNameUnique(s,p) {
-    const normalized = name => name.normalize('NFKC').replace(/\s+/g,' ').trim();
-    return s.residents.filter(other => normalized(other.name) === normalized(p.name)).length === 1;
+    // 保留调用入口，判定改为原生列表和详情可共同核对的组合身份。
+    return Boolean(shelterResidentIdentity(s,p));
+  }
+  function shelterTrainingComplete(s,p) {
+    const room=s.rooms.find(r=>r.id===p.roomId);
+    return room?.type==='training'&&['str','per','end','cha','int','agi','lck'].includes(room.trainStat)&&
+      Number.isFinite(p.stats?.[room.trainStat])&&p.stats[room.trainStat]>=10;
   }
   function shelterGearPlan(m,pool) {
     if (!shelterGear) return null;
@@ -6997,7 +11324,7 @@
       const room = move.room === null ? null : s.rooms.find(r => r.id === move.room);
       if (!p || move.room !== null && (!room || !staffRoomTypes.includes(room.type) || room.builtAt > m.now ||
           room.incident || room.unpowered || room.upgradeAt !== null ||
-          s.residents.filter(other => other.id !== p.id && other.deadAt === null && other.adultAt <= m.now && assigned.get(other.id) === room.id).length >= room.width*2)) return null;
+          s.residents.filter(other => other.id !== p.id && other.deadAt === null && other.adultAt <= m.now && assigned.get(other.id) === room.id).length >= shelterStaffCapacity(m,room,p.id))) return null;
       const floor=Object.fromEntries(Object.keys(demand).map(k=>[k,allowShortages?Math.min(projected[k],demand[k]*1.2):demand[k]*1.2]));
       const affected=[...new Set([old,room].filter(Boolean))],before=affected.map(output);
       assigned.set(p.id,move.room);
@@ -7038,9 +11365,11 @@
   function shelterAllocationMoves(m,targets) {
     const people=targets.filter(t=>m.state.residents.some(p=>p.id===t.id&&p.roomId!==t.room));
     const assigned=new Map(m.state.residents.map(p=>[p.id,p.roomId])),visited=new Set();
+    const residents=m.state.residents.map(p=>({...p})),byId=new Map(residents.map(p=>[p.id,p]));
+    const state={...m.state,residents};
     const futureSupply=shelterAllocationFutureSupply(m);
     let attempts=0;
-    function visit(moves) {
+    function visit(moves,production) {
       if(++attempts>2000)return null;
       if(people.every(p=>assigned.get(p.id)===p.room))return moves;
       if(moves.length>=people.length*2)return null;
@@ -7051,18 +11380,102 @@
         pending.some(other=>other.id!==p.id&&other.room===assigned.get(p.id))).map(p=>({id:p.id,room:null}))];
       for(const move of options) {
         const path=[...moves,{id:move.id,room:move.room}];
-        if(!shelterSwapProjection(m,path,futureSupply,true))continue;
-        const old=assigned.get(move.id);assigned.set(move.id,move.room);
-        const result=visit(path);assigned.set(move.id,old);
+        // 已核过的前缀不从头重放；仅在私有快照上验证下一步，回溯时恢复岗位。
+        const after=shelterSwapProjection({...m,state,actualProduction:production},[move],futureSupply,true);
+        if(!after)continue;
+        const old=assigned.get(move.id);assigned.set(move.id,move.room);byId.get(move.id).roomId=move.room;
+        const result=visit(path,after);assigned.set(move.id,old);byId.get(move.id).roomId=old;
         if(result)return result;
       }
       return null;
     }
-    return visit([]);
+    return visit([],{...(m.actualProduction||m.production)});
+  }
+  function shelterGreedyAllocation(m,rooms,workers,slots,base,floors,before,maxChecks=5000) {
+    const keys=Object.keys(m.demand),resources=rooms.map(r=>shelterRooms[r.type][1]),resourceOf=j=>resources[j];
+    const left=slots.slice(),production={...base},assigned=workers.map(()=>undefined);
+    // Only the moved worker changes this tie-break count. Recounting the entire
+    // roster for every tentative move made the bounded 200-person search costly.
+    let changes=0;
+    const changed=(i,j)=>j!==undefined&&((j===null?null:rooms[j].id)!==workers[i].p.roomId);
+    const place=(i,j)=>{assigned[i]=j;changes+=Number(changed(i,j));if(j!==null){left[j]--;production[resourceOf(j)]+=workers[i].rates[j];}};
+    const unplace=i=>{const j=assigned[i];changes-=Number(changed(i,j));if(j!==null&&j!==undefined){left[j]++;production[resourceOf(j)]-=workers[i].rates[j];}assigned[i]=undefined;};
+    const scrapRate=i=>Math.max(0,...rooms.map((r,j)=>left[j]>0&&resourceOf(j)==='scrap'?workers[i].rates[j]:0));
+    // 基础供给逐项补到需求1.2倍；每次补最缺的一项，选对该项产率相对回收产率最高的人，少占回收能手。
+    for(;;){
+      const need=keys.filter(k=>production[k]<m.demand[k]*1.2-1e-9)
+        .sort((a,b)=>production[a]/Math.max(1e-9,m.demand[a])-production[b]/Math.max(1e-9,m.demand[b]));
+      let best=null;
+      for(const k of need){
+        workers.forEach((w,i)=>{
+          if(assigned[i]!==undefined)return;
+          const opportunity=scrapRate(i);
+          rooms.forEach((r,j)=>{
+            if(left[j]<=0||resourceOf(j)!==k||!(w.rates[j]>0))return;
+            const value=w.rates[j]/Math.max(1e-6,opportunity);
+            if(!best||value>best.value+1e-9||Math.abs(value-best.value)<=1e-9&&w.rates[j]>workers[best.i].rates[best.j])best={i,j,value};
+          });
+        });
+        if(best)break;
+      }
+      if(!best)break;
+      place(best.i,best.j);
+    }
+    // 其余人按回收产率从高到低进回收房，回收满员后再进收益最高的其他空位，否则休息。
+    const restRates=workers.map((w,i)=>assigned[i]===undefined?scrapRate(i):0);
+    const rest=workers.map((w,i)=>i).filter(i=>assigned[i]===undefined).sort((a,b)=>restRates[b]-restRates[a]||workers[a].p.id-workers[b].p.id);
+    for(const i of rest){
+      const open=rooms.map((r,j)=>j).filter(j=>left[j]>0&&workers[i].rates[j]>0);
+      const scrap=open.filter(j=>resourceOf(j)==='scrap'),pool=scrap.length?scrap:open;
+      place(i,pool.length?pool.reduce((a,b)=>workers[i].rates[b]>workers[i].rates[a]?b:a):null);
+    }
+    const evaluate=()=>({score:shelterAllocationScore(production,m.demand),changes});
+    const valid=()=>keys.every(k=>production[k]>=floors[k]-1e-9);
+    // 局部改善：单人改岗（含休息）或两人互换，只接受严格更好的整体评分。
+    let current=evaluate(),checks=0;
+    for(let pass=0;pass<workers.length*rooms.length&&checks<maxChecks;pass++){
+      let improved=false;
+      for(let i=0;i<workers.length&&!improved&&checks<maxChecks;i++){
+        const from=assigned[i];
+        for(const j of [...rooms.map((r,j)=>j),null]){
+          if(checks>=maxChecks)break;
+          if(j===from||j!==null&&left[j]<=0)continue;
+          checks++;
+          unplace(i);place(i,j);
+          const next=evaluate();
+          if(valid()&&shelterAllocationCompare(next,current)>1e-6){current=next;improved=true;break;}
+          unplace(i);place(i,from);
+        }
+        for(let k=i+1;k<workers.length&&!improved&&checks<maxChecks;k++){
+          const a=assigned[i],b=assigned[k];
+          if(a===b)continue;
+          checks++;
+          unplace(i);unplace(k);place(i,b);place(k,a);
+          const next=evaluate();
+          if(valid()&&shelterAllocationCompare(next,current)>1e-6){current=next;improved=true;break;}
+          unplace(i);unplace(k);place(i,a);place(k,b);
+        }
+      }
+      if(!improved)break;
+    }
+    if(!valid()||!shelterAllocationImproves(before.score,current.score))return null;
+    return {...current,localChecks:checks,production:{...production},targets:workers.map((w,i)=>({id:w.p.id,room:assigned[i]===null?null:rooms[assigned[i]].id}))};
   }
   function shelterFindAllocation(m,pool,maxNodes=50000) {
-    // 全局候选搜索有计算上限；超过规模时交回局部优化，不把未穷举称为全局最优。
-    if(!pool.length || pool.length>16)return {plan:null,complete:false,reason:pool.length?'large-roster':'no-candidates',nodes:0};
+    // 大阵容仍运行有界贪心与交换；16人仅限制指数搜索，不能跳过全部可调人员。
+    if(!pool.length)return {plan:null,complete:false,reason:'no-candidates',nodes:0};
+    // A failed search is reusable while its actual inputs are unchanged. Inventory
+    // collection and wall-clock passage do not enter this production-only search.
+    // Use current rates/availability so adulthood, completion and event boundaries
+    // invalidate it even when the underlying timestamp fields have not changed.
+    const searchKey=JSON.stringify([m.view.vaultNo,maxNodes,m.demand,m.currentDemand,m.production,m.actualProduction,
+      m.reservedResidents,m.trainingDestinations,pool.map(p=>[p.id,p.roomId,m.state.rooms.map(r=>shelterWorkerRate(m.state,m.now,m.view.env,p,r))]),
+      m.state.rooms.map(r=>[r.id,r.type,r.width,r.level,r.builtAt<=m.now,r.upgradeAt,r.incident,r.unpowered]),
+      m.state.residents.map(p=>[p.id,p.roomId,p.deadAt,p.away,p.adultAt<=m.now,
+        m.state.rooms.map(r=>shelterWorkerRate(m.state,m.now,m.view.env,p,r))])]);
+    const previous=shelterFindAllocation.lastNoPlan;
+    if(previous?.key===searchKey)return {...previous.result,nodes:0,cachedNodes:previous.result.nodes,reused:true};
+    shelterFindAllocation.lastNoPlan=null;
     const s=m.state,keys=Object.keys(m.demand),resources=[...keys,'scrap'];
     const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&r.builtAt<=m.now&&!r.incident&&!r.unpowered&&r.upgradeAt===null);
     // 某资源的全部可生产房间已满，且无人能安全离岗时，其他房间无法先补产腾位。
@@ -7070,13 +11483,13 @@
     const locked=new Set(),futureSupply=shelterAllocationFutureSupply(m);
     for(const resource of keys) {
       const same=rooms.filter(r=>shelterRooms[r.type][1]===resource),roomIds=new Set(same.map(r=>r.id));
-      if(!same.length||same.some(r=>s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length<r.width*2))continue;
+      if(!same.length||same.some(r=>s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length<shelterStaffCapacity(m,r)))continue;
       const residents=pool.filter(p=>roomIds.has(p.roomId));
       if(residents.length&&!residents.some(p=>shelterSwapProjection(m,[{id:p.id,room:null}],futureSupply,true)))residents.forEach(p=>locked.add(p.id));
     }
     const adjustable=pool.filter(p=>!locked.has(p.id)),ids=new Set(adjustable.map(p=>p.id));
     if(!adjustable.length)return {plan:null,complete:true,reason:'no-safe-sequence',nodes:0};
-    const slots=rooms.map(r=>Math.max(0,r.width*2-s.residents.filter(p=>!ids.has(p.id)&&p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length));
+    const slots=rooms.map(r=>Math.max(0,shelterStaffCapacity(m,r)-s.residents.filter(p=>!ids.has(p.id)&&p.roomId===r.id&&p.deadAt===null&&p.adultAt<=m.now).length));
     const workers=adjustable.map(p=>({p,rates:rooms.map(r=>shelterWorkerRate(s,m.now,m.view.env,p,r))}));
     workers.sort((a,b)=>Math.max(0,...b.rates)-Math.max(0,...a.rates)||a.p.id-b.p.id);
     const suffix=Array.from({length:workers.length+1},()=>Object.fromEntries(resources.map(k=>[k,0])));
@@ -7085,7 +11498,7 @@
     const before={score:shelterAllocationScore(m.production,m.demand),changes:0};
     const production=shelterProductionWithout(m,[...ids]),floors=Object.fromEntries(keys.map(k=>[k,Math.min(m.production[k],m.demand[k]*1.2)]));
     const candidates=[],assignments=[];
-    let nodes=0,limited=false;
+    let nodes=0,limited=workers.length>16;
     function visit(index,changes) {
       if(++nodes>maxNodes){limited=true;return;}
       if(keys.some(k=>production[k]+suffix[index][k]<floors[k]-1e-9))return;
@@ -7111,19 +11524,25 @@
         if(limited)break;
       }
     }
-    visit(0,0);
+    if(!limited)visit(0,0);
+    // 搜索可能在找到可执行方案前达到计算上限。另以贪心加局部交换补一个候选：先按机会成本补足基础供给，
+    // 其余人优先回收，再逐人改岗或两两互换直到不再改善；仍须满足相同供应底线、改善条件和安全调岗顺序。
+    const greedy=shelterGreedyAllocation(m,rooms,workers,slots,production,floors,before);
+    if(greedy&&!candidates.some(c=>c.targets.every((t,i)=>t.room===greedy.targets[i].room)))
+      candidates.push(greedy),candidates.sort((a,b)=>shelterAllocationCompare(b,a));
     for(const candidate of candidates) {
       const targets=candidate.targets.filter(t=>pool.some(p=>p.id===t.id&&p.roomId!==t.room)).sort((a,b)=>a.id-b.id);
       const moves=shelterAllocationMoves(m,targets);
-      if(moves)return {plan:{targets,moves,production:candidate.production},complete:!limited,nodes:Math.min(nodes,maxNodes),before:m.production,reason:'plan'};
+      if(moves)return {plan:{targets,moves,production:candidate.production},complete:!limited,nodes:Math.min(nodes,maxNodes),
+        localChecks:greedy?.localChecks??0,before:m.production,reason:'plan'};
     }
-    return {plan:null,complete:!limited,nodes:Math.min(nodes,maxNodes),reason:candidates.length?'no-safe-sequence':limited?'search-limit':'no-improvement'};
+    const result={plan:null,complete:!limited,nodes:Math.min(nodes,maxNodes),reason:candidates.length?'no-safe-sequence':limited?'search-limit':'no-improvement'};
+    shelterFindAllocation.lastNoPlan={key:searchKey,result:{...result}};return result;
   }
   function planShelterAllocation(m,pool) {
     const result=shelterFindAllocation(m,pool);
     if(!result.plan)return {plan:null,note:result.reason==='no-safe-sequence'?'找到的增产方案尚无可安全执行的调岗顺序，本轮保留原岗位。':
-      result.reason==='large-roster'?'可调动人数较多，本轮使用局部优化，尚未完成整体最优核验。':
-      result.reason==='search-limit'?'本轮比较达到计算上限，暂未找到可执行的更优分配；不代表已经最优。':
+      result.reason==='search-limit'?'本轮有界比较未找到可执行的更优分配；未穷尽全部排列，不代表已经最优。':
       result.reason==='no-candidates'?'当前没有符合调岗条件的居民。':'本轮未找到收益更高且可安全执行的人员分配。'};
     const {targets,moves}=result.plan,futureSupply=shelterAllocationFutureSupply(m),demand=futureSupply?m.currentDemand:m.demand;
     const supplyFloor=Object.fromEntries(Object.keys(demand).map(k=>[k,Math.min((m.actualProduction||m.production)[k],demand[k]*1.2)]));
@@ -7131,7 +11550,7 @@
       targets,moves,step:0,futureSupply,supplyFloor};
     saveShelter({...shelterState,swap});
     log.add('shelter-optimization','按整体产出安排人员分配',
-      {steps:moves.length,people:targets.length,searchComplete:result.complete,compared:result.nodes,before:result.before,after:result.plan.production,
+      {steps:moves.length,people:targets.length,searchComplete:result.complete,compared:result.nodes,localChecks:result.localChecks,before:result.before,after:result.plan.production,
         assignments:targets.map(t=>({id:t.id,from:swap.people.find(p=>p.id===t.id).room,to:t.room})),futureSupply,
         scrapGain:result.plan.production.scrap-m.production.scrap,
         supplyGain:Object.keys(m.demand).reduce((sum,k)=>sum+Math.max(0,m.demand[k]*1.2-m.production[k])-Math.max(0,m.demand[k]*1.2-result.plan.production[k]),0)});
@@ -7153,7 +11572,8 @@
         !(swap.futureSupply === undefined || typeof swap.futureSupply === 'boolean') ||
         !(swap.prepareFamily === undefined || Array.isArray(swap.prepareFamily) && swap.prepareFamily.length === 3 &&
           swap.prepareFamily.every(id => Number.isSafeInteger(id) && id > 0) && swap.prepareFamily[0] < swap.prepareFamily[1]) ||
-        !Array.isArray(swap.people) || (allocation ? swap.people.length<1||swap.people.length>16 : swap.people.length!==2) ||
+        // 16只限制指数搜索；全员后备生成的持久化方案须覆盖游戏上限200人。
+        !Array.isArray(swap.people) || (allocation ? swap.people.length<1||swap.people.length>200 : swap.people.length!==2) ||
         swap.people.some(p => !p || !Number.isSafeInteger(p.id) || p.id <= 0 || !validRoom(p.room)) ||
         !Array.isArray(swap.moves) || (allocation ? !validAllocation() :
           swap.people[0].id===swap.people[1].id || swap.people[1].room===null || swap.people[0].room===swap.people[1].room ||
@@ -7194,6 +11614,29 @@
     return {id:p.id,room:move.room,from:p.roomId,name:p.name,
       reason:`${allocation?'按整体产出调整岗位':swap.prepareFamily ? '为原家庭返宿舍安排接替' : swap.futureSupply ? '补足未来供应，优化满员岗位' : '优化满员岗位'}（${swap.step+1}/${swap.moves.length}）`};
   }
+  function shelterFamilySupplyPreserved(m,moves) {
+    if(!m.familySupplies?.length)return true;
+    const s=m.state,keys=Object.keys(m.demand);
+    const rows=moves.map(move=>{
+      const p=s.residents.find(p=>p.id===move.id),from=s.rooms.find(r=>r.id===p.roomId),to=s.rooms.find(r=>r.id===move.room);
+      return {id:p.id,from:from&&shelterRooms[from.type][1],to:to&&shelterRooms[to.type][1],
+        loss:from?shelterWorkerRate(s,m.now,m.view.env,p,from):0,gain:to?shelterWorkerRate(s,m.now,m.view.env,p,to):0};
+    });
+    const after=supply=>{
+      const output={...supply.production};
+      for(const row of rows)if(!supply.reservedResidents?.includes(row.id)){
+        if(row.from)output[row.from]-=row.loss;if(row.to)output[row.to]+=row.gain;
+      }
+      return output;
+    };
+    const own=after(m);
+    // 一步可完成当前家庭供给时允许取舍；未完成的局部准备不能与另一家庭互相撤销。
+    if(keys.every(k=>own[k]>=m.demand[k]*1.2-1e-9))return true;
+    return m.familySupplies.every(supply=>{
+      const output=after(supply);
+      return keys.every(k=>output[k]>=Math.min(supply.production[k],supply.demand[k]*1.2)-1e-9);
+    });
+  }
   function planShelterSwap(m,pool,preview=false) {
     const keys = Object.keys(m.demand), futureSupply = Boolean(m.currentDemand && keys.some(key => m.production[key] < m.demand[key]*1.2-1e-9));
     const demand = futureSupply ? m.currentDemand : m.demand;
@@ -7224,6 +11667,9 @@
       const after = Object.fromEntries(keys.map(key => [key,m.production[key]+change[key]])), supplyGain = beforeGap-gap(after);
       if (futureSupply ? supplyGain <= 1e-6 : !(scrap > 1 || Math.abs(scrap) < 1e-6 && basic > 1)) continue;
       if (!keys.every(key => after[key] >= (futureSupply ? Math.min(m.production[key],m.demand[key]*1.2) : m.demand[key]*1.2)-1e-9)) continue;
+      // 尚不能让本家庭真正返宿舍的局部接替，不得撤销另一待返家庭已有的供应准备。
+      // 否则两对缺食物的父母会互换净水岗位，双方都没有出生进展；能一次补齐本家庭时仍允许取舍。
+      if(!shelterFamilySupplyPreserved(m,[{id:a.id,room:b.roomId},{id:b.id,room:a.roomId}]))continue;
       const people = [a,b].map(p => ({id:p.id,room:p.roomId}));
       for (const moves of shelterSwapSequences(...people)) {
         if (!shelterSwapProjection(m,moves,futureSupply)) continue;
@@ -7302,9 +11748,60 @@
     return {production:projected,demand,reservedResidents:[...absent],
       allowed:future <= budget.limit && Object.keys(demand).every(k => m.state.resources[k] >= demand[k]*2)};
   }
-  function shelterPopulationPreparation(m,families) {
+  function populationPairingContext(m,families,eligible) {
+    const s=m.state;
+    const roomReady=r=>r?.type==='quarters'&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
+      !s.births.some(b=>b.roomId===r.id)&&!s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id);
+    const replaceable=new Set(families.filter(f=>roomReady(s.rooms.find(r=>r.id===f.room))&&
+      [f.a,f.b].every(id=>s.residents.some(p=>p.id===id))&&
+      !s.residents.some(p=>[f.a,f.b].includes(p.id)&&p.romance||p.romance&&[f.a,f.b].includes(p.romance.partnerId))&&
+      !shelterFamilyExpecting(s,f.a,f.b)));
+    const rooms=s.rooms.filter(r=>roomReady(r)&&families.filter(f=>f.room===r.id).every(f=>replaceable.has(f)))
+      .sort((a,b)=>Number(families.some(f=>f.room===a.id))-Number(families.some(f=>f.room===b.id))||a.id-b.id);
+    const candidates=s.residents.filter(p=>eligible(p)&&p.happiness>=50&&
+      (p.roomId===null||s.rooms.some(r=>r.id===p.roomId&&staffRoomTypes.includes(r.type)))&&
+      !p.romance&&!(p.familyCooldownUntil>m.now)&&!s.births.some(b=>shelterBirthParents(s,b)?.includes(p.id))&&
+      !families.some(f=>[f.a,f.b].includes(p.id)&&!replaceable.has(f))).sort((a,b)=>a.id-b.id);
+    return {replaceable,rooms,candidates,unrelated:populationKinship(s)};
+  }
+  function populationPairingChoice(m,families,context,pair,assessment,reconsider=false) {
+    return context.rooms.map(room=>({room,replacedFamilies:families.filter(f=>f.room===room.id||[f.a,f.b].some(id=>pair.some(p=>p.id===id)))}))
+      .find(c=>(!reconsider||c.replacedFamilies.length)&&c.replacedFamilies.every(f=>{
+        const previous=shelterParentAssessment(m,[f.a,f.b].map(id=>m.state.residents.find(p=>p.id===id)));
+        // 与实际配对共用20%换届门槛，备供给不能为无法执行的替换预支。
+        return context.replaceable.has(f)&&previous&&assessment.score>previous.score*1.2+1e-6;
+      }));
+  }
+  function shelterPopulationPreparation(m,families,campaign=null) {
     const budget=populationBudget(m,families);
-    return budget.future+(budget.future===budget.living+budget.recovering&&budget.future<budget.limit?1:0);
+    if(budget.future>=budget.limit)return budget.future;
+    if(budget.future===budget.living+budget.recovering)return budget.future+1;
+    if(shelterStaffHold||shelterPending||shelterState.pair||campaign?.defense?.busy)return budget.future;
+    // 一位家长已回宿舍或两人正在等网站确认时，先完成该预约。
+    // 不能提前为下一对增加口粮门槛，反过来阻塞当前第二位家长返岗。
+    if(families.some(f=>budget.reserved.has(familyKey(f.a,f.b))&&[f.a,f.b].some(id=>
+      m.state.residents.some(p=>p.id===id&&(p.roomId!==f.room||!p.romance)))))return budget.future;
+    // 已出生成人先落实就业，再为预约之外的一对备供给；避免补岗过程中反复改换原工程备料。
+    if(shelterDormWorkers(m,campaign||{}).length)return budget.future;
+    const s=m.state,reserved=new Set([...(campaign?.reserved||[]),...(campaign?.dailyReserved||[]),
+      ...[...budget.reserved.values()].flat(),...(shelterState.swap?.people||[]).map(p=>p.id)]);
+    const context=populationPairingContext(m,families,p=>{
+      const r=s.rooms.find(r=>r.id===p.roomId),health=shelterHealth(p);
+      return p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&health?.hp>=.6*health?.max&&
+        !reserved.has(p.id)&&shelterNameUnique(s,p)&&
+        (p.roomId===null||r&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered);
+    });
+    if(!context.rooms.length)return budget.future;
+    const {candidates,unrelated}=context;
+    for(let i=0;i<candidates.length;i++)for(let j=i+1;j<candidates.length;j++){
+      const pair=[candidates[i],candidates[j]],key=familyKey(pair[0].id,pair[1].id);
+      if(!unrelated(...pair)||(shelterState.pairBlocks||[]).some(b=>b.until>Date.now()&&familyKey(b.a,b.b)===key))continue;
+      const old=families.find(f=>familyKey(f.a,f.b)===key);
+      const assessment=shelterParentAssessment(m,pair);
+      if(old&&context.rooms.some(r=>r.id===old.room)||assessment&&populationPairingChoice(m,families,context,pair,assessment))
+        return budget.future+1;
+    }
+    return budget.future;
   }
   function populationCanHouse(m,families,pair) {
     const supply = populationHousingSupply(m,families,pair);
@@ -7323,6 +11820,7 @@
           if(p.deadAt!==null)reasons.push(`${p.name}倒下`);
           if(p.adultAt>m.now)reasons.push(`${p.name}尚未成年`);
           if(!health||health.hp<.6*health.max)reasons.push(`${p.name}健康未达到调岗条件`);
+          if(!shelterResidentIdentity(s,p))reasons.push(`${p.name}（${p.id}）姓名、等级、属性及房间不能唯一定位`);
           if(p.happiness<50)reasons.push(`${p.name}心情${p.happiness}，需至少50`);
           if(cooldown)reasons.push(`${p.name}生育冷却约${cooldown}分钟`);
           if(reserved.has(p.id))reasons.push(`${p.name}由其他自动任务预留`);
@@ -7359,15 +11857,26 @@
   }
   function shelterDormWorkers(m,campaign) {
     if(shelterStaffMode==='off'||shelterStaffHold||campaign.defense?.busy)return [];
-    const s=m.state,reserved=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[])]);
-    return s.residents.filter(p=>p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&!reserved.has(p.id)&&
-      !p.romance&&!p.familyCooldownUntil&&p.parents?.length===2&&p.parents.every(Number.isSafeInteger)&&
+    const s=m.state,families=shelterState.families||[],reserved=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[])]);
+    const expecting=new Set(s.births.flatMap(b=>shelterBirthParents(s,b)||[]));
+    const unknownRooms=new Set(s.births.filter(b=>!shelterBirthParents(s,b)).map(b=>b.roomId));
+    for(const f of families)if(unknownRooms.has(f.room)){reserved.add(f.a);reserved.add(f.b);}
+    const population=s.residents.filter(p=>p.deadAt===null).length+s.births.length+shelterRecoveringPopulation(s);
+    const limit=shelterStaffMode==='population'?Math.min(shelterPopulationTarget??0,m.populationCap):m.populationCap;
+    const dormRooms=new Set(s.rooms.filter(r=>r.type==='quarters'&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered).map(r=>r.id));
+    return s.residents.filter(p=>dormRooms.has(p.roomId)&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&!reserved.has(p.id)&&
+      (!p.romance||expecting.has(p.id))&&
       shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&typeof p.name==='string'&&shelterNameUnique(s,p)&&
-      !(shelterState.families||[]).some(f=>[f.a,f.b].includes(p.id))&&
-      !s.residents.some(child=>child.parents?.includes(p.id))&&
-      !s.births.some(b=>b.roomId===p.roomId&&!shelterBirthParents(s,b))&&
-      s.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered))
+      // 家庭关系保留，不等于终身排除就业；已确认待产或冷却中的父母也需要真实岗位。
+      (!families.some(f=>[f.a,f.b].includes(p.id))||expecting.has(p.id)||p.familyCooldownUntil>m.now||population>=limit)&&
+      !unknownRooms.has(p.roomId))
       .map(p=>p.id);
+  }
+  function shelterRestingWorkers(m,campaign) {
+    if(shelterStaffMode==='off'||shelterStaffHold||campaign.defense?.busy)return [];
+    return m.state.residents.filter(p=>p.roomId===null&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&!p.romance&&
+      !campaign.reserved?.includes(p.id)&&!campaign.dailyReserved?.includes(p.id)&&
+      shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&typeof p.name==='string'&&shelterNameUnique(m.state,p)).map(p=>p.id);
   }
   function shelterWorkshopPreparation(m,campaign,original) {
     if(!original||original.kind!=='upgrade'||original.type==='workshop'||original.blocks.length||original.priority<20||original.priority>=70||
@@ -7379,7 +11888,8 @@
     // 人口模式先完成本阶段人口和成年子女就业，再把富余建设资金用于备料提速。
     // 早期口粮/岗位与工坊共用预算，单个项目省时不能以延后人口生产力为代价。
     if(shelterStaffMode==='population'&&(s.residents.filter(p=>p.deadAt===null).length<shelterPopulationTarget||
-        s.births.length||s.residents.some(p=>p.deadAt===null&&p.adultAt>m.now)||campaign.unemployedResidents?.length))return null;
+        s.births.length||s.residents.some(p=>p.deadAt===null&&p.adultAt>m.now)||
+        campaign.unemployedResidents?.length||campaign.restingResidents?.length))return null;
     if(!original.cost.parts||s.resources.parts>=target.parts||!(m.production.parts>0))return null;
     const baseline=shelterMaterialForecast(m)(target).hours;
     if(baseline===null||baseline<=1/6)return null;
@@ -7483,7 +11993,16 @@
     return {original,project,workers,powerReserve:1+originalPower,baselineHours:baseline,totalHours:stock.hours,savedHours:baseline-stock.hours};
   }
   function shelterConstructionPowerPreparation(m,campaign) {
-    if(shelterStaffMode==='off'||shelterStaffHold||shelterState.pair||shelterState.swap||campaign.defense?.busy)return null;
+    const material=campaign.materials;
+    // 普通换位不取消已经确认的补电工程，否则下一步跳回缺电的原工程，
+    // 零件目标归零撤掉工坊，供电需求改变又取消换位，随后重复招回工人。
+    // 仅接续同账号、同等级目标、同房间的原电站升级；家庭换位和新工程仍等待。
+    const retainedPower=campaign.levelInvestmentSwap&&validShelterMaterials(material)&&
+      material.vaultNo===m.view.vaultNo&&material.type==='power'&&
+      material.finalTarget===shelterResolvedLevelTarget(m,shelterLevelTarget)&&
+      material.targetLevel===Math.min(material.finalTarget,m.view.progress.level+1)&&
+      m.state.rooms.some(r=>r.id===material.id&&r.type===material.type&&r.level+1===material.level);
+    if(shelterStaffMode==='off'||shelterStaffHold||shelterState.pair||shelterState.swap&&!retainedPower||campaign.defense?.busy)return null;
     const s=m.state,active=r=>r&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
     const rooms=s.rooms.filter(r=>r.type==='power');
     // 空岗交给现有人员规划；已开工发电先等结果，不重复建房。
@@ -7511,22 +12030,25 @@
     }
     return donors.length||rooms.some(r=>active(r)&&r.level<3)?{extra,donors}:null;
   }
-  function shelterPopulationFamilySupply(m,campaign) {
-    if(shelterStaffMode!=='population'||shelterStaffHold||shelterState.pair||shelterState.swap||campaign.defense?.busy)return null;
-    const s=m.state,families=shelterState.families||[],reserved=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[])]);
+  function shelterPopulationFamilySupplyContext(m,campaign,policy={shelterStaffMode,shelterStaffHold,shelterState,shelterPopulationTarget}) {
+    const {shelterStaffMode:mode,shelterStaffHold:held,shelterState:state,shelterPopulationTarget:target}=policy;
+    if(mode!=='population'||held||state.pair||state.swap||campaign.defense?.busy)return null;
+    const s=m.state,families=state.families||[],reserved=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[])]);
     const home=p=>p&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now;
     const active=r=>r&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-    // 与普通人员管理一致：生产/闲置成人、冷却中的父母及未成家的成年子女可调；手动特殊岗位保持。
+    // 训练属性已满的居民也可接替；历史手动安排不应把无收益训练永久锁住。
     const population=s.residents.filter(p=>p.deadAt===null).length+s.births.length+shelterRecoveringPopulation(s);
+    if(population>=Math.min(target??0,m.populationCap))return null;
     const managed=p=>{
       const room=s.rooms.find(r=>r.id===p.roomId);
       if(p.roomId===null)return true;
       if(!active(room))return false;
       if(staffRoomTypes.includes(room.type))return true;
+      if(shelterTrainingComplete(s,p))return true;
       if(room.type!=='quarters'||s.births.some(b=>b.roomId===room.id&&!shelterBirthParents(s,b)))return false;
       if(s.births.some(b=>(shelterBirthParents(s,b)||[]).includes(p.id)))return true;
       const f=families.find(f=>[f.a,f.b].includes(p.id));
-      if(f?.room===room.id)return p.familyCooldownUntil>m.now||population>=Math.min(shelterPopulationTarget,m.populationCap);
+      if(f?.room===room.id)return p.familyCooldownUntil>m.now||population>=Math.min(target,m.populationCap);
       return p.parents?.length===2&&!s.residents.some(child=>child.parents?.includes(p.id))&&!p.familyCooldownUntil;
     };
     const available=p=>home(p)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&
@@ -7540,6 +12062,13 @@
           p.happiness>=50&&!p.romance&&!(p.familyCooldownUntil>m.now)&&(p.roomId===f.room||available(p)))&&
         pair.some(p=>p.roomId!==f.room)&&!s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===f.room&&![f.a,f.b].includes(p.id));
     });
+    return ready.length?{s,families,home,active,available,ready}:null;
+  }
+  function shelterPopulationFamilySupply(m,campaign) {
+    const context=shelterPopulationFamilySupplyContext(m,campaign);
+    if(!context)return null;
+    const {s,families,home,active,available,ready}=context;
+    const familySupplies=ready.map(f=>populationHousingSupply(m,families,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)))).filter(supply=>supply.allowed);
     let selected=null;
     for(const f of ready){
       const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)),supply=populationHousingSupply(m,families,pair);
@@ -7547,7 +12076,7 @@
       // 先恢复现有供应。家庭扩产只处理当前够用、两人离岗后接替容量不足的断点。
       if(!Object.keys(supply.demand).every(k=>m.production[k]>=supply.demand[k]*1.2-1e-9))continue;
       const absent=new Set(supply.reservedResidents),pool=s.residents.filter(p=>available(p)&&!absent.has(p.id));
-      const model={...m,...supply,currentDemand:m.demand,actualProduction:m.production};
+      const model={...m,...supply,currentDemand:m.demand,actualProduction:m.production,familySupplies};
       let preparationPossible;
       const canPrepare=()=>{
         if(preparationPossible!==undefined)return preparationPossible;
@@ -7560,6 +12089,7 @@
             const after=shelterProductionWithout(model,[p.id]),gain=shelterWorkerRate(s,m.now,m.view.env,p,r);
             if(!(gain-(supply.production[resource]-after[resource])>1&&shelterDepartureSafe(m,[p.id])&&
                 Object.keys(supply.demand).every(k=>after[k]>=Math.min(supply.production[k],supply.demand[k]*1.2)-1e-9)))continue;
+            if(!shelterFamilySupplyPreserved(model,[{id:p.id,room:r.id}]))continue;
             if(resource!=='scrap')return preparationPossible=true;
             // 填回收空岗本身不补口粮；只有此步确实打开后续安全接替时，才暂缓家庭扩产。
             // 例如宿舍成年子女先就业后可参与满员换位。预览不调岗、不保存计划。
@@ -7567,7 +12097,8 @@
             if(!s.rooms.some(room=>room.id===p.roomId&&room.type==='quarters'))continue;
             const next=shelterModel({...m.view,state:{...s,residents:s.residents.map(other=>other.id===p.id?{...other,roomId:r.id}:other)}});
             const nextSupply=populationHousingSupply(next,families,pair);
-            if(planShelterSwap({...next,...nextSupply,currentDemand:next.demand,actualProduction:next.production},
+            const nextFamilies=ready.map(f=>populationHousingSupply(next,families,[f.a,f.b].map(id=>next.state.residents.find(p=>p.id===id)))).filter(supply=>supply.allowed);
+            if(planShelterSwap({...next,...nextSupply,currentDemand:next.demand,actualProduction:next.production,familySupplies:nextFamilies},
                 next.state.residents.filter(available),true))return preparationPossible=true;
           }
         }
@@ -7751,19 +12282,9 @@
     if (budget.future >= budget.limit) { shelterPopulationNote+='已有名额达到当前目标或已建床位上限，暂缓新增生育。'; return null; }
     // 历史亲缘仍由 residents.parents 保留；家庭记录只表示本轮生育安排，不永久占用空宿舍。
     // 已有成人入住、感情、待产（含父母不明）时不换人，也不挪走人工放入宿舍的居民。
-    const replaceable=new Set(families.filter(f=>roomReady(s.rooms.find(r=>r.id===f.room),[])&&
-      [f.a,f.b].every(id=>s.residents.some(p=>p.id===id))&&
-      !s.residents.some(p=>[f.a,f.b].includes(p.id)&&p.romance||p.romance&&[f.a,f.b].includes(p.romance.partnerId))&&
-      !shelterFamilyExpecting(s,f.a,f.b)));
-    const rooms = s.rooms.filter(r => roomReady(r,[]) && families.filter(f=>f.room===r.id).every(f=>replaceable.has(f)))
-      .sort((a,b)=>Number(families.some(f=>f.room===a.id))-Number(families.some(f=>f.room===b.id))||a.id-b.id);
+    const pairing=populationPairingContext(m,families,eligible),{rooms,candidates,unrelated}=pairing;
     if (!rooms.length) { shelterPopulationNote+='暂无可重新安排的空宿舍；已入住成人、感情及待产仍保留。'; return null; }
     // 原生居民详情明确要求双方心情 >= 50；不能先调离生产，再等无效配对超时。
-    const unrelated = populationKinship(s), candidates = s.residents.filter(p => eligible(p) && p.happiness >= 50 &&
-      (p.roomId === null || s.rooms.some(r => r.id === p.roomId && staffRoomTypes.includes(r.type))) &&
-      !p.romance&&!(p.familyCooldownUntil > m.now)&&!s.births.some(b=>shelterBirthParents(s,b)?.includes(p.id))&&
-      !families.some(f => [f.a,f.b].includes(p.id)&&!replaceable.has(f)))
-      .sort((a,b) => a.id-b.id);
     const loss = pair => {
       // 人选排序同样比较两人离岗后的实际产量；容量外驻留和接替者不能按个人理论产量计损失。
       const projected=shelterProductionWithout(m,pair.map(p=>p.id));
@@ -7779,12 +12300,7 @@
       const first=pair.find(p=>shelterDepartureSafe(m,[p.id]));if(!first)continue;
       const score = loss(pair),assessment=shelterParentAssessment(m,pair);
       if(!assessment)continue;
-      const options=rooms.map(room=>({room,replacedFamilies:families.filter(f=>f.room===room.id||[f.a,f.b].some(id=>pair.some(p=>p.id===id)))}));
-      const choice=options.find(c=>(!reconsider||c.replacedFamilies.length)&&c.replacedFamilies.every(f=>{
-        const previous=shelterParentAssessment(m,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)));
-        // 20% 为换届稳定阈值，不是游戏规则；微小产速/心情变化不能反复拆换原配对。
-        return replaceable.has(f)&&previous&&assessment.score>previous.score*1.2+1e-6;
-      }));
+      const choice=populationPairingChoice(m,families,pairing,pair,assessment,reconsider);
       if(!choice)continue;
       if (!best || assessment.score>best.assessment.score+1e-6 || Math.abs(assessment.score-best.assessment.score)<1e-6&&
           (score.idle > best.score.idle || score.idle === best.score.idle &&
@@ -7805,8 +12321,14 @@
   }
   function shelterStaffPlan(m,skippedFamilies = []) {
     if (shelterStaffMode === 'off' || shelterStaffHold) return null;
-    const s = m.state;
+    const s = m.state,planningModel=m;
+    // The input roster is not mutated during one decision. Normalize once here;
+    // the next call, DOM identity check and submission still read fresh values.
+    const identityNames=new Map(s.residents.map(p=>[p,typeof p.name==='string'?p.name.normalize('NFKC').replace(/\s+/g,' ').trim():'']));
+    const identityChecks=new Map();
     const campaign=shelterCampaignSchedule(m),campaignReserved=new Set(campaign.reserved);
+    if(campaign.familySupplyPlanning)return null;
+    m={...m,trainingDestinations:campaign.trainingDestinations||[]};
     const dailySupply=shelterGrowthNeeds(m).demand;
     // 日目标保留的人手也约束普通调岗，避免刚补餐厅又被产废料优化调走；基础供应不足时先救供应。
     if(Object.keys(dailySupply).every(k=>m.production[k]>=dailySupply[k]*1.2-1e-9))
@@ -7835,17 +12357,19 @@
     const recovering = shelterRecoveringPopulation(s);
     const population = s.residents.filter(p => p.deadAt === null).length+s.births.length+recovering;
     const eligible = p => {
-      if (campaignReserved.has(p.id) || !home(p) || !healthy(p) || romanceResidents.has(p.id) || unknownBirthRooms.has(p.roomId) || protectedParent(p) ||
-          !shelterNameUnique(s,p)) return false;
+      if (campaignReserved.has(p.id) || !home(p) || !healthy(p) || romanceResidents.has(p.id) || unknownBirthRooms.has(p.roomId) || protectedParent(p)) return false;
+      if(!identityChecks.has(p))identityChecks.set(p,Boolean(shelterResidentIdentity(s,p,identityNames)));
+      if(!identityChecks.get(p))return false;
       const old = byRoom(p.roomId);
       if (old?.incident || old?.upgradeAt != null || old && old.builtAt > m.now) return false;
       if (p.roomId === null || old && staffRoomTypes.includes(old.type)) return true;
+      if (shelterTrainingComplete(s,p)) return true;
       if (old?.type !== 'quarters') return false;
       if (expecting.has(p.id)) return true;
       const f = familyOf(p);
       if (f && f.room === old.id) return p.familyCooldownUntil > m.now || population >= (populationMode ? Math.min(shelterPopulationTarget,m.populationCap) : m.populationCap);
-      // 只接管尚未组建家庭的成年子女；不拆散玩家放进宿舍的其他成人。
-      return p.parents.length === 2 && !s.residents.some(child => child.parents.includes(p.id)) && !p.familyCooldownUntil;
+      // 历史手动住宿不是永久岗位；真实感情、待产及已预约家庭已在上面保护。
+      return true;
     };
     if (populationMode && shelterState.pair) {
       const next = shelterPopulationPlan(m,families,{eligible,home,healthy});
@@ -7858,7 +12382,7 @@
       if(next||shelterStaffHold||shelterState.pair)return next;
     }
     const pool = s.residents.filter(p => eligible(p) && !(populationMode && shelterState.pair && [shelterState.pair.a,shelterState.pair.b].includes(p.id)));
-    const future = populationMode ? shelterPopulationPreparation(m,families) : 0;
+    const future = populationMode ? shelterPopulationPreparation(m,families,campaign) : 0;
     const readyFamilies = families.filter(f => {
       const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id)), room = byRoom(f.room);
       return room?.type === 'quarters' && room.builtAt <= m.now && room.upgradeAt === null && !room.incident && !room.unpowered &&
@@ -7866,7 +12390,7 @@
           (p.roomId === room.id || eligible(p))) &&
         !s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === room.id && ![f.a,f.b].includes(p.id));
     });
-    const recoveryDemand = shelterGrowthNeeds(m).demand;
+    const recoveryDemand = shelterGrowthNeeds(m,populationMode?campaign.populationPreparation:null,shelterPopulationTarget).demand;
     const constructionProject=!campaign.defense?.busy&&(shelterConstruction.build||shelterConstruction.upgrade||shelterConstruction.dig)?
       shelterDevelopmentPlan(m,shelterPopulationTarget,campaign,shelterLevelTarget).next.project:null;
     const workshopPreparation=campaign.workshopPreparation?.project===constructionProject?campaign.workshopPreparation:null;
@@ -7894,7 +12418,8 @@
     if (skippedFamilies.length && !preparation) return null;
     const staffDemand = preparation?.demand || baseDemand;
     const staffModel = {...m,demand:staffDemand,currentDemand:m.demand,
-      ...(preparation ? {...preparation,actualProduction:m.production} : {})};
+      ...(preparation ? {...preparation,actualProduction:m.production,familySupplies:readyFamilies.map(f=>
+        populationHousingSupply(m,families,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)))).filter(supply=>supply.allowed)} : {})};
     const supplyProduction = staffModel.production;
     const staffPool = preparation ? pool.filter(p => !preparation.reservedResidents.includes(p.id)) : pool;
     if (preparation) shelterPopulationNote = '原家庭正准备返宿舍：先按两人离岗后的产量安排接替，供应和名额重新核对通过后再返回。';
@@ -7926,12 +12451,15 @@
         (!preparation || shelterDepartureSafe(m,[p.id]));
     };
     const targets = s.rooms.filter(r => staffRoomTypes.includes(r.type) && r.builtAt <= m.now &&
-      !r.incident && !r.unpowered && r.upgradeAt === null && occupancy(r.id) < r.width*2);
-    const choices = (rooms,reason) => rooms.flatMap(r => staffPool.filter(p => p.roomId !== r.id && safeDonor(p)).map(p => {
+      !r.incident && !r.unpowered && r.upgradeAt === null && occupancy(r.id) < shelterStaffCapacity(m,r));
+    const choices = (rooms,reason,allowProductionLoss=false) => rooms.flatMap(r => staffPool.filter(p => p.roomId !== r.id && safeDonor(p)).map(p => {
       const old = byRoom(p.roomId), resource = shelterRooms[r.type][1];
-      const gain = rate(p,r)-(old && shelterRooms[old.type][1] === resource ? departureLoss(p) : 0);
+      const output=rate(p,r);
+      if(allowProductionLoss&&output<=0)return null;
+      const gain = output-(old && shelterRooms[old.type][1] === resource ? departureLoss(p) : 0);
+      if(!shelterFamilySupplyPreserved(staffModel,[{id:p.id,room:r.id}]))return null;
       return {id:p.id,room:r.id,from:p.roomId,reason,gain,name:p.name};
-    })).filter(c => c.gain > 1).sort((a,b) => b.gain-a.gain || a.id-b.id || a.room-b.room);
+    })).filter(c => c&&(allowProductionLoss||c.gain > 1)).sort((a,b) => b.gain-a.gain || a.id-b.id || a.room-b.room);
     const shortages = Object.keys(staffDemand).filter(k => supplyProduction[k] < staffDemand[k]*1.2-1e-9)
       .sort((a,b) => m.state.resources[a]/Math.max(1,staffDemand[a])-m.state.resources[b]/Math.max(1,staffDemand[b]));
     for (const resource of shortages) {
@@ -7971,7 +12499,9 @@
       if (planShelterSwap(staffModel,pool)) return shelterSwapStep(staffModel,eligible);
       // 一对暂时无法接替时，继续检查其他原家庭；不让第一对阻塞全部生育轮换。
       const note = shelterPopulationNote;
-      const next = shelterStaffPlan(m,[...skippedFamilies,familyKey(preparation.prepareFamily[0],preparation.prepareFamily[1])]);
+      // 递归检查另一家庭时复用原始只读快照。附加训练预留的局部模型不作为新的
+      // campaign输入，避免同一居民/库存状态重复做整套供给搜索；状态变化仍由原缓存键失效。
+      const next = shelterStaffPlan(planningModel,[...skippedFamilies,familyKey(preparation.prepareFamily[0],preparation.prepareFamily[1])]);
       if (next || shelterStaffHold) return next;
       shelterPopulationNote = note;
     }
@@ -7982,9 +12512,26 @@
         handoff&&constructionProject?.id===handoff.id&&
         constructionProject.type===handoff.type&&constructionProject.level===handoff.level)&&
         !shelterConstructionAllowance(constructionProject,m,shelterConstruction,shelterState,shelterPending,Date.now())){
+      // 闲置成人直接进入现成回收空岗不减少任何原岗位供应，也不需要临时腾位。
+      // 仅补已有生产者的回收房；空站首次上工会新增升级候选，仍先开工再重评。
+      // 已确认工坊交接和原生产者换位也不插队。
+      const idleJob=constructionProject?.levelInvestment&&!handoff&&
+        choices(targets.filter(r=>r.type==='scrap'&&s.residents.some(p=>p.roomId===r.id&&home(p)&&rate(p,r)>0)),
+          '等级开工前先让闲置成人接现有回收空岗').find(c=>c.from===null);
+      if(idleJob)return idleJob;
       shelterStaffNote='建设材料与供给已核对，先完成本项开工，再按实际施工状态优化岗位。';return null;
     }
     const material=shelterState.campaign?.materials,project=workshopPreparation?.original||constructionProject;
+    if(!shortages.length&&!preparation&&shelterConstruction.upgrade&&!shelterPending&&project?.requiresStaff&&
+        validShelterMaterials(material)&&material.vaultNo===m.view.vaultNo&&material.id===project.id&&
+        material.type===project.type&&material.level===project.level&&
+        ['scrap','parts'].every(k=>project.cost[k]<=shelterConstruction[`${k}Limit`])){
+      const destination=targets.find(r=>r.id===project.id);
+      // 恢复已确认工程可暂时降低同资源产出；按最小损失选人，仍须真实正产能和原供给安全。
+      const replacement=destination&&choices([destination],'为已确认原工程恢复生产者，实际到岗后重新核对备料与开工',true)[0];
+      if(replacement)return replacement;
+      shelterStaffNote='原工程缺少可安全接岗的生产者，保留缺项，等待实际人手；不按空房产能开工。';return null;
+    }
     const projectWorkers=!preparation&&shelterConstruction.upgrade&&!shelterPending&&
       project?.kind==='upgrade'&&staffRoomTypes.includes(project.type)&&project.blocks.every(reason=>
         ['先等一个施工名额空出','扩建后电力余量不足，先补发电'].includes(reason))&&
@@ -8016,8 +12563,24 @@
     const dormJobs=scrapChoices.filter(c=>byRoom(c.from)?.type==='quarters'&&(campaign.unemployedResidents.includes(c.id)||
       families.some(f=>f.room===c.from&&[f.a,f.b].includes(c.id))&&s.residents.find(p=>p.id===c.id).familyCooldownUntil>m.now));
     // 成年子女需要长期岗位，也应先腾出父母宿舍；临时冷却父母使用余下空位，不抢占子女就业顺序。
-    const dormJob=!preparation&&(dormJobs.find(c=>campaign.unemployedResidents.includes(c.id))||dormJobs[0]);
+    const dormJob=!preparation&&(dormJobs.find(c=>campaign.unemployedResidents.includes(c.id)&&
+      !families.some(f=>[f.a,f.b].includes(c.id)))||dormJobs[0]);
     if(dormJob)return {...dormJob,reason:'宿舍待就业成人直接接现有生产空岗，冷却不需要留在宿舍'};
+    // 休息区成人同样先接可立即增产的空岗；不必等整组换位才开始生产。
+    // 沿用真实容量、预留和供给检查；已有换位及工程交接已在前面接续。
+    const idleJob=!preparation&&scrapChoices.find(c=>c.from===null);
+    if(idleJob)return {...idleJob,reason:'休息区待就业成人直接接现有生产空岗'};
+    // 电站升级已可支付且正为下一工程补电时，先实际开工再做普通增产换位。
+    // 否则换位期间暂停工程准备会把目标改回缺电项目，需求门槛随之改变并取消刚开始的换位。
+    if(!preparation&&campaign.powerPreparation?.extra>0&&constructionProject?.kind==='upgrade'&&
+        constructionProject.type==='power'&&
+        !shelterConstructionAllowance(constructionProject,m,shelterConstruction,shelterState,shelterPending,Date.now()))return null;
+    // Only a freshly admitted ordinary assignment can use a background proposal.
+    // Existing returns, defense, family preparation and construction handoffs keep their checks above.
+    if(!preparation&&typeof shelterBackgroundAssignment==='function'){
+      const proposed=shelterBackgroundAssignment(m,scrapChoices);
+      if(proposed)return proposed;
+    }
     const allocation=!preparation&&shelterOptimize?planShelterAllocation(staffModel,growthPool):null;
     if(allocation?.plan)return shelterSwapStep(staffModel,eligible);
     const scrap=!preparation&&populationMode? scrapChoices.find(c=>c.gain===bestScrap?.gain&&campaign.unemployedResidents.includes(c.id))||bestScrap:bestScrap;
@@ -8097,7 +12660,26 @@
   function shelterWorkTitle(dialog,work = shelterWork) {
     if (!work) return false;
     const name = work.name.normalize('NFKC').replace(/\s+/g,' ').trim(), title = textOf(dialog?.querySelector('h2'));
-    return title.startsWith(`${name} · `) && /^\d+ 级$/.test(title.slice(name.length+3));
+    if(!title.startsWith(`${name} · `)||!/^\d+ 级$/.test(title.slice(name.length+3)))return false;
+    const proof=work.identity;
+    // 已提交后仅关闭同一DOM窗口；此时居民可因调岗结算升级或改变房间。
+    if(work.submitted)return dialog===work.dialog;
+    if(!proof||title!==`${proof.name} · ${proof.level} 级`)return false;
+    if(proof.fields.includes('stats')){
+      const items=[...(dialog.querySelector('ul[aria-label="属性"]')?.children||[])],labels=['力量','感知','耐力','魅力','智力','敏捷','幸运'];
+      if(items.length!==7||labels.some((label,i)=>{
+        const found=items.filter(li=>new RegExp(`^${label}\\s*\\d+(?:\\s*\\+\\s*\\d+)?$`).test(textOf(li)));
+        return found.length!==1||Number(textOf(found[0]).slice(label.length).match(/^\s*(\d+)/)?.[1])!==proof.stats[i];
+      }))return false;
+    }
+    if(proof.fields.includes('location')){
+      const descriptions=[...dialog.querySelectorAll('p')].map(textOf);
+      for(const id of (dialog.getAttribute('aria-describedby')||'').split(/\s+/)){
+        const el=id&&document.getElementById(id);if(el&&dialog.contains(el))descriptions.push(textOf(el));
+      }
+      if(!descriptions.includes(proof.location.detail))return false;
+    }
+    return true;
   }
   function closeShelterWork() {
     const work = shelterWork, dialog = work?.dialog;
@@ -8339,7 +12921,15 @@
       shelterStaffMode,shelterStaffHold,shelterPopulationTarget,shelterLevelTarget,shelterGear,shelterOptimize,
       shelterRead?.startedAt,shelterSocialNote,shelterCaravanNote];
     if(cache?.inputs?.every((value,i)=>value===inputs[i]))return cache.plan;
-    const plan=shelterCampaignScheduleFresh(m);
+    let plan=shelterCampaignScheduleFresh(m);
+    if(plan.adoptions?.length&&shelterStaffMode!=='off'&&!shelterStaffHold&&!shelterPending){
+      const previous=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
+      const ids=new Set(plan.adoptions.map(r=>r.id)),campaign={...previous,roles:[...previous.roles.filter(r=>!ids.has(r.id)),...plan.adoptions]};
+      if(!validCampaignRecord(campaign))throw new Error('历史训练用途无法可靠保存');
+      saveShelter({...shelterState,campaign});inputs[1]=shelterState;
+      log.add('shelter-training-adopted','已按实际训练状态保存单格用途和期限，未提交重复入室请求',{vaultNo:m.view.vaultNo,roles:plan.adoptions});
+      plan=shelterCampaignScheduleFresh(m);
+    }
     if(cache){cache.inputs=inputs;cache.plan=plan;}
     return plan;
   }
@@ -8363,13 +12953,25 @@
           populationCanHouse(m,shelterState.families,pair);
       }).flatMap(f=>[f.a,f.b]):[];
     const cfg={...shelterCampaign,workshop:workshopAutomatic(),partsReserve:shelterConstruction.partsReserve,workshopFamilyReady,
+      development:shelterStaffMode!=='off'&&!shelterStaffHold,
       parentTraining:Boolean(shelterCampaign.training&&['family','population'].includes(shelterStaffMode)&&!shelterStaffHold)};
     const plan=shelterCampaignPlan(m,cfg,record,shelterPopulationTarget);
+    if(shelterStaffMode==='population')record.populationPreparation=plan.populationPreparation=
+      shelterPopulationPreparation(m,shelterState.families||[],plan);
     plan.unemployedResidents=shelterDormWorkers(m,plan);
+    plan.restingResidents=shelterRestingWorkers(m,plan);
     plan.levelInvestmentHeld=Boolean(shelterStaffMode==='off'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap);
     plan.levelInvestmentSwap=Boolean(shelterState.swap&&!shelterState.swap.prepareFamily&&!shelterStaffHold&&
       !shelterPending&&!shelterState.pair&&['production','population'].includes(shelterStaffMode));
-    plan.populationFamilySupply=shelterPopulationFamilySupply(m,plan);
+    const familySupply=p=>{
+      const result=typeof shelterBackgroundFamilySupply==='function'?shelterBackgroundFamilySupply(m,p):
+        {status:'ready',supply:shelterPopulationFamilySupply(m,p)};
+      if(result.status==='ready'){p.populationFamilySupply=result.supply;p.familySupplyJob=result.id;return true;}
+      p.familySupplyPlanning={status:result.status,id:result.id,error:result.error};
+      p.populationFamilySupply=null;p.actions=[];p.choice=null;
+      p.notes.push('家庭供给正在后台核对，依赖该结果的调岗和建设暂缓。');return false;
+    };
+    if(!familySupply(plan))return plan;
     plan.powerPreparation=shelterConstructionPowerPreparation(m,plan);
     const describe=p=>{
       if(shelterPending){
@@ -8387,21 +12989,26 @@
     if(!workshopAutomatic()||plan.defense?.busy)return describe(plan);
     const development=shelterDevelopmentPlan(m,shelterPopulationTarget,plan,shelterLevelTarget);
     const next=development.next.project,materialStep=next?.type==='workshop'||next?.purpose?.type==='workshop';
-    const upgrade=next?.kind==='upgrade'?next:materialStep?development.partsProject:null;
+    const upgrade=next?.kind==='upgrade'?next:next?.employment&&development.retainedProject?
+      development.retainedProject:materialStep?development.partsProject:null;
     const target=upgrade?.cost.parts?upgrade.cost.parts+shelterConstruction.partsReserve:0;
     const scheduled=shelterCampaignPlan(m,{...cfg,workshop:true,partsTarget:target,
       workshopProject:upgrade?.id,
       workshopScrapReserve:shelterConstruction.scrapReserve+(upgrade?.cost.scrap||0)},record,shelterPopulationTarget);
     scheduled.unemployedResidents=shelterDormWorkers(m,scheduled);
+    scheduled.restingResidents=shelterRestingWorkers(m,scheduled);
     scheduled.levelInvestmentHeld=plan.levelInvestmentHeld;
     scheduled.levelInvestmentSwap=plan.levelInvestmentSwap;
-    scheduled.populationFamilySupply=shelterPopulationFamilySupply(m,scheduled);
+    if(!familySupply(scheduled))return scheduled;
     scheduled.powerPreparation=shelterConstructionPowerPreparation(m,scheduled);
     scheduled.workshopPreparation=shelterWorkshopPreparation(m,scheduled,upgrade);
     const finalTarget=shelterResolvedLevelTarget(m,shelterLevelTarget);
-    if(upgrade?.levelTarget&&upgrade.cost.parts>0&&Number.isInteger(finalTarget)&&finalTarget>=upgrade.levelTarget)
+    // A profitable independent upgrade also owns its manufacturing workers.
+    // Bind it on confirmed arrival, before staffing can change the next forecast.
+    const materialLevel=upgrade?.levelTarget||(!upgrade?.blocks.length?development.levelProgress?.targetLevel:null);
+    if(materialLevel&&upgrade?.cost.parts>0&&Number.isInteger(finalTarget)&&finalTarget>=materialLevel)
       for(const action of scheduled.actions)if(action.role==='workshop')action.materials={vaultNo:m.view.vaultNo,id:upgrade.id,type:upgrade.type,
-        level:upgrade.level,targetLevel:upgrade.levelTarget,finalTarget};
+        level:upgrade.level,targetLevel:materialLevel,finalTarget};
     return describe(scheduled);
   }
   function shelterWorkshopReleasePlan(m,plan) {
@@ -8476,7 +13083,7 @@
     // 保留原十秒在途余量，包括当前未满、提交时可能满批的房间。
     const projected=shelterFutureCollection(m,Date.now()-shelterRead.at+10000);
     const amount=r=>projected.amounts[r.id]||0;
-    for(const r of m.rooms.filter(r=>r.batch))reward[r.resource]=(reward[r.resource]||0)+amount(r);
+    Object.assign(reward,projected.totals);
     if(ready.some(r=>shelterFits(m,{[r.resource]:amount(r)}))){
       const tab=shelterReadyTab(m,'避难所');if(!tab)return true;
       if(tab.getAttribute('aria-selected')!=='true'){
@@ -8546,6 +13153,7 @@
   }
   function shelterCampaignAllowed(c) {
     if(!c||Date.now()<shelterExploreManualUntil||shelterStaffHold)return false;
+    if(c.kind==='assign'&&['training-release','medical-release','radio-release','workshop-release'].includes(c.role)&&shelterStaffMode!=='off')return true;
     if(c.kind.startsWith('explore-'))return shelterCampaign.explore;
     if(c.kind.startsWith('quest-'))return shelterCampaign.quests;
     if(c.kind==='stimpak')return shelterCampaign.medical;
@@ -8575,16 +13183,23 @@
       if(c.role?.startsWith('defense')){
         record.defense=record.defense.filter(r=>r.id!==id);
         if(c.role==='defense'&&!record.defenseManual.includes(id))record.defense.push({id,room:c.room,from:c.original,at});
+        if(c.role==='defense-release'){
+          if(record.roles.some(r=>r.id===id&&r.role==='training'&&r.room!==c.room))
+            record.trainingRest=[...record.trainingRest.filter(r=>r.id!==id),{id,at}];
+          record.roles=record.roles.filter(r=>r.id!==id||r.room===c.room);
+        }
       }else{
         record.roles=record.roles.filter(r=>r.id!==id);
         if(c.room!==null&&!c.role.endsWith('-release'))record.roles.push({id,room:c.room,role:c.role,at,...(c.role==='training'?{stat:c.stat,base:c.base,
-          ...(c.purpose==='parent'?{purpose:'parent',until:c.until}:{})}:{})});
+          ...(c.purpose==='production'?{purpose:c.purpose,until:c.until,windowEnd:c.windowEnd,destination:c.destination}:
+            c.purpose==='parent'?{purpose:'parent',until:c.until}:{})}:{})});
         else if(c.role==='training-release')record.trainingRest=[...record.trainingRest.filter(r=>r.id!==id),{id,at}];
       }
     }
     saveShelter({...shelterState,campaign:record});
     if(p.kind==='assign'&&c.role==='defense')shelterRaidTiming('confirmed',id,c.room);
     log.add('shelter-campaign-confirmed',c.reason,{kind:p.kind,targets:p.targets,mission:proof.mission,at,vaultNo:m.view.vaultNo,
+      ...(c.recovery?{recovery:c.recovery}:{}),
       ...(p.kind==='explore-start'?{trip:record.trips.find(r=>r.id===proof.mission)}:{}),
       ...(p.kind==='quest-start'&&c.assessment?{assessment:c.assessment}:{})});
   }
@@ -8610,13 +13225,22 @@
   function reconcileShelterDefense(m) {
     const previous=shelterState.campaign;if(!previous?.defense?.length&&!previous?.defenseManual?.length)return;
     const active=m.state.rooms.some(r=>r.incident?.kind==='raiders');
+    const settled=new Set(!active&&!shelterPending&&shelterStaffMode!=='off'&&!shelterStaffHold?
+      shelterDefensePlan(m,{...shelterCampaign,development:true,workshop:workshopAutomatic()},
+        {...previous,familyReserved:[...(shelterState.pair?[shelterState.pair.a,shelterState.pair.b]:[]),
+          ...(shelterState.swap?.people||[]).map(p=>p.id)],families:shelterState.families||[]}).settled:[]);
     const defense=(previous.defense||[]).filter(r=>{
       const p=m.state.residents.find(p=>p.id===r.id);
-      return p&&p.deadAt===null&&p.away===null&&[r.room,null].includes(p.roomId)&&(active||p.roomId!==r.from);
+      return p&&p.deadAt===null&&p.away===null&&[r.room,null].includes(p.roomId)&&(active||p.roomId!==r.from)&&!settled.has(r.id);
     });
     const defenseManual=active?previous.defenseManual||[]:[];
-    if(defense.length!==(previous.defense||[]).length||defenseManual.length!==(previous.defenseManual||[]).length)
-      saveShelter({...shelterState,campaign:{...previous,defense,defenseManual}});
+    if(defense.length!==(previous.defense||[]).length||defenseManual.length!==(previous.defenseManual||[]).length){
+      const roles=previous.roles.filter(r=>!settled.has(r.id)||m.state.residents.some(p=>p.id===r.id&&p.roomId===r.room));
+      const endedTraining=previous.roles.filter(r=>settled.has(r.id)&&r.role==='training'&&!roles.includes(r)).map(r=>r.id);
+      const trainingRest=[...previous.trainingRest.filter(r=>!endedTraining.includes(r.id)),...endedTraining.map(id=>({id,at:m.now}))];
+      saveShelter({...shelterState,campaign:{...previous,roles,trainingRest,defense,defenseManual}});
+      if(settled.size)log.add('shelter-defense-settled','战后现岗位已满足恢复安排，核销防守记录，未重复调岗',{residents:[...settled]});
+    }
   }
   function closeShelterRecall() {
     const w=shelterRecallWork;if(!w)return false;
@@ -8690,26 +13314,35 @@
     });return true;
   }
   function shelterWorkStep(m,dialogs) {
+    if(shelterCampaignSchedule(m).familySupplyPlanning){say('避难所：等待后台家庭供给复核，保留当前居民窗口');return true;}
     let choice;
     try { const campaign=shelterCampaignChoice(m);choice=campaign&&['assign','equip','stimpak'].includes(campaign.kind)?campaign:
       shelterPending||shelterCampaignSchedule(m).defense?.busy?null:shelterStaffPlan(m); }
     catch(error) { if(error?.code==='shelter-state-changed')throw error;holdShelterStaff('人员或配对记录无法核对，本轮只收取奖励'); }
+    if(choice?.kind==='development-wait'){say(choice.reason);return true;}
     if (shelterWork?.submitted || shelterLeave || !shelterEnabled || !choice) return closeShelterWork();
     if (shelterWork && (shelterWork.id !== choice.id || shelterWork.room !== choice.room || shelterWork.from !== choice.from ||
         shelterWork.kind !== choice.kind || shelterWork.item !== choice.item || shelterWork.fromItem !== choice.fromItem)) {
       return closeShelterWork();
     }
     if (!shelterWork) {
-      shelterWork = {...choice,openedAt:0,dialog:null};
+      const identity=shelterResidentIdentity(m.state,m.state.residents.find(p=>p.id===choice.id));
+      if(!identity){holdShelterStaff('居民姓名、等级、属性及房间仍有歧义，本轮不提交');return false;}
+      shelterWork = {...choice,identity,openedAt:0,dialog:null};
       if(!choice.kind||choice.kind==='assign')try {
         log.add('shelter-staff-decision','准备调岗；提交及到岗结果另行核对',{
           snapshotAt:m.now,visitStartedAt:shelterEntryAt,residentId:choice.id,name:String(choice.name||'').slice(0,200),
           from:choice.from,to:choice.room,role:choice.role||null,reason:choice.reason,
+          ...(choice.developmentProposal?{developmentProposal:choice.developmentProposal}:{}),
           production:m.production,plannedDemand:shelterGrowthNeeds(m).demand,
           populationTarget:shelterPopulationTarget,pairStep:shelterState.pair?.step??null,swapStep:shelterState.swap?.step??null});
       } catch { /* 诊断失败不能改变原调岗。 */ }
     }
     const work = shelterWork;
+    const identity=shelterResidentIdentity(m.state,m.state.residents.find(p=>p.id===work.id));
+    if(!identity||JSON.stringify(identity)!==JSON.stringify(work.identity)){
+      shelterWork=null;holdShelterStaff('居民组合身份已变化，取消原窗口操作并等待重新核对');return false;
+    }
     if (work.dialog) {
       if (!work.dialog.isConnected) {
         if (!work.closing && !work.submitted) {
@@ -8766,7 +13399,19 @@
     const p = m.state.residents.find(p => p.id === work.id), level = Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)));
     const name = p.name.normalize('NFKC').replace(/\s+/g,' ').trim();
     const title = `${name} · ${level} 级`;
-    const row = currentElement([...(root?.querySelectorAll('li > button') || [])].filter(b => textOf(b).startsWith(`${title} · `)));
+    const row = currentElement([...(root?.querySelectorAll('li > button') || [])].filter(b => {
+      // 原生列表的标题和属性是相邻span；textContent不会在两个块之间补空格。
+      const headings=[...b.querySelectorAll(':scope > span > span')].filter(el=>
+        textOf(el).startsWith(`${title} · `)&&el.nextElementSibling?.tagName==='SPAN'&&
+        /^力\d+ 感\d+ 耐\d+ 魅\d+ 智\d+ 敏\d+ 幸\d+ · 血 /.test(textOf(el.nextElementSibling)));
+      if(headings.length!==1)return false;
+      const heading=headings[0];
+      if(work.identity.fields.includes('stats')){
+        const match=textOf(heading.nextElementSibling).match(/^力(\d+) 感(\d+) 耐(\d+) 魅(\d+) 智(\d+) 敏(\d+) 幸(\d+) · /);
+        if(!match||work.identity.stats.some((v,i)=>v!==Number(match[i+1])))return false;
+      }
+      return !work.identity.fields.includes('location')||textOf(heading)===`${title} · ${work.identity.location.row}`;
+    }));
     if (!usable(row)) { holdShelterStaff('未能唯一定位居民，本轮保留原岗位'); shelterWork = null; return false; }
     offer(`shelter:staff-open:${work.id}`,`打开${name}的居民详情：${work.reason}`,() => { work.title = title; work.openedAt = Date.now(); row.click(); });
     return true;
@@ -8798,30 +13443,78 @@
         const amount=projected.amounts[r.id] || 0;
         const freeCapacity=Math.max(0,m.caps[r.resource]-m.state.resources[r.resource]-(projected.automatic[r.resource] || 0));
         const button=assessment && locator.query(`[data-room="${r.id}"]`)?.querySelector(`button[aria-label="收取${shelterResources[r.resource]}"]`);
-        const reason=!assessment?'not-checked':r.stored<r.batch?
+        const reason=!assessment?'not-checked':r.projectionUncertain&&r.stored<r.batch&&r.storedUpper>=r.batch?
+          'shared-projection':r.stored<r.batch?
           r.resource==='parts'&&m.state.resources.scrap<6*(r.batch-r.stored)?'materials-short':
           !r.workers?'no-workers':r.rate<=0?'production-stopped':'not-full':
           amount>freeCapacity || m.state.items.length>m.itemCap?'capacity-blocked':
           assessment.bulkReady || usable(button)?'ready':'controls-not-ready';
-        return {id:r.id,resource:r.resource,stored:r.stored,batch:r.batch,rate:r.rate,workers:r.workers,
+        return {id:r.id,resource:r.resource,stored:r.stored,storedUpper:r.storedUpper,
+          projectionUncertain:r.projectionUncertain,projectionReason:r.projectionReason,batch:r.batch,rate:r.rate,workers:r.workers,
           automatic:r.automatic,projectedAmount:amount,freeCapacity,reason};
       })};
   }
   function shelterCollectionText(info) {
     const reasons={'not-checked':'本轮尚未核对领取控件','not-full':'尚未满批','no-workers':'没有在岗成人',
+      'shared-projection':'共用材料或容量，尚不能确认本房满批；等待新快照核对',
       'production-stopped':'当前产量为零','materials-short':'废料不足以凑满一批零件',
       'capacity-blocked':'库存或装备容量不足','controls-not-ready':'领取按钮未就绪或无法唯一定位','ready':'已满批，可继续核对领取'};
     return `产出核对（${new Date(info.checkedAt).toLocaleTimeString('zh-CN')}）\n`+
-      (info.rooms.length?info.rooms.slice(0,12).map(r=>`房间${r.id}·${shelterResources[r.resource]}：${r.stored.toFixed(1)}/${r.batch}，`+
+      (info.rooms.length?info.rooms.slice(0,12).map(r=>`房间${r.id}·${shelterResources[r.resource]}：${r.stored.toFixed(1)}${r.projectionUncertain?`—${r.storedUpper.toFixed(1)}`:''}/${r.batch}，`+
         `${r.rate.toFixed(1)}/小时；${reasons[r.reason]}${r.automatic?'；有楼层机器人':''}。`).join('\n'):'暂无已建成的生产房间。')+
       (info.roomCount>12?'\n更多房间见本地日志。':'');
+  }
+  function shelterEmploymentDiagnostic(m,campaign,control={}) {
+    const s=m.state,living=s.residents.filter(p=>p.deadAt===null),
+      available=new Set([...(campaign?.unemployedResidents||[]),...(campaign?.restingResidents||[])]);
+    const adults=living.filter(p=>p.away===null&&p.adultAt<=m.now&&available.has(p.id));
+    const observed=living.filter(p=>p.away===null&&p.adultAt<=m.now&&
+      (p.roomId===null||s.rooms.some(r=>r.id===p.roomId&&r.type==='quarters')));
+    const unassessed=observed.filter(p=>!available.has(p.id));
+    const children=living.filter(p=>p.away===null&&Number.isFinite(p.adultAt)&&p.adultAt>m.now);
+    const rooms=s.rooms.filter(r=>r.type==='scrap').map(r=>{
+      const occupied=living.filter(p=>p.roomId===r.id).length,slots=Math.max(0,r.width*2-occupied);
+      const pending=r.builtAt>m.now||r.upgradeAt!==null,blocked=Boolean(r.incident||r.unpowered);
+      return {kind:'employment-room',id:r.id,capacity:r.width*2,occupied,slots,
+        status:blocked?'blocked':pending?'construction':'ready',
+        readyAt:pending?(r.builtAt>m.now?r.builtAt:r.upgradeAt):null,
+        awaitingConfirmation:pending&&r.builtAt<=m.now&&r.upgradeAt<=m.now,
+        incident:Boolean(r.incident),unpowered:Boolean(r.unpowered)};
+    });
+    const total=status=>rooms.filter(r=>r.status===status).reduce((n,r)=>n+r.slots,0),ready=total('ready'),pending=total('construction');
+    const blocks=[];
+    if(control.mode==='off')blocks.push('人员管理关闭');
+    if(control.held)blocks.push('人员管理暂停');
+    if(control.pending)blocks.push('原操作结果待核对');
+    if(campaign?.defense?.busy)blocks.push('防守正在处理');
+    const status=blocks.length?'held':!campaign?'not-assessed':!adults.length?children.length?'waiting-adulthood':'no-eligible-adult':
+      ready>0?'assignment-needed':pending>=adults.length?'waiting-construction':'capacity-needed';
+    const messages={held:'先处理人员管理或原操作阻塞','not-assessed':'本轮未取得人员计划，暂不能判断可调人手',
+      'waiting-adulthood':'当前无可自动安排的待就业成人；儿童尚未成年',
+      'no-eligible-adult':'当前没有可自动安排的待就业成人',
+      'assignment-needed':'已有可用回收空岗，继续核对调岗；有空岗不代表已安排生产',
+      'waiting-construction':'在建回收空岗数量可容纳当前待就业成人，等实际完工再核对',
+      'capacity-needed':'现有及在建回收空岗数量不足，需核对新增岗位工程及费用'};
+    return {summary:{status,message:messages[status]+(unassessed.length?`；另有${unassessed.length}名休息或宿舍成人未列入可调池，需核对家庭、健康、身份及预留原因`:''),blocks,eligibleAdults:adults.length,
+      observedUnassignedAdults:observed.length,notEligibleOrUnassessedAdults:unassessed.length,
+      restingAdults:living.filter(p=>p.away===null&&p.adultAt<=m.now&&p.roomId===null).length,
+      children:children.length,earliestAdultAt:children.length?Math.min(...children.map(p=>p.adultAt)):null,
+      readySlots:ready,pendingSlots:pending,blockedSlots:total('blocked'),
+      shortageNow:Math.max(0,adults.length-ready),shortageAfterConstruction:Math.max(0,adults.length-ready-pending),
+      potentialShortageAfterChildren:Math.max(0,adults.length+children.length-ready-pending),
+      scope:'仅核对回收岗位数量，已扣除外出占位；在建岗位未计当前产出，儿童未计可调成人；未来缺口不代表授权提前建设'},
+      rows:[...adults.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'eligible-adult'})),
+        ...unassessed.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'not-eligible-or-unassessed'})),
+        ...children.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'child',adultAt:p.adultAt,
+          remainingMinutes:Math.max(0,Math.ceil((p.adultAt-m.now)/60000))})),...rooms]};
   }
   function shelterDecisionLog(m,plan,campaign,population,collection,note) {
     const diagnosticId=crypto.randomUUID(),s=m.state;
     const pick=(value,keys)=>Object.fromEntries(keys.filter(k=>value?.[k]!==undefined).map(k=>[k,value[k]]));
-    const project=c=>c?pick(c,['kind','type','id','floor','col','level','title','priority','cost','shortage','blocks','hours','saveHours','benefit','gain','levelTarget','levelGain','levelInvestment','employment']):null;
+    const project=c=>c?pick(c,['kind','type','id','floor','col','level','title','priority','cost','shortage','blocks','hours','saveHours','benefit','gain','levelTarget','levelGain','levelInvestment','employment','requiresStaff']):null;
     const used=shelterConstructionSpent(shelterState,shelterPending,Date.now()),budget=populationBudget(m,shelterState.families||[]);
     const reserved=new Set(campaign?.reserved||[]),daily=new Set(campaign?.dailyReserved||[]);
+    const employment=shelterEmploymentDiagnostic(m,campaign,{mode:shelterStaffMode,held:shelterStaffHold,pending:Boolean(shelterPending)});
     const rows=[];
     for(const p of s.residents){
       const room=s.rooms.find(r=>r.id===p.roomId),health=shelterHealth(p),reasons=[];
@@ -8833,11 +13526,12 @@
       if(p.familyCooldownUntil>m.now)reasons.push('生育冷却未结束');
       if(p.romance)reasons.push('已有感情关系');
       if(reserved.has(p.id))reasons.push('综合任务预留');
-      if(!shelterNameUnique(s,p))reasons.push('姓名不能唯一定位');
+      if(!shelterNameUnique(s,p))reasons.push('姓名、等级、属性及房间不能唯一定位');
       if(room&&(room.builtAt>m.now||room.upgradeAt!==null||room.incident))reasons.push('原岗位施工或事件');
       if(room&&!staffRoomTypes.includes(room.type)&&room.type!=='quarters')reasons.push('特殊岗位');
       const family=(shelterState.families||[]).find(f=>f.a===p.id||f.b===p.id);
       rows.push({kind:'resident',...pick(p,['id','roomId','hp','happiness','adultAt','deadAt','familyCooldownUntil','xp','weaponId','outfitId']),
+        training:p.training??null,
         name:typeof p.name==='string'?p.name.slice(0,200):null,stats:pick(p.stats,['str','per','end','cha','int','agi','lck']),
         parents:Array.isArray(p.parents)?p.parents.slice(0,2):null,romance:pick(p.romance,['partnerId','startedAt']),
         away:p.away?pick(p.away,['kind','startedAt','returnAt']):null,maxHp:health?.max??null,
@@ -8847,8 +13541,9 @@
     for(const r of s.rooms){
       const production=m.rooms.find(row=>row.id===r.id),collect=collection?.rooms.find(row=>row.id===r.id);
       rows.push({kind:'room',...pick(r,['id','type','floor','col','width','level','builtAt','upgradeAt','unpowered','stored']),
+        trainStat:r.type==='training'?r.trainStat??null:null,
         incident:r.incident?pick(r.incident,['kind','hp','maxHp']):null,
-        production:pick(production,['resource','rate','batch','workers','stored','automatic','nextTickAt']),
+        production:pick(production,['resource','rate','batch','workers','stored','storedUpper','projectionUncertain','projectionReason','automatic','nextTickAt']),
         collection:collect||null});
     }
     for(const family of population?.families||[])rows.push({kind:'family',...family});
@@ -8858,9 +13553,17 @@
       allowanceReason:shelterConstructionAllowance(c,m,shelterConstruction,shelterState,shelterPending,Date.now()),
       funds:Object.fromEntries(['scrap','parts'].map(k=>[k,{cost:c.cost?.[k]??null,stock:s.resources[k],reserve:shelterConstruction[k+'Reserve'],
         remaining24h:shelterConstruction[k+'Limit']-used[k],missingWithReserve:Math.max(0,(c.cost?.[k]||0)+shelterConstruction[k+'Reserve']-s.resources[k])}]))});
+    for(const row of plan?.rejectedLevel||[])rows.push({kind:'construction-rejected',project:project(row.project),reasons:row.reasons});
     for(const text of plan?.notes||[])rows.push({kind:'planning-note',text});
-    for(const role of shelterState.campaign?.roles||[])rows.push({kind:'assigned-role',...pick(role,['id','room','from','role','at'])});
+    for(const role of shelterState.campaign?.roles||[])rows.push({kind:'assigned-role',...pick(role,['id','room','from','role','at','stat','base','purpose','until','windowEnd','destination'])});
+    for(const seat of campaign?.trainingDestinations||[])rows.push({kind:'training-destination',...pick(seat,['id','room'])});
+    const equipment=new Set(s.residents.flatMap(p=>[p.weaponId,p.outfitId]).filter(id=>id!==null));
+    for(const id of equipment){
+      const item=s.items.find(item=>item.id===id);
+      rows.push({kind:'equipped-item',id,known:Boolean(item),...pick(item,['slot','bonus','damage'])});
+    }
     for(const move of shelterState.swap?.moves||[])rows.push({kind:'planned-move',...pick(move,['id','room','from'])});
+    rows.push(...employment.rows);
     const parts=stockCore.diagnosticParts(rows),pending=shelterPending;
     log.add('shelter-decision','本轮发展、人员与收取诊断；规划候选不代表已开工',{
       diagnosticId,snapshotAt:m.now,readAt:shelterRead?.at??null,readAgeMs:shelterRead?Date.now()-shelterRead.at:null,
@@ -8868,12 +13571,16 @@
       staffMode:shelterStaffMode,staffHeld:shelterStaffHold,staffNote:shelterStaffNote.slice(0,2000),populationNote:shelterPopulationNote.slice(0,2000),
       populationNoteTruncated:shelterPopulationNote.length>2000,
       population:{living:budget.living,recovering:budget.recovering,future:budget.future,target:shelterPopulationTarget,capacity:m.populationCap,limit:budget.limit,
-        reservedPairs:budget.reserved.size,births:s.births.length},
+        reservedPairs:budget.reserved.size,births:s.births.length,preparation:campaign?.populationPreparation??null},
+      employment:employment.summary,
       pair:pick(shelterState.pair,['a','b','room','fromA','fromB','step','at','waitAt','roomWaitAt','release','failed']),
       swap:pick(shelterState.swap,['step','at','prepareFamily','futureSupply','supplyFloor']),
       pending:pending?{kind:pending.kind,at:pending.at}:null,
       resources:s.resources,caps:m.caps,production:m.production,demand:m.demand,plannedDemand:shelterGrowthNeeds(m).demand,
-      levelProgress:plan?.levelProgress??null,construction:shelterConstruction,constructionSpent:used,constructionNote:shelterConstructionNote,
+      productionEvidence:{lastSettledAt:s.lastSettledAt,sharedProjection:m.projection,
+        legacy:s.legacy?pick(s.legacy.perks,['production','training']):null,
+        events:Array.isArray(m.view.env?.events)?m.view.env.events.filter(e=>e.kind==='production').map(e=>pick(e,['kind','startsAt','endsAt','percent'])):null},
+      levelProgress:plan?.levelProgress??null,levelSearch:plan?.levelSearch??null,construction:shelterConstruction,constructionSpent:used,constructionNote:shelterConstructionNote,
       next:plan?.next?{...pick(plan.next,['status','title','reason','kind']),project:project(plan.next.project)}:null,
       partsTarget:plan?.partsTarget??null,partsProject:project(plan?.partsProject),
       candidateTotal:plan?.candidateTotal??null,candidatesRecorded:plan?.candidates.length??0,candidateLimit:8,
@@ -8934,6 +13641,9 @@
       const events = m.rooms.filter(r => !r.automatic && r.rate>0 && r.batch>r.stored &&
         (r.resource!=='parts' || m.state.resources.scrap>=6*(r.batch-r.stored))).map(r =>
           r.nextTickAt-m.now+Math.max(0,Math.ceil((r.batch-r.stored)/(r.rate/6)-1e-9)-1)*600000);
+      // Shared supply/capacity cannot identify the ready room yet. Re-read a settled snapshot
+      // within five minutes instead of falling back to the long idle-production interval.
+      if(m.projection?.uncertainRooms.length)events.push(300000-2000);
       try {
         const ops=shelterOperations(m);operations=`${new Date(m.now).toLocaleString('zh-CN')} 检查结果\n${ops.messages.join('\n')}`;
         events.push(...ops.events);attention=ops.counts;
@@ -9195,10 +13905,14 @@
     const claimed = p.kind === 'tutorial' ? (s.tutorial?.claimed || []) : p.kind === 'achievement' ? s.achievements : [];
     return p.targets.length > 0 && p.targets.every(id => claimed.includes(id));
   }
-  function shelterConstructionChoice(m) {
-    const campaign=shelterCampaignSchedule(m),next=shelterDevelopmentPlan(m,shelterPopulationTarget,campaign,shelterLevelTarget).next,c=next.project;
+  function shelterConstructionChoice(m,allowPlanningWait=false) {
+    const campaign=shelterCampaignSchedule(m);
+    if(campaign.familySupplyPlanning)return allowPlanningWait?
+      {kind:'development-wait',reason:'等待后台家庭供给比较，当前不启动新工程'}:null;
+    const next=shelterDevelopmentPlan(m,shelterPopulationTarget,campaign,shelterLevelTarget).next,c=next.project;
     const craft=shelterDailyCraft(m,shelterCampaign,shelterConstruction,shelterState,shelterPending,Date.now(),c);
     if(craft)return craft;
+    if(allowPlanningWait&&next.kind==='level-planning')return {kind:'development-wait',reason:next.reason};
     const reason=next.status!=='ready'?`${next.title}：${next.reason}`:
       shelterConstructionAllowance(c,m,shelterConstruction,shelterState,shelterPending,Date.now());
     if(reason){shelterConstructionNote=reason;return null;}
@@ -9257,7 +13971,8 @@
       finishShelter(m,shelterConstructionNote,60000);return true;
     }
     if(shelterConstructionDone){if(closeShelterBuild())return true;return false;}
-    const c=shelterConstructionChoice(m);
+    const c=shelterConstructionChoice(m,true);
+    if(c?.kind==='development-wait'){say(c.reason);return true;}
     if(!c||w&&shelterConstructionSignature(c)!==shelterConstructionSignature(w.project)){
       if(w){shelterConstructionHeld=true;shelterConstructionNote='建设目标或费用已变化，本轮撤销后重新规划';if(closeShelterBuild())return true;}
       return false;
@@ -9450,7 +14165,12 @@
     if (m.view.switches.frozen || m.view.nameRequired) { finishShelter(m,'避难所维护或尚未命名，等待你处理'); return; }
     reconcileShelterDefense(m);
     if(shelterSocialWork&&shelterSocialStep(m,dialogs))return;
-    const defending=shelterCampaignSchedule(m).defense?.busy;
+    const currentCampaign=shelterCampaignSchedule(m),defending=currentCampaign.defense?.busy;
+    const familyPlanning=currentCampaign.familySupplyPlanning;
+    if(familyPlanning){
+      if(['running','queued'].includes(familyPlanning.status)){say('避难所：后台比较家庭供给，完成后继续');return;}
+      finishShelter(m,'家庭供给后台比较未完成，一分钟后重新读取；保留岗位和材料',60000);return;
+    }
     if(shelterBuildWork&&shelterConstructionStep(m,dialogs))return;
     if(!defending&&!shelterCollectionChecked&&!shelterWork&&!shelterRecallWork&&!dialogs.length){
       if(shelterProductionClaimStep(m))return;
