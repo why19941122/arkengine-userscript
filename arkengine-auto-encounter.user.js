@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.24
+// @version      1.17.25
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1228,7 +1228,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.24';
+  const SCRIPT_VERSION = '1.17.25';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -1305,7 +1305,7 @@
   const LOG_PRIORITY_VERSION = 2;
   const criticalLog = event => Boolean(event.receiptId) || [
     'stock-submit','stock-response','stock-confirmed','stock-income','stock-prediction-settled',
-    'shelter-submitted','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed',
+    'shelter-submitted','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed','shelter-work-cancelled',
     'shelter-population','shelter-training-adopted','shelter-defense-settled','shelter-trips-recovered',
     'page-lifecycle','reward','pause',
   ].includes(event.type) || /-(error|held|blocked|recovered|resumed)$/.test(event.type) ||
@@ -3486,6 +3486,7 @@
       <div class="panel-actions"><button type="button" id="shelter-toggle"></button>
       <button type="button" id="shelter-check">检查避难所</button>
       </div>
+      <button type="button" id="shelter-cancel-old-assignment" hidden>解除已取消的旧调岗等待</button>
       <p class="hint" id="shelter-config-summary"></p>
       <p class="hint" id="shelter-construction-status"></p>
       <details class="panel-subsection" data-panel-section="shelter-plan"><summary>当前计划与运行提醒</summary>
@@ -7973,6 +7974,7 @@
     const message = stateFault('shelter') || shelterStopFault || `避难所${shelterEnabled ? '' : '已暂停'}：${shelterState.note}${
       shelterEnabled && left ? `；约 ${Math.ceil(left / 60000)} 分钟后检查` : ''}${watchNote}`;
     shadow.getElementById('shelter-status').textContent = message;
+    shadow.getElementById('shelter-cancel-old-assignment').hidden=!shelterUnsentTrainingRelease(shelterPending)||Boolean(shelterWorkConfirm||shelterWork);
     shelterToggle.textContent = shelterEnabled ? '暂停避难所' : '开启避难所';
     const recommended=shelterRecommended(),budget=recommended.construction;
     shadow.getElementById('shelter-preset-summary').textContent=`应用后：人口阶段目标 ${recommended.population} 人，开启持续分阶段增长；本阶段成年、就业和供应落实后规划下一批，逐对核对床位与口粮，最多200人。建设24小时上限 ${budget.scrapLimit} 废料 / ${budget.partsLimit} 零件，保留 ${budget.scrapReserve} / ${budget.partsReserve}。\n汽水优先：按网页资格时长召回，在原区域上限内比较概率。${localStorage.getItem(SHELTER_CONSTRUCTION)===null?'首次提供建设额度；':'沿用建设额度（含零值）；'}不清账本、不花汽水。`;
@@ -8079,6 +8081,22 @@
     saveShelter({ ...shelterState, nextAt: 0, note: '等待检查' });
     if (!shelterPending) { cancelShelterRead(); shelterStage = 0; shelterLeave = false;shelterUiWait=null;shelterCollection=null;shelterCollectionChecked=false;shelterExploreSkipped.clear();shelterExploreNote=''; }
     schedule();
+  });
+  function shelterUnsentTrainingRelease(p) {
+    return Boolean(p?.kind==='assign'&&p.before?.campaign?.choice?.role==='training-release'&&
+      !p.campaignKey&&!p.result&&!p.emergency&&!p.blockedBy);
+  }
+  shelterControl('shelter-cancel-old-assignment','click',()=>{
+    const p=shelterPending;
+    if(!shelterUnsentTrainingRelease(p)||shelterWorkConfirm||shelterWork||accountStopReason()||
+      [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible))return;
+    if(!window.confirm(`解除 #${p.targets[0]} 的旧训练离岗等待？\n仅在你已取消原调岗弹窗、且没有点过“确认”时选择确定。\n若点过确认或不能确定，请取消，保留原记录。`))return;
+    shelterWriteGuard();if(shelterPending?.id!==p.id)return;
+    saveShelterPending(null);cancelQueued();cancelShelterRead();
+    shelterStaffHold=false;shelterCampaignHeld='';shelterLeave=false;
+    saveShelter({...shelterState,nextAt:0,pendingReadOnly:undefined,note:'已按你的确认解除未执行的旧调岗，重新核对岗位'});
+    log.add('shelter-work-cancelled','用户确认原训练离岗弹窗已取消且未执行，解除旧等待',
+      {operation:p.id,resident:p.targets[0],ownerAcknowledged:true});schedule();
   });
   shelterControl('shelter-explore-claim','change',event=>{
     shelterExploreClaim=event.target.checked;localStorage.setItem(SHELTER_EXPLORE_CLAIM,String(shelterExploreClaim));
@@ -12715,20 +12733,54 @@
     }
     return true;
   }
+  function shelterConfirmationDescription(dialog) {
+    const ids=(dialog.getAttribute('aria-describedby')||'').split(/\s+/).filter(Boolean);
+    if(ids.length){
+      const nodes=ids.map(id=>[...dialog.querySelectorAll('[id]')].filter(el=>el.id===id));
+      if(nodes.some(matches=>matches.length!==1)||new Set(ids).size!==ids.length)return '';
+      return nodes.map(matches=>textOf(matches[0])).join(' ');
+    }
+    // Legacy confirmation markup used a paragraph without an accessible description ID.
+    const paragraphs=[...dialog.querySelectorAll('p')];return paragraphs.length===1?textOf(paragraphs[0]):'';
+  }
+  function shelterCancelWorkConfirmation(w,dialog,reason) {
+    const cancel=buttonIn(dialog,'取消');
+    if(!usable(cancel)){say('原生取消按钮不可核对，保留居民确认窗口');return true;}
+    offer(`shelter:work-cancel:${w.id}`,'取消未发送的居民安排，恢复其他自动任务',()=>{
+      if(shelterWorkConfirm!==w||w.pending()?.id!==w.id||w.sent()||w.clicked||w.manual||w.dialog!==dialog)return;
+      w.cancelling=reason;w.capture.cancelled=true;captureShelterAction=w.capture;
+      try{cancel.click();}finally{setTimeout(()=>{if(captureShelterAction===w.capture)captureShelterAction=null;},0);}
+    });return true;
+  }
   function shelterWorkConfirmation(dialogs) {
     const w=shelterWorkConfirm;if(!w)return false;
-    if(shelterPending?.id!==w.id||w.sent()){shelterWorkConfirm=null;return false;}
+    if(w.pending()?.id!==w.id||w.sent()){shelterWorkConfirm=null;return false;}
+    if(w.cancelling&&!w.manual&&!w.clicked&&w.dialog&&(!w.dialog.isConnected||!visible(w.dialog))){
+      // This live closure observed cancellation before confirm or native send. Never infer
+      // that a persisted old/unknown operation was unsent merely from a missing receipt.
+      w.clear();w.capture.end();shelterWorkConfirm=null;cancelShelterRead();
+      shelterStaffHold=true;shelterCampaignHeld=w.cancelling;shelterStaffNote=w.cancelling;
+      log.add('shelter-work-cancelled','已取消未发送的居民确认，继续其他自动任务',
+        {operation:w.id,reason:w.cancelling,resident:w.work.id,description:w.description||'',ageMs:Date.now()-w.at});
+      return closeShelterWork();
+    }
     const dialog=locator.pick(dialogs.filter(d=>textOf(d.querySelector('h2'))===w.title));
     if(!dialog)return false;
-    if(w.manual||w.clicked||Date.now()-w.at>15000||!shelterEnabled||!enabled||shelterLeave||accountStopReason()||
-      shelterWork!==w.work||shelterStaffMode!==w.mode||JSON.stringify(shelterCampaign)!==w.settings){say('居民操作确认已暂停，等待处理');return true;}
-    const description=[...dialog.querySelectorAll('p')].map(textOf).join('');
-    if(!description||!w.accept(description)){say('居民确认内容发生变化，本轮保留窗口');return true;}
+    w.dialog??=dialog;
+    if(w.manual||w.clicked||!shelterEnabled||!enabled||shelterLeave||accountStopReason()||shelterWork!==w.work||w.dialog!==dialog){
+      say('居民操作确认已暂停，等待处理');return true;
+    }
+    if(w.cancelling){say('等待原生取消窗口关闭，不重复点击');return true;}
+    const description=shelterConfirmationDescription(dialog);w.description=description.slice(0,1000);
+    const reason=shelterStaffMode!==w.mode||JSON.stringify(shelterCampaign)!==w.settings?'居民安排设置已变化':
+      Date.now()-w.at>15000?'居民确认已过期，下一轮重新评估':
+      !description||!w.accept(description)?'居民确认说明与已核对规则不符':'';
+    if(reason)return shelterCancelWorkConfirmation(w,dialog,reason);
     const confirm=buttonIn(dialog,'确认');if(!usable(confirm))return true;
     // The native confirm resolves a Promise before sending the exact bound action.
     // Re-arm only for this owned dialog click and its microtasks.
     offer(`shelter:work-confirm:${w.id}`,'确认本轮已核对的居民安排',()=>{
-      if(shelterWorkConfirm!==w||shelterPending?.id!==w.id||w.manual)return;
+      if(shelterWorkConfirm!==w||w.pending()?.id!==w.id||w.manual)return;
       w.clicked=true;captureShelterAction=w.capture;
       try{confirm.click();}finally{setTimeout(()=>{if(captureShelterAction===w.capture)captureShelterAction=null;},0);}
     });return true;
@@ -13994,7 +14046,7 @@
         if(independent&&(continueShelterAction||!shelterIndependentDefense(shelterPending,campaign,m,shelterCampaign,readStartedAt))||
           !independent&&shelterPending?.emergency)throw Error('避难所原操作与紧急动作不能独立核对');
         const action=body?.action,expected=shelterRequestAction(kind,kind==='season'?targets.slice(submitted):targets);
-        if(inFlight||submitted>=(kind==='season'?targets.length:1)||!enabled||localStorage.getItem(PREF)==='false'||!active||!shelterEnabled||accountStopReason()||getPending()?.id!==id||
+        if(capture.cancelled||inFlight||submitted>=(kind==='season'?targets.length:1)||!enabled||localStorage.getItem(PREF)==='false'||!active||!shelterEnabled||accountStopReason()||getPending()?.id!==id||
           kind==='explore'&&!shelterExploreClaim&&!shelterCampaign.explore||kind==='assign'&&!campaign&&shelterStaffMode==='off'||
           kind==='inspection'&&!shelterCampaign.dailyGoals||
           kind==='equip'&&!campaign&&(!shelterGear||shelterStaffMode==='off')||campaign&&!shelterCampaignAllowed(campaign)||
@@ -14048,7 +14100,7 @@
         const owner=kind==='equip'?m.state.residents.find(p=>p.weaponId===targets[1]||p.outfitId===targets[1]):null;
         const from=m.state.rooms.find(r=>r.id===p.roomId),to=m.state.rooms.find(r=>r.id===targets[1]);
         if(kind==='assign'&&(from?.type==='training'||to?.type==='quarters')||kind==='equip'&&owner&&owner.id!==p.id){
-          shelterWorkConfirm={id,at:Date.now(),work:shelterWork,capture,sent:()=>submitted>0,mode:shelterStaffMode,settings:JSON.stringify(shelterCampaign),
+          shelterWorkConfirm={id,at:Date.now(),work:shelterWork,capture,pending:getPending,clear:()=>persist(null),sent:()=>submitted>0,mode:shelterStaffMode,settings:JSON.stringify(shelterCampaign),
             title:(kind==='assign'?`确认调动 #${p.id} ${p.name}？`:`转交 #${owner.id} ${owner.name} 的装备？`).normalize('NFKC').replace(/\s+/g,' ').trim(),
             accept:description=>kind==='equip'?description==='原持有者会卸下这件装备,当前居民换下的装备放入仓库。':
               description.split(/[；;]/).every(part=>
@@ -15315,6 +15367,9 @@
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
     log.pulse(status.textContent, { ...diagnostic,
+      pendingShelter:Boolean(shelterPending),
+      shelterConfirmation:shelterWorkConfirm?{resident:shelterWorkConfirm.work.id,ageMs:Date.now()-shelterWorkConfirm.at,
+        phase:shelterWorkConfirm.manual?'manual':shelterWorkConfirm.cancelling?'cancelling':shelterWorkConfirm.clicked?'clicked':'awaiting'}:null,
       pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot() });
     const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
     if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
