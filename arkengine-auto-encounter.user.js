@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.21
+// @version      1.17.22
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1228,7 +1228,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.21';
+  const SCRIPT_VERSION = '1.17.22';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -5701,18 +5701,26 @@
     "    if(schedule.pair){const f=schedule.pair;addFamily([f.a,f.b],f.room,'pair');}",
     "    for(const p of s.residents)if(p.romance){",
     "      const other=s.residents.find(q=>q.id===p.romance.partnerId);",
-    "      if(!other||other.romance?.partnerId!==p.id||p.roomId!==other.roomId||",
-    "        !Number.isFinite(p.romance.progress)||p.romance.progress<0||p.romance.progress>1||",
+    "      if(!other||other.romance?.partnerId!==p.id||",
+    "        ![p,other].every(q=>Number.isFinite(q.romance.progress)&&q.romance.progress>=0&&q.romance.progress<=1)||",
     "        Math.abs(p.romance.progress-other.romance.progress)>1e-9)throw Error('Inconsistent inherited romance');",
-    "      if(!s.births.some(b=>pair(b.parents)&&pairKey(b.parents)===pairKey([p.id,other.id])))addFamily([p.id,other.id],p.roomId,'romance');",
+    "      if(p.id>other.id||s.births.some(b=>pair(b.parents)&&pairKey(b.parents)===pairKey([p.id,other.id])))continue;",
+    "      if(p.roomId!==other.roomId||p.roomId===null){",
+    "        // Native partners may keep their relationship while working apart. Preserve",
+    "        // their actual posts; neither a shared dorm nor renewed progress is implied.",
+    "        const key=pairKey([p.id,other.id]),old=families.get(key);",
+    "        families.set(key,{parents:[p.id,other.id],roomId:old?.roomId??null,kind:'romance',",
+    "          positions:[p,other].map(q=>({id:q.id,room:q.roomId}))});",
+    "      }else addFamily([p.id,other.id],p.roomId,'romance');",
     "    }",
     "    for(const f of families.values()){",
     "      const birth=s.births.find(b=>pair(b.parents)&&pairKey(b.parents)===pairKey(f.parents));",
     "      if(birth){state.families.push({...f,intentId:null,status:'pregnant',dueAt:birth.dueAt});continue;}",
     "      const intentId=add('existing:family:'+pairKey(f.parents),'inherited active family',{",
-    "        people:f.parents.map(p=>person(p)),seats:f.parents.map(p=>seat(p,f.roomId)),",
+    "        people:f.parents.map(p=>person(p)),seats:f.positions?",
+    "          f.positions.filter(p=>p.room!==null).map(p=>seat(p.id,p.room)):f.parents.map(p=>seat(p,f.roomId)),",
     "        families:[{parents:f.parents,dueAt:null,childId:null}]});",
-    "      state.families.push({...f,intentId,status:'needs-plan'});",
+    "      state.families.push({...f,intentId,status:f.positions?'paused':'needs-plan'});",
     "    }",
     "    for(const birth of s.births)if(!pair(birth.parents)){",
     "      const people=new Set(s.residents.filter(p=>p.roomId===birth.roomId&&p.adultAt<=now).map(p=>p.id));",
@@ -5766,10 +5774,16 @@
     "          p.roomId===row.destination&&p.from<=state.at&&p.until===book.windowEnd)))",
     "        throw Error('Inherited role lost its commitment');",
     "    }",
-    "    for(const f of state.families)if(f.status==='needs-plan'){",
+    "    for(const f of state.families)if(['needs-plan','paused'].includes(f.status)){",
     "      const e=book.entries.find(e=>e.id===f.intentId&&active(e));",
-    "      if(!pair(f.parents)||!id(f.roomId)||!e||!e.families.some(p=>pairKey(p.parents)===pairKey(f.parents))||",
-    "        f.parents.some(id=>!e.people.some(p=>p.residentId===id)||!e.seats.some(p=>p.residentId===id&&p.roomId===f.roomId)))",
+    "      const positions=f.status==='paused'?f.positions:f.parents.map(id=>({id,room:f.roomId}));",
+    "      if(!pair(f.parents)||(f.status==='paused'?!roomId(f.roomId):!id(f.roomId))||",
+    "        !Array.isArray(positions)||positions.length!==2||new Set(positions.map(p=>p.id)).size!==2||",
+    "        positions.some(p=>!f.parents.includes(p.id)||!roomId(p.room)||f.status==='paused'&&",
+    "          !view.state.residents.some(q=>q.id===p.id&&q.roomId===p.room))||",
+    "        !e||!e.families.some(p=>pairKey(p.parents)===pairKey(f.parents))||",
+    "        positions.some(q=>!e.people.some(p=>p.residentId===q.id)||q.room!==null&&",
+    "          !e.seats.some(p=>p.residentId===q.id&&p.roomId===q.room)))",
     "        throw Error('Inherited family lost its commitment');",
     "    }",
     "    if(state.swap){",
@@ -5825,6 +5839,8 @@
     "      (action.kind!=='upgrade'||action.roomId!==state.material.roomId||action.fromLevel!==state.material.fromLevel||state.material.status!=='ready'))",
     "      problems.push({kind:'inherited-material-project-not-ready'});",
     "    for(const f of state.families){",
+    "      if(f.status==='paused'&&held(f.intentId)&&(advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))",
+    "        problems.push({kind:'inherited-romance-paused',intentId:f.intentId});",
     "      if(f.status==='unknown-birth'&&(advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))",
     "        problems.push({kind:'inherited-birth-ownership-unknown',roomId:f.roomId});",
     "      if(f.status==='needs-plan'&&held(f.intentId)&&!familyPlans.some(p=>p.intentId===f.intentId)&&",
@@ -5847,7 +5863,10 @@
     "    if(!input)return input;const state=structuredClone(input);",
     "    for(const e of events)if(e.kind==='merge'){",
     "      for(const r of state.roles){if(r.roomId===e.roomId)r.roomId=e.into;if(r.destination===e.roomId)r.destination=e.into;}",
-    "      for(const f of state.families)if(f.roomId===e.roomId)f.roomId=e.into;",
+    "      for(const f of state.families){",
+    "        if(f.roomId===e.roomId)f.roomId=e.into;",
+    "        for(const p of f.positions??[])if(p.room===e.roomId)p.room=e.into;",
+    "      }",
     "      for(const d of state.defense){if(d.room===e.roomId)d.room=e.into;if(d.from===e.roomId)d.from=e.into;}",
     "      if(state.materialPurpose?.id===e.roomId)state.materialPurpose.id=e.into;",
     "      if(state.material){if(state.material.roomId===e.roomId)state.material.roomId=e.into;",
@@ -5961,7 +5980,7 @@
     "    if(input.existing?.material?.intentId===id&&input.existing.material.workers.some(w=>",
     "      input.existing.material.rooms.includes(input.view.state.residents.find(p=>p.id===w.id)?.roomId)))",
     "      throw Error('Inherited material workers must leave or transfer their use before release');",
-    "    if(input.existing?.families.some(f=>f.intentId===id&&f.kind==='romance'&&f.status==='needs-plan'&&",
+    "    if(input.existing?.families.some(f=>f.intentId===id&&f.kind==='romance'&&['needs-plan','paused'].includes(f.status)&&",
     "      input.book.entries.some(e=>e.id===id&&active(e))))throw Error('Inherited romance must retain its reservation');",
     "    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='romance'))throw Error('Active romance cannot lose its reservation');",
     "    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='planned'&&p.parents.every(id=>",
