@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.20
+// @version      1.17.21
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1228,7 +1228,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.20';
+  const SCRIPT_VERSION = '1.17.21';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -14166,16 +14166,18 @@
     reconcileShelterDefense(m);
     if(shelterSocialWork&&shelterSocialStep(m,dialogs))return;
     const currentCampaign=shelterCampaignSchedule(m),defending=currentCampaign.defense?.busy;
+    // 领取不依赖家庭供给搜索。提交前的新快照可能重启 Worker；先续接已到期的领取，
+    // 避免在后台等待分支取消倒计时，造成“等待→重读→重新等待”而始终不提交。
+    if(!defending&&!shelterCollectionChecked&&!shelterBuildWork&&!shelterWork&&!shelterRecallWork&&!dialogs.length){
+      if(shelterProductionClaimStep(m))return;
+      shelterCollectionChecked=true;
+    }
     const familyPlanning=currentCampaign.familySupplyPlanning;
     if(familyPlanning){
       if(['running','queued'].includes(familyPlanning.status)){say('避难所：后台比较家庭供给，完成后继续');return;}
       finishShelter(m,'家庭供给后台比较未完成，一分钟后重新读取；保留岗位和材料',60000);return;
     }
     if(shelterBuildWork&&shelterConstructionStep(m,dialogs))return;
-    if(!defending&&!shelterCollectionChecked&&!shelterWork&&!shelterRecallWork&&!dialogs.length){
-      if(shelterProductionClaimStep(m))return;
-      shelterCollectionChecked=true;
-    }
     if(!defending&&!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&!dialogs.length&&advanceShelterPopulation(m))return;
     if(!defending&&recoverShelterTrips(m))return;
     if(!defending&&(shelterExploreClaim||shelterCampaign.explore)&&!shelterWork&&!dialogs.length&&shelterExploreStep(m))return;
