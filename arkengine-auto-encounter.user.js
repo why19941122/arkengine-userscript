@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.39
+// @version      1.17.40
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1094,6 +1094,21 @@
       // Unknown outcomes may be resubmitted only within current funds; an actual receipt is reconciled without another POST.
       if(m.balance-config.reserve<a.debit)
         return '原交易确认可能动用当前保留余额，等待余额恢复或手动核对';
+      if(a.action==='buy') {
+        const current=m.view.positions.find(pos=>sameStockId(pos.stockId,a.stockId));
+        // Confirmation may execute an unfilled intent. Reuse today's entry criteria, not the old signal.
+        // A matching possible fill is only grounds to retrieve the original receipt, never proof of success.
+        if((current?.shares||0)===p.beforeShares){
+          const stock=m.view.stocks.find(s=>sameStockId(s.id,a.stockId)&&s.modelName===a.modelName),signal=stock&&trend(m.view,stock,now);
+          if(!signal||signal.direction!=='up'||signal.change*100<m.rules.buyFeePct+m.rules.sellFeePct+1)
+            return '原买单入场信号已失效或不足含费门槛，保留原请求，等待有效信号或绑定回执';
+          if(config.netEfficiency){
+            const cost=quote(stock.priceCents,a.shares,m.rules.buyFeePct,true),price=Math.floor(stock.priceCents*(1+signal.change)),
+              net=quote(price,a.shares,m.rules.sellFeePct,false);
+            if(cost===null||net===null||net<=cost)return '原买单入场信号的含费净额情景不再为正，保留原请求等待核对';
+          }
+        }
+      }
       return null;
     }
     // Only explain a completed no-action check; these messages do not change eligibility, limits, or scheduling.

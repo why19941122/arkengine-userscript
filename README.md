@@ -1,6 +1,22 @@
 # Ark Engine 油猴脚本
 
-**当前版本1.17.39：按净到账计算卖出股数，减少不必要拆单和取整损失。**
+**当前版本1.17.40：原买单续确认前重查入场信号，避免行情转弱后仍买入。**
+
+[安装或更新1.17.40](https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js?v=1.17.40)。安装后刷新游戏页并确认版本；原有暂停状态保留。
+
+买单结果未知、持仓仍是提交前股数时，确认原请求可能真正执行买入。现在会重新检查行情时效、上涨方向及原有含费门槛；开启净额筛选时，原股数的扣费情景也必须仍为正。信号转跌、走平或过期时保留原请求和预留，暂停续发且不消耗核对次数；恢复后仍只用原请求、原股数。确认倒计时结束前也会重读检查。
+
+持仓已出现可能成交后的股数时仍可核对原回执，但不凭股数判定成功。迟到的绑定成功回执照常入账，避免把已成交订单因行情变化误当未成交；原有资金、风险和持仓约束继续生效，卖出不受此次买入信号检查影响。
+
+118项核心检查和11个浏览器业务场景通过，发布源码另复验5个关键场景；旧1.17.39在“未知买单信号转弱”和“确认倒计时内转弱”两个同条件场景中均复现继续买入。测试在本机条件页执行，未操作实号、未运行长期模拟。
+
+本轮直接检索 GitHub 并核对源码，未使用 Grok Search。借鉴了 [Freqtrade](https://github.com/freqtrade/freqtrade/blob/227997806986013fb6544d9253429855c603ca97/freqtrade/strategy/interface.py#L1354) 的入场信号时效和提交前复核机制，沿用本项目阈值自行实现，未复制代码或增加依赖。[OR-Tools](https://github.com/google/or-tools/blob/100f66e6242ab8bf8d32feb8f3bf086db66ae2b5/ortools/sat/samples/assignment_task_sizes_sat.py) 的容量约束分配可用于后续避难所建模；本轮未集成求解器。找到的同游戏 [丰收消除小助手](https://github.com/guliacer/harvest-match-helper) 不含股市或避难所；[Fallout Shelter 自动化](https://github.com/Sambura/Fallout-shelter-automation) 属于另一款游戏，桌面图像方案不适合后台网页。本轮未找到所需模块的现成替代。
+
+最新实号日志仍为1.17.31，36笔旧卖出账目缺口继续限制新增买入。40万本金及10万累计亏损约束保留，未清账或自动结算历史仓；日均净赚10万目标仍未验收。
+
+以下保留历史版本说明。
+
+**历史版本1.17.39：按净到账计算卖出股数，减少不必要拆单和取整损失。**
 
 [安装或更新1.17.39](https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js?v=1.17.39)。安装后刷新游戏页并确认版本；原有暂停状态保留。
 
