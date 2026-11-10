@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.35
+// @version      1.17.36
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -744,7 +744,18 @@
       // Whole-token rounding applies to each partial sale, not to the original full position.
       if(proceeds===0)return {blocked:true,reason:`${s.modelName}当前可卖 ${shares} 股，扣费取整后预计净到账为0代币，暂不卖出`};
       return {action:'sell',stockId:s.id,modelName:s.modelName,shares,debit:0,
-        reason:net/o.cost>=1.08?'净收益达到8%':net/o.cost<=.94?'净亏损达到6%':'行情转弱'};
+        reason:net/o.cost<=.94?'净亏损达到6%':t?.direction==='down'?'行情转弱':'净收益达到8%'};
+    }
+    function exitPlans(m,ledger,now) {
+      const rows=[];
+      for(const s of m.view.stocks){
+        const choice=sellPlan(m,s,ledger.owned,now);if(!choice?.action)continue;
+        const cost=ledger.owned[String(s.id)].cost,estimatedNet=quote(s.priceCents,ledger.owned[String(s.id)].shares,m.rules.sellFeePct,false);
+        const priority=estimatedNet/cost<=.94?0:trend(m.view,s,now)?.direction==='down'?1:2;
+        rows.push({choice,priority,netReturnPct:(estimatedNet-cost)/cost*100,estimatedNet,cost});
+      }
+      // Risk exits precede profit-taking; within each group the worst fee-adjusted return goes first.
+      return rows.sort((a,b)=>a.priority-b.priority||a.netReturnPct-b.netReturnPct||String(a.choice.stockId).localeCompare(String(b.choice.stockId)));
     }
     function positionReport(m,ledger,now) {
       if(!m)return [];
@@ -802,9 +813,7 @@
         const trade=choose(m,{...config,predict:false},ledger,now);if(trade)return trade;
       }
       // No averaging down or mixing with manual positions. Each model has at most one script lot.
-      if(config.trade) for(const s of v.stocks) {
-        const sale=sellPlan(m,s,own,now);if(sale?.action)return sale;
-      }
+      if(config.trade){const sale=exitPlans(m,ledger,now)[0];if(sale)return sale.choice;}
       if(riskReason(m,config,ledger,now))return null;
       const trends=v.stocks.map(s=>({s,t:trend(v,s,now)})).filter(x=>x.t).sort((a,b)=>Math.abs(b.t.change)-Math.abs(a.t.change)||String(a.s.id).localeCompare(String(b.s.id)));
       // 未设置总风险上限时不做“无上限 - 未知成本”；Infinity-Infinity 会误拦独立预算的预测。
@@ -950,7 +959,9 @@
       return {at:now,selected,market:marketSummary(m,now),riskReason:risk||null,
         policy:{trade:config.trade,predict:config.predict,observeOnly:Boolean(config.observeOnly),autoBudget:Boolean(config.autoBudget),
           netEfficiency:Boolean(config.netEfficiency),buyFeePct:r.buyFeePct,sellFeePct:r.sellFeePct,buyThresholdPct:threshold,
-          quoteBufferPct:10,maxScriptPositions:3,saleCooldownMs:3600000},
+          quoteBufferPct:10,maxScriptPositions:3,saleCooldownMs:3600000,exitOrder:'stop-loss,weak-trend,take-profit; ascending net return'},
+        exitQueue:config.trade?exitPlans(m,ledger,now).map(({choice,priority,netReturnPct,estimatedNet,cost},i)=>
+          ({...choice,rank:i+1,priority,netReturnPct,estimatedNet,cost})):[],
         budget:{balance:m.balance,reserve:config.reserve,heldCost:held,riskExposure:finite(exposure),riskExposureKnown:Number.isFinite(exposure),
           spent24h:spent,predicted24h:predicted,stake:config.stake,predictionLimit:config.predictionLimit,
           remainingPrediction:config.predictionLimit-predicted,ownedCount,reserveBudget:budget,
@@ -1167,7 +1178,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -4264,14 +4275,18 @@
         {diagnosticId,snapshotAt:stockRead.at,part,totalParts:parts.length,rows});
     } catch { log.add('stock-diagnostic-error','详细诊断生成失败；交易仍按原条件核对'); }
   }
-  function stockFinish(note,hold=false) {
-    stockReload();
-    stockPersist({...stockLedger,nextAt:Date.now()+300000,note,hold:hold || stockLedger.hold,
+  function stockFinish(note,hold=false,exitContinuation=null) {
+    if(stockReload()||hold||stockLedger.hold||stockLedger.pending||!stockConfig.trade||stockConfig.observeOnly){
+      if(exitContinuation)note='股市共享状态已变化，本轮检查结束，五分钟后继续';
+      exitContinuation=null;
+    }
+    const retryAfterMs=exitContinuation?5000:300000;
+    stockPersist({...stockLedger,nextAt:Date.now()+retryAfterMs,note,hold:hold || stockLedger.hold,
       ...(stockRead?{valuation:{...stockCore.performance(stockRead.model,stockLedger,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),at:stockRead.at}}:{}),
       holdReason:hold?note:stockHoldReason()});
     stockDecisionLog();
     log.add(hold?'stock-held':'stock-check',note,{diagnosticId:stockRead?.diagnosticId??null,observationId:stockRead?.observationId??null,
-      pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),
+      pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),retryAfterMs,exitContinuation,
       buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now()),
       ...(stockRead?{market:stockCore.marketSummary(stockRead.model,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),
         performance:stockCore.performance(stockRead.model,stockLedger,Date.now())}:{}),
@@ -4591,7 +4606,14 @@
       {stake:entry.debit,payout:entry.settlement.payout,net:entry.settlement.payout-entry.debit,
         reward:{代币:entry.settlement.payout,股市返还:entry.settlement.payout,'股市预测净盈亏':entry.settlement.payout-entry.debit}},true,`stock-settled:${stockLedger.userId}:${entry.betId}`);
     if(stockLedger.entries.length>=2000){stockFinish('股市账本暂满，暂停新交易，五分钟后核对结算与到期记录');return;}
-    if(stockActions>=3){stockFinish('本轮股市检查结束，五分钟后继续');return;}
+    if(stockActions>=3){
+      const last=stockLedger.entries.at(-1),sale=stockConfig.trade&&!stockConfig.observeOnly&&!stockLedger.hold&&!stockLedger.pending&&
+        last?.action==='sell'&&last.result==='success'&&last.confirmedAt>=stockEntryAt?stockCore.exitPlans(m,stockLedger,Date.now())[0]?.choice:null;
+      const control=sale?stockControls(sale,m):{},button=sale?buttonIn(control.input?.parentElement?.parentElement,/^卖 \d+$/):null;
+      // A previous partial order may leave an oversized quantity in the input. The next visit refills and rechecks it.
+      const continuation=sale&&usable(control.input)&&visible(button)&&(Number(control.input.value)!==sale.shares||usable(button))?sale:null;
+      stockFinish(continuation?'本轮三笔已核对，仍有待卖持仓，五秒后接续检查':'本轮股市检查结束，五分钟后继续',false,continuation);return;
+    }
     const accountConfig=stockAccountBudget(m),a=stockCore.choose(m,accountConfig,stockLedger,Date.now());
     stockDecisionLog(a);
     if(stockConfig.observeOnly){
