@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.43
+// @version      1.17.44
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.43';
+  const SCRIPT_VERSION = '1.17.44';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -12467,14 +12467,15 @@
       shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&typeof p.name==='string'&&shelterNameUnique(m.state,p)).map(p=>p.id);
   }
   function shelterIdleEmploymentChoice(m,campaign) {
-    // Only add an unassigned adult to an already usable production seat. This does
+    // Add a resting or unpaired dorm adult to an already usable production seat. This does
     // not borrow workers, family members or materials from a background plan.
     if(shelterStaffMode==='off'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap||
       campaign.defense?.busy||['stimpak','explore-recall','quest-claim'].includes(campaign.choice?.kind)||
       campaign.choice?.role?.endsWith('-release'))return null;
     const s=m.state,held=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[]),
-      ...(shelterState.families||[]).flatMap(f=>[f.a,f.b]),...(shelterState.campaign?.defense||[]).map(d=>d.id)]);
-    const pool=s.residents.filter(p=>p.roomId===null&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
+      ...(shelterState.families||[]).flatMap(f=>[f.a,f.b]),...(shelterState.campaign?.defense||[]).map(d=>d.id),
+      ...s.births.flatMap(b=>shelterBirthParents(s,b)||[])]),dorm=new Set(shelterDormWorkers(m,campaign));
+    const pool=s.residents.filter(p=>(p.roomId===null||dorm.has(p.id))&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
       !p.romance&&!held.has(p.id)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&shelterResidentIdentity(s,p));
     if(!pool.length)return null;
     const model={...m,trainingDestinations:campaign.trainingDestinations||[]},demand=shelterGrowthNeeds(m).demand;
@@ -12487,7 +12488,7 @@
       const choices=rooms.filter(r=>shelterRooms[r.type][1]===resource).flatMap(r=>pool.map(p=>({p,r,
         gain:shelterWorkerRate(s,m.now,m.view.env,p,r)}))).filter(c=>Number.isFinite(c.gain)&&c.gain>0)
         .sort((a,b)=>b.gain-a.gain||a.p.id-b.p.id||a.r.id-b.r.id);
-      if(choices.length){const {p,r,gain}=choices[0];return {kind:'assign',id:p.id,from:null,room:r.id,targets:[p.id,r.id],
+      if(choices.length){const {p,r,gain}=choices[0];return {kind:'assign',id:p.id,from:p.roomId,room:r.id,targets:[p.id,r.id],
         name:p.name,gain,idleEmployment:true,reason:resource==='scrap'?'闲置成人优先就业：补现成回收空岗':
           `闲置成人优先就业：补足${shelterResources[resource]}供应`};}
     }
