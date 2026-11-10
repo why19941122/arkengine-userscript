@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.46
+// @version      1.17.47
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.46';
+  const SCRIPT_VERSION = '1.17.47';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -12520,12 +12520,13 @@
     const model={...m,trainingDestinations:campaign.trainingDestinations||[]},demand=shelterGrowthNeeds(m).demand;
     const shortage=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9)
       .sort((a,b)=>s.resources[a]/Math.max(1,demand[a])-s.resources[b]/Math.max(1,demand[b]));
-    const resources=[...shortage,'scrap'].filter(k=>s.resources[k]<m.caps[k]);
+    // Full basic stock does not remove ongoing consumption or committed growth.
+    // Keep supply shortages eligible; only optional scrap production needs free storage.
+    const resources=[...shortage,...(s.resources.scrap<m.caps.scrap?['scrap']:[])];
     const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&resources.includes(shelterRooms[r.type][1])&&
       r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
       s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length<shelterStaffCapacity(model,r));
-    for(const resource of [...shortage,'scrap']){
-      if(s.resources[resource]>=m.caps[resource])continue;
+    for(const resource of resources){
       const choices=rooms.filter(r=>shelterRooms[r.type][1]===resource).flatMap(r=>pool.map(p=>({p,r,
         gain:shelterWorkerRate(s,m.now,m.view.env,p,r)}))).filter(c=>Number.isFinite(c.gain)&&c.gain>0)
         .sort((a,b)=>b.gain-a.gain||a.p.id-b.p.id||a.r.id-b.r.id);
