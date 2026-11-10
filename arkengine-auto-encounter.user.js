@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.40
+// @version      1.17.41
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -509,7 +509,8 @@
       function read(record) {
         check(record?.schema===1&&id(record.trialId)&&id(record.userId)&&stamp(record.startedAt)&&whole(record.initialCash)&&
           Array.isArray(record.initialPositions)&&Array.isArray(record.events)&&whole(record.limits?.capital)&&whole(record.limits?.loss)&&
-          (record.initialBudgetLoss===undefined||whole(record.initialBudgetLoss)),'invalid record');
+          (record.initialBudgetLoss===undefined||whole(record.initialBudgetLoss))&&
+          (record.openingEquity===undefined||whole(record.openingEquity)&&record.initialBudgetLoss===0),'invalid record');
         const positions=record.initialPositions.map(position);check(distinct(positions,p=>p.stockId),'duplicate opening position');
         const state={trialId:record.trialId,userId:record.userId,startedAt:record.startedAt,at:record.startedAt,
           cash:record.initialCash,positions,orders:[],externalNet:0,realized:0,grossRealizedLoss:0,halt:null};
@@ -580,8 +581,10 @@
           if(v.upper===null||v.lower!==v.upper)unknown++;
         }
         const initialBudgetLoss=record.initialBudgetLoss||0;
-        const loss=Math.max(0,sum([initialBudgetLoss,-s.realized,unrealizedLoss]));
-        const stressLoss=Math.max(0,sum([initialBudgetLoss,-s.realized,s.capital])); // 无可信尾部界时按投入全损，含未决买单。
+        const period=record.openingEquity!==undefined;
+        const loss=Math.max(0,period?sum([record.openingEquity,-lower,s.externalNet]):sum([initialBudgetLoss,-s.realized,unrealizedLoss]));
+        const stressLoss=Math.max(0,period?sum([record.openingEquity,-s.cash,s.pendingBuy,s.externalNet]):
+          sum([initialBudgetLoss,-s.realized,s.capital])); // 无可信尾部界时按投入全损，含未决买单。
         const reasons=[];
         if(s.halt)reasons.push(s.halt.reason);
         if(s.capital>record.limits.capital)reasons.push('capital-exceeded');
@@ -589,10 +592,13 @@
         if(loss>=record.limits.loss)reasons.push('loss-limit');
         if(stressLoss>=record.limits.loss)reasons.push('risk-budget-exhausted');
         const newRiskCapacity=Math.max(0,Math.min(record.limits.capital-s.capital,s.availableCash,
-          sum([record.limits.loss,-initialBudgetLoss,s.realized,-s.capital])));
+          period?sum([record.limits.loss,-record.openingEquity,s.cash,-s.pendingBuy,-s.externalNet]):
+            sum([record.limits.loss,-initialBudgetLoss,s.realized,-s.capital])));
         return {trialId:s.trialId,userId:s.userId,at,cash:s.cash,heldCost:s.heldCost,pendingBuy:s.pendingBuy,capital:s.capital,
           externalNet:s.externalNet,realized:s.realized,initialBudgetLoss,grossRealizedLoss:s.grossRealizedLoss,unrealizedLoss,loss,stressLoss,
-          equity:{lower,upper,quoted},unknownPositions:unknown,pending:s.orders.filter(o=>o.status==='pending').length,
+          equity:{lower,upper,quoted},...(period?{periodNet:{lower:sum([lower,-record.openingEquity,-s.externalNet]),
+            upper:upper===null?null:sum([upper,-record.openingEquity,-s.externalNet])}}:{}),
+          unknownPositions:unknown,pending:s.orders.filter(o=>o.status==='pending').length,
           newRiskCapacity:reasons.length?0:newRiskCapacity,reasons:[...new Set(reasons)],halt:s.halt};
       }
       function reserve(record,event,valuation) {
@@ -706,6 +712,7 @@
       function manual(state,entry,view,now) {
         const e=entry,input=e.input,s=account.read(state.record),id='manual-'+e.id;
         if(input?.action==='predict'||s.userId!==input?.expectedUserId)return state;
+        if(state.record.openingEquity!==undefined&&e.confirmed&&e.at<s.startedAt)return state;
         if(s.orders.some(o=>o.id===id&&o.status==='filled'))return state;
         if(!e.confirmed||e.automatic||e.ambiguous||!e.before||e.at<s.startedAt||e.at<s.at)return issue(state,manualIssue);
         const before=s.positions.find(p=>sameStockId(p.stockId,e.before.stockId));
@@ -727,6 +734,26 @@
       }
       return {valid,values,start,refresh,submit,reconcile,capacity,issue,manual,manualIssue};
     })();
+    function beginPeriod(m,ledger,settings,now,periodId) {
+      if(ledger.period||ledger.periodArchive||ledger.pending||ledger.hold||ledger.userId!==m.view.userId||!m.view.enabled)
+        throw Error('已有新周期、原交易未决、停止原因未解除或账号不符，保留旧账');
+      if(ledger.entries.some(e=>e.result==='reserved'||e.action==='predict'&&e.result==='success'&&!e.settlement))
+        throw Error('仍有原交易或预测未结算，等待核对后开启新周期');
+      const accounting=accountRuntime.start(m,{...ledger,entries:[],archive:undefined},now,periodId);
+      const quotes=accountRuntime.values(m,now);
+      if(quotes.some(v=>v.quoted===null))throw Error('当前持仓缺少有效报价，不能把未知价值作为新周期起点');
+      const equity=BigInt(accounting.record.initialCash)+quotes.reduce((n,v)=>n+BigInt(v.quoted),0n);
+      if(equity>BigInt(Number.MAX_SAFE_INTEGER))throw Error('新周期起点金额超出范围');
+      accounting.record={...accounting.record,openingEquity:Number(equity)};
+      accounting.baseline=account.report(accounting.record,{at:now,values:quotes});
+      const {periodRequest,...previous}=ledger;
+      const totals=historyTotals(ledger.entries,ledger.archive);
+      return {...previous,period:{version:1,id:periodId,userId:m.view.userId,at:now,totals},
+        periodArchive:{version:1,userId:m.view.userId,at:now,ledger:JSON.parse(JSON.stringify(previous)),
+          settings:JSON.parse(JSON.stringify(settings)),openingQuotes:quotes},
+        accounting:accountRuntime.refresh(accounting,m,now),accountingWait:'',
+        note:'旧账已完整封存，新核算周期已建立；原24小时额度、冷却和持仓归属保留'};
+    }
     function historyTotals(entries,archive={}) {
       const sum={buyCost:0,knownProceeds:0,releasedCost:0,realized:0,unknownSales:0,predictionNet:0,predictionStake:0,predictionPaid:0,...archive};
       for(const e of entries){
@@ -765,6 +792,14 @@
     function riskReason(m,config,ledger,now) {
       if(config.lossLimit!=null){
         const p=performance(m,ledger,now);
+        if(ledger.period){
+          if(p.unknownSales>ledger.period.totals.unknownSales)return '本周期卖出到账或成本有缺口，停止新增风险，保留原记录';
+          if(!ledger.accounting||ledger.accounting.issue)return ledger.accounting?.issue||'新周期起点尚未核对';
+          const report=account.report(ledger.accounting.record,{at:now,values:accountRuntime.values(m,now)});
+          const predictionLoss=Math.max(0,ledger.period.totals.predictionNet-p.predictionNet);
+          if(report.loss+predictionLoss>=config.lossLimit)return '本周期亏损已达到限制，停止新增风险，已有持仓继续管理';
+          return null;
+        }
         if(p.unknownSales)return '亏损限制待核对：存在卖出到账或对应成本未知，停止新增风险，已有持仓继续管理';
         if(p.unknownPositions)return '亏损限制待核对：持仓成本或有效报价不完整，停止新增风险';
         if(Math.max(0,-p.realized-p.predictionNet-p.unrealized)>=config.lossLimit)
@@ -1259,7 +1294,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -3805,6 +3840,10 @@
         <p class="hint" id="stock-check-feedback" role="status" aria-live="polite"></p>
         <p class="hint" id="stock-config-summary"></p>
         <p class="hint" id="stock-performance"></p>
+        <p class="hint" id="stock-period-status"></p>
+        <div class="panel-actions"><button type="button" id="stock-period-start">封存旧账并开启新周期</button>
+        <button type="button" id="stock-period-export">导出封存旧账</button></div>
+        <p class="hint">新周期只可开启一次：旧账完整保留，旧盈亏不计入新周期；按启动时持仓的含费报价建立起点，本金最多40万，此后亏损最多10万。原24小时额度、冷却与持仓归属保留。导出旧账可另行备份。</p>
         <p class="hint" id="stock-manual-income"></p>
         <details class="panel-subsection" data-panel-section="stock-positions"><summary>逐只持仓与退出条件</summary><p class="hint" id="stock-positions" style="white-space:pre-line">检查后显示脚本持仓及等待原因。</p></details>
         <details class="panel-subsection" data-panel-section="stock-advanced"><summary>高级设置（可选）</summary>
@@ -3899,6 +3938,22 @@
   // 结算记录是历史清理的完成凭据，损坏字段不能被当作已经结算。
   const validStockLedger = v => objectState(v) && v.version===1 && (v.userId===null || stockCore.positive(v.userId)) &&
     (v.accounting===undefined||stockCore.accountRuntime.valid(v.accounting,v.userId))&&
+    (v.periodRequest===undefined||!v.period&&objectState(v.periodRequest)&&stockCore.id(v.periodRequest.id)&&
+      v.periodRequest.userId===v.userId&&stockCore.whole(v.periodRequest.at))&&
+    (v.period===undefined&&v.periodArchive===undefined||objectState(v.period)&&objectState(v.periodArchive)&&
+      v.period.version===1&&v.periodArchive.version===1&&v.period.userId===v.userId&&v.periodArchive.userId===v.userId&&
+      stockCore.id(v.period.id)&&stockCore.whole(v.period.at)&&v.periodArchive.at===v.period.at&&
+      objectState(v.periodArchive.ledger)&&v.periodArchive.ledger.period===undefined&&v.periodArchive.ledger.periodArchive===undefined&&
+      v.periodArchive.ledger.periodRequest===undefined&&v.periodArchive.ledger.userId===v.userId&&validStockLedger(v.periodArchive.ledger)&&
+      validStockConfig(v.periodArchive.settings)&&objectState(v.period.totals)&&
+      stockCore.same(v.period.totals,stockCore.historyTotals(v.periodArchive.ledger.entries,v.periodArchive.ledger.archive))&&
+      v.accounting?.record.trialId===v.period.id&&v.accounting.record.startedAt===v.period.at&&
+      stockCore.whole(v.accounting.record.openingEquity)&&Array.isArray(v.periodArchive.openingQuotes)&&
+      v.periodArchive.openingQuotes.every(q=>objectState(q)&&stockCore.whole(q.quoted))&&
+      v.periodArchive.openingQuotes.length===v.accounting.record.initialPositions.length&&
+      v.accounting.record.initialPositions.every(p=>v.periodArchive.openingQuotes.filter(q=>stockCore.sameStockId(q.stockId,p.stockId)).length===1)&&
+      BigInt(v.accounting.record.openingEquity)===BigInt(v.accounting.record.initialCash)+
+        v.periodArchive.openingQuotes.reduce((n,q)=>n+BigInt(q.quoted),0n))&&
     (v.accountingWait===undefined||typeof v.accountingWait==='string')&&
     (v.rejectionCooldownUntil===undefined||stockCore.whole(v.rejectionCooldownUntil))&&
     (v.archive===undefined||objectState(v.archive)&&['buyCost','knownProceeds','releasedCost','unknownSales','predictionStake','predictionPaid'].every(k=>stockCore.whole(v.archive[k]))&&
@@ -4178,6 +4233,22 @@
     stockPersist({...stockLedger,...(accounting?{accounting}:{}),accountingWait});
     stockRead.accountDone=true;
   }
+  function stockTryBeginPeriod(m) {
+    const request=stockLedger.periodRequest;if(!request)return true;
+    let next;
+    try {
+      if(request.userId!==m.view.userId||stockNative().length)throw Error('账号或原请求尚未核对');
+      if(stockIncomeEntries(m.view.userId).some(e=>!e.automatic&&!e.confirmed&&!e.rejected))
+        throw Error('仍有手动交易结果未知，请先核对原交易');
+      next=stockCore.beginPeriod(m,stockLedger,stockConfig,Date.now(),request.id);
+    }catch(error){stockFinish('新周期等待：'+error.message);return false;}
+    // Archive and replacement are one verified write. Quota failures leave the old ledger and request intact.
+    stockPersist(next);
+    log.add('stock-period-started','按明确指令封存旧账并开启一次性新周期，未执行交易',
+      {periodId:next.period.id,at:next.period.at,previous:next.period.totals,openingEquity:next.accounting.record.openingEquity,
+        capitalLimit:400000,lossLimit:100000});
+    return true;
+  }
   function stockAccountManual(entry,view) {
     stockReload();
     const current=stockLedger.accounting;
@@ -4217,12 +4288,18 @@
     const totals=stockCore.historyTotals(l.entries,l.archive),valuation=stockRead&&Date.now()-stockRead.at<=10000?
       {...stockCore.performance(stockRead.model,l,Date.now()),positions:stockCore.positionReport(stockRead.model,l,Date.now()),at:stockRead.at}:l.valuation;
     shadow.getElementById('stock-performance').textContent=`脚本交易：已记录买入成本 ${totals.buyCost}；已知卖出净额 ${totals.knownProceeds}；已知已实现盈亏 ${totals.realized}`+
-      `${totals.unknownSales?`；另有 ${totals.unknownSales} 笔卖出到账/成本未知，累计盈亏不完整`:''}。预测已结算净额 ${totals.predictionNet}。`+
+      `${totals.unknownSales?`；另有 ${totals.unknownSales} 笔卖出到账/成本未知，累计盈亏不完整${l.period?'（起点前部分已封存）':''}`:''}。预测已结算净额 ${totals.predictionNet}。`+
       (valuation?`\n最近核对 ${new Date(valuation.at).toLocaleTimeString('zh-CN')}：脚本持仓成本 ${valuation.heldCost}，按报价扣费估算浮盈亏 ${valuation.unrealized}${valuation.unknownPositions?`（另有${valuation.unknownPositions}只无法估值）`:''}。估值不代表可实际成交。`:'\n持仓估值等待下次完整检查。');
     const accounting=l.accounting,report=accounting?.report;
     if(accounting)shadow.getElementById('stock-performance').textContent+=`\n独立股票试验自 ${new Date(accounting.record.startedAt).toLocaleString('zh-CN')}：`+
       (report?`本金占用 ${report.capital}/400000（含未决预留 ${report.pendingBuy}）；累计保守亏损 ${report.loss}/100000；起点前已知亏损保留 ${report.initialBudgetLoss}。`:'等待本轮完整核对。')+
       (accounting.issue?` ${accounting.issue}`:' 七天结果仍须完整记录核验。');
+    shadow.getElementById('stock-period-status').textContent=l.period?
+      `新周期已于 ${new Date(l.period.at).toLocaleString('zh-CN')} 启动；旧账已知已实现盈亏 ${l.period.totals.realized}、缺证据卖出 ${l.period.totals.unknownSales} 笔已封存。`+
+        (report?.periodNet?`本周期保守净值变化 ${report.periodNet.lower} 代币${report.periodNet.upper===null?'（上界未知）':`，上界 ${report.periodNet.upper}`}；含未卖持仓估值，不是已到账收益。`:''):
+      l.periodRequest?'新周期已预约，等待完整读取账户并核对原交易；不会重复重置。':'尚未开启新周期，当前仍沿用原历史亏损口径。';
+    shadow.getElementById('stock-period-start').disabled=Boolean(l.period||l.periodRequest||l.userId===null||l.pending||l.hold||stateFault('stock')||stockFault);
+    shadow.getElementById('stock-period-export').disabled=!l.periodArchive;
     const positions=valuation?.positions;
     shadow.getElementById('stock-positions').textContent=!positions?'检查后显示脚本持仓及等待原因。':positions.length?
       `最近核对 ${new Date(valuation.at).toLocaleString('zh-CN')}；以下为当时扣费报价估算，不是已到账收益。\n`+
@@ -4323,6 +4400,23 @@
       }
       stockHint();schedule();
     }catch(error){if(!stockRetryChange(error)){stockFault='无法保存股市预约';stockCheckMessage=stockFault;stockHint();}}
+  });
+  shadow.getElementById('stock-period-start').addEventListener('click',()=>{
+    try {
+      stockReload();
+      if(stateFault('stock')||stockFault||stockLedger.period||stockLedger.periodRequest||stockLedger.userId===null||stockLedger.pending||stockLedger.hold)return;
+      stockPersist({...stockLedger,periodRequest:{id:crypto.randomUUID(),userId:stockLedger.userId,at:Date.now()},nextAt:0});
+      shadow.getElementById('stock-check').click();stockHint();schedule();
+    }catch(error){if(!stockRetryChange(error)){stockFault='新周期预约无法保存，旧账保留';stockHint();}}
+  });
+  shadow.getElementById('stock-period-export').addEventListener('click',()=>{
+    try {
+      stockReload();if(stateFault('stock')||!stockLedger.periodArchive)return;
+      const url=URL.createObjectURL(new Blob([JSON.stringify({version:SCRIPT_VERSION,period:stockLedger.period,
+        archive:stockLedger.periodArchive},null,2)],{type:'application/json'}));
+      const link=document.createElement('a');link.href=url;link.download=`arkengine-stock-archive-${stockLedger.period.userId}-${stockLedger.period.at}.json`;
+      link.click();setTimeout(()=>URL.revokeObjectURL(url),10000);
+    }catch{stockCheckMessage='旧账导出失败，浏览器中的封存记录保留';stockHint();}
   });
   // 人工操作优先；不改用户筛选或接管用户原请求。正在发送的交易仍保留原记录。
   for(const name of ['pointerdown','keydown','input'])document.addEventListener(name,event=>{
@@ -4677,6 +4771,7 @@
     const m=stockRead.model;
     if(stockReconcile(m))return;
     if(stockNative().length){stockFinish('存在手动股市原请求，请先在网页核对',true);return;}
+    if(!stockTryBeginPeriod(m))return;
     stockAccountRefresh(m);
     // 手动改变持仓后停止管理该模型，避免出售人工买入的股票。
     const owned={...stockLedger.owned},capacityWait=stockCapacityWait();let changed=capacityWait;
