@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.33
+// @version      1.17.34
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1179,6 +1179,7 @@
   let continueShelterAction = null;
   let captureStockAction = null;
   let observeStockPost = null;
+  let observeDungeonPost = null;
   let observeStockIncome = null;
   let observeShelterPost = null;
   let observeShelterIncome = null;
@@ -1228,7 +1229,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.33';
+  const SCRIPT_VERSION = '1.17.34';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -2091,7 +2092,16 @@
         }
       }catch{ /* 不可解析的人工请求照常交给网页。 */ }
       if(stockIncomeContext&&!stockIncomeRequest&&!observedStockBody)void observeStockIncome?.unknown(stockIncomeContext);
+      let dungeonReceipt = null;
+      try {
+        const input=args[0],url=new URL(typeof input==='string'?input:input instanceof URL?input.href:input?.url,document.baseURI);
+        if(observeDungeonPost && url.origin===location.origin && url.pathname==='/api/cultivation/dungeons' &&
+            String(args[1]?.method??input?.method??'GET').toUpperCase()==='POST' && typeof args[1]?.body==='string') {
+          dungeonReceipt=observeDungeonPost(JSON.parse(args[1].body));
+        }
+      } catch { /* 只观察能与已保存原请求完全匹配的 JSON，不改变网页请求。 */ }
       const promise = Reflect.apply(originalFetch, this, args);
+      if(dungeonReceipt)promise.then(r=>r.clone().json().then(body=>dungeonReceipt(r.status,body))).catch(()=>{});
       if(stockIncomeRead)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.view(stockIncomeRead,r.status,body))).catch(()=>{});
       if(stockIncomeRequest&&!stockBound)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.result(stockIncomeContext,stockIncomeRequest,r.status,body))).catch(()=>{});
       if(incomeRead||manualIncomeBody||auxIncomeBody){
@@ -2256,7 +2266,8 @@
     dungeonPlan = loadState(sessionStorage, DUNGEON_JOURNAL, null, 'dungeon', v => planState(v) &&
       (v.phase === 'opening' ? typeof v.description === 'string' : v.action === 'enter' ||
         v.action === 'choose' && Number.isInteger(v.step) && v.step >= 1 && v.step <= 8 ||
-        v.action === 'sweep' && Number.isInteger(v.times) && v.times >= 1 && v.times <= 5));
+        v.action === 'sweep' && Number.isInteger(v.times) && v.times >= 1 && v.times <= 5 &&
+          (!v.receipt || validDungeonReceipt(v.receipt, v.times))));
     if (stateFault('dungeon')) dungeonEnabled = false;
     // 旧标记采用零点划日，不能直接当作新的次数周期；只重新核对额度。
     if (!stateFault('dungeon') && dungeon.quotaResetHour !== 4) {
@@ -2915,6 +2926,39 @@
       try { bindDungeonRequest(); } catch { setEnabled(false, '秘境原操作保存失败，请手动核对结果'); }
     });
   }
+  function validDungeonReceipt(receipt, times) {
+    return objectState(receipt) && Number.isFinite(receipt.at) && (receipt.status === 400 ?
+      typeof receipt.error === 'string' && Boolean(receipt.error) : receipt.status === 200 &&
+      Number.isInteger(receipt.completed) && receipt.completed >= 0 && typeof receipt.partial === 'boolean' &&
+      receipt.completed + Number(receipt.partial) <= times && typeof receipt.stopReason === 'string');
+  }
+  observeDungeonPost = request => {
+    if (dungeonPlan?.phase !== 'submitted' || dungeonPlan.action !== 'sweep') return null;
+    bindDungeonRequest();
+    const original = dungeonPlan.original;
+    if (!original || Object.keys(request).length !== 4 || request.action !== 'sweep' ||
+        request.idempotencyKey !== original.value.idempotencyKey || request.sourceRunId !== original.value.input.sourceRunId ||
+        request.times !== original.value.input.times) return null;
+    const identity = JSON.stringify(original);
+    return (status, body) => {
+      if (dungeonPlan?.action !== 'sweep' || JSON.stringify(dungeonPlan.original) !== identity ||
+          dungeonPlan.receipt?.status === 200 || !objectState(body)) return;
+      let receipt;
+      if (status === 400 && typeof body.error === 'string' && body.error) {
+        // 网站在明确 400 时解除此原请求；只确认被拒绝，不推断历史费用或奖励。
+        receipt = { status, at: Date.now(), error: body.error.slice(0, 300) };
+      } else if (status === 200 && body.dungeonName === DUNGEON_NAME && Array.isArray(body.trips) &&
+          body.trips.length <= dungeonPlan.times && body.trips.every(t => objectState(t) && typeof t.finished === 'boolean') &&
+          (body.activeRunId == null || typeof body.activeRunId === 'string' && body.activeRunId.length > 0) &&
+          typeof body.stopReason === 'string') {
+        const completed = body.trips.filter(t => t.finished).length, partial = Boolean(body.activeRunId);
+        if (completed + Number(partial) > dungeonPlan.times) return;
+        receipt = { status, at: Date.now(), completed, partial, stopReason: body.stopReason.slice(0, 300) };
+      } else return;
+      try { saveDungeonPlan({ ...dungeonPlan, receipt }); schedule(); }
+      catch { setEnabled(false, '秘境回执保存失败，请手动核对原批次'); }
+    };
+  };
   function linkTo(path) {
     return [...document.querySelectorAll('a[href]')].find(link => {
       try {
@@ -3075,10 +3119,19 @@
     const section = locator.pick([...document.querySelectorAll('section')].filter(s =>
       [...s.querySelectorAll('p')].some(p => /^探索中 · /.test(textOf(p)))));
     if (dungeonPlan?.phase === 'submitted' && dungeonPlan.action === 'sweep') {
-      const result = dungeonSweepResult();
+      const saved = dungeonPlan.receipt;
+      if (saved?.status === 400) {
+        saveDungeon({ ...dungeon, deferrals: 0, stalls: 0, nextAt: Date.now() + 30 * 60000,
+          lastRejectedSweep: { at: Date.now(), plan: dungeonPlan } });
+        saveDungeonPlan(null);
+        recoveryBudget.clear('dungeon');
+        log.add('dungeon-sweep-rejected', '原扫荡请求明确被拒绝，归档后返回主殿', { error: saved.error });
+        returningFromDungeon = true; returnToHall(); return;
+      }
+      const result = saved?.status === 200 ? { ...saved, text: `通关 ${saved.completed} 次；停下原因:${saved.stopReason}` } : dungeonSweepResult();
       const quota = dungeonQuota();
-      const fresh = result && (result.text !== dungeonPlan.beforeSweep || quota && quota.remaining < dungeonPlan.beforeQuota);
-      if (errors || (!fresh && !section)) { waitDungeonResult(refresh, errors); return; }
+      const fresh = result && (saved?.status === 200 || result.text !== dungeonPlan.beforeSweep || quota && quota.remaining < dungeonPlan.beforeQuota);
+      if ((errors && !(saved?.status === 200 && !saved.partial)) || (!fresh && !section)) { waitDungeonResult(refresh, errors); return; }
       // 原生原请求已清除，页面给出了新的批次回执或正在探索的节点；不再创建同一批扫荡。
       if (fresh && (result.completed > dungeonPlan.times || result.partial !== Boolean(section))) {
         say('扫荡回执与当前探索不一致，等待状态核对'); return;
@@ -3086,7 +3139,8 @@
       const receipt = { at: Date.now(), plan: dungeonPlan, completed: fresh ? result.completed : null,
         partial: Boolean(section), result: fresh ? result.text : '', outcome: fresh ? 'confirmed' : 'active-run', quota };
       saveDungeon({ ...dungeon, run: null, deferrals: 0, stalls: 0, lastSweep: receipt,
-        exhaustedDay: quota?.remaining === 0 ? dungeonDay() : '', nextAt: section ? 0 : Date.now() + 30 * 60000 });
+        exhaustedDay: !errors && quota?.remaining === 0 ? dungeonDay() : '',
+        nextAt: section ? 0 : Date.now() + (dungeonCooldownDelay() ?? 30 * 60000) });
       saveDungeonPlan(null);
       recoveryBudget.clear('dungeon');
       log.add('dungeon-sweep-result', section ? '扫荡停在节点，接续当前探索' : '扫荡结果已核对，返回主殿',
@@ -3208,15 +3262,7 @@
     if (!card) { deferDungeon('当前未找到坠星古墓入口'); return; }
     const cooldown = [...card.querySelectorAll('button')].find(b => textOf(b) === '秘境冷却中');
     if (cooldown) {
-      // 网站 CountdownBadge 的 aria-label 为“秘境冷却 MM:SS / HH:MM:SS”。
-      const badge = [...document.querySelectorAll('[aria-label^="秘境冷却 "]')].find(visible);
-      const match = badge?.getAttribute('aria-label').match(/^秘境冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
-      let remaining = null;
-      if (match && Number(match[2]) < 60 && (match[3] === undefined || Number(match[3]) < 60)) {
-        remaining = match[3] === undefined ? (+match[1] * 60 + +match[2]) * 1000 :
-          (+match[1] * 3600 + +match[2] * 60 + +match[3]) * 1000;
-      }
-      deferDungeon('秘境仍在冷却', Number.isSafeInteger(remaining) ? Math.max(30000, remaining + 2000) : null); return;
+      deferDungeon('秘境仍在冷却', dungeonCooldownDelay()); return;
     }
     const enter = [...card.querySelectorAll('button')].find(b => textOf(b) === '进入秘境');
     const cost = textOf(card).match(/门票\s*(\d+)\s*钻\s*·\s*灵力\s*(\d+)/);
@@ -3230,6 +3276,14 @@
     });
   }
 
+  function dungeonCooldownDelay() {
+    const badge = locator.pick([...document.querySelectorAll('[aria-label^="秘境冷却 "]')]);
+    const match = badge?.getAttribute('aria-label').match(/^秘境冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
+    if (!match || Number(match[2]) >= 60 || match[3] !== undefined && Number(match[3]) >= 60) return null;
+    const remaining = match[3] === undefined ? (+match[1] * 60 + +match[2]) * 1000 :
+      (+match[1] * 3600 + +match[2] * 60 + +match[3]) * 1000;
+    return Number.isSafeInteger(remaining) ? Math.max(30000, remaining + 2000) : null;
+  }
   function dungeonSweepResult() {
     const result = locator.pick([...document.querySelectorAll('section[role="status"]')].filter(s =>
       [...s.querySelectorAll('h2')].some(h => textOf(h) === `扫荡结果 · ${DUNGEON_NAME}`)));
@@ -3242,7 +3296,7 @@
       [...s.querySelectorAll('h2')].some(h => textOf(h) === `按上次路线扫荡 · ${DUNGEON_NAME}`)));
     if (!section) return false; // 尚无可复用路线时，正常探索一次建立路线。
     const button = locator.pick([...section.querySelectorAll('button')].filter(b => textOf(b) === '按上次路线扫荡'));
-    if (!usable(button)) { deferDungeon('上次路线扫荡暂不可用'); return true; }
+    if (!usable(button)) { deferDungeon('上次路线扫荡暂不可用', dungeonCooldownDelay()); return true; }
     const select = locator.pick([...section.querySelectorAll('select[aria-label="扫荡次数"]')]);
     const options = select ? [...select.options].filter(o => !o.disabled).map(o => Number(o.value)) : [1];
     const times = Math.max(0, ...options.filter(n => Number.isInteger(n) && n >= 1 && n <= Math.min(5, quota.remaining)));
