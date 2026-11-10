@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.45
+// @version      1.17.46
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.45';
+  const SCRIPT_VERSION = '1.17.46';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -12499,13 +12499,20 @@
       localChecks:proposal.localChecks+(continuation?.localChecks||0)}};
   }
   function shelterIdleEmploymentChoice(m,campaign) {
-    // Add a resting or unpaired dorm adult to an already usable production seat. This does
-    // not borrow workers, family members or materials from a background plan.
+    // Fill usable production seats with idle adults, including parents still on
+    // confirmed cooldown. Keep active family duties and all role reservations intact.
     if(shelterStaffMode==='off'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap||
       campaign.defense?.busy||['stimpak','explore-recall','quest-claim'].includes(campaign.choice?.kind)||
       campaign.choice?.role?.endsWith('-release'))return null;
-    const s=m.state,held=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[]),
-      ...(shelterState.families||[]).flatMap(f=>[f.a,f.b]),...(shelterState.campaign?.defense||[]).map(d=>d.id),
+    const s=m.state,families=shelterState.families||[],
+      romance=new Set(s.residents.filter(p=>p.romance).flatMap(p=>[p.id,p.romance.partnerId]));
+    const coolingParents=new Set(families.filter(f=>!s.births.some(b=>b.roomId===f.room)).flatMap(f=>[f.a,f.b]).filter(id=>{
+      const p=s.residents.find(p=>p.id===id);
+      // Leave a full production tick; a nearly ready parent should not make a round trip.
+      return Number.isFinite(p?.familyCooldownUntil)&&p.familyCooldownUntil>m.now+600000&&!romance.has(id);
+    }));
+    const held=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[]),...romance,
+      ...families.flatMap(f=>[f.a,f.b]).filter(id=>!coolingParents.has(id)),...(shelterState.campaign?.defense||[]).map(d=>d.id),
       ...s.births.flatMap(b=>shelterBirthParents(s,b)||[])]),dorm=new Set(shelterDormWorkers(m,campaign));
     const pool=s.residents.filter(p=>(p.roomId===null||dorm.has(p.id))&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
       !p.romance&&!held.has(p.id)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&shelterResidentIdentity(s,p));
@@ -12524,8 +12531,10 @@
         .sort((a,b)=>b.gain-a.gain||a.p.id-b.p.id||a.r.id-b.r.id);
       if(choices.length){const {p,r,gain,idleAllocation}=shelterIdleEmploymentAllocation(model,pool,rooms,demand,choices[0]);
         return {kind:'assign',id:p.id,from:p.roomId,room:r.id,targets:[p.id,r.id],name:p.name,gain,idleEmployment:true,
-          ...(idleAllocation?{idleAllocation}:{}),reason:(resource==='scrap'?'闲置成人优先就业：补现成回收空岗':
-          `闲置成人优先就业：补足${shelterResources[resource]}供应`)+(idleAllocation?'；按闲置人员组合产出选人':'')};}
+          ...(idleAllocation?{idleAllocation}:{}),...(coolingParents.has(p.id)?{familyCooldownUntil:p.familyCooldownUntil}:{}),
+          reason:(resource==='scrap'?'闲置成人优先就业：补现成回收空岗':
+          `闲置成人优先就业：补足${shelterResources[resource]}供应`)+(idleAllocation?'；按闲置人员组合产出选人':'')+
+          (coolingParents.has(p.id)?'；生育冷却期间工作，保留原家庭':'')};}
     }
     return null;
   }
@@ -14110,6 +14119,7 @@
           snapshotAt:m.now,visitStartedAt:shelterEntryAt,residentId:choice.id,name:String(choice.name||'').slice(0,200),
           from:choice.from,to:choice.room,role:choice.role||null,reason:choice.reason,idleEmployment:Boolean(choice.idleEmployment),
           ...(choice.idleAllocation?{idleAllocation:choice.idleAllocation}:{}),
+          ...(choice.familyCooldownUntil?{familyCooldownUntil:choice.familyCooldownUntil}:{}),
           ...(choice.developmentProposal?{developmentProposal:choice.developmentProposal}:{}),
           production:m.production,plannedDemand:shelterGrowthNeeds(m).demand,
           populationTarget:shelterPopulationTarget,pairStep:shelterState.pair?.step??null,swapStep:shelterState.swap?.step??null});
