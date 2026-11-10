@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.42
+// @version      1.17.43
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -833,6 +833,21 @@
       // Risk exits precede profit-taking; within each group the worst fee-adjusted return goes first.
       return rows.sort((a,b)=>a.priority-b.priority||a.netReturnPct-b.netReturnPct||String(a.choice.stockId).localeCompare(String(b.choice.stockId)));
     }
+    function unlockRecheck(m,ledger,now) {
+      if(!m.view.enabled||ledger.userId!==m.view.userId||ledger.pending||ledger.hold||ledger.periodRequest||
+          ledger.rejectionCooldownUntil>now||!m.rules.reserveTokens||!m.rules.maxTradeTokens)return null;
+      let next=null;
+      for(const p of m.view.positions){
+        const o=ledger.owned[String(p.stockId)],s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),until=time(p.holdUntil);
+        if(!o||o.manual||!positive(o.cost)||p.shares!==o.shares||p.costBasisTokens!==o.cost||
+            !s||s.modelName!==o.modelName||s.stale||s.suspended||!Number.isFinite(until)||until<=now)continue;
+        const at=Math.max(now+5000,until+1000);
+        if(at>=now+300000||!(quote(s.priceCents,p.shares,m.rules.sellFeePct,false)>0))continue;
+        if(!next||at<next.at||at===next.at&&String(s.id).localeCompare(String(next.stockId))<0)
+          next={at,stockId:s.id,modelName:s.modelName,holdUntil:until};
+      }
+      return next;
+    }
     function positionReport(m,ledger,now) {
       if(!m)return [];
       return Object.entries(ledger.owned).filter(([,o])=>!o.manual&&o.shares>0).map(([id,o])=>{
@@ -1294,7 +1309,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,unlockRecheck,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -1356,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.42';
+  const SCRIPT_VERSION = '1.17.43';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -4462,17 +4477,23 @@
     } catch { log.add('stock-diagnostic-error','详细诊断生成失败；交易仍按原条件核对'); }
   }
   function stockFinish(note,hold=false,exitContinuation=null) {
-    if(stockReload()||hold||stockLedger.hold||stockLedger.pending||!stockConfig.trade||stockConfig.observeOnly){
+    const changed=stockReload(),now=Date.now();
+    const blocked=changed||hold||stockLedger.hold||stockLedger.pending||!enabled||!stockConfig.trade||stockConfig.observeOnly;
+    if(blocked){
       if(exitContinuation)note='股市共享状态已变化，本轮检查结束，五分钟后继续';
       exitContinuation=null;
     }
-    const retryAfterMs=exitContinuation?5000:300000;
-    stockPersist({...stockLedger,nextAt:Date.now()+retryAfterMs,note,hold:hold || stockLedger.hold,
+    const unlockRecheck=!blocked&&!exitContinuation&&stockRead&&now-stockRead.at<=10000?
+      stockCore.unlockRecheck(stockRead.model,stockLedger,now):null;
+    const retryAfterMs=exitContinuation?5000:unlockRecheck?unlockRecheck.at-now:300000;
+    if(unlockRecheck)note=note.replace(/五分钟后(?:继续|再检查|重新检查)/g,'稍后复查')+
+      `；${unlockRecheck.modelName}持有期即将结束，已预约解锁后重新核对`;
+    stockPersist({...stockLedger,nextAt:now+retryAfterMs,note,hold:hold || stockLedger.hold,
       ...(stockRead?{valuation:{...stockCore.performance(stockRead.model,stockLedger,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),at:stockRead.at}}:{}),
       holdReason:hold?note:stockHoldReason()});
     stockDecisionLog();
     log.add(hold?'stock-held':'stock-check',note,{diagnosticId:stockRead?.diagnosticId??null,observationId:stockRead?.observationId??null,
-      pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),retryAfterMs,exitContinuation,
+      pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),retryAfterMs,exitContinuation,unlockRecheck,
       buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now()),
       ...(stockRead?{market:stockCore.marketSummary(stockRead.model,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),
         performance:stockCore.performance(stockRead.model,stockLedger,Date.now())}:{}),
