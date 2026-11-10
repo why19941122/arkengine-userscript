@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.38
+// @version      1.17.39
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -351,6 +351,31 @@
         if(cost!==null && cost<=budget) low=mid; else high=mid-1; }
       return low;
     }
+    function saleAmount(price,shares,percent) {
+      if(!positive(price)||!positive(shares)||shares>2147483647||!fee(percent))return null;
+      const [a,b='']=String(percent).split('.'),scale=10n**BigInt(b.length);
+      const gross=BigInt(price)*BigInt(shares),charge=gross*BigInt(a+b)/(100n*scale),net=gross-charge;
+      // Match the native quantity helper's signed 32-bit cents limits, before token rounding.
+      if(charge>2147483647n||net>2147483647n)return null;
+      return Number(net/100n);
+    }
+    function saleSharesFor(price,percent,budget,limit) {
+      if(!positive(price)||!fee(percent)||!positive(budget)||!positive(limit)||limit>2147483647)return 0;
+      let low=0,high=limit;
+      while(low<high){
+        const mid=low+Math.ceil((high-low)/2),net=saleAmount(price,mid,percent);
+        if(net!==null&&net<=budget)low=mid;else high=mid-1;
+      }
+      if(!low||low===limit)return low;
+      const target=saleAmount(price,low,percent);if(!target)return low;
+      // Preserve shares when token rounding pays the same amount; a whole-position exit still clears the lot.
+      high=low;low=1;
+      while(low<high){
+        const mid=low+Math.floor((high-low)/2);
+        if(saleAmount(price,mid,percent)>=target)high=mid;else low=mid+1;
+      }
+      return low;
+    }
     function model(v,balance) {
       if (!v || !positive(v.userId) || typeof v.enabled!=='boolean' || !Number.isFinite(balance?.tokens) ||
           balance.tokens<0 || balance.tokens>Number.MAX_SAFE_INTEGER ||
@@ -614,8 +639,8 @@
       function values(m,now) {
         return m.view.positions.filter(p=>p.shares>0).map(p=>{
           const s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),q=s&&!s.stale&&!s.suspended?quote(s.priceCents,p.shares,m.rules.sellFeePct,false):null;
-          const can=q!==null&&m.view.enabled&&p.holdUntil!==undefined&&(p.holdUntil===null||time(p.holdUntil)<=now)&&
-            BigInt(s.priceCents)*BigInt(p.shares)<=BigInt(Math.min(m.rules.maxTradeTokens,m.rules.reserveTokens))*100n;
+          const can=q!==null&&q>0&&m.view.enabled&&p.holdUntil!==undefined&&(p.holdUntil===null||time(p.holdUntil)<=now)&&
+            saleAmount(s.priceCents,p.shares,m.rules.sellFeePct)!==null&&q<=Math.min(m.rules.maxTradeTokens,m.rules.reserveTokens);
           return {stockId:p.stockId,lower:can?q:0,upper:can?q:null,quoted:q};
         });
       }
@@ -753,8 +778,7 @@
           s.suspended || s.stale || p.holdUntil && time(p.holdUntil)>now)return null;
       const net=quote(s.priceCents,p.shares,r.sellFeePct,false),t=trend(m.view,s,now);
       if(net===null || !(net/o.cost>=1.08 || net/o.cost<=.94 || t?.direction==='down'))return null;
-      const cap=BigInt(Math.min(r.maxTradeTokens,r.reserveTokens))*100n/BigInt(s.priceCents);
-      const shares=Number(cap<BigInt(p.shares)?cap:BigInt(p.shares));
+      const shares=saleSharesFor(s.priceCents,r.sellFeePct,Math.min(r.maxTradeTokens,r.reserveTokens),p.shares);
       if(shares<=0)return null;
       const proceeds=quote(s.priceCents,shares,r.sellFeePct,false);
       if(proceeds===null)return null;
@@ -793,10 +817,10 @@
         if(sale?.blocked)return result('rounding',sale.reason);
         if(sale?.action){
           row.sellShares=sale.shares;row.estimatedSaleNet=quote(s.priceCents,sale.shares,m.rules.sellFeePct,false);
-          return result('sell',`${sale.reason}，当前最多可卖 ${sale.shares} 股${sale.shares<o.shares?'（受单笔额度或系统储备限制）':''}`);
+          return result('sell',`${sale.reason}，本次计划卖 ${sale.shares} 股${sale.shares<o.shares?'（按净到账额度分批，同额保留余股）':''}`);
         }
         const net=row.estimatedNet/o.cost,t=trend(m.view,s,now);
-        return net>=1.08||net<=.94||t?.direction==='down'?result('liquidity','已触发退出条件，单笔额度或系统储备暂不足一股'):
+        return net>=1.08||net<=.94||t?.direction==='down'?result('liquidity','已触发退出条件，单笔额度、系统储备或金额范围暂不支持卖出'):
           result('holding','尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
       });
     }
@@ -1029,6 +1053,7 @@
         const proceeds=quote(stock.priceCents,a.shares,m.rules.sellFeePct,false);
         if(proceeds===null)return '原卖出当前扣费后金额无法核对，保留原单等待';
         if(proceeds===0)return '原卖出扣费取整后预计净到账为0代币，保留原请求，等待报价恢复或手动核对';
+        if(saleAmount(stock.priceCents,a.shares,m.rules.sellFeePct)===null)return '原卖出金额超过网站整数范围，保留原请求等待核对';
         if(proceeds>m.rules.maxTradeTokens)return '原卖出当前净到账超过网站单笔额度，保留原请求等待恢复';
         if(proceeds>m.rules.reserveTokens)return '网站储备不足以支付原卖单，保留原请求等待恢复';
         return null;
@@ -1219,7 +1244,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
