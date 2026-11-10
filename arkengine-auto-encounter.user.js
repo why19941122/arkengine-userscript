@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.44
+// @version      1.17.45
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.44';
+  const SCRIPT_VERSION = '1.17.45';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -12466,6 +12466,38 @@
       !campaign.reserved?.includes(p.id)&&!campaign.dailyReserved?.includes(p.id)&&
       shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&typeof p.name==='string'&&shelterNameUnique(m.state,p)).map(p=>p.id);
   }
+  function shelterIdleEmploymentAllocation(m,pool,rooms,demand,first) {
+    // Reuse the bounded assignment heuristic for idle people only. Compare its
+    // whole roster with keeping the original first choice and optimizing the rest.
+    // No existing producer is borrowed, and no multi-step plan is saved or replayed.
+    if(!shelterOptimize||pool.length<2||new Set(rooms.map(r=>shelterRooms[r.type][1])).size<2)return first;
+    const s=m.state,resource=shelterRooms[first.r.type][1],gap=demand[resource]*1.2-m.production[resource];
+    if(!(gap>0))return first;
+    const slots=rooms.map(r=>Math.max(0,shelterStaffCapacity(m,r)-s.residents.filter(p=>
+      p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length));
+    const workers=pool.map(p=>({p,rates:rooms.map(r=>shelterWorkerRate(s,m.now,m.view.env,p,r))}));
+    if(workers.some(w=>w.rates.some(rate=>!Number.isFinite(rate)||rate<0)))return first;
+    const model={...m,demand},floors={...m.production},before={score:shelterAllocationScore(m.production,demand)};
+    const proposal=shelterGreedyAllocation(model,rooms,workers,slots,m.production,floors,before,1000);
+    if(!proposal)return first;
+    const forced={...m.production,[resource]:m.production[resource]+first.gain},remaining=slots.slice();
+    remaining[rooms.findIndex(r=>r.id===first.r.id)]--;
+    const continuation=shelterGreedyAllocation(model,rooms,workers.filter(w=>w.p.id!==first.p.id),remaining,
+      forced,floors,before,1000);
+    const baseline=continuation||{production:forced,score:shelterAllocationScore(forced,demand)};
+    if(!Object.keys(demand).every(k=>proposal.production[k]>=Math.min(baseline.production[k],demand[k]*1.2)-1e-9)||
+        !shelterAllocationImproves(baseline.score,proposal.score))return first;
+    const choices=proposal.targets.flatMap(t=>{
+      const p=pool.find(p=>p.id===t.id),r=rooms.find(r=>r.id===t.room);
+      if(!p||!r||shelterRooms[r.type][1]!==resource)return [];
+      const gain=workers.find(w=>w.p.id===p.id).rates[rooms.indexOf(r)];
+      // Preserve the original next-step shortage relief, capped at the full need.
+      return gain>=Math.min(first.gain,gap)-1e-9?[{p,r,gain}]:[];
+    }).sort((a,b)=>b.gain-a.gain||a.p.id-b.p.id||a.r.id-b.r.id);
+    if(!choices.length||choices[0].p.id===first.p.id&&choices[0].r.id===first.r.id)return first;
+    return {...choices[0],idleAllocation:{candidates:pool.length,baseline:baseline.production,planned:proposal.production,
+      localChecks:proposal.localChecks+(continuation?.localChecks||0)}};
+  }
   function shelterIdleEmploymentChoice(m,campaign) {
     // Add a resting or unpaired dorm adult to an already usable production seat. This does
     // not borrow workers, family members or materials from a background plan.
@@ -12481,16 +12513,19 @@
     const model={...m,trainingDestinations:campaign.trainingDestinations||[]},demand=shelterGrowthNeeds(m).demand;
     const shortage=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9)
       .sort((a,b)=>s.resources[a]/Math.max(1,demand[a])-s.resources[b]/Math.max(1,demand[b]));
-    const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
+    const resources=[...shortage,'scrap'].filter(k=>s.resources[k]<m.caps[k]);
+    const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&resources.includes(shelterRooms[r.type][1])&&
+      r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
       s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length<shelterStaffCapacity(model,r));
     for(const resource of [...shortage,'scrap']){
       if(s.resources[resource]>=m.caps[resource])continue;
       const choices=rooms.filter(r=>shelterRooms[r.type][1]===resource).flatMap(r=>pool.map(p=>({p,r,
         gain:shelterWorkerRate(s,m.now,m.view.env,p,r)}))).filter(c=>Number.isFinite(c.gain)&&c.gain>0)
         .sort((a,b)=>b.gain-a.gain||a.p.id-b.p.id||a.r.id-b.r.id);
-      if(choices.length){const {p,r,gain}=choices[0];return {kind:'assign',id:p.id,from:p.roomId,room:r.id,targets:[p.id,r.id],
-        name:p.name,gain,idleEmployment:true,reason:resource==='scrap'?'闲置成人优先就业：补现成回收空岗':
-          `闲置成人优先就业：补足${shelterResources[resource]}供应`};}
+      if(choices.length){const {p,r,gain,idleAllocation}=shelterIdleEmploymentAllocation(model,pool,rooms,demand,choices[0]);
+        return {kind:'assign',id:p.id,from:p.roomId,room:r.id,targets:[p.id,r.id],name:p.name,gain,idleEmployment:true,
+          ...(idleAllocation?{idleAllocation}:{}),reason:(resource==='scrap'?'闲置成人优先就业：补现成回收空岗':
+          `闲置成人优先就业：补足${shelterResources[resource]}供应`)+(idleAllocation?'；按闲置人员组合产出选人':'')};}
     }
     return null;
   }
@@ -14074,6 +14109,7 @@
         log.add('shelter-staff-decision','准备调岗；提交及到岗结果另行核对',{
           snapshotAt:m.now,visitStartedAt:shelterEntryAt,residentId:choice.id,name:String(choice.name||'').slice(0,200),
           from:choice.from,to:choice.room,role:choice.role||null,reason:choice.reason,idleEmployment:Boolean(choice.idleEmployment),
+          ...(choice.idleAllocation?{idleAllocation:choice.idleAllocation}:{}),
           ...(choice.developmentProposal?{developmentProposal:choice.developmentProposal}:{}),
           production:m.production,plannedDemand:shelterGrowthNeeds(m).demand,
           populationTarget:shelterPopulationTarget,pairStep:shelterState.pair?.step??null,swapStep:shelterState.swap?.step??null});
