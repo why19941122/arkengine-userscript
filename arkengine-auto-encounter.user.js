@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.37
+// @version      1.17.38
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1008,6 +1008,7 @@
       config=funding(m,config);
       const a=p.choice;
       if(p.manualTouched)return '原交易期间持仓被手动操作，保留原请求供手动核对';
+      if(!m.view.enabled)return '股市暂未开放，保留原请求等待恢复';
       if(a.action!=='predict') {
         const before=p.beforeShares,after=before+(a.action==='buy'?a.shares:-a.shares);
         if(!whole(before)||!positive(a.shares)||!whole(after))return '原交易持仓快照无法核对，保留原请求';
@@ -1023,9 +1024,13 @@
       if(a.action==='sell') {
         const stock=m.view.stocks.find(s=>sameStockId(s.id,a.stockId)&&s.modelName===a.modelName);
         if(!stock||stock.stale||stock.suspended)return '原卖出当前报价无法核对，保留原单等待';
+        const position=m.view.positions.find(s=>sameStockId(s.stockId,a.stockId));
+        if(position?.holdUntil&&time(position.holdUntil)>now)return '原卖出尚在持有期，保留原请求等待到期';
         const proceeds=quote(stock.priceCents,a.shares,m.rules.sellFeePct,false);
         if(proceeds===null)return '原卖出当前扣费后金额无法核对，保留原单等待';
         if(proceeds===0)return '原卖出扣费取整后预计净到账为0代币，保留原请求，等待报价恢复或手动核对';
+        if(proceeds>m.rules.maxTradeTokens)return '原卖出当前净到账超过网站单笔额度，保留原请求等待恢复';
+        if(proceeds>m.rules.reserveTokens)return '网站储备不足以支付原卖单，保留原请求等待恢复';
         return null;
       }
       const risk=riskReason(m,config,ledger,now);if(risk)return risk;
@@ -3855,6 +3860,7 @@
   const validStockLedger = v => objectState(v) && v.version===1 && (v.userId===null || stockCore.positive(v.userId)) &&
     (v.accounting===undefined||stockCore.accountRuntime.valid(v.accounting,v.userId))&&
     (v.accountingWait===undefined||typeof v.accountingWait==='string')&&
+    (v.rejectionCooldownUntil===undefined||stockCore.whole(v.rejectionCooldownUntil))&&
     (v.archive===undefined||objectState(v.archive)&&['buyCost','knownProceeds','releasedCost','unknownSales','predictionStake','predictionPaid'].every(k=>stockCore.whole(v.archive[k]))&&
       ['realized','predictionNet'].every(k=>Number.isSafeInteger(v.archive[k])))&&
     stockCore.whole(v.nextAt) && typeof v.note==='string' && typeof v.hold==='boolean' && objectState(v.owned) &&
@@ -4090,6 +4096,16 @@
   const stockHoldReason = () => stockLedger.hold ? stockLedger.holdReason || stockLedger.note : null;
   // Legacy capacity stops may resume reads; other holds and pending requests keep their existing protections.
   const stockCapacityWait = () => !stockLedger.pending && stockHoldReason()==='股市账本达到容量上限，请导出日志后核对';
+  function stockRecoverRejectedHold() {
+    const oldNote='交易被网站拒绝，未执行';
+    if(!enabled||!stockEnabled()||stockFault||stateFault('stock')||!stockLedger.hold||stockLedger.pending||
+      stockHoldReason()!==oldNote||stockLedger.note!==oldNote||stockLedger.entries.at(-1)?.result!=='rejected'||stockNative().length)return false;
+    const until=Math.max(Date.now(),stockLedger.nextAt,stockLedger.rejectionCooldownUntil??0);
+    stockPersist({...stockLedger,hold:false,holdReason:null,rejectionCooldownUntil:until,nextAt:until,
+      note:'旧交易已明确拒绝且未执行，解除该拒绝造成的永久等待，按冷却重新核对'});
+    log.add('stock-recovered','明确拒绝的旧交易恢复定时检查，保留原账本与风险限制',{cooldownUntil:until});
+    return true;
+  }
   function stockPersist(value) {
     // 通知可能迟到；发现共享记录已改变时，不能把按旧状态算出的值写回。
     const changed=stockReload();
@@ -4344,8 +4360,10 @@
   }
   function maybeVisitStock(running) {
     if(stockReload()){cancelStockRead();cancelQueued();}
+    if(stockRecoverRejectedHold()){cancelStockRead();cancelQueued();}
     // A paused feature keeps its original journal for reconciliation, without blocking unrelated work.
     if(!stockEnabled() || stockFault || stateFault('stock') || stockLedger.hold && !stockLedger.pending?.result && !stockCapacityWait() && !stockCanConfirmHere() || stockLedger.nextAt>Date.now() ||
+      !stockLedger.pending&&stockLedger.rejectionCooldownUntil>Date.now()||
       farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait())return false;
     rememberExpeditionTime(running);
     if(farmState.expeditionAt>Date.now() && farmState.expeditionAt-Date.now()<15000)return false;
@@ -4554,13 +4572,15 @@
       }
       // 自动额度随资产变化；成交后额度降低只限制新单，不把已确认成交误判成超价。
       const over=p.result==='success' && a.action==='buy' && (entry.debit>a.debit || !stockConfig.autoBudget&&stockCore.spend(entries,'buy',Date.now())>stockConfig.tradeLimit);
-      const resolvedWait=p.result==='success'&&!p.manualTouched&&
+      const resolvedWait=['success','rejected'].includes(p.result)&&!p.manualTouched&&
         (stockHoldReason()==='本页没有匹配的原交易，请回原标签页核对；不新建交易'||
-          a.action!=='predict'&&stockHoldReason()==='交易已执行，但持仓成本或数量尚未对应，保留原记录');
+          a.action!=='predict'&&stockHoldReason()==='交易已执行，但持仓成本或数量尚未对应，保留原记录'||
+          stockHoldReason()==='原交易已核对两次仍未知，保留记录，请手动确认原交易');
       const reason=over?'实际买入超过预留金额，已停止后续自动交易':stockLedger.hold&&!resolvedWait?stockHoldReason():null;
       const accounting=stockLedger.accounting&&stockCore.accountRuntime.reconcile(stockLedger.accounting,m,p,entry,Date.now());
       stockPersist({...stockLedger,owned,entries,...(accounting?{accounting}:{}),pending:null,hold:Boolean(reason),holdReason:reason,
-        note:p.result==='rejected'?'交易被网站拒绝，未执行':reason||`${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测下注'}已确认`});
+        ...(p.result==='rejected'?{rejectionCooldownUntil:Date.now()+300000}:{}),
+        note:reason||(p.result==='rejected'?'交易被网站拒绝，未执行；五分钟后重新核对':`${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测下注'}已确认`)});
       if(p.result==='success')stockRecordIncome(p,{
         action:a.action,model:a.modelName,reward:a.action==='buy'?{'股市买入支出':entry.debit}:
           a.action==='predict'?{'股市下注支出':entry.debit}:stockCore.saleReward(entry.proceeds,entry.releasedCost),
@@ -4573,7 +4593,7 @@
         ...(a.action==='sell'?{shares:a.shares,proceeds:entry.proceeds,releasedCost:entry.releasedCost,
           realized:stockCore.whole(entry.proceeds)&&stockCore.whole(entry.releasedCost)?entry.proceeds-entry.releasedCost:null}:{debitTokens:entry.debit})});
       stockRead=null;stockReadAt=Date.now()+2000;
-      if(p.result==='rejected' || over)stockFinish(stockLedger.note,true);
+      if(p.result==='rejected' || over)stockFinish(stockLedger.note,Boolean(reason));
       return true;
     }
     if(!p.key) {if(Date.now()-p.at>10000)stockFinish('尚未捕获属于脚本的原交易编号，保留记录，请核对',true);else say('等待原网页提交股市交易');return true;}
@@ -4601,6 +4621,8 @@
     const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
     if(dialogs.length){handleNotice(dialogs,'股市弹窗等待你处理');return;}
     if(Date.now()<stockManualUntil){say('股市正在手动操作，自动操作等待一分钟');return;}
+    if(stockRecoverRejectedHold()){cancelStockRead();cancelQueued();}
+    if(!stockLedger.pending&&stockLedger.rejectionCooldownUntil>Date.now()){stockBack();return;}
     if(!navigator.onLine){stockFinish('网络离线，保留股市记录，稍后检查');return;}
     if(plan || claimWait || farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait() || nativePending().length){stockFinish('其他玩法有原操作待核对，先返回远征');return;}
     if(stockLedger.hold && !stockLedger.pending?.result && !stockCapacityWait() && !stockCanConfirmHere()){stockFinish(stockLedger.note);return;}
