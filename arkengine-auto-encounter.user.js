@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.25
+// @version      1.17.26
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1228,7 +1228,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.25';
+  const SCRIPT_VERSION = '1.17.26';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13075,7 +13075,11 @@
         {status:'ready',supply:shelterPopulationFamilySupply(m,p)};
       if(result.status==='ready'){p.populationFamilySupply=result.supply;p.familySupplyJob=result.id;return true;}
       p.familySupplyPlanning={status:result.status,id:result.id,error:result.error};
-      p.populationFamilySupply=null;p.actions=[];p.choice=null;
+      p.populationFamilySupply=null;
+      // 原行程的召回与归来领奖不借用家庭人手；保留供提交前重读再次核对，
+      // 否则新快照启动 Worker 就会取消原倒计时。未知请求仍不允许穿插收尾。
+      p.actions=p.actions.filter(c=>!shelterPending&&['explore-recall','quest-claim'].includes(c.kind));
+      p.choice=p.actions[0]||null;
       p.notes.push('家庭供给正在后台核对，依赖该结果的调岗和建设暂缓。');return false;
     };
     if(!familySupply(plan))return plan;
@@ -14406,6 +14410,17 @@
       if(shelterProductionClaimStep(m))return;
       shelterCollectionChecked=true;
     }
+    // 已在途任务收尾和无消耗日常也不依赖家庭搜索；未完成或失败均继续核对。
+    // 不抢占居民/建设窗口，不绕过上方的人工接手、未知请求、周期与防守检查。
+    if(!defending&&!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&!dialogs.length){
+      if(recoverShelterTrips(m))return;
+      if((shelterExploreClaim||shelterCampaign.explore)&&shelterExploreStep(m))return;
+      if(shelterDailyClaimStep(m))return;
+      if(shelterInspectionStep(m))return;
+    }
+    if(!defending&&!shelterWork&&!shelterBuildWork&&
+        (shelterRecallWork||['explore-recall','quest-claim'].includes(currentCampaign.choice?.kind))&&
+        shelterCampaignStep(m,dialogs))return;
     const familyPlanning=currentCampaign.familySupplyPlanning;
     if(familyPlanning){
       if(['running','queued'].includes(familyPlanning.status)){say('避难所：后台比较家庭供给，完成后继续');return;}
@@ -14413,10 +14428,6 @@
     }
     if(shelterBuildWork&&shelterConstructionStep(m,dialogs))return;
     if(!defending&&!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&!dialogs.length&&advanceShelterPopulation(m))return;
-    if(!defending&&recoverShelterTrips(m))return;
-    if(!defending&&(shelterExploreClaim||shelterCampaign.explore)&&!shelterWork&&!dialogs.length&&shelterExploreStep(m))return;
-    if(!shelterWork&&!dialogs.length&&!shelterCampaignSchedule(m).defense?.busy&&shelterDailyClaimStep(m))return;
-    if(!defending&&!shelterWork&&!shelterRecallWork&&!dialogs.length&&shelterInspectionStep(m))return;
     if(!shelterWork&&(campaignActive()||shelterRecallWork)&&shelterCampaignStep(m,dialogs))return;
     if (shelterWork || (campaignActive()||shelterStaffMode !== 'off') && !shelterStaffHold) {
       if (shelterWorkStep(m,dialogs)) return;
