@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.36
+// @version      1.17.37
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -416,6 +416,23 @@
     function spend(entries,action,now) {
       return entries.filter(e=>e.action===action && entryTime(e)>now-86400000 && e.result!=='rejected').reduce((sum,e)=>sum+e.debit,0);
     }
+    function websiteLimits(m,entries,now) {
+      const reported=Object.hasOwn(m.view,'dailyBoughtTokens'),raw=m.view.dailyBoughtTokens,local=spend(entries,'buy',now);
+      const dailyKnown=whole(local)&&(!reported||whole(raw)),dailyUsed=dailyKnown?Math.max(local,reported?raw:0):null;
+      let cents=0n;
+      for(const p of m.view.positions.filter(p=>p.shares>0)){
+        const stock=m.view.stocks.find(s=>sameStockId(s.id,p.stockId));
+        if(!stock||!positive(stock.priceCents)){cents=null;break;}
+        cents+=BigInt(stock.priceCents)*BigInt(p.shares);
+        if(cents>BigInt(Number.MAX_SAFE_INTEGER)*100n){cents=null;break;}
+      }
+      // Native position capacity uses current gross market value; risk accounting still uses cost.
+      const ceiling=cents===null?null:Number((cents+99n)/100n);
+      return {dailySource:reported?(whole(raw)?'website-and-local':'invalid-website'):'local-only',
+        reportedDailyBoughtTokens:reported&&whole(raw)?raw:null,localBoughtTokens:whole(local)?local:null,
+        remainingDaily:dailyKnown?m.rules.maxDailyBuyTokens-dailyUsed:null,
+        positionValueCeilingTokens:ceiling,remainingPosition:ceiling===null?null:m.rules.maxPositionTokens-ceiling};
+    }
     function funding(m,config) {
       const cap=base=>{
         const positionLimit=Math.min(base.positionLimit,config.positionLimit??Infinity,config.riskLimit??Infinity);
@@ -791,7 +808,9 @@
         positions:m.view.positions.map(p=>Object.fromEntries(['stockId','shares','costBasisTokens','holdUntil'].map(k=>[k,p[k]]))),
         pendingKnown,...(pendingKnown?{pending:p?{id:p.id,at:p.at,action:p.choice?.action,stockId:p.choice?.stockId,
           modelName:p.choice?.modelName,shares:p.choice?.shares,reservedTokens:p.choice?.action==='buy'?p.choice.debit:0,result:p.result??null}:null}:{})};
-      const snapshot=()=>({userId:m.view.userId,enabled:m.view.enabled,rules,stocks,ticks,...(!parts.length?{accountSnapshot}:{})});
+      const snapshot=()=>({userId:m.view.userId,enabled:m.view.enabled,rules,stocks,ticks,
+        ...(Object.hasOwn(m.view,'dailyBoughtTokens')?{dailyBoughtTokens:whole(m.view.dailyBoughtTokens)?m.view.dailyBoughtTokens:null}:{}),
+        ...(!parts.length?{accountSnapshot}:{})});
       for(const stock of m.view.stocks){
         const s=Object.fromEntries(['id','modelName','priceCents','volume24h','stale','suspended'].filter(k=>stock[k]!==undefined).map(k=>[k,stock[k]]));
         const history=m.view.ticks.filter(t=>sameStockId(t.stockId,stock.id)).sort((a,b)=>time(a.createdAt)-time(b.createdAt)).slice(-12)
@@ -836,9 +855,11 @@
       const positions=v.positions.filter(p=>p.shares>0);
       if(positions.some(p=>!whole(p.costBasisTokens)))return null;
       const held=positions.reduce((sum,p)=>sum+p.costBasisTokens,0);
+      const website=websiteLimits(m,ledger.entries,now);
+      if(website.remainingDaily===null||website.remainingPosition===null)return null;
       // Ten percent quote buffer is a reservation, not a server-enforced limit price.
       const reserveBudget=Math.floor(Math.min(config.tradeLimit-spend(ledger.entries,'buy',now),
-        config.positionLimit-held,config.perStockLimit,free,r.maxTradeTokens,r.maxDailyBuyTokens-spend(ledger.entries,'buy',now),r.maxPositionTokens-held));
+        config.positionLimit-held,config.perStockLimit,free,r.maxTradeTokens,website.remainingDaily,r.maxPositionTokens-held,website.remainingPosition));
       if(reserveBudget<=0)return null;
       const buys=[];
       for(const {s,t} of trends) {
@@ -864,13 +885,15 @@
       const config=funding(m,settings),v=m.view,r=m.rules,positions=v.positions.filter(p=>p.shares>0);
       const finite=n=>Number.isFinite(n)?n:null,held=positions.some(p=>!whole(p.costBasisTokens))?null:positions.reduce((n,p)=>n+p.costBasisTokens,0);
       const spent=spend(ledger.entries,'buy',now),predicted=spend(ledger.entries,'predict',now),exposure=riskExposure(m,ledger);
+      const website=websiteLimits(m,ledger.entries,now);
       const risk=riskReason(m,config,ledger,now),riskFree=config.riskLimit==null?Infinity:config.riskLimit-exposure;
       const free=Math.max(0,Math.min(m.balance-config.reserve,riskFree));
       const limits=[['cash-after-reserve',m.balance-config.reserve],['risk-limit',riskFree],
         ['daily-buy-limit',config.tradeLimit-spent],['position-limit',held===null?null:config.positionLimit-held],
         ['per-stock-limit',config.perStockLimit],['website-single-limit',r.maxTradeTokens],
-        ['website-daily-limit',r.maxDailyBuyTokens-spent],['website-position-limit',held===null?null:r.maxPositionTokens-held]];
-      const budget=held===null?null:Math.floor(Math.min(...limits.map(([,n])=>n)));
+        ['website-daily-limit',website.remainingDaily],['website-position-cost-limit',held===null?null:r.maxPositionTokens-held],
+        ['website-position-limit',website.remainingPosition]];
+      const budget=limits.some(([,n])=>n===null)?null:Math.floor(Math.min(...limits.map(([,n])=>n)));
       const ownedCount=positions.filter(p=>ledger.owned[String(p.stockId)]&&!ledger.owned[String(p.stockId)].manual).length;
       const global=[];
       if(!v.enabled)global.push('market-closed');
@@ -880,6 +903,7 @@
       if(!config.tradeLimit)buyGlobal.push('no-buy-allocation');
       if(ownedCount>=3)buyGlobal.push('three-script-positions');
       if(held===null||config.fundingUnknown)buyGlobal.push('unknown-position-cost');
+      if(website.remainingDaily===null||website.remainingPosition===null)buyGlobal.push('unknown-website-capacity');
       if(budget!==null&&budget<=0)buyGlobal.push('no-remaining-budget');
       const threshold=r.buyFeePct+r.sellFeePct+1;
       const stocks=v.stocks.map(s=>{
@@ -962,7 +986,7 @@
           quoteBufferPct:10,maxScriptPositions:3,saleCooldownMs:3600000,exitOrder:'stop-loss,weak-trend,take-profit; ascending net return'},
         exitQueue:config.trade?exitPlans(m,ledger,now).map(({choice,priority,netReturnPct,estimatedNet,cost},i)=>
           ({...choice,rank:i+1,priority,netReturnPct,estimatedNet,cost})):[],
-        budget:{balance:m.balance,reserve:config.reserve,heldCost:held,riskExposure:finite(exposure),riskExposureKnown:Number.isFinite(exposure),
+        budget:{balance:m.balance,reserve:config.reserve,heldCost:held,website,riskExposure:finite(exposure),riskExposureKnown:Number.isFinite(exposure),
           spent24h:spent,predicted24h:predicted,stake:config.stake,predictionLimit:config.predictionLimit,
           remainingPrediction:config.predictionLimit-predicted,ownedCount,reserveBudget:budget,
           constraints:limits.map(([key,n])=>({key,remaining:finite(n),unlimited:n===Infinity,known:n!==null&&!Number.isNaN(n)}))},
@@ -1027,6 +1051,14 @@
         const otherCost=positions.filter(pos=>!sameStockId(pos.stockId,a.stockId)).reduce((sum,pos)=>sum+pos.costBasisTokens,0);
         const ownCost=positions.find(pos=>sameStockId(pos.stockId,a.stockId))?.costBasisTokens||0;
         if(otherCost+Math.max(ownCost,a.debit)>config.positionLimit)return '原交易预留与当前持仓超过设置上限，等待资金条件恢复或手动核对';
+        const website=websiteLimits(m,ledger.entries.filter(e=>e.id!==p.id),now);
+        if(website.remainingDaily===null||website.remainingPosition===null)return '网站买入额度或持仓现价无法核对，保留原请求';
+        if(cost>m.rules.maxTradeTokens)return '原买入当前含费金额超过网站单笔额度，保留原请求';
+        // An unknown receipt does not prove the website counter includes this order. Keep it pending when funds are insufficient.
+        if(cost>website.remainingDaily)return '网站买入额度不足以确认原买单，保留原请求等待核对';
+        const reflected=positions.find(pos=>sameStockId(pos.stockId,a.stockId))?.shares===p.beforeShares+a.shares;
+        const needed=reflected?0:Number((BigInt(stock.priceCents)*BigInt(a.shares)+99n)/100n);
+        if(needed>website.remainingPosition)return '原买入与当前持仓现价超过网站上限，保留原请求';
       }
       // A lower balance cannot prove this intent executed: another feature may have spent it.
       // Unknown outcomes may be resubmitted only within current funds; an actual receipt is reconciled without another POST.
@@ -1057,6 +1089,7 @@
       };
       if(config.trade) {
         const positions=m.view.positions.filter(p=>p.shares>0),spent=spend(ledger.entries,'buy',now);
+        const website=websiteLimits(m,ledger.entries,now);
         const held=positions.reduce((sum,p)=>sum+(p.costBasisTokens??0),0);
         let reason;
         if(config.fundingUnknown||positions.some(p=>!whole(p.costBasisTokens)))reason='持仓成本不完整或资产总额不可核对，等待同步';
@@ -1065,7 +1098,10 @@
         else if(held>=config.positionLimit)reason='当前持仓成本已达设置上限';
         else if(held>=r.maxPositionTokens)reason='已达网站总持仓成本上限';
         else if(spent>=config.tradeLimit)reason='24小时买入额度已用完'+budgetWait('buy',config.tradeLimit,1,'开始释放');
-        else if(spent>=r.maxDailyBuyTokens)reason='网站买入额度暂无余量，按已记录支出保守等待';
+        else if(website.remainingDaily===null)reason='网站买入额度字段无法核对，等待同步';
+        else if(website.remainingDaily<=0)reason='网站买入额度暂无余量，按账号已用额与本地记录保守等待';
+        else if(website.remainingPosition===null)reason='网站持仓现价无法核对，等待完整报价';
+        else if(website.remainingPosition<=0)reason='已达网站总持仓现价上限';
         else if(free<=0)reason='可用余额已到保留线';
         else if(!r.maxTradeTokens)reason='网站单笔交易额度为0';
         else {
@@ -1178,7 +1214,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
