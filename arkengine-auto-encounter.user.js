@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.48
+// @version      1.17.49
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.48';
+  const SCRIPT_VERSION = '1.17.49';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -14808,6 +14808,12 @@
     const training=r?.type==='training'?`·${{str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[r.trainStat]}`:'';
     return r?`${shelterBuildRules[r.type][0]}${training}${r.width>1?` ×${r.width}`:''} · ${r.level} 级`:'';
   }
+  function shelterBuildTitleMatches(w,dialog) {
+    const title=textOf(dialog.querySelector('h2'));
+    if(w.project.kind!=='dig')return title===w.title;
+    const floor=title.match(/^(?:往下挖第|向下挖到第)\s*(\d+)\s*层\?$/);
+    return Boolean(floor&&+floor[1]===w.project.floor);
+  }
   function closeShelterBuild() {
     const w=shelterBuildWork;if(!w)return false;
     if(w.dialog&&visible(w.dialog)){
@@ -14847,7 +14853,9 @@
     }
     if(w?.openedAt){
       if(!w.dialog){if(Date.now()-w.openedAt<5000){say('等待本轮建设窗口');return true;}w.cancelled=true;return true;}
-      if(dialogs.length!==1||dialogs[0]!==w.dialog||textOf(w.dialog.querySelector('h2'))!==w.title){w.cancelled=true;return true;}
+      if(dialogs.length!==1||dialogs[0]!==w.dialog||!shelterBuildTitleMatches(w,w.dialog)){
+        w.cancelReason='本轮建设窗口标题或目标楼层不一致，撤销后重新核对';w.cancelled=true;return true;
+      }
       let button;
       if(c.kind==='build'){
         const row=locator.pick([...w.dialog.querySelectorAll('li')].filter(li=>textOf(li.querySelector('p')).replace(/会和左边合并$/,'').trim()===shelterBuildRules[c.type][0]));
@@ -14865,7 +14873,7 @@
           const match=textOf(b).replace(/,/g,'').match(/^升到 (\d+) 级 · (\d+) 废料(?: (\d+) 零件)? · /);
           return match&&+match[1]===c.level&&+match[2]===c.cost.scrap&&+(match[3]||0)===c.cost.parts;
         }));
-      }else if(textOf(w.dialog).replace(/,/g,'').includes(`花 ${c.cost.scrap} 废料把电梯井延伸一层。`))button=buttonIn(w.dialog,'确认');
+      }else if(shelterConfirmationDescription(w.dialog).replace(/,/g,'')===`花 ${c.cost.scrap} 废料把电梯井延伸一层。`)button=buttonIn(w.dialog,'确认');
       if(!usable(button)){
         w.cancelReason=shelterConstructionNote='原生建设按钮或费用与规划不一致，本轮不消费';w.cancelled=true;
         log.add('shelter-construction-cancelled',w.cancelReason,{kind:c.kind,level:c.level,cost:c.cost,
@@ -14890,12 +14898,16 @@
     else button=locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b).replace(/,/g,'')===`往下挖 · ${c.cost.scrap} 废料`));
     if(!usable(button)){shelterConstructionNote='当前建设入口无法唯一核对，本轮等待';shelterBuildWork.cancelled=true;return true;}
     offer('shelter:construction-open','打开规划项目的原生建设窗口',()=>{
+      const before=new Set([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible));
+      if(before.size){shelterBuildWork.cancelled=true;return;}
       shelterBuildWork.title=shelterBuildTitle(c,m);shelterBuildWork.openedAt=Date.now();button.click();
       const own=shelterBuildWork;
       queueMicrotask(()=>{
         if(shelterBuildWork!==own||own.cancelled)return;
         const opened=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-        if(opened.length===1&&textOf(opened[0].querySelector('h2'))===own.title)own.dialog=opened[0];
+        // 本次原生点击新开的唯一窗口先记录归属，再核对标题和费用。
+        // 标题变化也必须走撤销/超时路径，不能落入未知弹窗等待而绕过收尾。
+        if(opened.length===1&&!before.has(opened[0]))own.dialog=opened[0];
       });
     });return true;
   }
@@ -14910,7 +14922,7 @@
       shelterWorkTitle(dialogs[0]) && [...dialogs[0].querySelectorAll('label')].some(el => /^调去/.test(textOf(el)));
     if (openingWork) shelterWork.dialog = dialogs[0];
     if(shelterBuildWork?.openedAt&&!shelterBuildWork.dialog&&!shelterBuildWork.cancelled&&dialogs.length===1&&
-      textOf(dialogs[0].querySelector('h2'))===shelterBuildWork.title)shelterBuildWork.dialog=dialogs[0];
+      Date.now()-shelterBuildWork.openedAt<=5000)shelterBuildWork.dialog=dialogs[0];
     const buildDialog=dialogs.length===1&&dialogs[0]===shelterBuildWork?.dialog;
     if(shelterRecallWork&&!shelterRecallWork.dialog&&dialogs.length===1&&textOf(dialogs[0].querySelector('h2'))===shelterRecallWork.title)shelterRecallWork.dialog=dialogs[0];
     const recallDialog=dialogs.length===1&&dialogs[0]===shelterRecallWork?.dialog;
