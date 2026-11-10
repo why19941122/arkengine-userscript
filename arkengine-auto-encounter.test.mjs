@@ -27,6 +27,8 @@ import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
 const rawSource = await readFile(process.env.ARKENGINE_TEST_SOURCE || new URL('./arkengine-auto-encounter.user.js', import.meta.url), 'utf8');
 const scriptVersion=rawSource.match(/^\/\/ @version\s+(\S+)/m)[1];
+assert.equal(rawSource.match(/const SCRIPT_VERSION\s*=\s*'([^']+)'/)?.[1],scriptVersion,
+  '发布标头、面板与日志版本必须一致；请同步更新 SCRIPT_VERSION');
 // 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
 const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;')
   .replace('function shelterCampaignPlan(m,cfg={},record={},target=14) {',
