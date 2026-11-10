@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.47
+// @version      1.17.48
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.47';
+  const SCRIPT_VERSION = '1.17.48';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -8917,6 +8917,17 @@
     }
     return {population,recovering,construction,pairs,futureMouths,committedPower,demand};
   }
+  function shelterSupplyShortages(m,demand,production=m.production) {
+    // Use current net drain to order actual shortages. Planned family/construction
+    // demand still defines which jobs need staffing, but is not current consumption.
+    const drainHours=k=>m.demand[k]-m.production[k]>1e-9?
+      m.state.resources[k]/(m.demand[k]-m.production[k]):Infinity;
+    return Object.keys(demand).filter(k=>production[k]<demand[k]*1.2-1e-9).sort((a,b)=>{
+      const ah=drainHours(a),bh=drainHours(b);
+      if(ah!==bh)return ah<bh?-1:1;
+      return m.state.resources[a]/Math.max(1,demand[a])-m.state.resources[b]/Math.max(1,demand[b]);
+    });
+  }
   function shelterPopulationStage(m,target,continuous,state={},pending=null) {
     const s=m.state,living=s.residents.filter(p=>p.deadAt===null),growth=shelterGrowthNeeds(m);
     const valid=Number.isInteger(target)&&target>=2&&target<=200;
@@ -12518,8 +12529,7 @@
       !p.romance&&!held.has(p.id)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&shelterResidentIdentity(s,p));
     if(!pool.length)return null;
     const model={...m,trainingDestinations:campaign.trainingDestinations||[]},demand=shelterGrowthNeeds(m).demand;
-    const shortage=Object.keys(demand).filter(k=>m.production[k]<demand[k]*1.2-1e-9)
-      .sort((a,b)=>s.resources[a]/Math.max(1,demand[a])-s.resources[b]/Math.max(1,demand[b]));
+    const shortage=shelterSupplyShortages(m,demand);
     // Full basic stock does not remove ongoing consumption or committed growth.
     // Keep supply shortages eligible; only optional scrap production needs free storage.
     const resources=[...shortage,...(s.resources.scrap<m.caps.scrap?['scrap']:[])];
@@ -13121,8 +13131,7 @@
       if(!shelterFamilySupplyPreserved(staffModel,[{id:p.id,room:r.id}]))return null;
       return {id:p.id,room:r.id,from:p.roomId,reason,gain,name:p.name};
     })).filter(c => c&&(allowProductionLoss||c.gain > 1)).sort((a,b) => b.gain-a.gain || a.id-b.id || a.room-b.room);
-    const shortages = Object.keys(staffDemand).filter(k => supplyProduction[k] < staffDemand[k]*1.2-1e-9)
-      .sort((a,b) => m.state.resources[a]/Math.max(1,staffDemand[a])-m.state.resources[b]/Math.max(1,staffDemand[b]));
+    const shortages = shelterSupplyShortages(m,staffDemand,supplyProduction);
     for (const resource of shortages) {
       const choice = choices(targets.filter(r => shelterRooms[r.type][1] === resource),
         `${preparation ? '原家庭返宿舍前安排接替，' : ''}${constructionPower&&resource==='power'?'为近期工程预留供电，':''}补足${shelterResources[resource]}供应`)[0];
