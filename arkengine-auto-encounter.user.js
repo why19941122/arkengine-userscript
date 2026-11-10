@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.34
+// @version      1.17.35
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1229,7 +1229,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.34';
+  const SCRIPT_VERSION = '1.17.35';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -3047,7 +3047,9 @@
     }
     if (Date.now() - dungeonPlan.at < RETRY_MS) { say('等待原秘境结果，不重复入场或选择'); return; }
     const entry = dungeonPlan.phase === 'submitted' && dungeonPlan.action === 'enter' && (!dungeon.run || dungeon.run.step === 0);
-    if ((!dungeonPlan.refreshed || (entry && !dungeonPlan.entryReviewAttempted)) && usable(refresh)) {
+    const settledAfterRead = dungeonPlan.action === 'sweep' && dungeonPlan.receipt?.status === 200 &&
+      dungeonPlan.receipt.at > dungeonPlan.at;
+    if ((!dungeonPlan.refreshed || settledAfterRead || (entry && !dungeonPlan.entryReviewAttempted)) && usable(refresh)) {
       recordClick(refresh, 'dungeon:refresh', 'original', '刷新并核对原秘境结果', () => {
         saveDungeonPlan({ ...dungeonPlan, refreshed: true, at: Date.now(),
           ...(entry ? { entryAt: dungeonPlan.entryAt ?? dungeonPlan.at, entryReviewAttempted: true } : {}) });
@@ -3134,7 +3136,7 @@
       if ((errors && !(saved?.status === 200 && !saved.partial)) || (!fresh && !section)) { waitDungeonResult(refresh, errors); return; }
       // 原生原请求已清除，页面给出了新的批次回执或正在探索的节点；不再创建同一批扫荡。
       if (fresh && (result.completed > dungeonPlan.times || result.partial !== Boolean(section))) {
-        say('扫荡回执与当前探索不一致，等待状态核对'); return;
+        waitDungeonResult(refresh, '扫荡回执与当前探索不一致，需刷新状态核对'); return;
       }
       const receipt = { at: Date.now(), plan: dungeonPlan, completed: fresh ? result.completed : null,
         partial: Boolean(section), result: fresh ? result.text : '', outcome: fresh ? 'confirmed' : 'active-run', quota };
@@ -3175,13 +3177,16 @@
     const recent = textOf(recentDungeonResult());
     if (dungeon.run?.step === 8 && (notices.some(n => /^秘境探索完成，本次累计/.test(textOf(n))) ||
         (recent && recent !== dungeon.run.beforeResult))) {
-      const interval = (40 * 60000) + Math.floor(Math.random() * (10 * 60000 + 1));
+      // 新版允许无冷却连跑时，以当前原生入口为准；未知或禁用入口仍保留原间隔。
+      const continueSweep = !errors && dungeonQuota()?.remaining > 0 && usable(dungeonSweepControls()?.button);
+      const interval = continueSweep ? 0 : (40 * 60000) + Math.floor(Math.random() * (10 * 60000 + 1));
       recoveryBudget.clear('dungeon');
       saveDungeon({ ...dungeon, deferrals: 0, stalls: 0, run: null, nextAt: Date.now() + interval });
       saveDungeonPlan(null);
-      returningFromDungeon = true;
-      log.add('dungeon-complete', '八节探索已完成，返回主殿', { nextAt: dungeon.nextAt });
-      last.textContent = `秘境已完成；${Math.round(interval / 60000)} 分钟后再检查`;
+      returningFromDungeon = !continueSweep;
+      log.add('dungeon-complete', continueSweep ? '八节探索已完成，按网页可用路线继续扫荡' : '八节探索已完成，返回主殿',
+        { nextAt: dungeon.nextAt, continueSweep });
+      last.textContent = continueSweep ? '秘境已完成，准备扫荡今日剩余次数' : `秘境已完成；${Math.round(interval / 60000)} 分钟后再检查`;
     }
     if (dungeonPlan) {
       if (dungeonPlan.phase === 'opening') {
@@ -3291,11 +3296,17 @@
     const count = text.match(/通关\s*(\d+)\s*次/);
     return count && text.includes('停下原因:') ? { text, completed: Number(count[1]), partial: text.includes('另有 1 次停在半路') } : null;
   }
-  function tryDungeonSweep(quota, recent) {
+  function dungeonSweepControls() {
     const section = locator.pick([...document.querySelectorAll('section')].filter(s =>
       [...s.querySelectorAll('h2')].some(h => textOf(h) === `按上次路线扫荡 · ${DUNGEON_NAME}`)));
-    if (!section) return false; // 尚无可复用路线时，正常探索一次建立路线。
+    if (!section) return null;
     const button = locator.pick([...section.querySelectorAll('button')].filter(b => textOf(b) === '按上次路线扫荡'));
+    return { section, button };
+  }
+  function tryDungeonSweep(quota, recent) {
+    const controls = dungeonSweepControls();
+    if (!controls) return false; // 尚无可复用路线时，正常探索一次建立路线。
+    const { section, button } = controls;
     if (!usable(button)) { deferDungeon('上次路线扫荡暂不可用', dungeonCooldownDelay()); return true; }
     const select = locator.pick([...section.querySelectorAll('select[aria-label="扫荡次数"]')]);
     const options = select ? [...select.options].filter(o => !o.disabled).map(o => Number(o.value)) : [1];
