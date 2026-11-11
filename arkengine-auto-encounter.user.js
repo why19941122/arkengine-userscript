@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.49
+// @version      1.17.50
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1371,7 +1371,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.49';
+  const SCRIPT_VERSION = '1.17.50';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13366,14 +13366,73 @@
     // Legacy confirmation markup used a paragraph without an accessible description ID.
     const paragraphs=[...dialog.querySelectorAll('p')];return paragraphs.length===1?textOf(paragraphs[0]):'';
   }
+  function shelterBindDialog(w,dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible)) {
+    // 归属来自本轮原生操作前后的DOM变化；标题/身份只决定能否提交，不决定能否取消。
+    if(!w?.dialogBefore||w.dialog||w.manual||w.dialogAmbiguous)return;
+    const added=dialogs.filter(d=>!w.dialogBefore.has(d));
+    if(added.length>1){w.dialogAmbiguous=true;return;}
+    if(added.length===1)w.dialog=added[0];
+  }
+  function shelterOpenDialog(w,perform) {
+    w.dialogBefore=new Set(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+    perform();queueMicrotask(()=>shelterBindDialog(w));
+  }
+  function shelterCloseWindow(w,button,key,label,perform=()=>button.click()) {
+    if(w.manual){say('本轮窗口已由你接手，等待处理');return true;}
+    if(w.closeFailed){say('本轮窗口关闭失败，等待手动处理');return true;}
+    if(w.closeAt&&Date.now()-w.closeAt<5000){say('等待本轮窗口关闭');return true;}
+    if((w.closeAttempts||0)>=2){
+      w.closeFailed=true;pauseShelter('本轮窗口两次关闭均未生效，已停止自动点击；请手动关闭窗口后开启避难所');return true;
+    }
+    if(!usable(button)){
+      w.closeUnavailableAt??=Date.now();
+      if(Date.now()-w.closeUnavailableAt>=15000){w.closeFailed=true;pauseShelter('本轮窗口15秒未能核对取消或关闭按钮，请手动关闭窗口后开启避难所');}
+      else say('本轮窗口的取消或关闭按钮不可核对，等待处理');return true;
+    }
+    offer(key,label,()=>{
+      if(w.manual||!w.dialog?.isConnected||!visible(w.dialog)||!usable(button))return;
+      w.closeAt=Date.now();w.closeAttempts=(w.closeAttempts||0)+1;perform();
+    });return true;
+  }
+  function shelterRecoverDialogs(dialogs) {
+    const own=w=>w?.dialog&&dialogs.length===1&&dialogs[0]===w.dialog&&!w.manual;
+    const work=shelterWork;
+    if(own(work)&&work.closing&&!shelterWorkConfirm&&!shelterPending)return closeShelterWork();
+    if(own(work)&&!shelterWorkConfirm&&!shelterPending&&
+        !work.submitted&&(work.cancelReason||!shelterWorkTitle(work.dialog,work)||Date.now()-work.openedAt>30000)){
+      if(!work.cancelReason){work.cancelReason='居民窗口内容变化或核对超时，本轮撤销后继续';holdShelterStaff(work.cancelReason);}
+      return closeShelterWork();
+    }
+    const recall=shelterRecallWork;
+    if(own(recall)&&!shelterPending&&(recall.cancelled||Date.now()-recall.at>15000||textOf(recall.dialog.querySelector('h2'))!==recall.title)){
+      if(!recall.cancelReason){recall.cancelReason='召回窗口标题变化、核对超时或已撤销，本轮不再打开';holdShelterCampaign(recall.cancelReason);}
+      recall.cancelled=true;
+      return closeShelterRecall();
+    }
+    const social=shelterSocialWork;
+    if(own(social)&&social.closing&&!shelterState.social?.pending)return closeShelterSocial();
+    if(own(social)&&!shelterState.social?.pending&&(Date.now()-social.at>20000||
+        textOf(social.dialog.querySelector('h2'))!==social.row.shelterName||
+        !new RegExp(`第\\s*${social.row.vaultNo}\\s*号`).test(textOf(social.dialog)))){
+      social.closing=true;shelterSocialHeld=true;shelterSocialNote='参观窗口身份变化或核对超时，本轮撤销后继续';
+      return closeShelterSocial();
+    }
+    return false;
+  }
+  for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
+    if(!event.isTrusted||!inShelter()||event.composedPath().includes(host))return;
+    for(const w of [shelterWorkConfirm,shelterWork,shelterRecallWork,shelterSocialWork,shelterBuildWork]){
+      shelterBindDialog(w);
+      if(w?.dialogBefore&&(!w.dialog||w.dialog.contains(event.target)))w.manual=true;
+    }
+  },true);
   function shelterCancelWorkConfirmation(w,dialog,reason) {
     const cancel=buttonIn(dialog,'取消');
-    if(!usable(cancel)){say('原生取消按钮不可核对，保留居民确认窗口');return true;}
-    offer(`shelter:work-cancel:${w.id}`,'取消未发送的居民安排，恢复其他自动任务',()=>{
+    return shelterCloseWindow(w,cancel,`shelter:work-cancel:${w.id}`,'取消未发送的居民安排，恢复其他自动任务',()=>{
       if(shelterWorkConfirm!==w||w.pending()?.id!==w.id||w.sent()||w.clicked||w.manual||w.dialog!==dialog)return;
       w.cancelling=reason;w.capture.cancelled=true;captureShelterAction=w.capture;
       try{cancel.click();}finally{setTimeout(()=>{if(captureShelterAction===w.capture)captureShelterAction=null;},0);}
-    });return true;
+    });
   }
   function shelterWorkConfirmation(dialogs) {
     const w=shelterWorkConfirm;if(!w)return false;
@@ -13387,15 +13446,15 @@
         {operation:w.id,reason:w.cancelling,resident:w.work.id,description:w.description||'',ageMs:Date.now()-w.at});
       return closeShelterWork();
     }
-    const dialog=locator.pick(dialogs.filter(d=>textOf(d.querySelector('h2'))===w.title));
-    if(!dialog)return false;
-    w.dialog??=dialog;
+    const dialog=w.dialog;
+    if(!dialog||!dialogs.includes(dialog))return false;
     if(w.manual||w.clicked||!shelterEnabled||!enabled||shelterLeave||accountStopReason()||shelterWork!==w.work||w.dialog!==dialog){
       say('居民操作确认已暂停，等待处理');return true;
     }
-    if(w.cancelling){say('等待原生取消窗口关闭，不重复点击');return true;}
+    if(w.cancelling)return shelterCancelWorkConfirmation(w,dialog,w.cancelling);
     const description=shelterConfirmationDescription(dialog);w.description=description.slice(0,1000);
-    const reason=shelterStaffMode!==w.mode||JSON.stringify(shelterCampaign)!==w.settings?'居民安排设置已变化':
+    const reason=textOf(dialog.querySelector('h2'))!==w.title?'居民确认标题或身份与本轮安排不一致':
+      shelterStaffMode!==w.mode||JSON.stringify(shelterCampaign)!==w.settings?'居民安排设置已变化':
       Date.now()-w.at>15000?'居民确认已过期，下一轮重新评估':
       !description||!w.accept(description)?'居民确认说明与已核对规则不符':'';
     if(reason)return shelterCancelWorkConfirmation(w,dialog,reason);
@@ -13414,14 +13473,12 @@
   function closeShelterWork() {
     const work = shelterWork, dialog = work?.dialog;
     if (!dialog?.isConnected) { shelterWork = null; return false; }
-    if (work.closing) { say('等待居民窗口关闭，请勿重复操作'); return true; }
-    if (!shelterWorkTitle(dialog,work)) {
+    if (work.manual) { say('居民窗口已由你接手，等待处理'); return true; }
+    if (!work.dialogBefore && !shelterWorkTitle(dialog,work)) {
       shelterWork = null; holdShelterStaff('居民窗口已被更改，本轮人员管理等待你处理'); return true;
     }
     const close = currentElement([...dialog.querySelectorAll('button')].filter(b => b.getAttribute('aria-label') === '关闭' || textOf(b) === '关闭'));
-    if (!usable(close)) { say('等待关闭脚本打开的居民窗口'); return true; }
-    offer('shelter:staff-close','关闭已核对的居民窗口',() => { close.click(); work.closing = true; });
-    return true;
+    return shelterCloseWindow(work,close,'shelter:staff-close','关闭本轮居民窗口',() => { work.closing = true;close.click(); });
   }
   function validShelterSocial(v) {
     const id=x=>Number.isSafeInteger(x)&&x>0;
@@ -13459,8 +13516,7 @@
     const w=shelterSocialWork;if(!w)return false;
     if(w.dialog?.isConnected){
       const button=currentElement([...w.dialog.querySelectorAll('button')].filter(b=>/^(关闭|Close)$/.test(b.getAttribute('aria-label')||textOf(b))));
-      if(!usable(button)){shelterSocialNote='互助窗口等待手动关闭';return true;}
-      offer('shelter:help-close','关闭本轮参观窗口',()=>button.click());return true;
+      return shelterCloseWindow(w,button,'shelter:help-close','关闭本轮参观窗口');
     }
     shelterSocialWork=null;return false;
   }
@@ -13520,12 +13576,17 @@
       const button=currentElement([...(section?.querySelectorAll('ol li button')||[])].filter(b=>textOf(b).includes(row.shelterName)&&
         new RegExp(`第\\s*${row.vaultNo}\\s*号`).test(textOf(b))));
       if(!usable(button)){shelterSocialNote='目标排行行暂不可唯一定位，稍后检查';return false;}
-      offer('shelter:help-open:'+row.userId,'参观可获奖励的避难所',()=>{shelterSocialWork={row,visitor,at:Date.now(),dialog:null};button.click();});return true;
+      offer('shelter:help-open:'+row.userId,'参观可获奖励的避难所',()=>{
+        shelterSocialWork={row,visitor,at:Date.now(),dialog:null};shelterOpenDialog(shelterSocialWork,()=>button.click());
+      });return true;
     }
     if(!w.dialog){
       const dialog=currentElement(dialogs.filter(d=>textOf(d.querySelector('h2'))===w.row.shelterName&&new RegExp(`第\\s*${w.row.vaultNo}\\s*号`).test(textOf(d))));
       if(!dialog){if(Date.now()-w.at>15000){w.closing=true;shelterSocialNote='未确认参观窗口，本轮不帮助';}else say('等待参观窗口加载');return true;}
       w.dialog=dialog;
+    }
+    if(textOf(w.dialog.querySelector('h2'))!==w.row.shelterName||!new RegExp(`第\\s*${w.row.vaultNo}\\s*号`).test(textOf(w.dialog))){
+      w.closing=true;shelterSocialHeld=true;return closeShelterSocial();
     }
     const button=buttonIn(w.dialog,'帮忙 · 双方各得废料');
     if(!usable(button)){w.closing=true;shelterSocialNote='对方互助按钮不可用，保留网站限制';return closeShelterSocial();}
@@ -14014,8 +14075,8 @@
   function closeShelterRecall() {
     const w=shelterRecallWork;if(!w)return false;
     if(w.dialog?.isConnected){
-      const cancel=buttonIn(w.dialog,'取消');if(!usable(cancel)){say('召回窗口等待你处理');return true;}
-      offer('shelter:recall-cancel','撤销尚未发送的召回',()=>{cancel.click();shelterRecallWork=null;});return true;
+      const cancel=buttonIn(w.dialog,'取消');
+      return shelterCloseWindow(w,cancel,'shelter:recall-cancel','撤销尚未发送的召回');
     }
     shelterRecallWork=null;return false;
   }
@@ -14102,9 +14163,8 @@
       [legacy&&`${c.name} · ${zone}`,`#${e.residentId} ${c.name} · ${zone}`].includes(textOf(li.querySelector('p')))));
     const button=buttonIn(row,'召回');if(!usable(button))return holdShelterCampaign('原普通探险的召回按钮暂不可核对');
     offer('shelter:recall-open','打开普通探险召回确认',()=>{
-      shelterRecallWork={id:c.targets[0],at:Date.now(),title:`召回 ${textOf(row.querySelector('p')).startsWith('#')?`#${e.residentId} `:''}${c.name}?`};button.click();
-      queueMicrotask(()=>{const ds=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-        if(shelterRecallWork&&ds.length===1&&textOf(ds[0].querySelector('h2'))===shelterRecallWork.title)shelterRecallWork.dialog=ds[0];});
+      shelterRecallWork={id:c.targets[0],at:Date.now(),title:`召回 ${textOf(row.querySelector('p')).startsWith('#')?`#${e.residentId} `:''}${c.name}?`};
+      shelterOpenDialog(shelterRecallWork,()=>button.click());
     });return true;
   }
   function shelterWorkStep(m,dialogs) {
@@ -14138,7 +14198,8 @@
     const work = shelterWork;
     const identity=shelterResidentIdentity(m.state,m.state.residents.find(p=>p.id===work.id));
     if(!identity||JSON.stringify(identity)!==JSON.stringify(work.identity)){
-      shelterWork=null;holdShelterStaff('居民组合身份已变化，取消原窗口操作并等待重新核对');return false;
+      if(!work.cancelReason){work.cancelReason='居民组合身份已变化，取消原窗口操作并等待重新核对';holdShelterStaff(work.cancelReason);}
+      return closeShelterWork();
     }
     if (work.dialog) {
       if (!work.dialog.isConnected) {
@@ -14148,9 +14209,9 @@
         }
         shelterWork = null; return false;
       }
-      if (work.closing) { say('等待居民窗口关闭'); return true; }
+      if (work.closing) return closeShelterWork();
       if(work.kind==='stimpak'){
-        if(!shelterWorkTitle(work.dialog,work)){shelterWork=null;holdShelterStaff('治疗窗口身份变化');return true;}
+        if(!shelterWorkTitle(work.dialog,work)){holdShelterStaff('治疗窗口身份变化');return closeShelterWork();}
         const button=buttonIn(work.dialog,/^用治疗针\((?:恢复最大血量 40%,)?剩 \d+\)$/);
         if(!usable(button)){holdShelterStaff('原生治疗按钮不可核对');return closeShelterWork();}
         shelterSubmit(button,'stimpak',work.targets,m,work.reason,()=>{work.submitted=true;button.click();});return true;
@@ -14160,7 +14221,7 @@
       const select = labels.length === 1 ? labels[0].querySelector('select') : null;
       const option = select && [...select.options].find(o => o.value === value && !o.disabled);
       if (!usable(select) || !option) { holdShelterStaff('原网页没有可用的岗位或服装选项，本轮保留现有安排'); return closeShelterWork(); }
-      if (!shelterWorkTitle(work.dialog,work)) { shelterWork = null; holdShelterStaff('居民窗口身份发生变化，本轮等待你处理'); return true; }
+      if (!shelterWorkTitle(work.dialog,work)) { holdShelterStaff('居民窗口身份发生变化，本轮撤销'); return closeShelterWork(); }
       const room = m.state.rooms.find(r => r.id === work.room);
       shelterStaffNote = equip ? `${work.reason}。` : `${work.reason}：${work.room === null ? '暂时休息' : `安排到${staffRoomNames[room?.type] || '目标房间'}`}。`;
       shelterSubmit(select,equip ? 'equip' : 'assign',work.targets||[work.id,equip ? work.item : work.room],m,shelterStaffNote,() => {
@@ -14251,7 +14312,7 @@
       }
     }
     offer(`shelter:staff-open:${work.id}`,`打开${name}的居民详情：${work.reason}`,() => {
-      work.nativeId=numberedTitle;work.title = title; work.openedAt = Date.now(); row.click();
+      work.nativeId=numberedTitle;work.title = title; work.openedAt = Date.now();shelterOpenDialog(work,()=>row.click());
     });
     return true;
   }
@@ -14746,7 +14807,7 @@
       log.add(shelterWorkConfirm?.id===id?'shelter-prepared':'shelter-submitted',label,
         {kind,targets,phase:shelterWorkConfirm?.id===id?'awaiting-confirmation':'native-control',
           ...(independent?{independent:true,blockedKind:shelterPending.kind}:{})});
-      try { perform(); } finally {
+      try { if(shelterWorkConfirm?.id===id)shelterOpenDialog(shelterWorkConfirm,perform);else perform(); } finally {
         // 下挖原生确认先 resolve，再在紧随的微任务发送；只覆盖这一轮确认。
         if(kind==='dig'||kind==='explore-recall')queueMicrotask(()=>{if(captureShelterAction===capture)captureShelterAction=null;});
         else captureShelterAction = null;
@@ -14818,8 +14879,7 @@
     const w=shelterBuildWork;if(!w)return false;
     if(w.dialog&&visible(w.dialog)){
       const close=locator.pick([...w.dialog.querySelectorAll('button')].filter(b=>b.getAttribute('aria-label')==='关闭'||textOf(b)==='取消'));
-      if(!usable(close)){say('建设窗口关闭按钮无法核对，等待处理');return true;}
-      offer('shelter:build-close','关闭本轮建设窗口',()=>{close.click();shelterBuildWork=null;});return true;
+      return shelterCloseWindow(w,close,'shelter:build-close','关闭本轮建设窗口');
     }
     shelterBuildWork=null;return false;
   }
@@ -14898,17 +14958,9 @@
     else button=locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b).replace(/,/g,'')===`往下挖 · ${c.cost.scrap} 废料`));
     if(!usable(button)){shelterConstructionNote='当前建设入口无法唯一核对，本轮等待';shelterBuildWork.cancelled=true;return true;}
     offer('shelter:construction-open','打开规划项目的原生建设窗口',()=>{
-      const before=new Set([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible));
-      if(before.size){shelterBuildWork.cancelled=true;return;}
-      shelterBuildWork.title=shelterBuildTitle(c,m);shelterBuildWork.openedAt=Date.now();button.click();
-      const own=shelterBuildWork;
-      queueMicrotask(()=>{
-        if(shelterBuildWork!==own||own.cancelled)return;
-        const opened=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-        // 本次原生点击新开的唯一窗口先记录归属，再核对标题和费用。
-        // 标题变化也必须走撤销/超时路径，不能落入未知弹窗等待而绕过收尾。
-        if(opened.length===1&&!before.has(opened[0]))own.dialog=opened[0];
-      });
+      if([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)){shelterBuildWork.cancelled=true;return;}
+      shelterBuildWork.title=shelterBuildTitle(c,m);shelterBuildWork.openedAt=Date.now();
+      shelterOpenDialog(shelterBuildWork,()=>button.click());
     });return true;
   }
   function shelterStep() {
@@ -14917,20 +14969,11 @@
     if(shelterReload()){cancelShelterRead();cancelQueued();}
     if((campaignActive()||shelterExploreClaim||['build','upgrade','dig'].some(k=>shelterConstruction[k]))&&Date.now()<shelterExploreManualUntil){say('你正在操作避难所页面，自动操作等待一分钟');return;}
     const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    for(const w of [shelterWorkConfirm,shelterWork,shelterRecallWork,shelterSocialWork,shelterBuildWork])shelterBindDialog(w,dialogs);
     if(shelterWorkConfirmation(dialogs))return;
-    const openingWork = shelterWork?.openedAt && !shelterWork.dialog && dialogs.length === 1 &&
-      shelterWorkTitle(dialogs[0]) && [...dialogs[0].querySelectorAll('label')].some(el => /^调去/.test(textOf(el)));
-    if (openingWork) shelterWork.dialog = dialogs[0];
-    if(shelterBuildWork?.openedAt&&!shelterBuildWork.dialog&&!shelterBuildWork.cancelled&&dialogs.length===1&&
-      Date.now()-shelterBuildWork.openedAt<=5000)shelterBuildWork.dialog=dialogs[0];
-    const buildDialog=dialogs.length===1&&dialogs[0]===shelterBuildWork?.dialog;
-    if(shelterRecallWork&&!shelterRecallWork.dialog&&dialogs.length===1&&textOf(dialogs[0].querySelector('h2'))===shelterRecallWork.title)shelterRecallWork.dialog=dialogs[0];
-    const recallDialog=dialogs.length===1&&dialogs[0]===shelterRecallWork?.dialog;
-    const socialDialog=dialogs.length===1&&shelterSocialWork&&(dialogs[0]===shelterSocialWork.dialog||
-      textOf(dialogs[0].querySelector('h2'))===shelterSocialWork.row.shelterName&&
-        new RegExp(`第\\s*${shelterSocialWork.row.vaultNo}\\s*号`).test(textOf(dialogs[0])));
-    if(socialDialog&&!shelterSocialWork.dialog)shelterSocialWork.dialog=dialogs[0];
-    if (dialogs.length && !openingWork && !buildDialog && !recallDialog && !socialDialog && !(dialogs.length === 1 && dialogs[0] === shelterWork?.dialog)) {
+    if(shelterRecoverDialogs(dialogs))return;
+    const ownDialog=dialogs.length===1&&[shelterWork,shelterBuildWork,shelterRecallWork,shelterSocialWork].some(w=>w?.dialog===dialogs[0]);
+    if (dialogs.length && !ownDialog) {
       if(shelterEnabled&&!stateFault('shelter'))handleNotice(dialogs,'避难所弹窗需要先处理，自动操作等待');
       else say('避难所弹窗需要先处理，自动操作等待');
       return;
