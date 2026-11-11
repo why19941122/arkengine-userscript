@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.51
+// @version      1.17.52
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.51';
+  const SCRIPT_VERSION = '1.17.52';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13901,15 +13901,16 @@
     return describe(scheduled);
   }
   function shelterWorkshopReleasePlan(m,plan) {
-    // 阶段人口与就业落实后，结束备料的自动工人可直接进入已有生产空岗，省去先休息再复岗。
+    // 结束备料的工人可直接进入已有生产空岗，省去先休息再复岗；人口增长本身不要求空转。
     // 只合并原本已决定释放的动作；供给、家庭接替、换位和来袭仍沿用各自完整流程。
     const s=m.state;
     if(plan.choice?.role!=='workshop-release'||plan.defense?.busy||shelterPending||shelterStaffHold||
         !['production','population'].includes(shelterStaffMode)||shelterState.pair||shelterState.swap||
         plan.dailyProduction?.some(g=>g.resource!=='scrap'&&g.hours>0&&g.forecast<g.remaining)||
-        s.births.length||s.residents.some(p=>p.deadAt===null&&p.adultAt>m.now)||
         shelterStaffMode==='population'&&(!Number.isInteger(shelterPopulationTarget)||
-          s.residents.filter(p=>p.deadAt===null).length<shelterPopulationTarget||plan.unemployedResidents?.length))return;
+          plan.unemployedResidents?.length))return;
+    const populationSettled=!s.births.length&&!s.residents.some(p=>p.deadAt===null&&p.adultAt>m.now)&&
+      (shelterStaffMode!=='population'||s.residents.filter(p=>p.deadAt===null).length>=shelterPopulationTarget);
     const demand=shelterGrowthNeeds(m).demand;
     const project=shelterDevelopmentPlan(m,shelterPopulationTarget,plan,shelterLevelTarget).next.project;
     const constructionPower=shelterConstructionPowerReserve(project,m,shelterConstruction,shelterState,shelterPending,Date.now());
@@ -13917,7 +13918,7 @@
     const supplied=Object.keys(demand).every(k=>m.production[k]>=demand[k]*1.2-1e-9);
     // 已就绪的容量等级或基础生产房升级先开工，实际扣料后再重评工坊；避免先整组释放、下一工程马上又补回。
     // 仅更改当前两步的先后，不预支下一工程需求，不延迟家庭、医疗、防守或其他综合动作。
-    if(supplied&&project?.kind==='upgrade'&&(project.levelInvestment&&['quarters','storage'].includes(project.type)||
+    if(populationSettled&&supplied&&project?.kind==='upgrade'&&(project.levelInvestment&&['quarters','storage'].includes(project.type)||
         staffRoomTypes.includes(project.type))&&project.cost.parts>0&&
         !shelterConstructionAllowance(project,m,shelterConstruction,shelterState,shelterPending,Date.now())&&
         plan.actions.every(a=>a.role==='workshop-release')&&plan.actions.every(a=>{
@@ -13939,14 +13940,21 @@
       Object.keys(demand).every(k=>m.production[k]>=(demand[k]-(k==='power'?constructionPower:0))*1.2-1e-9&&
         s.resources[k]>=2*demand[k]);
     if(!supplied&&!powerReturn&&!shelterConstructionSupply(m,[],demand,m.production).safe)return;
+    if(!powerReturn&&s.resources.scrap>=m.caps.scrap)return;
+    const staffing={...m,trainingDestinations:plan.trainingDestinations||[]};
     const rooms=s.rooms.filter(r=>r.type===(powerReturn?'power':'scrap')&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.unpowered&&!r.incident&&
-      s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length<r.width*2);
+      s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length<shelterStaffCapacity(staffing,r));
+    // 家庭轮换交回原流程；其他家庭待产或幼儿成长不妨碍无家庭任务的工人生产。
+    const familyDuty=shelterStaffMode==='population'&&s.residents.filter(p=>p.deadAt===null).length<Math.min(shelterPopulationTarget,m.populationCap);
+    const familyPeople=new Set([...(familyDuty?shelterState.families||[]:[]).flatMap(f=>[f.a,f.b]),
+      ...s.births.flatMap(b=>shelterBirthParents(s,b)||[]),...s.residents.filter(p=>p.romance).flatMap(p=>[p.id,p.romance.partnerId])]);
     const choices=[];
     for(const action of plan.actions){
       if(action.role!=='workshop-release')break;
       const p=s.residents.find(p=>p.id===action.id),old=p&&s.rooms.find(r=>r.id===p.roomId),hp=p&&shelterHealth(p);
       if(!p||action.room!==null||old?.type!=='workshop'||old.upgradeAt!==null||old.builtAt>m.now||old.incident||old.unpowered||
-          p.away!==null||!hp||hp.hp<.6*hp.max||p.romance||plan.reserved.includes(p.id)||!shelterNameUnique(s,p))continue;
+          p.away!==null||!hp||hp.hp<.6*hp.max||familyPeople.has(p.id)||plan.reserved.includes(p.id)||
+          plan.dailyReserved?.includes(p.id)||!shelterResidentIdentity(s,p))continue;
       for(const room of rooms){
         const gain=shelterWorkerRate(s,m.now,m.view.env,p,room);
         if(gain>1)choices.push({action,room:room.id,gain});
