@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.64
+// @version      1.17.65
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.64';
+  const SCRIPT_VERSION = '1.17.65';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13128,9 +13128,9 @@
       return Boolean(left && right && ![...left].some(id => right.has(id)));
     };
   }
-  function stopPopulationPlan(message) {
+  function stopPopulationPlan(message,hold=true) {
     saveShelter({...shelterState,pair:null}); shelterPopulationNote = message;
-    log.add('shelter-population',message,{phase:'cancelled'}); holdShelterStaff(message);
+    log.add('shelter-population',message,{phase:'cancelled'}); if(hold)holdShelterStaff(message);
   }
   function shelterPopulationPlan(m,families,{eligible,home,healthy},create = false,reconsider = false) {
     if (shelterStaffMode !== 'population') return null;
@@ -13194,7 +13194,9 @@
           const next = activeBlocks.filter(b => familyKey(b.a,b.b) !== key).concat({a:plan.a,b:plan.b,until:Date.now()+86400000}).slice(-200);
           saveShelter({...shelterState,pairBlocks:next});
         }
-        stopPopulationPlan(plan.failed ? '未观察到网站确认感情，已结束尝试；此组合 24 小时内不重试' : '心情、人口或供应条件已变化，已结束本次配对安排');
+        // Both residents have left the attempted dorm and their positions were checked.
+        // Ordinary cleanup must not hold unrelated jobs or the next eligible family.
+        stopPopulationPlan(plan.failed ? '未观察到网站确认感情，已结束尝试；此组合 24 小时内不重试' : '心情、人口或供应条件已变化，已结束本次配对安排',false);
         return null;
       }
       const ordered=plan.first===plan.b?[pair[1],pair[0]]:pair;
