@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.57
+// @version      1.17.58
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.57';
+  const SCRIPT_VERSION = '1.17.58';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13733,13 +13733,26 @@
       Date.now()-w.at>15000?'居民确认已过期，下一轮重新评估':
       !description||!w.accept(description)?'居民确认说明与已核对规则不符':'';
     if(reason)return shelterCancelWorkConfirmation(w,dialog,reason);
-    if(w.work.fromOwner){
+    const trainingReturn=w.work.role==='training-release'&&w.work.room!==null;
+    if(w.work.fromOwner||trainingReturn){
       if(!shelterRead||shelterRead.at<=w.at||Date.now()-shelterRead.at>1500){
         offered=queued?.key===`shelter:work-confirm:${w.id}`;readShelter();return true;
       }
-      if(!shelterWeaponTransferAllowed(shelterRead.model,w.work,shelterCampaign,shelterState.campaign||{})){
+      if(w.work.fromOwner&&!shelterWeaponTransferAllowed(shelterRead.model,w.work,shelterCampaign,shelterState.campaign||{})){
         w.cancelling='武器归属、出发队伍或留守条件变化，取消本次转交';
         return shelterCancelWorkConfirmation(w,dialog,w.cancelling);
+      }
+      if(trainingReturn){
+        const m=shelterRead.model,s=m.state,p=s.residents.find(p=>p.id===w.work.id),room=s.rooms.find(r=>r.id===w.work.room),hp=p&&shelterHealth(p);
+        const trainingDestinations=(shelterState.campaign?.roles||[]).filter(r=>r.role==='training'&&r.purpose==='production'&&
+          r.id!==w.work.id&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>({id:r.id,room:r.destination}));
+        if(!p||p.roomId!==w.work.from||p.deadAt!==null||p.away!==null||p.adultAt>m.now||!hp||hp.hp<.6*hp.max||
+            JSON.stringify(shelterResidentIdentity(s,p))!==JSON.stringify(w.work.identity)||
+            !room||room.builtAt>m.now||room.upgradeAt!==null||room.incident||room.unpowered||
+            s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===room.id).length>=shelterStaffCapacity({...m,trainingDestinations},room,w.work.id)){
+          w.cancelling='训练返岗的居民、目标房或可用空位变化，取消本次调岗';
+          return shelterCancelWorkConfirmation(w,dialog,w.cancelling);
+        }
       }
     }
     const confirm=buttonIn(dialog,'确认');if(!usable(confirm))return true;
@@ -14136,12 +14149,12 @@
     plan.actions.splice(index<0?plan.actions.length:index,0,action);plan.reserved.push(p.id);plan.choice=plan.actions[0];
   }
   function shelterWorkshopReleasePlan(m,plan) {
-    // 已决定结束的辅助值班直接进入已有生产空岗，省去先休息再复岗。
+    // 已决定结束的辅助值班或生产训练直接进入已有生产空岗，省去先休息再复岗。
     // 只合并原本已决定释放的动作；供给、家庭接替、换位和来袭仍沿用各自完整流程。
     const s=m.state;
     const releaseRole=plan.choice?.role,dailyRelease=releaseRole==='craftDaily-release';
     const sourceTypes={'workshop-release':['workshop'],'craftDaily-release':['armory','tailor'],
-      'medical-release':['medbay'],'radio-release':['radio']}[releaseRole];
+      'medical-release':['medbay'],'radio-release':['radio'],'training-release':['training']}[releaseRole];
     if(!sourceTypes||plan.defense?.busy||shelterPending||shelterStaffHold||
         !['production','population'].includes(shelterStaffMode)||shelterState.pair||shelterState.swap||
         plan.dailyProduction?.some(g=>g.resource!=='scrap'&&g.hours>0&&g.forecast<g.remaining)||
@@ -14196,6 +14209,7 @@
       if(action.role!==releaseRole)break;
       const p=s.residents.find(p=>p.id===action.id),old=p&&s.rooms.find(r=>r.id===p.roomId),hp=p&&shelterHealth(p);
       if(!p||action.room!==null||!sourceTypes.includes(old?.type)||old.upgradeAt!==null||old.builtAt>m.now||old.incident||old.unpowered||
+          releaseRole==='training-release'&&!shelterState.campaign?.roles?.some(r=>r.id===p.id&&r.room===old.id&&r.role==='training'&&r.purpose==='production')||
           p.away!==null||!hp||hp.hp<.6*hp.max||familyPeople.has(p.id)||plan.reserved.includes(p.id)||
           plan.dailyReserved?.includes(p.id)||!shelterResidentIdentity(s,p))continue;
       for(const room of rooms){
@@ -14215,7 +14229,8 @@
     // 已有休息人员应按原人员规划竞争空岗，不让低收益的直接交接抢占其位置。
     if(s.residents.some(p=>p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&p.roomId===null))return;
     const supportLabel={'medical-release':'医务室','radio-release':'电台'}[releaseRole];
-    const direct={...best.action,room:best.room,targets:[best.action.id,best.room],reason:supportLabel?
+    const direct={...best.action,room:best.room,targets:[best.action.id,best.room],reason:releaseRole==='training-release'?
+      `${best.action.reason}；原岗位不可用，直接${supplyReturn.length?'补足':'接续'}${shelterResources[best.resource]}${supplyReturn.length?'供应':'生产'}`:supportLabel?
       `${supportLabel}值班结束，直接${supplyReturn.length?'补足':'接续'}${shelterResources[best.resource]}${supplyReturn.length?'供应':'生产'}`:dailyRelease?
       `临时制作值班结束，直接接续${shelterResources[best.resource]}生产`:supplyReturn.length?
       `工坊备料结束，直接补足${shelterResources[best.resource]}供应`:powerReturn?
