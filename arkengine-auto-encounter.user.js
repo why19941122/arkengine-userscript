@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.61
+// @version      1.17.62
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.61';
+  const SCRIPT_VERSION = '1.17.62';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -13800,7 +13800,14 @@
   },true);
   function closeShelterWork() {
     const work = shelterWork, dialog = work?.dialog;
-    if (!dialog?.isConnected) { shelterWork = null; return false; }
+    if (!dialog?.isConnected) {
+      shelterWork = null;
+      // Retiring the previous job is a state transition, not proof that no work
+      // remains. Re-enter the scheduler before it can finish this visit, including
+      // native list assignments which never opened a resident dialog.
+      if (work) schedule();
+      return Boolean(work);
+    }
     if (work.manual) { say('居民窗口已由你接手，等待处理'); return true; }
     if (!work.dialogBefore && !shelterWorkTitle(dialog,work)) {
       shelterWork = null; holdShelterStaff('居民窗口已被更改，本轮人员管理等待你处理'); return true;
@@ -14606,7 +14613,7 @@
           if (shelterStaffMode === 'population' && shelterState.pair) stopPopulationPlan('居民窗口已关闭，本轮停止安排新配对');
           else holdShelterStaff('居民窗口已关闭，本轮尊重手动操作');
         }
-        shelterWork = null; return false;
+        return closeShelterWork();
       }
       if (work.closing) return closeShelterWork();
       if(work.kind==='stimpak'){
