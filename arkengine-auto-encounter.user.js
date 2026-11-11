@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.52
+// @version      1.17.53
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.52';
+  const SCRIPT_VERSION = '1.17.53';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -1951,7 +1951,8 @@
         `本组今日确认${group==='expedition'?'到账':'收入'}：代币 ${totals['代币'] || 0} · 修为 ${totals['修为'] || 0} · 钻石 ${totals['钻石'] || 0}（${group==='expedition'?'含股市本金返还，非净利润':'毛收入，不含未完成秘境'}）`+
         (group==='expedition'?`\n股市：返还 ${totals['股市返还']||0} 代币（含本金）；其中股票卖出到账 ${totals['股市卖出到账']||0}；买入支出 ${totals['股市买入支出']||0}，下注支出 ${totals['股市下注支出']||0}；股票已核对实现盈亏 ${totals['股市已实现盈亏']||0}，已结算预测净盈亏 ${totals['股市预测净盈亏']||0}；卖出到账待核对 ${totals['股市卖出待核对']||0} 笔，卖出成本待核对 ${totals['股市卖出成本待核对']||0} 笔，买入金额未核实 ${totals['股市买入待核对']||0} 笔。存在待核对时，已知盈亏不代表完整盈亏。`+
           `\n避难所领取入库：${['废料','零件','电力','食物','净水','治疗针','汽水'].map(k=>`${k} ${totals['避难所'+k]||0}`).join(' · ')}；商队代币 ${totals['避难所商队代币']||0}、装备 ${totals['避难所商队装备']||0} 件；金额待核对 ${totals['避难所金额待核对']||0} 笔。`+
-          '\n含可核对的自动与手动操作。按本地确认日入账，资源可含返还，估值和缺失的旧历史不入账。':'');
+          '\n含可核对的自动与手动操作。按本地确认日入账，资源可含返还，估值和缺失的旧历史不入账。':
+          `\n其中秘境扫荡：修为 ${totals['秘境扫荡修为']||0} · 钻石 ${totals['秘境扫荡钻石']||0} · 代币 ${totals['秘境扫荡代币']||0}；完成 ${totals['秘境扫荡通关']||0} 趟，金额待核对 ${totals['秘境金额待核对']||0} 趟。已含在总收入中，未扣门票；中断趟留待最终累计，不重复计入。`);
       if (hint.textContent !== message) hint.textContent = message;
     }
     function refreshLog() {
@@ -1959,8 +1960,8 @@
         cached = value || { day: logDay(), totals: {}, events: [] }; render(); return cached;
       }).catch(failed);
     }
-    function add(type, detail = '', data = {}, sum = false, receiptId) {
-      const now = Date.now();
+    function add(type, detail = '', data = {}, sum = false, receiptId, confirmedAt = Date.now()) {
+      const now = confirmedAt;
       const durable = sum || ['page-refresh','navigation-refresh','expedition-idle-refresh',
         'farm-stamina-refresh','quota-refresh','shelter-batch-reload','operation-refresh'].includes(type);
       if (durable) receiptId ||= crypto.randomUUID();
@@ -3122,12 +3123,43 @@
       try { bindDungeonRequest(); } catch { setEnabled(false, '秘境原操作保存失败，请手动核对结果'); }
     });
   }
+  function dungeonSweepIncome(trips) {
+    // 原生扫荡逐趟返回实际 rewards；未完成趟留给原有最终累计入账，不能两边相加。
+    const finished=trips.filter(t=>t.finished),reward={修为:0,钻石:0,代币:0,灵力:0,'秘境扫荡通关':finished.length};
+    if(!finished.length)return null;
+    const fields={exp:'修为',diamonds:'钻石',tokens:'代币',stamina:'灵力'};
+    for(const trip of finished){
+      const values=Object.keys(fields).map(k=>trip.rewards?.[k]??0);
+      if(!objectState(trip.rewards)||values.some((n,i)=>!Number.isFinite(n)||n<0||
+          n>Number.MAX_SAFE_INTEGER-reward[Object.values(fields)[i]])){
+        reward['秘境金额待核对']=(reward['秘境金额待核对']||0)+1;continue;
+      }
+      Object.entries(fields).forEach(([key,label],i)=>{reward[label]+=values[i];});
+    }
+    return reward;
+  }
   function validDungeonReceipt(receipt, times) {
     return objectState(receipt) && Number.isFinite(receipt.at) && (receipt.status === 400 ?
       typeof receipt.error === 'string' && Boolean(receipt.error) : receipt.status === 200 &&
       Number.isInteger(receipt.completed) && receipt.completed >= 0 && typeof receipt.partial === 'boolean' &&
-      receipt.completed + Number(receipt.partial) <= times && typeof receipt.stopReason === 'string');
+      receipt.completed + Number(receipt.partial) <= times && typeof receipt.stopReason === 'string'&&
+      (receipt.income===undefined||objectState(receipt.income)&&/^dungeon-sweep:[a-f0-9-]{36}$/.test(receipt.income.id)&&
+        objectState(receipt.income.reward)&&receipt.income.reward['秘境扫荡通关']===receipt.completed&&
+        Object.entries(receipt.income.reward).every(([k,n])=>['修为','钻石','代币','灵力','秘境扫荡通关','秘境金额待核对'].includes(k)&&
+          Number.isFinite(n)&&n>=0&&n<=Number.MAX_SAFE_INTEGER)));
   }
+  const dungeonIncomeDelivered=new Set();
+  function recordDungeonSweepIncome(receipt) {
+    if(!validDungeonReceipt(receipt,5)||receipt.status!==200||!receipt.income||
+        receipt.at>Date.now()||logDay(receipt.at)<logDay(Date.now()-6*86400000)||dungeonIncomeDelivered.has(receipt.income.id))return;
+    const {id,reward}=receipt.income;dungeonIncomeDelivered.add(id);
+    const totals={...reward,...Object.fromEntries(['修为','钻石','代币'].map(k=>['秘境扫荡'+k,reward[k]||0]))};
+    // add 同步写入交付队列；结果页清除或跨日刷新后仍按原确认日与原ID交付一次。
+    void log.add('dungeon-sweep-income','原扫荡回执确认已完成趟数的实际收入',
+      {reward:totals,completed:receipt.completed,partial:receipt.partial},true,id,receipt.at);
+  }
+  recordDungeonSweepIncome(dungeonPlan?.receipt);
+  recordDungeonSweepIncome(dungeon.lastSweep?.plan?.receipt);
   observeDungeonPost = request => {
     if (dungeonPlan?.phase !== 'submitted' || dungeonPlan.action !== 'sweep') return null;
     bindDungeonRequest();
@@ -3149,9 +3181,11 @@
           typeof body.stopReason === 'string') {
         const completed = body.trips.filter(t => t.finished).length, partial = Boolean(body.activeRunId);
         if (completed + Number(partial) > dungeonPlan.times) return;
-        receipt = { status, at: Date.now(), completed, partial, stopReason: body.stopReason.slice(0, 300) };
+        const reward=dungeonSweepIncome(body.trips);
+        receipt = { status, at: Date.now(), completed, partial, stopReason: body.stopReason.slice(0, 300),
+          ...(reward?{income:{id:'dungeon-sweep:'+crypto.randomUUID(),reward}}:{}) };
       } else return;
-      try { saveDungeonPlan({ ...dungeonPlan, receipt }); schedule(); }
+      try { saveDungeonPlan({ ...dungeonPlan, receipt }); recordDungeonSweepIncome(receipt); schedule(); }
       catch { setEnabled(false, '秘境回执保存失败，请手动核对原批次'); }
     };
   };
