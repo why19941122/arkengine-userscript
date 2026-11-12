@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.87
+// @version      1.17.88
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1409,7 +1409,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.87';
+  const SCRIPT_VERSION = '1.17.88';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -5001,6 +5001,7 @@
     Object.entries(campaignNumbers).every(([k,[min,max]])=>['guardResidents','guardPowerPercent'].includes(k)&&v[k]===undefined||Number.isInteger(v[k])&&v[k]>=min&&v[k]<=max);
   let shelterCampaign=loadState(localStorage,SHELTER_CAMPAIGN,campaignDefaults,'shelter',validCampaignConfig);
   let shelterCampaignForm='',shelterCampaignNote='',shelterRecallWork=null,shelterCampaignEditing=false,shelterCampaignHeld='',shelterQuestSelection=null,shelterWorkConfirm=null,shelterCampaignWork=null;
+  const shelterExecutionDeferrals=new Map();
   const campaignKind=kind=>['explore-start','explore-recall','quest-start','quest-claim','stimpak','craft'].includes(kind);
   const workshopAutomatic=()=>shelterConstruction.upgrade&&shelterConstruction.partsLimit>0&&shelterConstruction.scrapLimit>0&&shelterStaffMode!=='off';
   const campaignActive=()=>campaignFlags.some(k=>shelterCampaign[k])||workshopAutomatic()||
@@ -14158,7 +14159,10 @@
       // This live closure observed cancellation before confirm or native send. Never infer
       // that a persisted old/unknown operation was unsent merely from a missing receipt.
       w.clear();w.capture.end();shelterWorkConfirm=null;cancelShelterRead();
-      shelterStaffHold=true;shelterCampaignHeld=w.cancelling;shelterStaffNote=w.cancelling;
+      if(w.work.executionFailure){
+        w.work.submitted=false;w.work.closing=true;shelterExecutionDefer(w.work,w.cancelling);
+      }else{ shelterStaffHold=true;shelterCampaignHeld=w.cancelling; }
+      shelterStaffNote=w.cancelling;
       log.add('shelter-work-cancelled','已取消未发送的居民确认，继续其他自动任务',
         {operation:w.id,reason:w.cancelling,resident:w.work.id,description:w.description||'',ageMs:Date.now()-w.at});
       return closeShelterWork();
@@ -14182,7 +14186,9 @@
     if(w.work.execution&&!shelterExecutionCurrent(shelterRead.model,w.work,w.pending())){
       log.add('shelter-confirmation-invalidated','最终确认前动作条件变化，取消未发送安排',
         {operation:w.id,kind:w.work.execution.kind,targets:w.work.execution.targets,...w.work.executionFailure});
-      return shelterCancelWorkConfirmation(w,dialog,'最终确认前动作条件已变化，重新核对人员安排');
+      const reason=w.work.fromOwner&&!shelterWeaponTransferAllowed(shelterRead.model,w.work,shelterCampaign,shelterState.campaign||{})?
+        '武器归属、出发队伍或留守条件变化，取消本次转交':'最终确认前动作条件已变化，重新核对人员安排';
+      return shelterCancelWorkConfirmation(w,dialog,reason);
     }
     if(w.work.fromOwner||trainingReturn){
       if(!shelterRead||shelterRead.at<=w.at||Date.now()-shelterRead.at>1500){
@@ -14942,6 +14948,7 @@
   }
   function shelterCampaignStep(m,dialogs,maintenanceOnly=false,execution=null) {
     const c=execution?.choice||shelterCampaignChoice(m,maintenanceOnly),w=shelterRecallWork;
+    if(!execution&&shelterExecutionDeferred(c))return false;
     if(w&&(w.cancelled||!c||c.kind!=='explore-recall'||c.targets[0]!==w.id||shelterLeave||!shelterCampaignAllowed(c)))return closeShelterRecall();
     if(!c||!shelterCampaignAllowed(c)||['assign','equip','stimpak'].includes(c.kind))return false;
     if(w){
@@ -15029,17 +15036,68 @@
       shelterOpenDialog(shelterRecallWork,()=>button.click());
     });return true;
   }
-  function shelterExecutionFacts(m,retainSupply=false) {
+  function shelterExecutionFacts(m,retainSupply=false,passiveProgress=true) {
     // Response revision identifies a reading, not a change to its action facts.
     // Compare the actual state/rules below even when the server revises metadata.
     const {serverTime,revision,...view}=m.view;
     const {power,food,water,...resources}=view.state.resources;
-    // Basic supply is checked separately against the admitted action's lower
-    // bounds. Every other observation, obligation and policy must still match.
-    const facts=retainSupply?{...view,state:{...view.state,resources}}:view;
+    // Basic supply and passive progress have lower bounds. Structural state,
+    // obligations, inventory-sensitive decisions and policy still match exactly.
+    const observation=passiveProgress?shelterExecutionObservation(view):{view};
+    const facts=retainSupply?{...observation.view,state:{...observation.view.state,resources}}:observation.view;
     return JSON.stringify([facts,shelterState,shelterConstruction,shelterCampaign,
       shelterStaffMode,shelterStaffHold,shelterCampaignHeld,shelterPopulationTarget,shelterPopulationContinuous,
       shelterLevelTarget,shelterGear,shelterOptimize,shelterConstructionDone,shelterConstructionHeld]);
+  }
+  function shelterExecutionObservation(view) {
+    // Keep identity, occupancy, rules and unknown fields exact. Passive progress
+    // has a separate lower bound; completing a level/stat/relationship still
+    // changes the structural facts. This is shared by every resident/departure
+    // action, including its final native confirmation.
+    const progress={},number=(copy,key,path,marker=null)=>{
+      if(!Number.isFinite(copy[key]))return;
+      progress[path+'.'+key]=copy[key];copy[key]=marker;
+    };
+    const rooms=view.state.rooms.map(r=>{const next={...r};number(next,'stored',`rooms.${r.id}`);return next;});
+    const residents=view.state.residents.map(p=>{
+      const next={...p},path=`residents.${p.id}`;
+      number(next,'xp',path,Math.min(50,1+Math.floor(Math.sqrt(Math.max(0,p.xp)/3))));
+      number(next,'hp',path);number(next,'happiness',path);
+      number(next,'training',path,p.training>=1);
+      if(p.romance){next.romance={...p.romance};number(next.romance,'progress',path+'.romance',p.romance.progress>=1);}
+      return next;
+    });
+    return {view:{...view,state:{...view.state,rooms,residents}},progress};
+  }
+  function shelterExecutionKey(choice) {
+    const kind=choice.kind||'assign',targets=choice.targets||(kind==='assign'?[choice.id,choice.room]:
+      kind==='equip'?[choice.id,choice.item]:kind==='stimpak'?[choice.id]:shelterConstructionTargets(choice));
+    return JSON.stringify([kind,targets]);
+  }
+  function shelterExecutionDeferred(choice) {
+    if(!choice)return false;
+    if(shelterExecutionDeferrals.has(shelterExecutionKey(choice)))return true;
+    // A cancelled transfer must not immediately become another transfer for the
+    // same person, or a departure relying on the cancelled equipment. Healing
+    // and emergency defense remain available through their own safety checks.
+    return choice.kind!=='stimpak'&&[...shelterExecutionDeferrals.values()].some(d=>
+      shelterExecutionResidents(choice).some(id=>d.residents.includes(id)));
+  }
+  function shelterExecutionResidents(choice) {
+    const kind=choice.kind||'assign';
+    return kind==='quest-start'?(choice.team||choice.targets.slice(1)):
+      ['assign','equip','stimpak','explore-start'].includes(kind)?
+        [choice.id,choice.fromOwner,...(choice.departureTeam||[])].filter(Number.isSafeInteger):[];
+  }
+  function shelterExecutionDefer(work,note='已撤销安排，本轮该居民的调岗、装备和新出征先让路') {
+    // Only an explicitly rejected, unsent operation yields its place. Unknown
+    // sent requests remain governed by the pending journal, never by this set.
+    if(!work?.execution||!work.executionFailure||work.submitted||shelterPending)return;
+    const key=shelterExecutionKey(work.execution.choice);
+    if(shelterExecutionDeferrals.has(key))return;
+    shelterExecutionDeferrals.set(key,{residents:shelterExecutionResidents(work.execution.choice),note});
+    log.add('shelter-execution-deferred','本轮已撤销的未发送动作先让路，下次访问重新核对',
+      {kind:work.execution.kind,targets:work.execution.targets,...work.executionFailure});
   }
   function shelterConstructionExecutionBasis(m) {
     const s=m.state;
@@ -15135,7 +15193,7 @@
     // Training's useful-output ceiling and reserve-based storage demand are not
     // monotone in stock: those decisions still require an identical snapshot.
     const person=['assign','equip'].includes(kind)?m.state.residents.find(p=>p.id===choice.id):null,training=m.state.rooms.some(r=>
-      r.type==='training'&&[choice.room,person?.roomId].includes(r.id));
+      r.type==='training'&&(r.id===choice.room||kind==='equip'&&r.id===person?.roomId));
     const supply=training||choice.storageDemand?null:
       Object.fromEntries(['power','food','water'].map(k=>[k,m.state.resources[k]]));
     // Strategies, reserve-driven storage and training investments retain their
@@ -15146,8 +15204,10 @@
     const construction=['build','upgrade','dig'].includes(kind)&&['power','diner','water','scrap'].includes(ordinaryType)&&!choice.strategy&&!choice.materials&&
       !choice.storageDemand&&!['storage','training'].includes(choice.type)&&!choice.purpose?.strategy?
       {basis:structuredClone(shelterConstructionExecutionBasis(m)),bounds:shelterConstructionExecutionBounds(m)}:null;
+    const progress=['build','upgrade','dig'].includes(kind)?null:shelterExecutionObservation(m.view).progress;
     return {kind,targets:[...targets],choice:structuredClone(choice),campaign:campaign?structuredClone(campaign):null,
-      facts:construction?null:shelterExecutionFacts(m,Boolean(supply)),supply,construction,serverAt:m.now,localAt:now,deadline,localDeadline};
+      facts:construction?null:shelterExecutionFacts(m,Boolean(supply),Boolean(progress)),
+      progress,supply,construction,serverAt:m.now,localAt:now,deadline,localDeadline};
   }
   function shelterExecutionCurrent(m,work,preparing=null) {
     const e=work?.execution;if(!e)return null;
@@ -15167,8 +15227,15 @@
         !Number.isFinite(before)||!Number.isFinite(current[k])||current[k]<before).map(([k])=>k);
       if(lower.length)return shelterExecutionReject(work,'construction-safety-bound',lower.slice(0,8));
     }else{
-      const facts=shelterExecutionFacts(m,Boolean(e.supply));
+      const facts=shelterExecutionFacts(m,Boolean(e.supply),Boolean(e.progress));
       if(facts!==e.facts)return shelterExecutionReject(work,'facts',shelterExecutionChangedPaths(JSON.parse(e.facts),JSON.parse(facts)));
+      const progress=e.progress?shelterExecutionObservation(m.view).progress:{},lower=Object.entries(e.progress||{}).filter(([key,before])=>
+        !Number.isFinite(progress[key])||progress[key]<before).map(([key])=>key);
+      if(lower.length)return shelterExecutionReject(work,'progress-regressed',lower.slice(0,8));
+      if(e.kind==='stimpak'){
+        const p=m.state.residents.find(p=>p.id===e.choice.id),hp=p&&shelterHealth(p);
+        if(!hp||hp.hp>=.9*hp.max)return shelterExecutionReject(work,'healing-no-longer-needed');
+      }
     }
     if(e.supply&&Object.entries(e.supply).some(([k,before])=>
       !Number.isFinite(before)||!Number.isFinite(m.state.resources[k])||m.state.resources[k]<before))
@@ -15193,6 +15260,7 @@
       else {const campaign=idleJob?null:shelterCampaignChoice(m);choice=idleJob||(campaign&&['assign','equip','stimpak'].includes(campaign.kind)?campaign:
         shelterPending||plan.defense?.busy?null:shelterStaffPlan(m));if(choice===campaign)selectedCampaign=campaign;} }
     catch(error) { if(error?.code==='shelter-state-changed')throw error;holdShelterStaff('人员或配对记录无法核对，本轮只收取奖励'); }
+    if(!execution&&!plan?.defense?.busy&&shelterExecutionDeferred(choice))choice=null;
     if(choice?.kind==='development-wait'){say(choice.reason);return true;}
     if (shelterWork?.submitted || shelterLeave || !shelterEnabled || !choice) return closeShelterWork();
     if (shelterWork && (shelterWork.id !== choice.id || shelterWork.room !== choice.room || shelterWork.from !== choice.from ||
@@ -15538,13 +15606,18 @@
       delay=Math.min(delay,60000);
       if(note==='本轮检查完成')note=shelterConstructionNote||'本轮建设已撤销，一分钟后重新核对';
     }
+    if(shelterExecutionDeferrals.size&&!shelterPending){
+      delay=Math.min(delay,60000);
+      if(note==='本轮检查完成')note='已撤销动作本轮先让路，一分钟内重新核对';
+    }
     pendingReadOnly ??= shelterState.pendingReadOnly;
     let development=shelterState.development,populationAdvice=shelterState.populationAdvice,developmentTrace=shelterState.developmentTrace;
     let developmentNext=null,urgentDefense=false,diagnosticPlan=null,diagnosticCampaign=null,diagnosticId=null,employmentContinuation=null;
     let operations=shelterState.operations,attention={},levelProgress=null,populationDiagnostics=null;
     const collection=shelterCollection || (m?shelterCollectionInfo(m):null);
     if (m) {
-      try { const campaign=shelterCampaignSchedule(m);shelterCampaignNote=[...(shelterCampaignHeld?[shelterCampaignHeld]:[]),...campaign.notes,...(campaign.choice?[`下一项：${campaign.choice.reason}`]:[])].join('\n');
+      try { const campaign=shelterCampaignSchedule(m);shelterCampaignNote=[...(shelterCampaignHeld?[shelterCampaignHeld]:[]),
+        ...[...shelterExecutionDeferrals.values()].map(d=>d.note),...campaign.notes,...(campaign.choice?[`下一项：${campaign.choice.reason}`]:[])].join('\n');
         urgentDefense=Boolean(campaign.defense?.busy);
         const job=shelterIdleEmploymentChoice(m,campaign);
         if(job)employmentContinuation={residentId:job.id,roomId:job.room,recheckMs:5000};
@@ -16062,6 +16135,7 @@
       return;
     }
     if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0; shelterLeave = false;shelterVisitPeriod=null;
+      shelterExecutionDeferrals.clear();
       shelterCampaignHeld='';shelterPopulationNote='';
       shelterQuestSelection=null;
       shelterCampaignWork=null;
@@ -16182,6 +16256,7 @@
             ageMs:Date.now()-executing.execution.localAt,readAgeMs:Date.now()-shelterRead.at,
             serverAt:m.now,deadline:executing.execution.deadline,localDeadline:executing.execution.localDeadline});
       }
+      if(!defending)shelterExecutionDefer(executing);
       if(executing===shelterCampaignWork){shelterCampaignWork=null;shelterQuestSelection=null;cancelQueued();}
       else if(executing===shelterBuildWork){
         // A rejected project must not reopen on every scheduler tick. Other
