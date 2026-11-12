@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.84
+// @version      1.17.85
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.84';
+  const SCRIPT_VERSION = '1.17.85';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -14984,6 +14984,56 @@
       shelterStaffMode,shelterStaffHold,shelterCampaignHeld,shelterPopulationTarget,shelterPopulationContinuous,
       shelterLevelTarget,shelterGear,shelterOptimize,shelterConstructionDone,shelterConstructionHeld]);
   }
+  function shelterConstructionExecutionBasis(m) {
+    const s=m.state;
+    // An admitted ordinary project depends on layout, workforce and obligations,
+    // not the response envelope or every worker's accumulating progress. Keep
+    // ordering: native occupancy uses the first residents in a room.
+    return {
+      site:{vaultNo:m.view.vaultNo,level:m.view.progress.level,switches:m.view.switches,nameRequired:m.view.nameRequired,
+        depth:s.depth,digging:s.digging,legacy:s.legacy,env:m.view.env,handies:s.handies},
+      rooms:s.rooms.map(r=>({id:r.id,type:r.type,floor:r.floor,col:r.col,width:r.width,level:r.level,
+        builtAt:r.builtAt,upgradeAt:r.upgradeAt,incident:r.incident,unpowered:r.unpowered,
+        separate:r.separate,trainStat:r.trainStat,craft:r.craft})),
+      residents:s.residents.map(p=>({id:p.id,name:p.name,roomId:p.roomId,away:p.away,deadAt:p.deadAt,adultAt:p.adultAt,
+        level:Math.min(50,1+Math.floor(Math.sqrt(Math.max(0,p.xp)/3))),stats:p.stats,parents:p.parents,
+        romance:p.romance?{partnerId:p.romance.partnerId}:null,familyCooldownUntil:p.familyCooldownUntil,
+        weaponId:p.weaponId,outfitId:p.outfitId})),
+      items:s.items,births:s.births,daily:s.daily,season:s.season,weekly:s.weekly,
+      extraResources:Object.fromEntries(Object.entries(s.resources).filter(([k])=>!Object.hasOwn(shelterResources,k))),
+      // Persisted roles include family/training return seats and future projects.
+      policy:[shelterState,shelterConstruction,shelterCampaign,shelterStaffMode,shelterStaffHold,
+        shelterCampaignHeld,shelterPopulationTarget,shelterPopulationContinuous,shelterLevelTarget,
+        shelterGear,shelterOptimize,shelterConstructionDone,shelterConstructionHeld]
+    };
+  }
+  function shelterConstructionExecutionBounds(m) {
+    const bounds={};
+    for(const k of Object.keys(shelterResources))bounds[`resources.${k}`]=m.state.resources[k];
+    for(const [k,v] of Object.entries(m.production))bounds[`production.${k}`]=v;
+    for(const r of m.state.rooms)bounds[`rooms.${r.id}.stored`]=r.stored;
+    for(const p of m.state.residents){
+      // A fall in health/mood must invalidate even when aggregate production is
+      // unchanged: a worker may be reserved for the new room after completion.
+      bounds[`residents.${p.id}.hp`]=p.hp;
+      bounds[`residents.${p.id}.happiness`]=p.happiness;
+    }
+    return bounds;
+  }
+  function shelterExecutionChangedPaths(before,after,path='',found=[]) {
+    if(found.length>=8||JSON.stringify(before)===JSON.stringify(after))return found;
+    if(Array.isArray(before)!==Array.isArray(after))found.push(path||'state');
+    else if(before&&after&&typeof before==='object'&&typeof after==='object'){
+      for(const key of new Set([...Object.keys(before),...Object.keys(after)])){
+        shelterExecutionChangedPaths(before[key],after[key],path?`${path}.${key}`:key,found);
+        if(found.length>=8)break;
+      }
+    }else found.push(path||'state');
+    return found;
+  }
+  function shelterExecutionReject(work,reason,fields=[]) {
+    work.executionFailure={reason,fields};return null;
+  }
   function shelterExecutionDeadline(value,now,lifetime=30000) {
     let deadline=now+lifetime;
     const consider=at=>{if(Number.isFinite(at)&&at>now)deadline=Math.min(deadline,at);};
@@ -15031,22 +15081,46 @@
       r.type==='training'&&[choice.room,person?.roomId].includes(r.id));
     const supply=training||choice.storageDemand?null:
       Object.fromEntries(['power','food','water'].map(k=>[k,m.state.resources[k]]));
+    // Strategies, reserve-driven storage and training investments retain their
+    // original exact contract; their marginal benefit is not monotone in stock
+    // or training progress. Ordinary construction keeps its admitted workforce,
+    // layout and policy, and requires all safety/production bounds not to worsen.
+    const ordinaryType=kind==='dig'?choice.purpose?.type:choice.type;
+    const construction=['build','upgrade','dig'].includes(kind)&&['power','diner','water','scrap'].includes(ordinaryType)&&!choice.strategy&&!choice.materials&&
+      !choice.storageDemand&&!['storage','training'].includes(choice.type)&&!choice.purpose?.strategy?
+      {basis:structuredClone(shelterConstructionExecutionBasis(m)),bounds:shelterConstructionExecutionBounds(m)}:null;
     return {kind,targets:[...targets],choice:structuredClone(choice),campaign:campaign?structuredClone(campaign):null,
-      facts:shelterExecutionFacts(m,Boolean(supply)),supply,serverAt:m.now,localAt:now,deadline,localDeadline};
+      facts:construction?null:shelterExecutionFacts(m,Boolean(supply)),supply,construction,serverAt:m.now,localAt:now,deadline,localDeadline};
   }
   function shelterExecutionCurrent(m,work) {
-    const e=work?.execution;if(!e||shelterPending||work.cancelled||work.cancelReason||work.closing||work.manual||work.submitted||
-      !shelterEnabled||shelterStaffHold||shelterCampaignHeld||Date.now()<shelterExploreManualUntil)return null;
+    const e=work?.execution;if(!e)return null;
+    if(shelterPending)return shelterExecutionReject(work,'pending');
+    if(work.manual||Date.now()<shelterExploreManualUntil)return shelterExecutionReject(work,'manual');
+    if(work.cancelled||work.cancelReason||work.closing||work.submitted)return shelterExecutionReject(work,'operation-ended');
+    if(!shelterEnabled||shelterStaffHold||shelterCampaignHeld)return shelterExecutionReject(work,'policy-held');
     const serverNow=m.now+Math.max(0,shelterRead?.model===m?Date.now()-shelterRead.at:0);
-    if(m.now<e.serverAt||serverNow>=e.deadline||Date.now()<e.localAt||Date.now()>=e.localDeadline||
-      shelterExecutionFacts(m,Boolean(e.supply))!==e.facts)return null;
+    if(m.now<e.serverAt||serverNow>=e.deadline||Date.now()<e.localAt||Date.now()>=e.localDeadline)
+      return shelterExecutionReject(work,'deadline');
+    if(e.construction){
+      const basis=shelterConstructionExecutionBasis(m),fields=shelterExecutionChangedPaths(e.construction.basis,basis);
+      if(fields.length)return shelterExecutionReject(work,'construction-basis',fields);
+      const current=shelterConstructionExecutionBounds(m),lower=Object.entries(e.construction.bounds).filter(([k,before])=>
+        !Number.isFinite(before)||!Number.isFinite(current[k])||current[k]<before).map(([k])=>k);
+      if(lower.length)return shelterExecutionReject(work,'construction-safety-bound',lower.slice(0,8));
+    }else{
+      const facts=shelterExecutionFacts(m,Boolean(e.supply));
+      if(facts!==e.facts)return shelterExecutionReject(work,'facts',shelterExecutionChangedPaths(JSON.parse(e.facts),JSON.parse(facts)));
+    }
     if(e.supply&&Object.entries(e.supply).some(([k,before])=>
-      !Number.isFinite(before)||!Number.isFinite(m.state.resources[k])||m.state.resources[k]<before))return null;
+      !Number.isFinite(before)||!Number.isFinite(m.state.resources[k])||m.state.resources[k]<before))
+      return shelterExecutionReject(work,'supply',Object.keys(e.supply).filter(k=>m.state.resources[k]<e.supply[k]).map(k=>`resources.${k}`));
     const choice=work.project||work,kind=choice.kind||'assign',
       targets=choice.targets||(kind==='assign'?[choice.id,choice.room]:
         kind==='equip'?[choice.id,choice.item]:kind==='stimpak'?[choice.id]:shelterConstructionTargets(choice));
-    if(kind!==e.kind||JSON.stringify(targets)!==JSON.stringify(e.targets))return null;
-    if(['build','upgrade','dig'].includes(kind)&&shelterConstructionAllowance(e.choice,m,shelterConstruction,shelterState,shelterPending,Date.now()))return null;
+    if(kind!==e.kind||JSON.stringify(targets)!==JSON.stringify(e.targets))return shelterExecutionReject(work,'target');
+    if(['build','upgrade','dig'].includes(kind)&&shelterConstructionAllowance(e.choice,m,shelterConstruction,shelterState,shelterPending,Date.now()))
+      return shelterExecutionReject(work,'construction-budget');
+    work.executionFailure=null;
     return e;
   }
   function shelterWorkStep(m,dialogs,employmentPlan=null,execution=null) {
@@ -15767,6 +15841,7 @@
     const materials=original?.kind==='upgrade'&&original.levelTarget&&original.cost.parts>0?
       {vaultNo:m.view.vaultNo,id:original.id,type:original.type,level:original.level,targetLevel:original.levelTarget,finalTarget:shelterResolvedLevelTarget(m,shelterLevelTarget)}:null;
     return {kind:c.kind,type:c.type,id:c.id,floor:c.floor,col:c.col,level:c.level,cost:c.cost,title:c.title,purpose:c.purpose,trainStat:c.trainStat,strategy:c.strategy,
+      ...(c.storageDemand?{storageDemand:c.storageDemand}:{}),
       ...(validShelterMaterials(materials)?{materials}:{})};
   }
   function shelterBuildTitle(c,m) {
@@ -16017,10 +16092,20 @@
       if(!executing.executionInvalidated&&!executing.submitted&&!shelterConstructionDone){
         executing.executionInvalidated=true;
         log.add('shelter-execution-invalidated','当前动作的状态、设置或时间条件变化，关闭旧窗口后重新规划',
-          {kind:executing.execution.kind,targets:executing.execution.targets,submitted:Boolean(executing.submitted)});
+          {kind:executing.execution.kind,targets:executing.execution.targets,submitted:Boolean(executing.submitted),
+            reason:defending?'defense':executing.executionFailure?.reason||'unavailable',fields:executing.executionFailure?.fields||[],
+            cancellation:executing.cancelReason||null,
+            ageMs:Date.now()-executing.execution.localAt,readAgeMs:Date.now()-shelterRead.at,
+            serverAt:m.now,deadline:executing.execution.deadline,localDeadline:executing.execution.localDeadline});
       }
       if(executing===shelterCampaignWork){shelterCampaignWork=null;shelterQuestSelection=null;cancelQueued();}
-      else if(executing===shelterBuildWork){executing.cancelled=true;if(closeShelterBuild())return;}
+      else if(executing===shelterBuildWork){
+        // A rejected project must not reopen on every scheduler tick. Other
+        // maintenance/work can finish this visit; reconsider on a fresh visit.
+        executing.cancelled=true;shelterConstructionHeld=true;
+        shelterConstructionNote=executing.cancelReason||'当前工程条件变化，本轮停止重复开窗；一分钟后重新核对';
+        if(closeShelterBuild())return;
+      }
       else {executing.closing=true;if(closeShelterWork())return;}
       schedule();return;
     }
