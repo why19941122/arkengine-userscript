@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.89
+// @version      1.17.92
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -513,6 +513,11 @@
       return cap({...config,tradeLimit:Math.min(allocation,m.rules.maxDailyBuyTokens),positionLimit,
         perStockLimit:Math.floor(positionLimit/3),reserve,capital});
     }
+    function accountBudget(m,settings,ledger,now,capacity) {
+      const funded=funding(m,settings),spent=spend(ledger.entries,'buy',now);
+      // Capacity is additional risk; the chooser subtracts rolling spend once from this total allowance.
+      return {...funded,autoBudget:false,tradeLimit:Math.min(funded.tradeLimit,spent+(whole(capacity)?capacity:0))};
+    }
     // 独立股票试验账本。原始起点与事件为权威记录，不从全账户余额差推算盈利。
     // 回放与未来实号适配共用；此处不自动建立实号试验或改变线上设置。
     const account = (() => {
@@ -681,7 +686,8 @@
       }
       function values(m,now) {
         return m.view.positions.filter(p=>p.shares>0).map(p=>{
-          const s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),q=s&&!s.stale&&!s.suspended?quote(s.priceCents,p.shares,m.rules.sellFeePct,false):null;
+          // stale describes upstream price updates, not a trading suspension. readStock verifies snapshot freshness.
+          const s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),q=s&&!s.suspended?quote(s.priceCents,p.shares,m.rules.sellFeePct,false):null;
           const can=q!==null&&q>0&&m.view.enabled&&p.holdUntil!==undefined&&(p.holdUntil===null||time(p.holdUntil)<=now)&&
             saleAmount(s.priceCents,p.shares,m.rules.sellFeePct)!==null&&q<=Math.min(m.rules.maxTradeTokens,m.rules.reserveTokens);
           return {stockId:p.stockId,lower:can?q:0,upper:can?q:null,quoted:q};
@@ -815,7 +821,7 @@
         if(o.manual||!o.shares)continue;
         sum.heldCost+=o.cost;
         const p=m.view.positions.find(p=>String(p.stockId)===id),s=m.view.stocks.find(s=>String(s.id)===id);
-        const value=s&&!s.stale&&!s.suspended&&p?.shares===o.shares&&p.costBasisTokens===o.cost?
+        const value=s&&!s.suspended&&p?.shares===o.shares&&p.costBasisTokens===o.cost?
           quote(s.priceCents,o.shares,m.rules.sellFeePct,false):null;
         if(value===null)sum.unknownPositions++;else sum.unrealized+=value-o.cost;
       }
@@ -827,6 +833,7 @@
         .filter(e=>e.action==='predict'&&e.result!=='rejected'&&!e.settlement).reduce((n,e)=>n+e.debit,0);
     }
     function riskReason(m,config,ledger,now) {
+      if(ledger.periodRequest)return '新周期起点待核对，暂停新增风险，已有持仓继续管理';
       if(config.lossLimit!=null){
         const p=performance(m,ledger,now);
         if(ledger.period){
@@ -847,7 +854,7 @@
     function sellPlan(m,s,owned,now) {
       const o=owned[String(s.id)],p=m.view.positions.find(p=>sameStockId(p.stockId,s.id)),r=m.rules;
       if(!m.view.enabled || !o || o.manual || !p || p.shares!==o.shares || p.costBasisTokens!==o.cost || !o.cost ||
-          s.suspended || s.stale || p.holdUntil && time(p.holdUntil)>now)return null;
+          s.suspended || p.holdUntil && time(p.holdUntil)>now)return null;
       const net=quote(s.priceCents,p.shares,r.sellFeePct,false),t=trend(m.view,s,now);
       if(net===null || !(net/o.cost>=1.08 || net/o.cost<=.94 || t?.direction==='down'))return null;
       const shares=saleSharesFor(s.priceCents,r.sellFeePct,Math.min(r.maxTradeTokens,r.reserveTokens),p.shares);
@@ -871,13 +878,13 @@
       return rows.sort((a,b)=>a.priority-b.priority||a.netReturnPct-b.netReturnPct||String(a.choice.stockId).localeCompare(String(b.choice.stockId)));
     }
     function unlockRecheck(m,ledger,now) {
-      if(!m.view.enabled||ledger.userId!==m.view.userId||ledger.pending||ledger.hold||ledger.periodRequest||
+      if(!m.view.enabled||ledger.userId!==m.view.userId||ledger.pending||ledger.hold||
           ledger.rejectionCooldownUntil>now||!m.rules.reserveTokens||!m.rules.maxTradeTokens)return null;
       let next=null;
       for(const p of m.view.positions){
         const o=ledger.owned[String(p.stockId)],s=m.view.stocks.find(s=>sameStockId(s.id,p.stockId)),until=time(p.holdUntil);
         if(!o||o.manual||!positive(o.cost)||p.shares!==o.shares||p.costBasisTokens!==o.cost||
-            !s||s.modelName!==o.modelName||s.stale||s.suspended||!Number.isFinite(until)||until<=now)continue;
+            !s||s.modelName!==o.modelName||s.suspended||!Number.isFinite(until)||until<=now)continue;
         const at=Math.max(now+5000,until+1000);
         if(at>=now+300000||!(quote(s.priceCents,p.shares,m.rules.sellFeePct,false)>0))continue;
         if(!next||at<next.at||at===next.at&&String(s.id).localeCompare(String(next.stockId))<0)
@@ -893,7 +900,7 @@
           sellShares:0,estimatedSaleNet:null,holdUntil:p?.holdUntil??null};
         const result=(status,reason)=>({...row,status,reason});
         if(!p||p.shares!==o.shares||p.costBasisTokens!==o.cost)return result('unconfirmed','持仓数量或成本与脚本账本不一致，等待核对');
-        if(!s||s.stale||s.suspended)return result('unavailable',s?.suspended?'当前停牌，无法卖出':s?.stale?'行情停滞，等待有效报价':'缺少当前报价');
+        if(!s||s.suspended)return result('unavailable',s?.suspended?'当前停牌，无法卖出':'缺少当前报价');
         row.estimatedNet=quote(s.priceCents,o.shares,m.rules.sellFeePct,false);
         if(row.estimatedNet===null)return result('unavailable','扣费金额无法核对');
         row.unrealized=row.estimatedNet-o.cost;
@@ -908,11 +915,56 @@
         }
         const net=row.estimatedNet/o.cost,t=trend(m.view,s,now);
         return net>=1.08||net<=.94||t?.direction==='down'?result('liquidity','已触发退出条件，单笔额度、系统储备或金额范围暂不支持卖出'):
-          result('holding','尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
+          result('holding',s.stale?'行情停滞，按当前网站报价尚未触发净收益8%或净亏损6%的退出条件':
+            '尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
       });
+    }
+    function marketShape(view) {
+      // Only names/types from the already accepted response. Unknown numeric values
+      // are not collected or interpreted as model usage, error rates or price drivers.
+      try{
+        let fieldsLeft=96,keysLeft=512;
+        const safe=name=>/^[A-Za-z][A-Za-z0-9_]{0,47}$/.test(name)&&
+          !/key|auth|secret|password|cookie|session|credential|signature|access|refresh|bearer|token|email|phone/i.test(name);
+        const type=x=>x===null?'null':Array.isArray(x)?'array':typeof x;
+        const describe=(values,depth)=>{
+          const types=[...new Set(values.map(type))].sort(),result={types};
+          const objects=values.filter(x=>type(x)==='object'),arrays=values.filter(Array.isArray);
+          if(depth>=3){if(objects.length||arrays.length)result.truncated=true;return result;}
+          if(objects.length){
+            const fields=new Map();let omitted=0;
+            for(const object of objects){
+              for(const name of Object.keys(object)){
+                if(keysLeft--<=0){result.truncated=true;break;}
+                if(!safe(name)){omitted++;continue;}
+                const property=Object.getOwnPropertyDescriptor(object,name);
+                if(!property||!Object.hasOwn(property,'value')){omitted++;continue;}
+                if(!fields.has(name))fields.set(name,[]);fields.get(name).push(property.value);
+              }
+              if(keysLeft<=0)break;
+            }
+            result.fields=[];
+            for(const name of [...fields.keys()].sort()){
+              if(fieldsLeft--<=0){result.truncated=true;break;}
+              result.fields.push({name,presentInSamples:fields.get(name).length,...describe(fields.get(name),depth+1)});
+            }
+            result.objectSamples=objects.length;if(omitted)result.omitted=omitted;
+          }
+          if(arrays.length){
+            const items=[];let total=0;
+            for(const array of arrays){total+=array.length;for(let i=0;i<array.length&&items.length<8;i++)items.push(array[i]);}
+            result.arrayItems=total;result.sampledItems=items.length;
+            if(total>items.length)result.truncated=true;
+            if(items.length)result.items=describe(items,depth+1);
+          }
+          return result;
+        };
+        return {version:1,arraySampleLimit:8,fieldLimit:96,shape:describe([view],0)};
+      }catch{return null;} // Optional discovery evidence must not interrupt trading or raw observations.
     }
     function observationParts(m,ledger=null) {
       const parts=[];let stocks=[],ticks=[];
+      const marketSchema=marketShape(m.view);
       const rules=Object.fromEntries(['buyFeePct','sellFeePct','maxTradeTokens','maxDailyBuyTokens','maxPositionTokens','reserveTokens'].map(k=>[k,m.rules[k]]));
       const pendingKnown=ledger?.userId===m.view.userId,p=pendingKnown?ledger.pending:null;
       const accountSnapshot={userId:m.view.userId,balanceTokens:m.balance,
@@ -921,9 +973,15 @@
           modelName:p.choice?.modelName,shares:p.choice?.shares,reservedTokens:p.choice?.action==='buy'?p.choice.debit:0,result:p.result??null}:null}:{})};
       const snapshot=()=>({userId:m.view.userId,enabled:m.view.enabled,rules,stocks,ticks,
         ...(Object.hasOwn(m.view,'dailyBoughtTokens')?{dailyBoughtTokens:whole(m.view.dailyBoughtTokens)?m.view.dailyBoughtTokens:null}:{}),
-        ...(!parts.length?{accountSnapshot}:{})});
+        ...(!parts.length?{accountSnapshot,marketSchema}:{})});
       for(const stock of m.view.stocks){
         const s=Object.fromEntries(['id','modelName','priceCents','volume24h','stale','suspended'].filter(k=>stock[k]!==undefined).map(k=>[k,stock[k]]));
+        // Public stock UI uses these prices; keep absence distinct from explicit null
+        // or an invalid response. They are observation evidence, not entry signals.
+        for(const key of ['openPriceCents','high24hCents','low24hCents'])if(Object.hasOwn(stock,key)){
+          if(whole(stock[key])||stock[key]===null)s[key]=stock[key];
+          else {s[key]=null;(s.invalidOptionalFields??=[]).push(key);}
+        }
         const history=m.view.ticks.filter(t=>sameStockId(t.stockId,stock.id)).sort((a,b)=>time(a.createdAt)-time(b.createdAt)).slice(-12)
           .map(t=>({stockId:t.stockId,priceCents:t.priceCents,createdAt:t.createdAt}));
         // UTF-8 is at most three bytes per UTF-16 code unit; leave ample room for the event envelope.
@@ -992,8 +1050,9 @@
       return buys.sort((a,b)=>b.signalMargin-a.signalMargin||b.signalNet-a.signalNet||String(a.stockId).localeCompare(String(b.stockId)))[0]||null;
     }
     // Read-only explanations. The actual choice still comes from choose; eligibility is not a submitted order.
-    function decisionDiagnostics(m,settings,ledger,now,selected=choose(m,settings,ledger,now)) {
+    function decisionDiagnostics(m,settings,ledger,now,selected,capacity) {
       const config=funding(m,settings),v=m.view,r=m.rules,positions=v.positions.filter(p=>p.shares>0);
+      if(selected===undefined)selected=choose(m,capacity===undefined?config:accountBudget(m,settings,ledger,now,capacity),ledger,now);
       const finite=n=>Number.isFinite(n)?n:null,held=positions.some(p=>!whole(p.costBasisTokens))?null:positions.reduce((n,p)=>n+p.costBasisTokens,0);
       const spent=spend(ledger.entries,'buy',now),predicted=spend(ledger.entries,'predict',now),exposure=riskExposure(m,ledger);
       const website=websiteLimits(m,ledger.entries,now);
@@ -1004,6 +1063,7 @@
         ['per-stock-limit',config.perStockLimit],['website-single-limit',r.maxTradeTokens],
         ['website-daily-limit',website.remainingDaily],['website-position-cost-limit',held===null?null:r.maxPositionTokens-held],
         ['website-position-limit',website.remainingPosition]];
+      if(capacity!==undefined)limits.push(['account-risk-budget',whole(capacity)?capacity:0]);
       const budget=limits.some(([,n])=>n===null)?null:Math.floor(Math.min(...limits.map(([,n])=>n)));
       const ownedCount=positions.filter(p=>ledger.owned[String(p.stockId)]&&!ledger.owned[String(p.stockId)].manual).length;
       const global=[];
@@ -1012,6 +1072,7 @@
       const buyGlobal=[...global];
       if(!config.trade)buyGlobal.push('trade-disabled');
       if(!config.tradeLimit)buyGlobal.push('no-buy-allocation');
+      if(capacity!==undefined&&!(capacity>0))buyGlobal.push('no-account-risk-budget');
       if(ownedCount>=3)buyGlobal.push('three-script-positions');
       if(held===null||config.fundingUnknown)buyGlobal.push('unknown-position-cost');
       if(website.remainingDaily===null||website.remainingPosition===null)buyGlobal.push('unknown-website-capacity');
@@ -1134,7 +1195,7 @@
       }
       if(a.action==='sell') {
         const stock=m.view.stocks.find(s=>sameStockId(s.id,a.stockId)&&s.modelName===a.modelName);
-        if(!stock||stock.stale||stock.suspended)return '原卖出当前报价无法核对，保留原单等待';
+        if(!stock||stock.suspended)return '原卖出当前报价无法核对，保留原单等待';
         const position=m.view.positions.find(s=>sameStockId(s.stockId,a.stockId));
         if(position?.holdUntil&&time(position.holdUntil)>now)return '原卖出尚在持有期，保留原请求等待到期';
         const proceeds=quote(stock.priceCents,a.shares,m.rules.sellFeePct,false);
@@ -1346,7 +1407,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,unlockRecheck,positionReport,observationParts,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleAmount,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,accountBudget,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,unlockRecheck,positionReport,observationParts,marketShape,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -1409,7 +1470,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.89';
+  const SCRIPT_VERSION = '1.17.92';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -4390,20 +4451,21 @@
     stockRead.accountDone=true;
   }
   function stockTryBeginPeriod(m) {
-    const request=stockLedger.periodRequest;if(!request)return true;
+    const request=stockLedger.periodRequest;if(!request)return {wait:'',blocked:false};
+    if(request.userId!==m.view.userId||stockNative().length)
+      return {wait:'新周期等待：账号或原请求尚未核对',blocked:true};
+    if(stockIncomeEntries(m.view.userId).some(e=>!e.automatic&&!e.confirmed&&!e.rejected))
+      return {wait:'新周期等待：仍有手动交易结果未知，请先核对原交易',blocked:true};
     let next;
     try {
-      if(request.userId!==m.view.userId||stockNative().length)throw Error('账号或原请求尚未核对');
-      if(stockIncomeEntries(m.view.userId).some(e=>!e.automatic&&!e.confirmed&&!e.rejected))
-        throw Error('仍有手动交易结果未知，请先核对原交易');
       next=stockCore.beginPeriod(m,stockLedger,stockConfig,Date.now(),request.id);
-    }catch(error){stockFinish('新周期等待：'+error.message);return false;}
+    }catch(error){return {wait:'新周期等待：'+error.message,blocked:stockLedger.entries.some(e=>e.result==='reserved')};}
     // Archive and replacement are one verified write. Quota failures leave the old ledger and request intact.
     stockPersist(next);
     log.add('stock-period-started','按明确指令封存旧账并开启一次性新周期，未执行交易',
       {periodId:next.period.id,at:next.period.at,previous:next.period.totals,openingEquity:next.accounting.record.openingEquity,
         capitalLimit:400000,lossLimit:100000});
-    return true;
+    return {wait:'',blocked:false};
   }
   function stockAccountManual(entry,view) {
     stockReload();
@@ -4423,10 +4485,9 @@
     if(JSON.stringify(accounting)!==JSON.stringify(current))stockPersist({...stockLedger,accounting});
   }
   function stockAccountBudget(m) {
-    const capacity=stockCore.accountRuntime.capacity(stockLedger.accounting,m,Date.now());
-    const funded=stockCore.funding(m,stockConfig),spent=stockCore.spend(stockLedger.entries,'buy',Date.now());
+    const now=Date.now(),capacity=stockCore.accountRuntime.capacity(stockLedger.accounting,m,now);
     // 仅限制新买入，不降低原生卖出资格或把预测收益混入股票试验。
-    return {...funded,autoBudget:false,tradeLimit:Math.min(funded.tradeLimit,spent+capacity)};
+    return stockCore.accountBudget(m,stockConfig,stockLedger,now,capacity);
   }
   function stockAccountWait() {
     const s=stockLedger.accounting;
@@ -4602,7 +4663,8 @@
     stockRead.diagnosticDone=true;
     try {
       const diagnosticId=crypto.randomUUID(),at=Date.now();
-      const {stocks,rounds,...summary}=stockCore.decisionDiagnostics(stockRead.model,stockConfig,stockLedger,at,selected);
+      const capacity=stockCore.accountRuntime.capacity(stockLedger.accounting,stockRead.model,at);
+      const {stocks,rounds,...summary}=stockCore.decisionDiagnostics(stockRead.model,stockConfig,stockLedger,at,selected,capacity);
       const parts=stockCore.diagnosticParts([...stocks.map(row=>({kind:'stock',...row})),...rounds.map(row=>({kind:'prediction',...row}))]);
       stockRead.diagnosticId=diagnosticId;
       log.add('stock-decision','逐股核对行情、费用、预算和冷却；候选不代表成交',{
@@ -4933,8 +4995,6 @@
     const m=stockRead.model;
     if(stockReconcile(m))return;
     if(stockNative().length){stockFinish('存在手动股市原请求，请先在网页核对',true);return;}
-    if(!stockTryBeginPeriod(m))return;
-    stockAccountRefresh(m);
     // 手动改变持仓后停止管理该模型，避免出售人工买入的股票。
     const owned={...stockLedger.owned},capacityWait=stockCapacityWait();let changed=capacityWait;
     for(const [id,o] of Object.entries(owned)) {
@@ -4942,7 +5002,8 @@
       if(!o.manual && (p?.shares!==o.shares || p?.costBasisTokens!==o.cost)) {owned[id]={...o,manual:true};changed=true;}
     }
     const settlements=[];
-    const keep=e=>stockCore.entryTime(e)>Date.now()-7*86400000 || e.action==='predict' && e.result!=='rejected' && !e.settlement;
+    // A requested period archives the original rows before normal retention can compact them into totals.
+    const keep=e=>stockLedger.periodRequest || stockCore.entryTime(e)>Date.now()-7*86400000 || e.action==='predict' && e.result!=='rejected' && !e.settlement;
     const expired=stockLedger.entries.filter(e=>!keep(e));
     const archive=expired.length?stockCore.historyTotals(expired,stockLedger.archive):stockLedger.archive;
     const entries=stockLedger.entries.filter(keep).map(entry=>{
@@ -4960,6 +5021,10 @@
     for(const entry of settlements)log.add('stock-prediction-settled','预测已结算，返还不补回下注额度',
       {stake:entry.debit,payout:entry.settlement.payout,net:entry.settlement.payout-entry.debit,
         reward:{代币:entry.settlement.payout,股市返还:entry.settlement.payout,'股市预测净盈亏':entry.settlement.payout-entry.debit}},true,`stock-settled:${stockLedger.userId}:${entry.betId}`);
+    // Reconcile settled bets first. Quote/settlement waits allow exits; unresolved trades still block execution.
+    const period=stockTryBeginPeriod(m);
+    stockAccountRefresh(m);
+    if(period.blocked){stockFinish(period.wait);return;}
     if(stockLedger.entries.length>=2000){stockFinish('股市账本暂满，暂停新交易，五分钟后核对结算与到期记录');return;}
     if(stockActions>=3){
       const last=stockLedger.entries.at(-1),sale=stockConfig.trade&&!stockConfig.observeOnly&&!stockLedger.hold&&!stockLedger.pending&&
@@ -4975,7 +5040,7 @@
       stockFinish(a?`仅观察：${a.action==='buy'?'买入':a.action==='sell'?'卖出':'预测'}候选 ${a.modelName}，${a.reason}；未执行`:
         `仅观察：${stockCore.waitReason(m,stockConfig,stockLedger,Date.now())}`);return;
     }
-    if(!a){stockFinish(stockAccountWait()||stockCore.waitReason(m,accountConfig,stockLedger,Date.now()));return;}
+    if(!a){stockFinish(period.wait||stockAccountWait()||stockCore.waitReason(m,accountConfig,stockLedger,Date.now()));return;}
     const control=stockControls(a,m),quantity=a.action==='predict'?a.betTokens:a.shares;
     if(!usable(control.input)){stockWaitForControl(a,control);return;}
     stockUiWait=null;

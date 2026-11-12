@@ -188,6 +188,7 @@ test('股票编号类型：旧卖出冷却和字符串行情继续匹配，但�
   assert.equal(c.choose(m,{...config,predict:false},l,now)?.action,'buy');
   assert.equal(c.observationParts(m)[0].ticks.length,6);
   v.positions=[{stockId:'01',shares:10,costBasisTokens:100}];
+  v.stocks.push({id:'01',modelName:'独立编号模型',priceCents:1000,volume24h:1000});
   assert.equal(c.choose(m,{...config,predict:false},l,now)?.action,'buy','01 is a distinct opaque identifier');
 });
 
@@ -316,6 +317,16 @@ test('观察行情分片：67只模型保留每只最近12点和决策字段，�
   for(const part of parts){assert.ok(Buffer.byteLength(JSON.stringify(part))<24000);assert.ok(!JSON.stringify(part).includes('secret-must-not-be-copied'));}
   const restored={...v,stocks:parts.flatMap(p=>p.stocks),ticks:parts.flatMap(p=>p.ticks)};
   for(const s of v.stocks)assert.deepEqual(c.trend(restored,s,now),c.trend(v,s,now));
+});
+test('股市观察起点：首片保留原仓和未决预留，未知字段不补造，不记录请求密钥',()=>{
+  const {v,m,l}=fixture();v.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:null,private:'must-not-copy'}];
+  const pending={id:'pending',at:now,key:'must-not-copy',choice:{action:'buy',stockId:2,modelName:'模型乙',shares:3,debit:50}};
+  const parts=c.observationParts(m,{...l,userId:v.userId,pending}),e=parts[0].accountSnapshot;
+  assert.equal(e.pendingKnown,true);assert.equal(e.pending.reservedTokens,50);assert.equal(e.positions[0].costBasisTokens,100);
+  assert.equal(e.balanceTokens,m.balance);assert.ok(!JSON.stringify(parts).includes('must-not-copy'));
+  assert.equal(c.observationParts(m)[0].accountSnapshot.pendingKnown,false);
+  delete v.positions[0].holdUntil;
+  assert.ok(!Object.hasOwn(JSON.parse(JSON.stringify(c.observationParts(m)[0].accountSnapshot.positions[0])),'holdUntil'));
 });
 test('股市总风险核对：原买入已反映在持仓时不重复计本金，单股限制仍约束原请求',()=>{
   const {m,l}=fixture(),p={id:'pending',beforeShares:0,choice:{action:'buy',stockId:1,modelName:'模型甲',shares:70,debit:900}};
@@ -464,7 +475,7 @@ test('股市原交易资金：人工接管阻止原卖出续发，普通卖出�
 });
 test('股市原交易报价：按原股数重算当前含费成本，等于原预留可确认，多一代币就等待',()=>{
   const {m,l}=fixture(),p={id:'original',beforeShares:0,choice:{action:'buy',stockId:1,modelName:'模型甲',shares:70,debit:900}};
-  m.view.stocks[0].priceCents=1260;assert.equal(c.quote(1260,70,2,true),900);
+  m.view.stocks[0].priceCents=1260;m.view.ticks.at(-1).priceCents=1260;assert.equal(c.quote(1260,70,2,true),900);
   assert.equal(c.recoveryWait(m,config,l,p,now),null);
   const before=JSON.stringify(p);m.view.stocks[0].priceCents=1261;
   assert.match(c.recoveryWait(m,config,l,p,now),/901.*原预留 900/);assert.equal(JSON.stringify(p),before);
@@ -522,9 +533,9 @@ test('股市原卖出报价：按原股数扣费取整，零代币等待，一�
   }
 });
 
-test('股市原卖出报价：缺失、改名、停牌、过期或金额无法安全计算均保留原单',()=>{
+test('股市原卖出报价：缺失、改名、停牌或金额无法安全计算均保留原单',()=>{
   for(const change of [m=>m.view.stocks=[],m=>m.view.stocks[0].id=2,m=>m.view.stocks[0].modelName='模型乙',
-    m=>m.view.stocks[0].stale=true,m=>m.view.stocks[0].suspended=true,m=>m.view.stocks[0].priceCents=Number.MAX_SAFE_INTEGER]){
+    m=>m.view.stocks[0].suspended=true,m=>m.view.stocks[0].priceCents=Number.MAX_SAFE_INTEGER]){
     const {m,l}=fixture(),p={id:'original',beforeShares:1000,choice:{action:'sell',stockId:1,modelName:'模型甲',shares:1000,debit:0}};
     l.owned['1']={shares:1000,cost:100,manual:false};m.view.positions=[{stockId:1,shares:1000,costBasisTokens:100}];
     change(m);assert.match(c.recoveryWait(m,config,l,p,now),/无法核对/);
@@ -620,13 +631,13 @@ test('股市持仓：只出售脚本持仓，尊重锁定、系统储备和净�
   m.view.positions[0].holdUntil=null;m.rules.reserveTokens=0;assert.equal(c.choose(m,config,l,now),null);
   m.rules.reserveTokens=50;assert.equal(c.choose(m,config,l,now).shares,4);
 });
-test('股市零回收：整仓有盈利但储备只允许卖出零净额小单时保留持仓，恢复后正常卖出',()=>{
+test('股市小额卖出：按净额可用储备凑足正到账，不按毛额误判零回收',()=>{
   const {m,l}=fixture();m.view.stocks[0].priceCents=49;m.view.positions=[{stockId:1,shares:100,costBasisTokens:10}];
   l.owned['1']={shares:100,cost:10};m.rules.reserveTokens=1;
   assert.equal(c.quote(49,100,2.5,false),47);assert.equal(c.quote(49,2,2.5,false),0);
-  assert.equal(c.choose(m,{...config,predict:false},l,now),null);
+  assert.equal(c.choose(m,{...config,predict:false},l,now).shares,3);
   m.rules.reserveTokens=2;const a=c.choose(m,{...config,predict:false},l,now);
-  assert.equal(a.action,'sell');assert.equal(a.shares,4);assert.equal(c.quote(49,a.shares,2.5,false),1);
+  assert.equal(a.action,'sell');assert.equal(a.shares,5);assert.equal(c.quote(49,a.shares,2.5,false),2);
 });
 test('股市零回收：整仓报价也不足一代币时不为零到账止损，其他可卖持仓继续处理',()=>{
   const {m,l}=fixture();m.view.stocks[0].priceCents=1;m.view.positions=[{stockId:1,shares:1,costBasisTokens:100}];
