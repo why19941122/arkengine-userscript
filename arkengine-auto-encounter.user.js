@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.81
+// @version      1.17.82
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -1408,7 +1408,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.81';
+  const SCRIPT_VERSION = '1.17.82';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -14738,8 +14738,22 @@
   }
   function shelterCampaignChoice(m,maintenanceOnly=false) {
     const plan=maintenanceOnly?shelterMaintenanceSchedule(m):shelterCampaignSchedule(m);
-    shelterCampaignNote=[...(shelterCampaignHeld?[shelterCampaignHeld]:[]),...plan.notes,...(plan.choice?[`下一项：${plan.choice.reason}`]:[])].join('\n');
-    return shelterStaffHold||shelterCampaignHeld?null:plan.choice;
+    let choice=plan.choice,note='';
+    // Campaign assignments precede ordinary staffing in the executor. Apply the
+    // construction handoff here too, including the submission-time recheck.
+    // Keep existing training, releases, healing and trip completion untouched.
+    const elective=choice?.kind==='assign'&&['training','radio','medical'].includes(choice.role)&&
+      (choice.role!=='medical'||!m.state.residents.some(p=>p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
+        shelterHealth(p)?.hp<.9*shelterHealth(p)?.max));
+    if(!maintenanceOnly&&elective&&!shelterStaffHold&&!shelterCampaignHeld&&!plan.defense?.busy&&
+        !shelterPending&&!shelterState.pair&&!shelterState.swap&&!shelterConstructionDone&&!shelterConstructionHeld){
+      const construction=shelterConstructionChoice(m);
+      if(['build','upgrade','dig'].includes(construction?.kind)){
+        choice=null;note='工程已具备开工条件，新增训练及普通辅助补员等开工确认后再评估；供给救急和家庭接替仍优先。';
+      }
+    }
+    shelterCampaignNote=[...(shelterCampaignHeld?[shelterCampaignHeld]:[]),...plan.notes,...(note?[note]:choice?[`下一项：${choice.reason}`]:[])].join('\n');
+    return shelterStaffHold||shelterCampaignHeld?null:choice;
   }
   let shelterTripLookup=null;
   function recoverShelterTrips(m) {
