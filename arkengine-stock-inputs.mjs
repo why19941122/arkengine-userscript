@@ -92,9 +92,9 @@ export function stockInputReadiness(log){
       else ticks.set(key,tick.priceCents);
       if(!latest.has(id)||latest.get(id)<stamp)latest.set(id,stamp);
     }
-    // The explicit 1.17.92 contract copies optional prices for every stock. Its
+    // The verified 1.17.92–1.17.102 contract copies optional prices for every stock. Its
     // sampled field inventory alone cannot prove that a particular stock omitted one.
-    const collectorEvidence=sample.sourceVersion==='1.17.92'&&Object.hasOwn(view,'marketSchema');
+    const collectorEvidence=['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102'].includes(sample.sourceVersion)&&Object.hasOwn(view,'marketSchema');
     const rows=view.stocks.map(stock=>{
       const id=String(stock.id);assert.ok((positive(stock.id)||typeof stock.id==='string'&&stock.id.trim())&&
         typeof stock.modelName==='string'&&stock.modelName&&positive(stock.priceCents),'Invalid stock');
@@ -145,7 +145,7 @@ export function stockInputReadiness(log){
     readiness:{priceInputCoverage:reasons.length===0?'available-for-descriptive-study':'insufficient-inputs',reasons,
       driverInputs:'unverified',predictiveValue:'unverified',livePromotion:false},
     limitations:['Field names/types cannot establish model-call-count or error-rate semantics; unknown values were not collected.',
-      'Absence is classified as not-returned only under the explicit 1.17.92 full-stock optional-price copying contract; other collector versions remain unknown.',
+      'Absence is classified as not-returned only under the verified 1.17.92–1.17.102 full-stock optional-price copying contract; other collector versions remain unknown.',
       'Valid optional prices are observed inputs, not validated predictors or proof of a profitable strategy.',
       'Horizon counts are overlapping coverage checks, not independent trading opportunities; 60/240m are fixed existing research horizons.',
       'The first read after the horizon is used; missing, suspended and gapped evidence is never filled or replaced with a later favourable quote.',

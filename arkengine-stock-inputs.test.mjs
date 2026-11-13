@@ -45,6 +45,13 @@ test('input readiness: known collector distinguishes absent, null, zero, invalid
   assert.deepEqual(states(r,'openPriceCents'),{'not-returned':1,null:1,'positive-integer':1,'reported-invalid':1,zero:1});
 });
 
+test('input readiness: 1.17.102 preserves the verified collector contract without trusting unknown future versions',()=>{
+  for(const version of ['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103']){
+    const r=stockInputReadiness(fixture({n:1,version,edit(v){delete v.stocks[0].openPriceCents;}}));
+    assert.deepEqual(states(r,'openPriceCents'),{[version==='1.17.103'?'not-collected':'not-returned']:1});
+  }
+});
+
 test('input readiness: healthy inputs support only descriptive study, not semantic proof or live promotion',()=>{
   const input=fixture({edit(v){v.providerStats={requestCount:987654321,errorRate:.123456789};v.privateNote='do-not-copy';}}),before=JSON.stringify(input);
   const r=stockInputReadiness(input);
