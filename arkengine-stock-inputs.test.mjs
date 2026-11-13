@@ -45,10 +45,10 @@ test('input readiness: known collector distinguishes absent, null, zero, invalid
   assert.deepEqual(states(r,'openPriceCents'),{'not-returned':1,null:1,'positive-integer':1,'reported-invalid':1,zero:1});
 });
 
-test('input readiness: 1.17.102 preserves the verified collector contract without trusting unknown future versions',()=>{
-  for(const version of ['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103']){
+test('input readiness: 1.17.110 preserves the verified collector contract without trusting unknown future versions',()=>{
+  for(const version of ['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103','1.17.104','1.17.105','1.17.106','1.17.107','1.17.108','1.17.109','1.17.110','1.17.111']){
     const r=stockInputReadiness(fixture({n:1,version,edit(v){delete v.stocks[0].openPriceCents;}}));
-    assert.deepEqual(states(r,'openPriceCents'),{[version==='1.17.103'?'not-collected':'not-returned']:1});
+    assert.deepEqual(states(r,'openPriceCents'),{[version==='1.17.111'?'not-collected':'not-returned']:1});
   }
 });
 
