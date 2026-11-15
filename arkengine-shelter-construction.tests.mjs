@@ -19,6 +19,144 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     s.residents.filter(p=>p.adultAt===0).forEach(p=>{p.stats.agi=20;p.stats.per=20;p.stats.str=20;});`;
   const digLogs=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`;
 
+  const stockBudget=config({scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0});
+  const spent=`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:sm.view.vaultNo,nextAt:0,note:'已付历史',
+    constructionLedger:[{id:'already-paid',at:clock-1000,scrap:10000,parts:100}]}));`;
+  await t.test('实际库存预算浏览器：旧默认日额已用尽仍按库存开工，回执记账与刷新均不重复',async()=>{
+    await setupShelter(digScene+stockBudget+spent+`sm.budgetFixtureSearch=location.search;`);
+    const before=await evaluate('sm.view.state.resources.scrap'),search=await evaluate('location.search');
+    await drive(done,'real inventory funds dig despite historical payments');
+    assert.deepEqual((await evaluate(calls)).map(c=>c.type),['dig']);
+    assert.equal(await evaluate('sm.view.state.resources.scrap'),before-Math.ceil(120*2**1.4));
+    assert.equal(await evaluate(`${state}.constructionLedger.length`),2);
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-stock-budget').checked`),true);
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(search)});`);
+    await reloadShelter();await drive(done,'no replay after inventory-paid dig');
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='dig').length`),1,'原下挖不重发，建成后允许接续宿舍');
+    assert.equal(await evaluate(`${state}.constructionLedger.filter(e=>e.scrap===Math.ceil(120*2**1.4)).length`),1);
+  });
+  await t.test('实际库存预算浏览器：24层单项费用超过一万，原生报价确认后真实扣款',async()=>{
+    await setupShelter(digScene+stockBudget+`
+      s.depth=23;s.resources={...s.resources,scrap:20000,parts:200,power:1000,food:1000,water:1000};
+      s.rooms.filter(r=>['power','diner','water','scrap'].includes(r.type)).forEach(r=>r.level=3);
+      for(let floor=2;floor<=23;floor++)s.rooms.push(room(100+floor,'elevator',floor,1),
+        room(200+floor,'storage',floor,2,3,1),room(300+floor,'storage',floor,5,3,1));
+      s.rooms.find(r=>r.id===202).type='medbay';s.resources.stimpak=5;
+      s.residents.push({...structuredClone(s.residents[0]),id:17,name:'医生17',roomId:202});
+      s.items=[{id:1,slot:'weapon',damage:[10,10]}];s.residents[0].weaponId=1;
+      sm.ui20261109=true;`);
+    await drive(done,'floor 24 funded under actual inventory');
+    assert.deepEqual((await evaluate(calls)).map(c=>c.type),['dig'],JSON.stringify(await evaluate(`({note:${state}.constructionNote,development:${state}.development,operations:${state}.operations})`)));
+    assert.equal(await evaluate('sm.view.state.depth'),23,'开工回执不能冒充下挖完工');
+    assert.equal(await evaluate('sm.view.state.digging.floor'),24);
+    assert.equal(await evaluate('sm.view.state.resources.scrap'),20000-Math.ceil(120*24**1.4));
+    assert.equal(await evaluate(`${state}.constructionLedger[0].scrap`),10268);
+  });
+  await t.test('实际库存预算浏览器：未知商队跨日预留拦截开工，不能重复花同一份库存',async()=>{
+    await setupShelter(digScene+stockBudget+`sm.budgetFixtureSearch=location.search;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:sm.view.vaultNo,nextAt:0,note:'未知原单',
+        caravan:{pending:{id:'original-caravan',at:clock-2*86400000,day:'old-day',vaultNo:sm.view.vaultNo,slot:0,
+          key:'original-caravan-key',cost:{scrap:600,parts:0}}}}));`);
+    const search=await evaluate('location.search');
+    await drive(done,'unknown commitment preserved');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(`${state}.caravan.pending.id`),'original-caravan');
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(search)});`);
+    await reloadShelter();await drive(done,'unknown commitment survives refresh');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(`${state}.caravan.pending.cost.scrap`),600);
+  });
+  await t.test('实际库存预算浏览器：自定义日限额和临开工改回限额仍阻止发送',async()=>{
+    await setupShelter(digScene+config({budgetMode:'daily',scrapLimit:10000,partsLimit:100})+spent);
+    await drive(done,'explicit daily budget remains');assert.deepEqual(await evaluate(calls),[]);
+    await setupShelter(digScene+stockBudget+spent);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'actual-stock quote before policy change');
+    await evaluate(`const c=JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'));c.budgetMode='daily';
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(c));`);
+    await drive(done,'policy rechecked before send');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(pending),null);
+  });
+  await t.test('实际库存预算浏览器：设置保存刷新保留模式，自定义数字和总暂停不被重置',async()=>{
+    await setupShelter(scene+config({scrapLimit:5000,partsLimit:50,scrapReserve:200,partsReserve:5})+
+      `localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');`);
+    const key='arkengine:auto-shelter:construction:v1',saved=`JSON.parse(localStorage.getItem('${key}'))`;
+    assert.equal(await evaluate(`${panel}.getElementById('shelter-stock-budget').checked`),false);
+    for(const stock of [true,false]){
+      await evaluate(`${panel}.getElementById('shelter-stock-budget').checked=${stock};${panel}.getElementById('shelter-development-save').click();`);
+      assert.deepEqual(await evaluate(saved),{build:true,upgrade:true,dig:true,budgetMode:stock?'stock':'daily',
+        scrapLimit:5000,partsLimit:50,scrapReserve:200,partsReserve:5});
+      await reloadShelter();
+      assert.equal(await evaluate(`${panel}.getElementById('shelter-stock-budget').checked`),stock);
+      assert.equal(await evaluate(`${saved}.budgetMode`),stock?'stock':'daily');
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
+      assert.deepEqual(await evaluate(calls),[]);
+    }
+  });
+
+  await t.test('下挖弹窗更新：新版标题确认一次，关闭后继续其他玩法',async()=>{
+    await setupShelter(digScene+`sm.ui20261109=true;`);
+    await drive(`!!document.querySelector('[data-construction-dialog]')`,'current dig dialog opened');
+    assert.equal(await evaluate(`document.querySelector('[data-construction-dialog] h2').textContent`),'往下挖第 2 层？');
+    await drive(done,'current dig dialog confirmed');
+    assert.equal((await evaluate(calls)).length,1);assert.equal((await evaluate(calls))[0].type,'dig');
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+    assert.equal(await evaluate(`!!document.querySelector('[data-construction-dialog]')`),false);
+  });
+  await t.test('下挖弹窗更新：旧标题仍确认一次',async()=>{
+    await setupShelter(digScene+`sm.ui20261109=false;`);await drive(done,'legacy dig dialog confirmed');
+    assert.equal((await evaluate(calls)).length,1);assert.equal((await evaluate(calls))[0].type,'dig');
+    assert.equal(await evaluate(pending),null);
+  });
+  for(const [label,mutation] of [
+    ['楼层不符',`d.querySelector('h2').textContent='往下挖第 99 层？';`],
+    ['未知标题',`d.querySelector('h2').textContent='新版建设提示';`],
+    ['费用不符',`d.querySelector('[data-construction-description]').textContent='花 999 废料，把电梯井延伸一层。';`],
+    ['额外消费说明',`d.querySelector('[data-construction-description]').textContent+='另花 1 代币。';`],
+    ['错误说明引用',`d.setAttribute('aria-describedby','missing-description');`]
+  ])await t.test('下挖弹窗更新：'+label+'只撤销本轮窗口，不消费也不整夜阻塞',async()=>{
+    await setupShelter(digScene+`const open=openConstruction;window.openConstruction=(...args)=>{open(...args);const d=document.querySelector('[data-construction-dialog]');${mutation}};`);
+    await drive(done,'changed dig dialog cancelled');
+    assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
+    assert.equal(await evaluate(`${state}.constructionLedger?.length||0`),0);
+    assert.equal(await evaluate(`!!document.querySelector('[data-construction-dialog]')`),false);
+    const check=await evaluate(`(${digLogs}).filter(e=>e.type==='shelter-check').at(-1)`);
+    assert.ok(check.data.nextAt-check.at<=62000,JSON.stringify(check));
+  });
+  await t.test('下挖弹窗更新：访问超时撤销，人工预先打开的相同窗口不接管',async()=>{
+    await setupShelter(digScene);await drive(`!!document.querySelector('[data-construction-dialog]')`,'dig before timeout');
+    // Valid native preparation may cross 30 seconds; the bounded visit still
+    // expires at five minutes plus its existing 30-second window allowance.
+    await pulse(331000);await drive(done,'dig visit timeout yields');assert.deepEqual(await evaluate(calls),[]);
+    await setupShelter(digScene+`openConstruction('dig');`);await pulse(61000);await pulse(1000);
+    assert.equal(await evaluate(`!!document.querySelector('[data-construction-dialog]')`),true);
+    assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
+  });
+  await t.test('下挖弹窗更新：确认前余额下降或人工接手，不发送下挖',async()=>{
+    for(const manual of [false,true]){
+      await setupShelter(digScene);await drive(`!!document.querySelector('[data-construction-dialog]')`,'dig before cancellation');
+      if(manual)await trustedStaffKey();else await evaluate('sm.view.state.resources.scrap=0;');
+      await pulse(manual?61000:1000);await drive(done,'dig cancelled before submission');
+      assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
+    }
+  });
+  await t.test('下挖弹窗更新：延后渲染的新标题仍绑定本轮，确认后不重复消费',async()=>{
+    await setupShelter(digScene+`const open=openConstruction;window.openConstruction=(...args)=>setTimeout(()=>open(...args),50);`);
+    await drive(done,'delayed native dig dialog');
+    assert.equal((await evaluate(calls)).length,1);assert.equal((await evaluate(calls))[0].type,'dig');
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+  });
+  await t.test('下挖弹窗更新：延后渲染且标题未知，也必须撤销而非卡住',async()=>{
+    await setupShelter(digScene+`const open=openConstruction;window.openConstruction=(...args)=>setTimeout(()=>{
+      open(...args);document.querySelector('[data-construction-dialog] h2').textContent='新版建设提示';},50);`);
+    await drive(done,'delayed unknown native dialog cancelled');
+    assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
+    assert.equal(await evaluate(`!!document.querySelector('[data-construction-dialog]')`),false);
+  });
+  await t.test('避难所弹窗恢复：下挖窗口超过旧五秒识别期限仍可撤销，不能被当作未知弹窗',async()=>{
+    await setupShelter(digScene+`const open=openConstruction;window.openConstruction=(...args)=>setTimeout(()=>{
+      clock+=6000;open(...args);document.querySelector('[data-construction-dialog] h2').textContent='延后显示的新版提示';},50);`);
+    await drive(done,'late unknown dig cancelled');assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`document.querySelector('[data-construction-dialog]')`),null);
+  });
+
   await t.test('建设规划耗时：重复决策不能耗尽提交新鲜度并撤销已可开工工程',async()=>{
     await setupShelter(scene+config()+`s.residents=s.residents.filter(p=>![2,4,6,8].includes(p.id));
       localStorage.setItem('arkengine:auto-shelter:staff:v1','production');sm.planCostMs=250;`);
@@ -28,14 +166,15 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     assert.equal(report.calls.length,1,JSON.stringify(report));
     assert.equal(await evaluate(pending),null);assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
   });
-  await t.test('建设撤销接续：窗口超时后一分钟重新核对，不误归为正常完成后闲等十五分钟',async()=>{
+  await t.test('建设撤销接续：确认控件不可用后一分钟重新核对，不误归为正常完成后闲等十五分钟',async()=>{
     await setupShelter(scene+config());
     await drive(`!!document.querySelector('[data-construction-dialog]')`,'construction dialog before timeout');
-    await pulse(31000);await drive(done,'cancel expired construction without spending');
+    await evaluate(`[...document.querySelectorAll('[data-construction-dialog] button')].find(b=>b.textContent.startsWith('升到 ')).disabled=true;`);
+    await pulse(31000);await drive(done,'cancel unavailable construction without spending');
     assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
     const check=await evaluate(`(${digLogs}).filter(e=>e.type==='shelter-check').at(-1)`);
     assert.ok(check.data.nextAt-check.at<=62000,JSON.stringify({wait:check.data.nextAt-check.at,note:check.detail}));
-    assert.match(check.detail,/建设.*撤销|超时/);
+    assert.match(check.detail,/原生建设按钮或费用与规划不一致，本轮不消费/);
   });
 
   await t.test('运行修复浏览器：建设窗口已打开时跨过访问时限，先确认当前项目再返回',async()=>{
@@ -54,7 +193,8 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     await setupShelter(scene+config()+`sm.visitStart=clock;
       const originalData=shelterData;window.shelterData=()=>{if(!sm.lateRead){sm.lateRead=true;clock+=48000;}return originalData();};`);
     await drive(`!!document.querySelector('[data-construction-dialog]')`,'late construction hard deadline');
-    await pulse(40000);await drive(done,'hard deadline yields');assert.deepEqual(await evaluate(calls),[]);
+    await evaluate(`[...document.querySelectorAll('[data-construction-dialog] button')].find(b=>b.textContent.startsWith('升到 ')).disabled=true;`);
+    await pulse(await evaluate('sm.visitStart+331000-clock'));await drive(done,'hard deadline yields');assert.deepEqual(await evaluate(calls),[]);
     assert.equal(await evaluate(pending),null);
   });
   await t.test('运行修复浏览器：窗口收尾仍重核最新预算，不能借延时绕过额度下降',async()=>{
@@ -168,12 +308,15 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
     assert.equal(await evaluate(`${pending}.id`),saved.id);
     assert.match(await evaluate(`${panel}.getElementById('shelter-construction-status').textContent`),/200\/3000/);
   });
-  await t.test('自动建设：等待确认时修改设置或人工接管均撤销原项目',async()=>{
+  await t.test('自动建设：设置变化撤销，人工接管原生窗口则保留窗口并停止提交',async()=>{
     for(const manual of [false,true]){
       await setupShelter(scene+config());await drive(`!!document.querySelector('[data-construction-dialog]')`,'construction window opened');
-      if(manual)await trustedStaffKey();
+      if(manual){await evaluate(`document.querySelector('[data-construction-dialog] button').focus();`);await trustedStaffKey();}
       else await evaluate(`${panel}.getElementById('shelter-upgrade').checked=false;${panel}.getElementById('shelter-development-save').click();`);
-      await pulse(manual?61000:1000);await drive(done,'construction cancelled');assert.deepEqual(await evaluate(calls),[]);
+      await pulse(manual?61000:1000);
+      if(manual){for(let i=0;i<8;i++)await pulse();assert.ok(await evaluate(`!!document.querySelector('[data-construction-dialog]')`));}
+      else await drive(done,'construction cancelled');
+      assert.deepEqual(await evaluate(calls),[]);assert.equal(await evaluate(pending),null);
     }
   });
   await t.test('自动建设：原生发送目标错误时拦截，待确认预留保留',async()=>{

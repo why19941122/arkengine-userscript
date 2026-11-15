@@ -3,7 +3,7 @@ import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import {powerPrerequisiteView,digPowerPrerequisiteView,fullPowerPrerequisiteView} from './arkengine-shelter-campaign.fixture.mjs';
-const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
+const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const segment=(from,to)=>source.slice(source.indexOf(from),source.indexOf(to));
 const declarations=['shelterRooms','shelterBuildRules','campaignDefaults'].map(n=>source.match(new RegExp(`const ${n}\\s*=[^;]*;`))[0]).join('\n');
 const implementation=[declarations,segment('  function shelterWorkerRate(','  function readShelter('),
@@ -11,6 +11,9 @@ const implementation=[declarations,segment('  function shelterWorkerRate(','  fu
   segment('  function shelterCampaignSchedule(','  function shelterDailyClaimStep('),
   segment('  function shelterConstructionChoice(','  function shelterBuildTitle(')].join('\n');
 function setup(v=powerPrerequisiteView()){
+  // Isolate construction staffing from the later automatic dorm employment feature.
+  // These cases only vary production workers; resting residents are unavailable here.
+  for(const p of v.state.residents)if(v.state.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'))p.hp=1;
   const context={objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
     shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'},
     shelterStaffMode:'production',shelterStaffHold:'',shelterOptimize:false,shelterGear:false,shelterPopulationTarget:14,shelterLevelTarget:10,
@@ -101,7 +104,7 @@ test('工程供电准备：开关、材料、额度、保留量或未决操作�
     ({context})=>context.shelterConstruction.scrapLimit=479,
     ({context})=>context.shelterConstruction.partsReserve=1,
     ({context})=>context.shelterPending={id:'unknown'},
-    ({context})=>context.shelterState.constructionLedger=[{id:'spent',at:Date.now(),scrap:10000,parts:0}]
+    ({context})=>{context.shelterConstruction.budgetMode='daily';context.shelterState.constructionLedger=[{id:'spent',at:Date.now(),scrap:10000,parts:0}];}
   ]){const scene=setup();change(scene);assert.equal(scene.api.staff(scene.api.model(scene.v)),null);}
 });
 test('工程供电准备：没有健康可调人员时保持原岗位，不抽空食物或净水供应',()=>{

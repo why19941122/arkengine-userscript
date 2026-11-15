@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import {campaignView,levelGateView} from './arkengine-shelter-campaign.fixture.mjs';
+import {holdShelterClaimReads as holdClaimReads} from './arkengine-shelter.fixture.mjs';
+import {stockHistoricalRequest} from './arkengine-stock-history.fixture.mjs';
 
 export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate,pulse,drive,until,withDelayedStockNavigation}) {
   const shelterPending=`localStorage.getItem('arkengine:auto-shelter:pending:v1')`;
@@ -18,9 +20,63 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:clock+900000,note:'普通复查尚未到期'}));
     sm.view.state.rooms.push({id:90,type:'door',floor:1,col:0,width:1,level:1,builtAt:0,upgradeAt:null,stored:0,
       unpowered:false,incident:{kind:'raiders',hp:80,maxHp:80}});`;
-  await t.test('跨页防守巡检：股市未提交买入让位于在家增援，不受十五分钟预约限制',async()=>{
+  await t.test('普通预约公平性：避难所再次到期不能插到久等股市前，股市完成后继续避难所',async()=>{
+    await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:clock-1000,note:'刚到期的短间隔接续'}));`);
+    await drive(`fm.calls.some(c=>c.type==='navigate')`,'first due feature navigation');
+    assert.equal(await evaluate(`fm.calls.find(c=>c.type==='navigate').path`),'/stock','股市原预约0早于刚到期的避难所');
+    await drive(`km.calls.length===1&&sm.calls.some(c=>c.type==='collect_all')&&location.pathname==='/activities/expedition'`,'stock then shelter both served',160);
+    assert.deepEqual(await evaluate(`km.calls.map(c=>c.action)`),['sell']);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='collect_all').length`),1);
+  });
+  for(const mode of ['无可用队伍','派遣撤销等待'])await t.test(`普通预约入口：${mode}也先处理久等股市，再接续避难所`,async()=>{
+    await setupFeatures(`model.runs=[];
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:clock-1000,note:'刚到期的短间隔接续'}));
+      ${mode==='无可用队伍'?`window.preview=()=>({normal:0,burst:0,total:0});`:`
+        const open=openDispatch;window.openDispatch=()=>{open();document.querySelector('[role="dialog"] h2').textContent='派遣内容已变化';};
+        const close=clearDialog;window.clearDialog=()=>{sm.cancelledDispatchAt=clock;close();};`}`);
+    await drive(`fm.calls.some(c=>c.type==='navigate')`,'dispatch fallback chooses the oldest appointment',60);
+    if(mode==='派遣撤销等待'){
+      assert.equal(await evaluate('model.opens'),1);
+      assert.ok(await evaluate('clock>=sm.cancelledDispatchAt&&clock<sm.cancelledDispatchAt+60000'));
+    }
+    assert.equal(await evaluate(`fm.calls.find(c=>c.type==='navigate').path`),'/stock');
+    assert.deepEqual(await evaluate('model.calls'),[],'no expedition request was sent');
+    await drive(`km.calls.length===1&&sm.calls.some(c=>c.type==='collect_all')&&location.pathname==='/activities/expedition'`,
+      'old stock and newer shelter appointments both complete',160);
+    assert.deepEqual(await evaluate(`km.calls.map(c=>c.action)`),['sell']);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='collect_all').length`),1);
+  });
+  for(const mode of ['额度已满','无可用队伍','派遣撤销等待'])await t.test(`普通预约主动检查：${mode}时点击检查股市仍优先`,async()=>{
+    await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'同到期的普通预约'}));
+      ${mode==='额度已满'?'':`model.runs=[];`}
+      ${mode==='无可用队伍'?`window.preview=()=>({normal:0,burst:0,total:0});`:mode==='派遣撤销等待'?`
+        const open=openDispatch;window.openDispatch=()=>{open();document.querySelector('[role="dialog"] h2').textContent='派遣内容已变化';};`:''}`);
+    await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('stock-check').click();`);
+    await drive(`fm.calls.some(c=>c.type==='navigate')`,'explicit stock check takes priority',60);
+    assert.equal(await evaluate(`fm.calls.find(c=>c.type==='navigate').path`),'/stock');
+    assert.deepEqual(await evaluate('model.calls'),[]);
+  });
+  await t.test('普通预约归来保护：无可用队伍时等待即将归来的原远征，先领取再访问',async()=>{
+    await setupFeatures(`model.runs=model.runs.slice(0,1);window.preview=()=>({normal:0,burst:0,total:0});
+      sm.originalArrival=clock+12000;
+      const render=renderExp;window.renderExp=()=>{render();
+        if(model.runs.length){const p=document.createElement('p'),at=new Date(sm.originalArrival);
+          p.textContent='完整到达: '+at.getFullYear()+'/'+(at.getMonth()+1)+'/'+at.getDate()+' '+
+            at.getHours()+':'+String(at.getMinutes()).padStart(2,'0')+':'+String(at.getSeconds()).padStart(2,'0');
+          document.getElementById('running').append(p);}
+      };`);
+    for(let i=0;i<7;i++)await pulse();
+    assert.deepEqual(await evaluate(`fm.calls.filter(c=>c.type==='navigate')`),[]);
+    assert.deepEqual(await evaluate('km.calls'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate(`clock=sm.originalArrival;model.runs[0].done=true;renderExp();`);
+    await drive(`model.calls.some(c=>c.type==='claim')`,'original expedition is claimed before another feature');
+    assert.deepEqual(await evaluate(`fm.calls.filter(c=>c.type==='navigate')`),[]);
+    await drive(`fm.calls.some(c=>c.type==='navigate')`,'normal appointments resume after the claim');
+    assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
+  });
+  await t.test('跨页防守巡检：股市未提交卖出让位于在家增援，不受十五分钟预约限制',async()=>{
     await setupFeatures(raidWatch,'/stock');
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'patrol preempts stock purchase',35);
+    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'patrol preempts stock sale',35);
     assert.deepEqual(await evaluate('km.calls'),[]);
     assert.ok(await evaluate('sm.reads>=1'));
     await drive(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))?.campaign?.defense?.length>0`,'first defender confirmed',30);
@@ -30,7 +86,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.ok(found&&sent&&confirmed);assert.equal(sent.data.raidId,found.data.id);assert.equal(confirmed.data.raidId,found.data.id);
     assert.ok(sent.data.elapsedMs>=0&&sent.data.elapsedMs<30000);assert.ok(confirmed.data.elapsedMs>=sent.data.elapsedMs);
   });
-  await t.test('跨页防守巡检：人工弹窗阻止切页及新买入，关闭后立即转向防守',async()=>{
+  await t.test('跨页防守巡检：人工弹窗阻止切页及卖出，关闭后立即转向防守',async()=>{
     await setupFeatures(raidWatch+`const d=document.createElement('div');d.id='owner-dialog';d.setAttribute('role','dialog');d.textContent='人工确认';document.body.append(d);`,'/stock');
     await pulse(35000);
     assert.equal(await evaluate('location.pathname'),'/stock');
@@ -38,21 +94,28 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     await evaluate("document.getElementById('owner-dialog').remove();");
     await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'raid after manual dialog closed',35);
   });
-  await t.test('跨页防守巡检：总暂停阻止迟到读取导航，已返回的未知买入保留但不拖延增援',async()=>{
+  await t.test('跨页防守巡检：总暂停阻止迟到读取导航，已返回的未知原交易保留但不拖延增援',async()=>{
     await setupFeatures(raidWatch+'sm.deferRead=true;','/stock');
     await drive('typeof sm.resolveRead==="function"','deferred patrol');
     await evaluate("localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');sm.resolveRead();");
     await pulse(35000);
     assert.equal(await evaluate('location.pathname'),'/stock');
     assert.deepEqual(await evaluate('sm.calls'),[]);assert.deepEqual(await evaluate('km.calls'),[]);
-    await setupFeatures(raidWatch+`sm.view.state.rooms.at(-1).incident=null;km.mode='unknown';`,'/stock');
-    await drive('km.calls.length===1','original buy pending');
-    const original=await evaluate(`${stock}.pending.id`);
-    await evaluate("sm.view.state.rooms.at(-1).incident={kind:'raiders',hp:80,maxHp:80};");
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'returned unknown stock yields to raid',45);
-    assert.equal(await evaluate(`${stock}.pending.id`),original);
-    assert.equal(await evaluate('km.calls.length'),1);
-    assert.ok(await evaluate(`${stock}.pending.responseAt>=${stock}.pending.at`));
+    for(const action of ['sell','buy']){
+      await setupFeatures(raidWatch+`sm.view.state.rooms.at(-1).incident=null;km.mode='unknown';`+
+        (action==='buy'?`km.view.positions=[];`+stockHistoricalRequest():''),'/stock');
+      if(action==='buy'){
+        assert.equal(await evaluate('km.calls.length'),0);
+        await evaluate(`stockAct('buy',{});`); // User confirmation of the exact old request, never a new automatic buy.
+      }
+      await drive('km.calls.length===1','original response returned with unknown result');
+      const original=await evaluate(`${stock}.pending.id`);
+      await evaluate("sm.view.state.rooms.at(-1).incident={kind:'raiders',hp:80,maxHp:80};");
+      await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'returned unknown stock yields to raid',45);
+      assert.equal(await evaluate(`${stock}.pending.id`),original);
+      assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate('km.calls[0].action'),action);
+      assert.ok(await evaluate(`${stock}.pending.responseAt>=${stock}.pending.at`));
+    }
   });
   await t.test('跨页防守巡检：交易仍在传输时不切页，响应返回后保留原单并立即增援',async()=>{
     await setupFeatures(raidWatch+`sm.view.state.rooms.at(-1).incident=null;km.deferPost=true;`,'/stock');
@@ -257,7 +320,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.deepEqual(await evaluate('badNavigationClicks'),[]);
     assert.equal(await evaluate(`fm.calls.filter(c=>c.type==='plant').length`),1);
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
-    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
   });
 
   await t.test('玩法隔离人员轮换：避难所到时限让股市运行，返回后接续原调岗而不重放',async()=>{
@@ -276,9 +339,9 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
       error.message+=JSON.stringify(await evaluate(`({calls:sm.calls,schedule:${schedule},pending:${shelterPending},staff:document.getElementById('ark-auto-expedition').shadowRoot.getElementById('shelter-staff-status').textContent})`));throw error;
     });
     const id=await evaluate(`${schedule}.swap.id`);
-    await pulse(61000);await drive(done,'stock served between allocation visits');
+    await pulse(301000);await drive(done,'stock served after the current five-minute visit limit');
     assert.equal(await evaluate(`${moves}.length`),1);assert.equal(await evaluate(`${schedule}.swap.id`),id);
-    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
     await pulse(61000);await drive(`${moves}.length===4&&${schedule}.swap===null&&location.pathname==='/activities/expedition'`,'resume allocation after other feature',240);
     assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,3).map(p=>p.roomId)'),[3,4,2]);
     assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`JSON.parse(${shelterPending})`),null);
@@ -288,15 +351,15 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:explore-claim:v1','true');
       const s=sm.view.state;s.rooms[0].stored=0;s.residents[0].away={kind:'explore'};
       s.explorers=[{id:11,residentId:1,startedAt:clock-3600000,returnAt:clock-1,tier:0,abyss:false,
-        stimpaks:0,loot:{scrap:50,parts:0,stimpak:0,items:[]}}];sm.beforeClaimView=structuredClone(sm.view);`,'/shelter');
+        stimpaks:0,loot:{scrap:50,parts:0,stimpak:0,items:[]}}];sm.beforeClaimView=structuredClone(sm.view);${holdClaimReads}`,'/shelter');
     await drive('sm.calls.length===1','explorer claim before stale cross-feature view');
     await until(()=>evaluate(`Boolean(JSON.parse(${shelterPending})?.result?.proof)`),'explorer receipt before cross-feature wait');
     const original=await evaluate(shelterPending);
-    await evaluate(`sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';renderShelter();`);
+    await evaluate(`sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';sm.releaseClaimReads();renderShelter();`);
     await drive(done,'stock continues while stale explorer waits');
     assert.equal(await evaluate(shelterPending),original);assert.equal(await evaluate(shelfEnabled),'true');
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['explore_claim']);
-    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
     assert.equal(await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1')).pendingReadOnly`),JSON.parse(original).id);
   });
   await t.test('玩法隔离：避难所原领取超时只读核对时股市仍运行，保留原记录不补领',async()=>{
@@ -307,13 +370,13 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.equal(await evaluate(shelfEnabled),'true');assert.equal(await evaluate(shelterPending),original);
     assert.equal(await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1')).pendingReadOnly`),JSON.parse(original).id);
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
-    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
   });
   await t.test('玩法隔离：已暂停农场保留旧收获记录，不阻塞避难所和股市，刷新不重放',async()=>{
     await setupFeatures(oldFarm);const original=await evaluate(farmPending);
     await drive(done,'other features proceed past paused farm');
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
-    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['buy']);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
     assert.equal(await evaluate(farmPending),original);
     assert.equal(await evaluate(`fm.calls.filter(c=>['plant','harvest'].includes(c.type)).length`),0);
     await reloadFeatures();await pulse(20000);

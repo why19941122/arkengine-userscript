@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import {mkdir,writeFile} from 'node:fs/promises';
 import {join} from 'node:path';
 import {campaignView} from './arkengine-shelter-campaign.fixture.mjs';
+import {stockOwnedPosition} from './arkengine-stock.fixture.mjs';
+import {stockHistoricalRequest} from './arkengine-stock-history.fixture.mjs';
 
 export async function settingsTests({t,setupShelter,reloadShelter,setupStock,reloadStock,evaluate,pulse,drive,until,viewport,screenshot,pressEnter}) {
   const panel=`document.getElementById('ark-auto-expedition').shadowRoot`;
@@ -13,27 +15,32 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
   const cfg={trade:true,predict:false,tradeLimit:100000,predictionLimit:700,stake:50,reserve:2500};
   const click=id=>evaluate(`${panel}.getElementById('${id}').click();`);
   const feedback=()=>evaluate(`${panel}.getElementById('stock-check-feedback').textContent`);
+  const diagnostic=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='stock-decision').at(-1).data`;
   const campaign={explore:false,quests:false,training:false,medical:false,radio:false,combatGear:false,
     tier:0,hours:12,stimpaks:3,reserve:4,chance:80,attempts:2,trainTarget:8};
 
   await t.test('推荐预设：首次股市无需填写，暂停总开关不交易，刷新保留全部额度',async()=>{
     await setupStock(paused);assert.equal(await evaluate(stock),null);assert.equal(await evaluate('km.reads'),0);
     await click('stock-preset');
-    assert.deepEqual(await evaluate(stock),{trade:true,predict:false,netEfficiency:true,autoBudget:true,tradeLimit:3000,predictionLimit:500,stake:100,reserve:1000,riskLimit:10000});
+    assert.deepEqual(await evaluate(stock),{trade:true,predict:false,observeOnly:false,netEfficiency:true,autoBudget:true,tradeLimit:400000,predictionLimit:0,stake:0,reserve:1000,riskLimit:400000,positionLimit:400000,lossLimit:100000});
     await pulse(10000);assert.equal(await evaluate('km.reads'),0);assert.deepEqual(await evaluate('km.calls'),[]);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
     await reloadStock();assert.equal(await evaluate(`${stock}.reserve`),1000);assert.equal(await evaluate('km.reads'),0);
     await click('stock-pause');assert.equal(await evaluate(`${stock}.trade||${stock}.predict`),false);
-    assert.equal(await evaluate(`${stock}.tradeLimit`),3000);
+    assert.equal(await evaluate(`${stock}.tradeLimit`),400000);
   });
-  await t.test('推荐预设：直接开启股市后实际择股买入，并遵守推荐额度和保留余额',async()=>{
-    await setupStock();await click('stock-preset');
-    await drive('km.calls.some(c=>c.action===\'buy\')','preset enables a real local buy');
-    await drive(`location.pathname==='/activities/expedition'`,'preset buy confirmed');
+  await t.test('推荐预设：直接开启股市后卖出旧仓，保留资金设置且不开放新买入',async()=>{
+    await setupStock(stockOwnedPosition);await click('stock-preset');
+    await drive('km.calls.some(c=>c.action===\'sell\')','preset enables a legal old-position exit');
+    await drive(`location.pathname==='/activities/expedition'`,'preset sale confirmed');
     assert.equal(await evaluate(`${ledger}.pending`),null);
-    assert.ok(await evaluate(`${ledger}.entries.filter(e=>e.action==='buy').reduce((n,e)=>n+e.debit,0)<=3000`));
-    assert.ok(await evaluate('km.tokens>=2000'));
-    assert.match(await evaluate(`${panel}.getElementById('stock-config-summary').textContent`),/买入上限 8000.*持仓上限 8000.*保留代币 2000/);
+    assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
+    assert.equal(await evaluate(`${ledger}.entries[0].proceeds`),117);assert.equal(await evaluate('km.tokens'),10117);
+    assert.equal(await evaluate(`${ledger}.entries[0].releasedCost`),100);
+    assert.equal(await evaluate(`${diagnostic}.policy.newBuy`),false);
+    assert.equal(await evaluate(`${diagnostic}.budget.reserve`),2024,'卖出后按实际10117资产保留向上取整的20%');
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.find(e=>e.type==='stock-decision').data.budget.reserve`),2020,
+      '起点包含10000现金和100旧仓成本');
   });
   await t.test('推荐预设：100000退为手动备用，自动模式保留独立预测额度、持仓、已用预算和停止原因',async()=>{
     const saved={version:1,userId:77,nextAt:0,note:'人工核对',hold:true,holdReason:'原交易待人工核对',pending:null,
@@ -42,13 +49,13 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     await setupStock(`${paused}localStorage.setItem('${stockKey}',JSON.stringify(${JSON.stringify(cfg)}));
       localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify(${JSON.stringify(saved)}));`);
     for(let i=0;i<2;i++){
-      await click('stock-preset');assert.deepEqual(await evaluate(stock),{...cfg,predict:false,netEfficiency:true,autoBudget:true,riskLimit:10000});
+      await click('stock-preset');assert.deepEqual(await evaluate(stock),{...cfg,predict:false,observeOnly:false,netEfficiency:true,autoBudget:true,riskLimit:400000,positionLimit:400000,lossLimit:100000});
       const actual=await evaluate(ledger);assert.deepEqual(actual.entries,saved.entries);assert.deepEqual(actual.owned,saved.owned);
       assert.equal(actual.hold,true);assert.equal(actual.holdReason,saved.holdReason);
     }
     await reloadStock();assert.equal(await evaluate(`${stock}.tradeLimit`),100000);
     assert.equal(await evaluate(`${stock}.autoBudget`),true);
-    assert.match(await evaluate(`${panel}.getElementById('stock-preset-summary').textContent`),/自动计算股票额度.*总风险本金上限 10000.*保留已设独立限制/);
+    assert.match(await evaluate(`${panel}.getElementById('stock-preset-summary').textContent`),/管理旧仓.*新买入等待收益验证.*保留原资金设置与更严格的独立限制.*总风险本金上限 400000/);
   });
   await t.test('推荐预设：股票零备用额度不妨碍显式启用自动资金，建设零额度仍保留',async()=>{
     await setupStock(`${paused}localStorage.setItem('${stockKey}',JSON.stringify({...${JSON.stringify(cfg)},tradeLimit:0,predictionLimit:0,stake:0}));`);
@@ -70,7 +77,7 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     const c=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'))`);
     for(const key of ['explore','quests','training','medical','radio','combatGear'])assert.equal(c[key],true);
     assert.equal(c.sodaEfficiency,true);
-    assert.deepEqual(await evaluate(construction),{build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0});
+    assert.deepEqual(await evaluate(construction),{build:true,upgrade:true,dig:true,budgetMode:'stock',scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0});
     assert.deepEqual(await evaluate('sm.calls'),[]);
     await reloadShelter();assert.equal(await evaluate(`${construction}.scrapLimit`),10000);
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
@@ -84,7 +91,7 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
       localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'fixture',constructionLedger:${JSON.stringify(entries)}}));`);
     await click('shelter-preset');await click('shelter-preset');
     assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'44');
-    assert.deepEqual(await evaluate(construction),{...budgets,build:true,upgrade:true,dig:true});
+    assert.deepEqual(await evaluate(construction),{...budgets,budgetMode:'daily',build:true,upgrade:true,dig:true});
     assert.deepEqual(await evaluate(`${state}.constructionLedger`),entries);
     const c=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'))`);
     for(const key of ['tier','hours','stimpaks','reserve','chance','attempts','trainTarget'])assert.equal(c[key],campaign[key]);
@@ -93,7 +100,7 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     for(const previous of [14,28]){
       await setupShelter(`${paused}localStorage.setItem('arkengine:auto-shelter:population:v1','${previous}');`);
       assert.equal(await evaluate(`${panel}.getElementById('shelter-population').value`),String(previous));
-      assert.match(await evaluate(`${panel}.getElementById('shelter-preset-summary').textContent`),/人口阶段目标 30.*开启持续分阶段增长.*逐对核对床位与口粮/);
+      assert.match(await evaluate(`${panel}.getElementById('shelter-preset-summary').textContent`),/人口阶段目标 30.*开启持续分阶段增长.*床位、成年口粮和岗位逐批准备/);
       await click('shelter-preset');await pulse(10000);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:population:v1')`),'30');
       assert.deepEqual(await evaluate('sm.calls'),[],'the preset must still respect the paused main switch');
@@ -123,40 +130,47 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     await click('stock-preset');assert.equal(await evaluate(`${stock}.predict`),false);
     assert.equal(await evaluate(`${stock}.predictionLimit`),700);assert.equal(await evaluate(`${stock}.stake`),50);
     await click('toggle');await drive(`location.pathname==='/activities/expedition'`,'recommended stock with prediction round');
-    assert.ok(await evaluate('km.calls.some(c=>c.action===\'buy\')'));assert.ok(await evaluate('km.calls.every(c=>c.action!==\'predict\')'));
+    assert.deepEqual(await evaluate('km.calls'),[]);
+    assert.equal(await evaluate(`${diagnostic}.policy.newBuy`),false);assert.equal(await evaluate(`${diagnostic}.policy.predict`),false);
   });
-  await t.test('自动资金收益：同为手填100000，余额变小或变大时实际订单跟随资产，刷新不清预算',async()=>{
-    const orders=[];
+  await t.test('自动资金诊断：同为手填100000，额度随资产变化，刷新不清预算也不自动新买',async()=>{
+    const budgets=[];
     for(const tokens of [1500,10000]){
       await setupStock(`${paused}km.tokens=${tokens};localStorage.setItem('${stockKey}',JSON.stringify(${JSON.stringify(cfg)}));`);
       await click('stock-preset');await click('toggle');await drive(`location.pathname==='/activities/expedition'`,'dynamic funds order');
-      const l=await evaluate(ledger);assert.equal(l.entries.length,1);assert.equal(l.hold,false);
-      orders.push(l.entries[0].debit);assert.ok(await evaluate(`km.tokens>=${tokens===1500?1000:2000}`));
+      const l=await evaluate(ledger);assert.equal(l.entries.length,0);assert.equal(l.hold,false);
+      budgets.push(await evaluate(`${diagnostic}.budget.reserveBudget`));assert.equal(await evaluate('km.tokens'),tokens);
+      assert.equal(await evaluate(`${diagnostic}.budget.reserve`),tokens===1500?1000:2000);
+      assert.equal(await evaluate(`${diagnostic}.selected`),null);assert.equal(await evaluate(`${diagnostic}.policy.newBuy`),false);
       assert.equal(await evaluate(`${stock}.tradeLimit`),100000,'旧数字只存作手动备用');
       await reloadStock();await drive(`location.pathname==='/activities/expedition'`,'dynamic funds reload');
-      assert.deepEqual(await evaluate(`${ledger}.entries`),l.entries);assert.equal(await evaluate('km.calls.length'),1);
+      assert.deepEqual(await evaluate(`${ledger}.entries`),l.entries);assert.equal(await evaluate('km.calls.length'),0);
+      assert.equal(await evaluate(`${diagnostic}.budget.reserveBudget`),budgets.at(-1));
     }
-    assert.ok(orders[1]>orders[0]*5,'自动投入随资产增加，未被旧备用保留金额卡住');
+    assert.ok(budgets[0]>0&&budgets[1]>budgets[0]*5,'资金计算随资产变化，但不成为新增自动交易');
   });
-  await t.test('自动资金收益：余额不足周转金时不买，关闭自动模式后按手填小额度执行',async()=>{
+  await t.test('自动资金诊断：余额不足周转金及手填小额度均保留正确约束，不恢复自动买入',async()=>{
     await setupStock(`${paused}km.tokens=800;`);await click('stock-preset');await click('toggle');
     await drive(`location.pathname==='/activities/expedition'`,'low funds wait');assert.deepEqual(await evaluate('km.calls'),[]);
-    assert.match(await evaluate(`${ledger}.note`),/自动资金暂无/);
+    assert.ok(await evaluate(`${diagnostic}.budget.reserveBudget<=0`));
     await setupStock(paused);await click('stock-preset');
     await evaluate(`${panel}.getElementById('stock-auto-budget').checked=false;
       ${panel}.getElementById('stock-trade-limit').value='600';${panel}.getElementById('stock-save').click();`);
     await click('toggle');await drive(`location.pathname==='/activities/expedition'`,'manual budget restored');
     assert.equal(await evaluate(`${stock}.autoBudget`),false);
-    assert.ok(await evaluate(`${ledger}.entries[0].debit<=200`));
+    assert.equal(await evaluate(`${diagnostic}.budget.constraints.find(c=>c.key==='daily-buy-limit').remaining`),600);
+    assert.equal(await evaluate(`${diagnostic}.budget.constraints.find(c=>c.key==='per-stock-limit').remaining`),200);
+    assert.deepEqual(await evaluate('km.calls'),[]);assert.equal(await evaluate(`${ledger}.entries.length`),0);
   });
   await t.test('自动资金收益：原买单未知后余额下降，跨刷新保留原单但不挤占周转金续发',async()=>{
-    await setupStock(`${paused}km.mode='deferred';`);await click('stock-preset');await click('toggle');
-    await drive('km.calls.length===1','unknown dynamic order');
+    await setupStock(paused+stockHistoricalRequest());await click('stock-preset');await click('toggle');
+    await drive(`location.pathname==='/activities/expedition'`,'unknown historical dynamic order preserved');
     const original=await evaluate(`${ledger}.pending.id`);
     await evaluate(`km.tokens=1500;`);await pulse(31000);await drive(`location.pathname==='/activities/expedition'`,'lower funds wait');
     await reloadStock();await drive(`location.pathname==='/activities/expedition'`,'lower funds after reload');
-    assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`${ledger}.pending.id`),original);
-    assert.match(await evaluate(`${ledger}.note`),/额度|保留余额/);
+    assert.equal(await evaluate('km.calls.length'),0);assert.equal(await evaluate(`${ledger}.pending.id`),original);
+    assert.match(await evaluate(`${ledger}.note`),/暂停.*手动核对/);
+    assert.equal(await evaluate(`${ledger}.entries[0].debit`),123);assert.equal(await evaluate(`${ledger}.entries[0].result`),'reserved');
   });
   await t.test('汽水效率收益浏览器：区域概率为零时不出发，人员仍可参加周任务',async()=>{
     await setupShelter(`sm.view=${JSON.stringify(campaignView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
@@ -177,22 +191,22 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
     assert.equal(await evaluate(`sm.calls.find(c=>c.type==='assign').roomId`),31);
   });
   await t.test('自动资金收益：待确认期间切回手动小额度，不按旧自动额度续发',async()=>{
-    await setupStock(`${paused}km.mode='deferred';`);await click('stock-preset');await click('toggle');
-    await drive('km.calls.length===1','original auto order before custom limit');const original=await evaluate(`${ledger}.pending.id`);
+    await setupStock(paused+stockHistoricalRequest());await click('stock-preset');await click('toggle');
+    await drive(`location.pathname==='/activities/expedition'`,'historical original before custom limit');const original=await evaluate(`${ledger}.pending`);
     await evaluate(`${panel}.getElementById('stock-auto-budget').checked=false;
       ${panel}.getElementById('stock-trade-limit').value='0';${panel}.getElementById('stock-save').click();km.mode='success';`);
     await pulse(31000);await drive(`location.pathname==='/activities/expedition'`,'custom pause for original auto order');
-    assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`${ledger}.pending.id`),original);
+    assert.equal(await evaluate('km.calls.length'),0);assert.deepEqual(await evaluate(`${ledger}.pending`),original);
     assert.equal(await evaluate(`${stock}.autoBudget`),false);
   });
   await t.test('推荐预设：股市未决原交易与预留预算不被应用按钮释放或重发',async()=>{
-    await setupStock(`localStorage.setItem('${stockKey}',JSON.stringify(${JSON.stringify(cfg)}));km.mode='unknown';`);
-    await drive('km.calls.length===1','original unknown stock order');
+    await setupStock(`localStorage.setItem('${stockKey}',JSON.stringify(${JSON.stringify(cfg)}));`+stockHistoricalRequest());
+    await drive(`location.pathname==='/activities/expedition'`,'original unknown historical order');
     await evaluate(`${paused}window.dispatchEvent(new Event('focus'));`);await pulse();
     const before=await evaluate(ledger);assert.ok(before.pending);
     await click('stock-preset');const after=await evaluate(ledger);
     assert.deepEqual(after.pending,before.pending);assert.deepEqual(after.entries,before.entries);assert.deepEqual(after.owned,before.owned);
-    await pulse(30000);assert.equal(await evaluate('km.calls.length'),1);
+    await pulse(30000);assert.equal(await evaluate('km.calls.length'),0);
   });
   await t.test('推荐预设：避难所未决探险原请求与家庭规划不丢失',async()=>{
     await setupShelter(`sm.view=${JSON.stringify(campaignView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;

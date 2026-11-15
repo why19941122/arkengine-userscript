@@ -8,6 +8,41 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   const done = `location.pathname==='/activities/expedition' && ${state}?.nextAt>clock`;
   const waiting = `${done}&&${enabled}==='true'&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`;
   const quiet = `sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;sm.view.state.rooms[0].stored=0;`;
+  await t.test('避难所短访问浏览器：剩20秒不切页，原远征先领取，再正常访问避难所',async()=>{
+    await setupShelter(`${quiet}model.runs=model.runs.slice(0,1);window.preview=()=>({normal:0,burst:0,total:0});
+      sm.originalArrival=clock+20000;
+      const render=renderExp;window.renderExp=()=>{render();
+        if(model.runs.length){const p=document.createElement('p'),at=new Date(sm.originalArrival);
+          p.textContent='完整到达: '+at.getFullYear()+'/'+(at.getMonth()+1)+'/'+at.getDate()+' '+
+            at.getHours()+':'+String(at.getMinutes()).padStart(2,'0')+':'+String(at.getSeconds()).padStart(2,'0');
+          document.getElementById('running').append(p);}
+      };`,'/activities/expedition');
+    for(let i=0;i<6;i++)await pulse();
+    assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+    assert.equal(await evaluate('fm.calls.filter(c=>c.type==="navigate").length'),0);
+    await evaluate('clock=sm.originalArrival;model.runs[0].done=true;renderExp();');
+    await drive('model.calls.some(c=>c.type==="claim")','claim original arrival first');
+    assert.equal(await evaluate('fm.calls.filter(c=>c.type==="navigate").length'),0);
+    await drive('fm.calls.some(c=>c.type==="navigate"&&c.path==="/shelter")','normal visit after arrival');
+    assert.equal(await evaluate('model.calls.filter(c=>c.type==="claim").length'),1);
+  });
+  await t.test('新版UI：60积分免费赛季档按原回执领取，刷新不重复',async()=>{
+    await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;`);
+    await drive(done,'60 points per tier');
+    assert.deepEqual(await evaluate('sm.calls.map(a=>[a.type,a.tier])'),[['claim_season',1],['claim_season',2]]);
+    assert.equal(await evaluate(pending),null);await pulse(1000);
+    await evaluate(`history.replaceState({},'','/shelter?shelter-fixture=season-reload');renderShelter();`);await reloadShelter();await pulse(1000);
+    assert.equal(await evaluate('sm.calls.length'),2);
+  });
+  await t.test('新版UI：穿戴装备不占仓库容量，闲置满仓仍保留免费装备',async()=>{
+    for(const equipped of [true,false]){
+      await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=300;sm.view.state.season.claimedFree=[1,2,3,4];
+        sm.view.state.items=Array.from({length:20},(_,i)=>({id:100+i,slot:'outfit',tier:0,bonus:{end:1}}));
+        sm.view.state.residents[0].outfitId=${equipped?'100':'null'};`);
+      await drive(done,'unworn equipment capacity');
+      assert.equal(await evaluate('sm.calls.filter(a=>a.type==="claim_season").length'),equipped?1:0);
+    }
+  });
   const incomeTotals=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).totals`;
   const manualIncomeScene=`${quiet}sm.view.state.rooms[0].stored=30;sm.resultMessages={collect:'收到 30 废料',collect_all:'收到 30 废料'};
     localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','false');`;
@@ -154,10 +189,12 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('收入统计避难所：赛季各档独立累计，部分成功只记已确认档位',async()=>{
     for(const mode of ['success','partial']){
-      await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='${mode}';sm.resultMessages={claim_season:'奖励：30 废料 · 零件 +2'};`);
+      await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;sm.mode='${mode}';sm.resultMessages={claim_season:'奖励：30 废料 · 零件 +2'};`);
       await drive(done,'season income confirmed');
       assert.equal(await evaluate(`${incomeTotals}['避难所废料']`),mode==='success'?60:30);
       assert.equal(await evaluate(`${incomeTotals}['避难所零件']`),mode==='success'?4:2);
+      assert.deepEqual(await evaluate('sm.calls.filter(a=>a.type==="claim_season").map(a=>a.tier)'),[1,2]);
+      assert.deepEqual(await evaluate('sm.view.state.season.claimedFree'),mode==='success'?[1,2]:[1]);
     }
   });
   const lateTab = label => `sm.delayedTab=true;const originalRender=renderShelter;
@@ -169,7 +206,23 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       ...['power','diner','water','scrap'].map((type,i)=>({...base,id:i+1,type,floor:1,col:i+2})),
       {...base,id:5,type:'quarters',floor:2,col:2,width:3},{...base,id:6,type:'storage',floor:3,col:2}];
     s.residents=Array.from({length:8},(_,i)=>({...structuredClone(adult),id:i+1,name:'居民'+(i+1),roomId:Math.floor(i/2)+1,
-      xp:0,happiness:100,stats:{str:5,per:5,end:5,cha:5,int:5,agi:5,lck:5}}));s.resources.scrap=100;`;
+      xp:0,happiness:100,stats:{str:5,per:5,end:5,cha:5,int:5,agi:5,lck:5}}));s.resources.scrap=100;
+    localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:false,upgrade:false,dig:false,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0}));`;
+  await t.test('避难所只读规划额度：材料充足但零额度不报可开工，刷新不消费也不把攒料时间当额度恢复',async()=>{
+    await setupShelter(`${developmentScene}s.resources.scrap=1000;
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:0,partsLimit:0,scrapReserve:0,partsReserve:0}));`);
+    const fixtureSearch=await evaluate('location.search');
+    const verify=async()=>{
+      const advice=await evaluate(`${state}.development`);
+      assert.match(advice,/建设计划：先满足条件。下一步：.*废料回收站/);
+      assert.match(advice,/当前建设额度不足且没有可核对的恢复时间，等待账本或原操作确认后重评/);
+      assert.doesNotMatch(advice,/建设计划：条件已满足|约.*后可攒齐/);
+      assert.deepEqual(await evaluate('sm.calls'),[]);
+    };
+    await drive(done,'zero construction allowance blocks funded project');await verify();
+    await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
+    await reloadShelter();await drive(done,'zero allowance survives reload');await verify();
+  });
   await t.test('避难所在建生产：预留施工岗位而不重复造房，工程完成后改为先补员且不自动消费',async()=>{
     await setupShelter(`${developmentScene}s.residents.push({...structuredClone(s.residents[0]),id:9,name:'闲置成人',roomId:null});
       s.rooms.push({...s.rooms.find(r=>r.id===4),id:30,col:6,builtAt:clock+600000});`);
@@ -202,13 +255,22 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.match(advice,/尚缺 100 废料/);assert.match(advice,/回本约/);
     await evaluate(`sm.view.state.resources.scrap=300;${panel}.getElementById('shelter-check').click();`);
     await drive(`location.pathname==='/shelter'`,'review construction funds');await drive(done,'construction ready');
-    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：条件已满足。下一步：.*废料回收站/);
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先满足条件。下一步：.*废料回收站/);
+    assert.match(advice,/下一步升级未开启，保留规划顺序/);
     await evaluate(`sm.view.state.residents.push(...[9,10,11].map(id=>({...structuredClone(sm.view.state.residents[0]),id,name:'儿童'+id,roomId:5,adultAt:clock+3600000})));
       ${panel}.getElementById('shelter-check').click();`);
-    await drive(`location.pathname==='/shelter'`,'review approaching population capacity');await drive(done,'housing now takes priority');
-    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：条件已满足。下一步：.*新建一格宿舍/);
+    await drive(`location.pathname==='/shelter'`,'review approaching population capacity');await drive(done,'existing children need future jobs before more housing');
+    advice=await evaluate(`${state}.development`);
+    assert.match(advice,/未来72小时已有 3 名儿童、待产或已开始家庭的子女尚缺岗位/);
+    assert.match(advice,/下一步：.*新建一格废料回收站/);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate(`{const s=sm.view.state;s.rooms.push({...s.rooms.find(r=>r.id===4),id:30,floor:3,col:3,width:2});
+      ${panel}.getElementById('shelter-check').click();}`);
+    await drive(`location.pathname==='/shelter'`,'review real future vacancies');await drive(done,'housing takes priority with employment capacity');
+    advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先满足条件。下一步：.*新建一格宿舍/);
+    assert.match(advice,/下一步建造未开启，保留规划顺序/);
     const next=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.developmentNext`);
-    assert.equal(next.type,'quarters');assert.equal(next.status,'ready');assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.equal(next.type,'quarters');assert.equal(next.status,'blocked');assert.deepEqual(await evaluate('sm.calls'),[]);
   });
   await t.test('避难所在建人手：两种工程不能重复预留一人，增加专长人选后覆盖供应，刷新与完工重新评估',async()=>{
     await setupShelter(`${developmentScene}
@@ -261,7 +323,8 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     const fixtureSearch=await evaluate('location.search');
     await drive(done,'housing expansion despite impossible upgrade');
     let advice=await evaluate(`${state}.development`);
-    assert.match(advice,/建设计划：条件已满足。下一步：向下扩至第 3 层，为宿舍/);
+    assert.match(advice,/建设计划：先满足条件。下一步：向下扩至第 3 层，为宿舍/);
+    assert.match(advice,/下一步下挖未开启，保留规划顺序/);
     assert.match(advice,/2160 废料.*超过.*库存容量/);assert.match(advice,/两项合计 751 废料/);
     assert.doesNotMatch(advice,/为工坊腾出空间|备选升级至少还缺/);
     await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
@@ -287,13 +350,13 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       s.resources.food=39;s.resources.scrap=500;localStorage.setItem('arkengine:auto-shelter:population:v1','16');`);
     const fixtureSearch=await evaluate('location.search');
     await drive(done,'choose safe diner upgrade');
-    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 3 层餐厅升至 2 级/);
+    assert.match(await evaluate(`${state}.development`),/建设计划：先满足条件。下一步：第 3 层餐厅升至 2 级.*下一步升级未开启，保留规划顺序/s);
     await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
     await reloadShelter();await drive(done,'safe alternative persists after reload');
     assert.match(await evaluate(`${state}.development`),/下一步：第 3 层餐厅升至 2 级/);
     await evaluate(`sm.view.state.resources.food=40;${panel}.getElementById('shelter-check').click();`);
     await drive(`location.pathname==='/shelter'`,'review larger food reserve');await drive(done,'higher gain diner becomes safe');
-    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 1 层餐厅升至 2 级/);
+    assert.match(await evaluate(`${state}.development`),/建设计划：先满足条件。下一步：第 1 层餐厅升至 2 级.*下一步升级未开启，保留规划顺序/s);
     await evaluate(`sm.view.state.resources.food=37;${panel}.getElementById('shelter-check').click();`);
     await drive(`location.pathname==='/shelter'`,'review insufficient reserve for either room');await drive(done,'retain safety block');
     const advice=await evaluate(`${state}.development`);assert.match(advice,/建设计划：先满足条件/);assert.match(advice,/停产期间食物需至少 40 库存/);
@@ -311,10 +374,10 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       for(const id of [13,14])s.residents.push({...structuredClone(s.residents[0]),id,name:'回收'+id,roomId:30,stats:{...s.residents[0].stats,end:0}});
       s.resources.scrap=1000;`);
     await drive(done,'choose smaller upgrade within power margin');
-    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 3 层废料回收站升至 2 级/);
+    assert.match(await evaluate(`${state}.development`),/建设计划：先满足条件。下一步：第 3 层废料回收站升至 2 级.*下一步升级未开启，保留规划顺序/s);
     await evaluate(`sm.view.state.residents.filter(p=>p.roomId===1).forEach(p=>p.stats.str=5);${panel}.getElementById('shelter-check').click();`);
     await drive(`location.pathname==='/shelter'`,'review stronger power workers');await drive(done,'select shorter payback upgrade');
-    assert.match(await evaluate(`${state}.development`),/建设计划：条件已满足。下一步：第 1 层废料回收站升至 2 级/);
+    assert.match(await evaluate(`${state}.development`),/建设计划：先满足条件。下一步：第 1 层废料回收站升至 2 级.*下一步升级未开启，保留规划顺序/s);
     assert.deepEqual(await evaluate('sm.calls'),[]);
   });
   await t.test('避难所零件时机：远期宿舍缺料不提前造工坊，刷新保持，当前生产升级需要时再准备',async()=>{
@@ -340,7 +403,8 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       s.residents.push({...structuredClone(s.residents[0]),id:9,name:'闲置回收专长',roomId:null,stats:{...s.residents[0].stats,end:17}});`);
     const fixtureSearch=await evaluate('location.search');await drive(done,'build scrap before optional workshop');
     let advice=await evaluate(`${state}.development`);
-    assert.match(advice,/建设计划：条件已满足。下一步：.*新建一格废料回收站/);
+    assert.match(advice,/建设计划：先满足条件。下一步：.*新建一格废料回收站/);
+    assert.match(advice,/下一步建造未开启，保留规划顺序/);
     assert.match(advice,/暂不为这些备选方案提前安排工坊/);assert.doesNotMatch(advice,/新建一格工坊|备选升级至少还缺/);
     await pulse(1000);await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+${JSON.stringify(fixtureSearch)});`);
     await reloadShelter();await drive(done,'preferred build survives reload');
@@ -411,7 +475,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.equal(await evaluate(`${lastCollection}.rooms[0].stored`),0);
     assert.equal(await evaluate(`${lastCollection}.rooms[0].reason`),'not-full');
   });
-  const pausedSeason=`${quiet}sm.view.state.season.points=300;
+  const pausedSeason=`${quiet}sm.view.state.season.points=120;
     window.shelterTransport=async(u,o)=>{const response=await fetch(u,o);
       if(JSON.parse(o.body).action.tier===1)await new Promise(resolve=>{window.continueOldBatch=resolve;});return response;};`;
   const oldSnapshot=kind=>`${quiet}
@@ -480,7 +544,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.equal(await evaluate('sm.view.state.resources.scrap'),449);
   });
   await t.test('避难所批次持久化：发送进度无法保存时不发请求，保留原记录并暂停',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=150;const save=Storage.prototype.setItem;
+    await setupShelter(`${quiet}sm.view.state.season.points=60;const save=Storage.prototype.setItem;
       Storage.prototype.setItem=function(k,v){if(k==='arkengine:auto-shelter:pending:v1'&&JSON.parse(v)?.sentCount>0)throw Error('fixture write blocked');
         return save.call(this,k,v);};`);
     await drive(`sm.calls.length>0||${enabled}==='false'`,'journal or original transport reached');
@@ -497,7 +561,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1,2]);assert.equal(await evaluate(enabled),'true');
   });
   await t.test('避难所批次恢复：未知首档跨刷新只核对已发送范围，不补领首档或后档',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='unknown';`);
+    await setupShelter(`${quiet}sm.view.state.season.points=120;sm.mode='unknown';`);
     await drive('sm.calls.length===1','unknown first tier sent');
     const original=await evaluate(pending);assert.equal(original.sentCount,1);
     await reloadShelter();await drive(waiting,'only attempted prefix awaits reconciliation');
@@ -505,7 +569,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.deepEqual(restored.targets,[1]);assert.equal(restored.sentCount,1);assert.equal(await evaluate('sm.calls.length'),1);
   });
   await t.test('避难所批次兼容：缺少发送进度的旧记录保留全部目标，不推断未发送',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;sm.view.state.season.claimedFree=[1];
+    await setupShelter(`${quiet}sm.view.state.season.points=120;sm.view.state.season.claimedFree=[1];
       localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify({id:'legacy-batch',kind:'season',targets:[1,2],vaultNo:77,
         at:clock-60000,before:{collected:0,serverTime:clock-60000,day:'2026-10-10',month:'2026-10'}}));`);
     const original=await evaluate(pending);await drive(waiting,'legacy batch remains conservative');
@@ -513,7 +577,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('避难所批次校验：损坏的发送进度保留原文且不发送',async()=>{
     for(const count of [0,-1,1.5,'1',3,null]){
-      await setupShelter(`${quiet}sm.view.state.season.points=300;
+      await setupShelter(`${quiet}sm.view.state.season.points=120;
         localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify({id:'broken-batch',kind:'season',targets:[1,2],vaultNo:77,
           sentCount:${JSON.stringify(count)},at:clock-60000,before:{collected:0,day:'2026-10-10',month:'2026-10'}}));`);
       const raw=await evaluate(`localStorage.getItem('arkengine:auto-shelter:pending:v1')`);
@@ -553,7 +617,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     for(const kind of ['daily','season']){
       const oldDay=kind==='daily'?'2026-10-10':'2026-10-31',newDay=kind==='daily'?'2026-10-11':'2026-11-01';
       await setupShelter(`${quiet}clock=Date.parse('${oldDay}T23:59:45+08:00');sm.view.state.lastSettledAt=clock;
-        sm.view.state.daily.day='${oldDay}';${kind==='daily'?`sm.dailyIncomplete=false;sm.view.state.daily.claimed=[1,2];`:`sm.view.state.season.points=150;`}
+        sm.view.state.daily.day='${oldDay}';${kind==='daily'?`sm.dailyIncomplete=false;sm.view.state.daily.claimed=[1,2];`:`sm.view.state.season.points=60;`}
         window.shelterTransport=(u,o)=>{clock=Date.parse('${newDay}T00:00:01+08:00');sm.view.state.lastSettledAt=clock;
           sm.dailyIncomplete=true;sm.view.state.daily={day:'${newDay}',claimed:[]};sm.view.state.season={month:'${newDay.slice(0,7)}',points:0,claimedFree:[]};
           return fetch(u,o);};`);
@@ -579,7 +643,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('避难所周期批次：首档后换月只核对已发送档，重新读取后才处理新赛季',async()=>{
     await setupShelter(`${quiet}clock=Date.parse('2026-10-31T23:59:45+08:00');sm.view.state.lastSettledAt=clock;
-      sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=300;
+      sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=120;
       window.shelterTransport=(u,o)=>fetch(u,o).then(response=>{if(!sm.rolled&&JSON.parse(o.body).action.tier===1){
         sm.rolled=true;clock=Date.parse('2026-11-01T00:00:01+08:00');sm.view.state.lastSettledAt=clock;
         sm.view.state.daily.day='2026-11-01';sm.view.state.season={month:'2026-11',points:0,claimedFree:[]};}return response;});`);
@@ -587,13 +651,13 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1]);
     assert.deepEqual(await evaluate(`${pending}.targets`),[1]);assert.equal(await evaluate(enabled),'true');
     await pulse(await evaluate(`${state}.nextAt-clock+1000`));await drive(`${pending}===null&&${done}`,'sent old tier confirmed');
-    await evaluate(`sm.view.state.season.points=300;${panel}.getElementById('shelter-check').click();`);
+    await evaluate(`sm.view.state.season.points=120;${panel}.getElementById('shelter-check').click();`);
     await drive(`${pending}===null&&sm.calls.length===3&&${done}`,'new season evaluated afresh');
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1,1,2]);
   });
   await t.test('避难所周期迟到批次：只读等待后跨月回执到达，撤销未发送档且保留已发送结果',async()=>{
     await setupShelter(`${quiet}clock=Date.parse('2026-10-31T23:59:00+08:00');sm.view.state.lastSettledAt=clock;
-      sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=300;
+      sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=120;
       const previous=window.fetch,drawShelter=renderShelter;
       window.renderShelter=()=>location.pathname==='/shelter'?drawShelter():renderExp();
       window.fetch=(u,o)=>{const response=previous(u,o);return u==='/api/shelter/action'?
@@ -609,7 +673,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   await t.test('避难所周期人工暂停：跨月迟到回执不解除独立或总暂停，也不改人工停止说明',async()=>{
     for(const control of ['shelter-toggle','toggle']){
       await setupShelter(`${quiet}clock=Date.parse('2026-10-31T23:59:00+08:00');sm.view.state.lastSettledAt=clock;
-        sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=300;
+        sm.view.state.daily.day='2026-10-31';sm.view.state.season.points=120;
         const previous=window.fetch,drawShelter=renderShelter;
         window.renderShelter=()=>location.pathname==='/shelter'?drawShelter():renderExp();
         window.fetch=(u,o)=>{const response=previous(u,o);return u==='/api/shelter/action'?
@@ -626,7 +690,11 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('避难所跨周期：每日与赛季成功回执跨刷新保留，重置后仍确认旧奖励且不重领',async()=>{
     for(const kind of ['daily','season']){
-      await setupShelter(`${quiet}${kind==='daily'?`sm.dailyIncomplete=false;sm.view.state.daily.claimed=[1,2];`:`sm.view.state.season.points=300;`}`);
+      // Hold the post-submit GET explicitly so the intended pending receipt
+      // survives until reload, regardless of how promptly confirmation runs.
+      await setupShelter(`${quiet}${kind==='daily'?`sm.dailyIncomplete=false;sm.view.state.daily.claimed=[1,2];`:`sm.view.state.season.points=120;`}
+        const read=window.fetch;window.fetch=(url,options)=>url==='/api/shelter'&&sm.calls.length?
+          new Promise(()=>{}):read(url,options);`);
       await drive(`sm.calls.filter(c=>c.type==='${kind==='daily'?'claim_objective':'claim_season'}').length===${kind==='daily'?1:2}`,'original periodic rewards sent');
       await until(()=>evaluate(`${pending}?.result?.rewardProofs?.length===${kind==='daily'?1:2}`),'period evidence captured before reset');
       const newDay=kind==='daily'?'2026-10-11':'2026-11-01';
@@ -664,13 +732,13 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     }
   });
   await t.test('避难所跨周期部分批次：仅首档成功的凭据不能确认其他档，新赛季相同档也不补全',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='partial';`);
+    await setupShelter(`${quiet}sm.view.state.season.points=120;sm.mode='partial';`);
     await drive(waiting,'partial season waits');
     assert.deepEqual(await evaluate(`${pending}.result.rewardProofs.map(p=>p.target)`),[1]);
     const original=await evaluate(pending);
     await pulse();await evaluate(`history.replaceState({},'','/shelter?shelter-fixture=partial-rollover');
       clock=Date.parse('2026-11-01T12:00:00+08:00');sm.view.state.lastSettledAt=clock;
-      sm.view.state.season={month:'2026-11',points:300,claimedFree:[1,2]};`);
+      sm.view.state.season={month:'2026-11',points:120,claimedFree:[1,2]};`);
     await reloadShelter();await drive(waiting,'incomplete old season still unresolved');
     assert.deepEqual(await evaluate(pending),original);assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1,2]);
   });
@@ -713,7 +781,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.ok(await evaluate(`${pending}.result.proof`));
   });
   await t.test('避难所迟到批次：进入只读等待后不再发送下一档，人工补领后核对原批次',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;const previous=window.fetch;
+    await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;const previous=window.fetch;
       const drawShelter=renderShelter;window.renderShelter=()=>location.pathname==='/shelter'?drawShelter():renderExp();
       window.fetch=(u,o)=>{const response=previous(u,o);
         return u==='/api/shelter/action'&&JSON.parse(o.body).action.tier===1?
@@ -777,7 +845,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       [`sm.view.state.rooms[0].stored=30;`,{type:'collect',roomId:1},'collect'],
       [`sm.tutorial=true;`,{type:'claim_tutorial',step:2},'tutorial'],
       [`sm.dailyIncomplete=false;`,{type:'claim_objective',index:2},'daily'],
-      [`sm.view.state.season.points=150;`,{type:'claim_season',tier:1,premium:true},'season'],
+      [`sm.view.state.season.points=60;`,{type:'claim_season',tier:1,premium:true},'season'],
       [`sm.achievementIncomplete=false;`,{type:'claim_achievement',id:'depth-10'},'achievement'],
       [`sm.view.state.rooms[0].stored=30;`,{type:'collect_all',spend:100},'collect']
     ];
@@ -826,7 +894,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('避难所批次绑定：免费赛季首档返回后暂停，不继续发送后续档位',async()=>{
     for(const pref of ['arkengine:auto-shelter:enabled:v1','arkengine:auto-expedition:enabled:v1']){
-      await setupShelter(`${quiet}sm.view.state.season.points=300;window.shelterTransport=(u,o)=>fetch(u,o).then(response=>{
+      await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;window.shelterTransport=(u,o)=>fetch(u,o).then(response=>{
         if(JSON.parse(o.body).action.tier===1)localStorage.setItem('${pref}','false');return response;});`);
       await drive('sm.calls.length>0','first tier submitted');await pulse(3000);
       assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1]);
@@ -835,7 +903,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
   await t.test('避难所批次绑定：免费赛季后续档被改成付费或其他动作时在发送前阻止',async()=>{
     for(const action of [{type:'claim_season',tier:2,premium:true},{type:'claim_tutorial',step:1}]){
-      await setupShelter(`${quiet}sm.view.state.season.points=300;window.shelterTransport=(u,o)=>{
+      await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;window.shelterTransport=(u,o)=>{
         const body=JSON.parse(o.body);if(body.action.tier===2)body.action=${JSON.stringify(action)};
         return fetch(u,{...o,body:JSON.stringify(body)});};`);
       await drive('sm.calls.length>0','first valid tier');await pulse(3000);
@@ -844,7 +912,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     }
   });
   await t.test('避难所批次绑定：异步三档正常完成，之后人工请求不被旧批次接管',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=450;window.shelterTransport=async(u,o)=>{
+    await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=180;window.shelterTransport=async(u,o)=>{
       const response=await fetch(u,o);await new Promise(resolve=>setTimeout(resolve,20));return response;};`);
     await drive(done,'three async tiers completed');
     assert.deepEqual(await evaluate('sm.calls.map(c=>[c.type,c.tier,c.premium])'),[
@@ -856,7 +924,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.equal(await evaluate('sm.calls[3].type'),'claim_tutorial');assert.equal(await evaluate(pending),null);
   });
   await t.test('避难所批次绑定：部分失败结束捕获，人工处理后原记录只核对，不重放已领取档',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;sm.mode='partial';`);
+    await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;sm.mode='partial';`);
     await drive(waiting,'partial batch waits without replay');
     const original=await evaluate(pending);
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.tier)'),[1,2]);
@@ -869,7 +937,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     assert.equal(await evaluate(pending),null);assert.equal(await evaluate('sm.calls.length'),3);
   });
   await t.test('避难所批次绑定：等首档响应时普通读取和其他接口不被捕获，放行后按原批次完成',async()=>{
-    await setupShelter(`${quiet}sm.view.state.season.points=300;const previous=window.fetch;
+    await setupShelter(`${quiet}sm.ui20261109=true;sm.view.state.season.points=120;const previous=window.fetch;
       window.fetch=(u,o)=>u==='/api/fixture-other-action'?Promise.resolve(new Response(JSON.stringify({ok:true}))):previous(u,o);
       window.shelterTransport=(u,o)=>{const response=fetch(u,o);return JSON.parse(o.body).action.tier===1?
         new Promise(resolve=>{window.releaseSeason=()=>resolve(response);}):response;};`);
@@ -1119,11 +1187,15 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   await t.test('避难所发展规划：显示真实扩建及下挖成本，只有建议不点击消费按钮',async()=>{
     await setupShelter(`${quiet}const s=sm.view.state;s.depth=3;s.digging=null;s.rooms[0].floor=1;s.rooms[0].col=2;
       for(let i=1;i<=3;i++)s.rooms.push({...s.rooms[0],id:10+i,type:'elevator',floor:i,col:1});
-      s.rooms.push({...s.rooms[0],id:20,type:'quarters',floor:2,col:2,width:3});`);
+      s.rooms.push({...s.rooms[0],id:20,type:'quarters',floor:2,col:2,width:3});
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:false,upgrade:false,dig:false,scrapLimit:0,partsLimit:0,scrapReserve:0,partsReserve:0}));`);
     await drive(done,'development advice without building');
     const advice=await evaluate(`${panel}.getElementById('shelter-development').textContent`);
     assert.match(advice,/192 废料/);assert.match(advice,/836 废料/);assert.match(advice,/停产/);
-    assert.match(advice,/自动建设默认关闭/);assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.match(advice,/自动建设默认开启，仅在额度与保留量允许时执行当前下一步，人工暂停仍有效/);
+    const config=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:construction:v1'))`);
+    assert.equal(config.build,false);assert.equal(config.upgrade,false);assert.equal(config.dig,false);
+    assert.equal(config.scrapLimit,0);assert.equal(config.partsLimit,0);assert.deepEqual(await evaluate('sm.calls'),[]);
     assert.equal(await evaluate(`${state}.development`),advice);
   });
   await t.test('避难所发展规划零件：缺料时提示工坊，刷新保留建议，材料备齐后撤销且不自动消费',async()=>{
@@ -1198,6 +1270,44 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     await drive(done,'wait for discrete production tick');assert.deepEqual(await evaluate('sm.calls'),[]);
     assert.equal(await evaluate(enabled),'true');assert.equal(await evaluate(pending),null);
   });
+  for(const settled of [false,true])await t.test('避难所跨结算收取：'+(settled?
+    '真实结算后收取整批，刷新不重复': '仅HTTP成功而库存未变化，保留原单且刷新不重发'),async()=>{
+    await setupShelter(`${quiet}sm.fixtureSearch=location.search;sm.simulateResources=${settled};
+      sm.view.state.rooms[0].stored=29.95;sm.view.state.rooms[0].floor=1;
+      sm.view.state.lastSettledAt=clock-600000;
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','off');
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:false,upgrade:false,dig:false,
+        scrapLimit:0,partsLimit:0,scrapReserve:0,partsReserve:0}));`);
+    await drive(settled?done:waiting,'collection across an elapsed resource tick',180);
+    const calls=await evaluate('sm.calls');assert.equal(calls.length,1);
+    assert.ok(['collect','collect_all'].includes(calls[0].type));
+    const receipt=await evaluate(`sm.receipts[${JSON.stringify(calls[0].idempotencyKey)}]`),saved=await evaluate(pending);
+    assert.equal(receipt.view.state.stats.collected,settled?30:0);
+    if(settled){
+      assert.equal(saved,null);
+      const ledgers=await evaluate('sm.resourceLedger');
+      assert.ok(ledgers.some(r=>r.ticks===1));
+      assert.equal(ledgers.reduce((n,r)=>n+r.collected.scrap,0),30);
+      assert.ok(ledgers.every(r=>Object.values(r.unserved).every(v=>v===0)));
+      assert.ok(receipt.view.state.rooms[0].stored<29.95);
+    }else{
+      assert.equal(receipt.view.state.rooms[0].stored,29.95);
+      assert.ok(saved.before.rooms[0].stored>=30,'request was based on an elapsed production tick');
+      assert.equal(saved.result.status,200);assert.equal(saved.result.proof,undefined);
+      assert.equal(saved.lifecycle.requestKey,calls[0].idempotencyKey);
+    }
+    const reads=await evaluate('sm.reads');
+    await pulse(1000);await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(settled?done:waiting,'original collection after fresh read',180);
+    if(!settled){
+      assert.equal(await evaluate('sm.reads'),reads,'refresh respects the existing unknown-receipt backoff');
+      await evaluate(`clock=Math.max(clock,${state}.nextAt+1);`);
+      await drive(`sm.reads>${reads}&&(${waiting})`,'read-only reconciliation at the original deadline',180);
+    }
+    assert.ok(await evaluate(`sm.reads>${reads}`));
+    assert.deepEqual(await evaluate('sm.calls'),calls);
+    assert.equal(await evaluate(`${pending}?.id??null`),saved?.id??null);
+  });
   await t.test('避难所产出核验：同层机器人已自动收取时不重复手动收取',async()=>{
     await setupShelter(`${quiet}sm.view.state.rooms[0].floor=1;sm.view.state.rooms[0].stored=30;
       sm.view.state.handies=[{id:1,floor:1}];sm.view.state.lastSettledAt=clock-600000;`);
@@ -1209,6 +1319,33 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       sm.view.state.resources.scrap=0;sm.view.state.lastSettledAt=clock-3600000;`);
     await drive(done,'workshop cannot spend missing scrap');assert.deepEqual(await evaluate('sm.calls'),[]);
   });
+  await t.test('避难所共享供料：不把同一废料承诺给两房，新快照确认后收取并跨刷新去重',async()=>{
+    await setupShelter(`${quiet}sm.fixtureSearch=location.search;
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','off');
+      const originalRoom=sm.view.state.rooms[0],originalPerson=sm.view.state.residents[0];
+      sm.view.state.rooms=[1,2].map(id=>({...originalRoom,id,type:'workshop',floor:id,col:2,stored:2.9}));
+      sm.view.state.residents=[1,2].map(id=>({...structuredClone(originalPerson),id,name:'工人'+id,roomId:id,stats:{...originalPerson.stats,int:5}}));
+      sm.view.state.resources.scrap=.6;sm.view.state.resources.parts=0;sm.view.state.lastSettledAt=clock-600000;`);
+    await drive(done,'uncertain shared feed remains read-only',240);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.equal(await evaluate(pending),null);
+    assert.ok(await evaluate(`${state}.nextAt-clock<=302000`),'uncertainty must retain bounded rechecks');
+    const info=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1).data.collection`);
+    assert.ok(info.rooms.every(r=>r.reason==='shared-projection'&&r.stored===2.9&&Math.abs(r.storedUpper-3)<1e-8));
+    assert.match(await evaluate(`${panel}.getElementById('shelter-operations').textContent`),/共用材料或容量/);
+    // A subsequent server snapshot settles the shared input once. Do not alter pending or supply.
+    await evaluate(`sm.simulateResources=true;settleShelterResources();${panel}.getElementById('shelter-check').click();`);
+    await drive(`location.pathname==='/shelter'`,'read newly settled production');
+    await drive(done,'collect actually settled batch',240);
+    assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate('sm.calls[0].type'),'collect_all');
+    assert.equal(await evaluate('sm.view.state.resources.parts'),3);
+    assert.equal(await evaluate('sm.view.state.resources.scrap'),0);
+    assert.equal(await evaluate(pending),null);
+    await pulse(1000);
+    await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+sm.fixtureSearch);`);
+    await reloadShelter();await drive(done,'shared production remains reconciled after reload',240);
+    assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(pending),null);
+  });
   await t.test('避难所产出核验：机器人占用库存后，其他楼层手动收取仍须预留容量',async()=>{
     await setupShelter(`${quiet}sm.view.state.rooms[0].floor=1;sm.view.state.rooms[0].stored=30;
       sm.view.state.rooms.push({...sm.view.state.rooms[0],id:2,floor:2});sm.view.state.resources.scrap=2660;
@@ -1217,7 +1354,7 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   });
 
   await t.test('避难所：远征和农场空闲后领取全批与奖励，再返回且不频繁访问',async()=>{
-    await setupShelter(`localStorage.setItem('arkengine:auto-farm:enabled:v1','true');sm.view.state.season.points=300;`,'/activities/expedition');
+    await setupShelter(`sm.ui20261109=true;localStorage.setItem('arkengine:auto-farm:enabled:v1','true');sm.view.state.season.points=120;`,'/activities/expedition');
     await drive(done,'complete shelter visit',180);
     assert.equal(await evaluate('fm.crops.length'),12);
     assert.deepEqual(await evaluate(`sm.calls.map(c=>c.type)`),['collect_all','claim_tutorial','claim_objective','claim_objective','claim_objective','claim_season','claim_season','claim_achievement']);
@@ -1338,12 +1475,20 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
     await drive(waiting,'HTTP status is not a receipt');assert.ok(await evaluate(pending));assert.deepEqual(await evaluate('sm.calls'),[]);
   });
   await t.test('避难所回执核验：保存本次原生领取的返回状态，刷新并重新产满后仍能确认',async()=>{
-    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;`);
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;sm.holdProofReads=true;sm.heldProofReads=0;
+      const proofFetch=window.fetch;window.fetch=(url,options)=>{
+        if(url==='/api/shelter'&&sm.holdProofReads&&sm.calls.length){
+          sm.heldProofReads++;return new Promise(()=>{});
+        }return proofFetch(url,options);
+      };`);
     await drive('sm.calls.length===1','collection request sent');
     await until(()=>evaluate(`Boolean(${pending}?.result?.proof)`),'persist response proof');
     assert.equal(await evaluate(`${pending}.result.proof.collected`),30);
-    await evaluate('sm.view.state.rooms[0].stored=30;sm.view.state.resources.scrap=2100;');
+    assert.ok(await evaluate('sm.heldProofReads>0'),'hold GET reconciliation so the persisted POST proof is observable');
+    const reads=await evaluate('sm.reads');
+    await evaluate('sm.view.state.rooms[0].stored=30;sm.view.state.resources.scrap=2100;sm.holdProofReads=false;');
     await reloadShelter();await drive(done,'proof survives refill and reload');
+    assert.ok(await evaluate(`sm.reads>${reads}`),'the new page must confirm the original proof against a fresh snapshot');
     assert.equal(await evaluate(pending),null);assert.equal(await evaluate('sm.calls.length'),1);
   });
   await t.test('避难所：免费档部分成功后不整批重放，其他功能保持开启',async()=>{

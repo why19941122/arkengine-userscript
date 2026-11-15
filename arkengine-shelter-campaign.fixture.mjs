@@ -11,6 +11,24 @@ export function campaignView(time=2_000_000_000){
       rooms:[room(1,'power',2),room(2,'diner',3),room(3,'water',4),room(4,'scrap',5),{...room(5,'quarters',2,2),width:2},room(6,'storage',6),
         ...Array.from({length:7},(_,i)=>room(10+i,'elevator',1,i+1,1))]}};
 }
+export function fullRosterAllocationView(count=24,time=2_000_000_000){
+  const v=campaignView(time),base=v.state.residents[0],room=v.state.rooms[0],types=['power','diner','water','scrap'];
+  if(![24,200].includes(count))throw Error('Explicit full-roster fixture size required');
+  const rooms=count===24?4:40;
+  v.state.rooms=Array.from({length:rooms},(_,i)=>({...room,id:i+1,type:types[i%4],width:3,
+    floor:Math.floor(i/2)+1,col:i%2?5:2,stored:0}));
+  const quarters=Math.ceil(count/24);
+  v.state.rooms.push(...Array.from({length:quarters},(_,i)=>({...room,id:1000+i,type:'quarters',width:3,level:3,
+    floor:Math.floor(rooms/2)+1+Math.floor(i/2),col:i%2?5:2,stored:0})));
+  v.state.residents=Array.from({length:count},(_,i)=>({...structuredClone(base),id:i+1,name:'全员居民'+(i+1),roomId:i%rooms+1,
+    stats:{str:(i*7)%11,agi:(i*3)%11,per:(i*5)%11,end:(i*9)%11,cha:3,int:3,lck:3}}));
+  if(count===24)for(const [i,p] of v.state.residents.entries()){
+    p.stats={str:0,agi:0,per:0,end:0,cha:3,int:3,lck:3};p.stats[['agi','per','end','str'][i%4]]=10;
+  }
+  v.state.resources={scrap:1000,parts:0,power:1000,food:1000,water:1000,stimpak:0};
+  v.state.depth=Math.ceil(rooms/2)+Math.ceil(quarters/2);v.progress={level:8};
+  return v;
+}
 export function levelGateView(time=2_000_000_000){
   const v=campaignView(time),s=v.state,base=s.rooms[0];
   const room=(id,type,floor,col,width,level=1)=>({...base,id,type,floor,col,width,level});
@@ -66,6 +84,21 @@ export function populationGrowthView(time=2_000_000_000){
   v.progress.score=2*s.residents.length+3*s.depth+s.rooms.filter(r=>!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
   return v;
 }
+export function reservedGrowthView(time=2_000_000_000){
+  // 21人、两对感情预约、24床；供给够23人但不够24人。合成边界场景，不含实号资料。
+  const v=levelGateView(time),s=v.state,base=s.residents[0];
+  s.rooms.find(r=>r.id===1).level=2;
+  Object.assign(s.rooms.find(r=>r.id===8),{floor:3,col:6});
+  s.rooms.push({...s.rooms[0],id:9,type:'quarters',floor:3,col:5,width:1,level:1});
+  const posts=[1,1,2,2,2,3,3,3,4,4,4,4,4,4,8,8,5,5,9,9,null];
+  s.residents=posts.map((roomId,i)=>({...structuredClone(base),id:i+1,name:'居民'+(i+1),roomId,
+    happiness:75,xp:0,hp:100,stats:{str:8,per:8,end:8,cha:8,int:8,agi:8,lck:8}}));
+  for(const [a,b] of [[17,18],[19,20]])for(const [id,other] of [[a,b],[b,a]])
+    s.residents.find(p=>p.id===id).romance={partnerId:other,progress:.2};
+  s.residents.at(-1).away={kind:'explore'};
+  s.resources={scrap:820,parts:10,power:718,food:721,water:533,stimpak:7};
+  v.progress={level:5,score:84,next:87};return v;
+}
 export function storageChoiceView(time=2_000_000_000){
   // 独立7级快照：装备近满，已有一格仓库可升级；不代表连续发展或实号状态。
   const v=upperStageView(time),s=v.state,base=s.rooms[0];
@@ -85,6 +118,14 @@ export function familyGrowthView(time=2_000_000_000){
   for(const p of s.residents){p.familyCooldownUntil=time-1;if(p.roomId===5)p.roomId=4;}
   for(const id of [6,7])s.residents.find(p=>p.id===id).stats.per=17;
   s.residents.find(p=>p.id===15).parents=[6,7];s.residents.find(p=>p.id===3).roomId=4;
+  return v;
+}
+export function familyTrainingSeatView(time=2_000_000_000){
+  // 两名在训居民已预约三级水站的两席；表面空房不能再用于家庭接替。
+  const v=familyGrowthView(time),s=v.state;
+  s.rooms.push({...s.rooms.find(r=>r.id===3),id:108,floor:1,col:7,level:3});
+  Object.assign(s.rooms.find(r=>r.id===8),{trainStat:'per',level:1});
+  for(const id of [11,12])s.residents.find(p=>p.id===id).training=.5;
   return v;
 }
 export function dormWorkshopCycleView(time=2_000_000_000){

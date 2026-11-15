@@ -1,5 +1,12 @@
 import { farmMarkup } from './arkengine-farm.fixture.mjs';
 
+// An existing script-owned lot lets generic execution tests exercise legal exits.
+// It is installed before the userscript starts, so the accounting opening matches the position.
+export const stockOwnedPosition=`km.saleReceipt=true;
+  km.view.positions=[{stockId:1,shares:10,costBasisTokens:100,holdUntil:null}];
+  localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify({version:1,userId:77,nextAt:0,note:'fixture',hold:false,
+    entries:[],pending:null,owned:{'1':{shares:10,cost:100,modelName:'模型甲',manual:false}}}));`;
+
 // Local DOM reproduces the public stock page labels and useRequestIntent contract.
 export const stockMarkup=farmMarkup+`<script>
 window.km={reads:0,calls:[],busy:false,qty:{},stake:100,mode:'success',receipts:{},tokens:10000,search:'',
@@ -33,6 +40,12 @@ window.fetch=async(url,options)=>{
  if(km.mode==='deferred'&&!existing)return new Response('{}',{status:503});
  let body=existing||{userId:km.view.userId,action:a.action,idempotencyKey:a.idempotencyKey,ok:true};
  let status=200;
+ if(km.nativeSaleCapacity&&!existing&&a.action==='sell'){
+  const stock=km.view.stocks.find(s=>s.modelName===a.modelName),gross=stock.priceCents*a.shares,
+    fee=Math.floor(gross*km.view.rules.sellFeePct/100),net=gross-fee,proceeds=Math.floor(net/100);
+  if(!Number.isSafeInteger(net)||net>2147483647||fee>2147483647||proceeds>Math.min(km.view.rules.maxTradeTokens,km.view.rules.reserveTokens))
+   return new Response(JSON.stringify({...body,ok:false,executed:false,code:'sale_capacity'}),{status:400});
+ }
  if(km.mode==='rejected'){body={...body,ok:false,executed:false,code:'fixture_rejection'};status=400;}
  else if(!existing){
   const v=km.view;
@@ -43,6 +56,7 @@ window.fetch=async(url,options)=>{
    const price=km.fillPrice||s.priceCents,gross=price*a.shares,fee=Math[a.action==='buy'?'ceil':'floor'](gross*(a.action==='buy'?v.rules.buyFeePct:v.rules.sellFeePct)/100);
    if(a.action==='buy'){
     const cost=Math.ceil((gross+fee)/100);km.tokens-=cost;
+    if(km.nativeCapacity&&Number.isSafeInteger(v.dailyBoughtTokens)&&v.dailyBoughtTokens>=0)v.dailyBoughtTokens+=cost;
     if(!p){p={stockId:s.id,shares:0,costBasisTokens:0,holdUntil:new Date(clock+3600000).toISOString()};v.positions.push(p);}
     p.shares+=a.shares;p.costBasisTokens+=cost;
    }else{const proceeds=Math.floor((gross-fee)/100);km.tokens+=proceeds;
@@ -83,6 +97,12 @@ window.renderStock=()=>{
   card.querySelector('p').textContent=s.modelName;const input=card.querySelector('input');input.setAttribute('aria-label',s.modelName+' 交易数量');input.value=km.qty[s.id]||'1';
   input.oninput=()=>{km.qty[s.id]=input.value;renderStock();};
   const shares=Number(input.value),buy=card.querySelector('button');buy.textContent='买 '+shares;buy.disabled=blocked||s.suspended;
+  if(km.nativeCapacity){
+   const r=km.view.rules,value=km.view.positions.reduce((n,p)=>n+p.shares*(km.view.stocks.find(s=>s.id===p.stockId)?.priceCents||0)/100,0);
+   const budget=Math.max(0,Math.min(km.tokens,r.maxTradeTokens,r.maxDailyBuyTokens-(km.view.dailyBoughtTokens??0),r.maxPositionTokens-value));
+   const gross=s.priceCents*shares,cost=Math.ceil((gross+Math.ceil(gross*r.buyFeePct/100))/100);
+   buy.disabled=buy.disabled||!Number.isInteger(shares)||shares<1||cost>budget;
+  }
   buy.onclick=()=>stockAct('buy',{modelName:s.modelName,shares});
   const p=km.view.positions.find(p=>p.stockId===s.id&&p.shares>0);
   if(p){const sell=document.createElement('button');sell.textContent='卖 '+Math.min(shares,p.shares);sell.disabled=blocked||s.suspended||Date.parse(p.holdUntil)>clock||shares>p.shares;sell.onclick=()=>stockAct('sell',{modelName:s.modelName,shares:Math.min(shares,p.shares)});buy.parentElement.append(sell);}

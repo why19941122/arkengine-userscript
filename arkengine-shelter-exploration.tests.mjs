@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {holdShelterClaimReads as holdClaimReads} from './arkengine-shelter.fixture.mjs';
 
 export async function shelterExplorationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,expStatus,trustedStaffKey}) {
   const panel=`document.getElementById('ark-auto-expedition').shadowRoot`,pending=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))`;
@@ -30,12 +31,12 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     assert.equal(await evaluate('sm.view.state.residents[0].away'),null);
   });
   await t.test('探险迟到快照：已收到成功回执但页面仍显示原探险时保留原记录，不再次领取',async()=>{
-    await setupShelter(`${scene}${flag}sm.beforeClaimView=structuredClone(sm.view);`);
+    await setupShelter(`${scene}${flag}${holdClaimReads}sm.beforeClaimView=structuredClone(sm.view);`);
     await drive('sm.calls.length===1','explorer claim executed');
     await until(()=>evaluate(`Boolean(${pending}?.result?.proof)`),'explorer success proof saved');
     const original=await evaluate(pending);
     // 模拟领取响应已经成功，但随后的页面和只读读取仍给出旧数据；重复提交不得发生。
-    await evaluate(`sm.afterClaimView=structuredClone(sm.view);sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';renderShelter();`);
+    await evaluate(`sm.afterClaimView=structuredClone(sm.view);sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';sm.releaseClaimReads();renderShelter();`);
     await drive(done,'stale explorer view yields to expedition');
     assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(`${pending}.id`),original.id);
     assert.deepEqual(await evaluate(`${pending}.result.proof`),original.result.proof);
@@ -46,11 +47,11 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(`${state}.pendingReadOnly`),undefined);
   });
   await t.test('探险迟到快照刷新：旧探险等待跨刷新保留，实际列表更新且居民重新出发后核对旧领取',async()=>{
-    await setupShelter(`${scene}${flag}sm.beforeClaimView=structuredClone(sm.view);`);
+    await setupShelter(`${scene}${flag}${holdClaimReads}sm.beforeClaimView=structuredClone(sm.view);`);
     await drive('sm.calls.length===1','original explorer claimed before reload');
     await until(()=>evaluate(`Boolean(${pending}?.result?.proof)`),'proof before stale reload');
     const original=await evaluate(pending);
-    await evaluate(`sm.afterClaimView=structuredClone(sm.view);sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';renderShelter();`);
+    await evaluate(`sm.afterClaimView=structuredClone(sm.view);sm.view=structuredClone(sm.beforeClaimView);sm.mode='unknown';sm.releaseClaimReads();renderShelter();`);
     await reloadShelter();await drive(done,'stale explorer survives reload');
     assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(`${pending}.id`),original.id);
     assert.deepEqual(await evaluate(`${pending}.result.proof`),original.result.proof);
@@ -62,7 +63,7 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     assert.equal(await evaluate(enabled),'true');
   });
   await t.test('探险迟到快照时间：早于成功回执的读取不提前解除记录，时间同步后仍不重复领取',async()=>{
-    await setupShelter(`${scene}${flag}const originalData=shelterData;
+    await setupShelter(`${scene}${flag}${holdClaimReads}const originalData=shelterData;
       window.shelterTransport=(u,o)=>{clock+=1000;return fetch(u,o);};
       window.shelterData=()=>{const v=originalData();if(Number.isFinite(sm.readTime))v.serverTime=sm.readTime;return v;};`);
     await drive('sm.calls.length===1','explorer before regressing read time');
@@ -71,7 +72,7 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     assert.ok(original.result.proof.at>original.before.serverTime,'本场景必须区分原请求时间与成功凭据时间');
     await evaluate(`sm.readTime=${original.result.proof.at}-1;sm.view.state.residents[0].away={kind:'explore'};
       sm.view.state.explorers=[{id:22,residentId:1,startedAt:clock,returnAt:clock+3600000,tier:0,abyss:false,
-        stimpaks:0,loot:{scrap:0,parts:0,stimpak:0,items:[]}}];renderShelter();`);
+        stimpaks:0,loot:{scrap:0,parts:0,stimpak:0,items:[]}}];sm.releaseClaimReads();renderShelter();`);
     await drive(done,'older snapshot waits');assert.equal(await evaluate(`${pending}.id`),original.id);
     assert.equal(await evaluate('sm.calls.length'),1);
     await assertWait('snapshot-before-proof',/快照时间早于原领取成功凭据/,true);
@@ -79,9 +80,9 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
     await drive(`${pending}===null&&${done}`,'current snapshot reconciles proof');assert.equal(await evaluate('sm.calls.length'),1);
   });
   await t.test('探险迟到快照缺失：已有成功凭据但探险列表暂缺时等待，列表恢复后正常核对',async()=>{
-    await setupShelter(`${scene}${flag}`);await drive('sm.calls.length===1','explorer before missing list');
+    await setupShelter(`${scene}${flag}${holdClaimReads}`);await drive('sm.calls.length===1','explorer before missing list');
     await until(()=>evaluate(`Boolean(${pending}?.result?.proof)`),'proof before missing list');
-    const original=await evaluate(pending);await evaluate('delete sm.view.state.explorers;renderShelter();');
+    const original=await evaluate(pending);await evaluate('delete sm.view.state.explorers;sm.releaseClaimReads();renderShelter();');
     await drive(done,'missing explorer list waits');assert.equal(await evaluate(`${pending}.id`),original.id);
     assert.equal(await evaluate(enabled),'true');assert.equal(await evaluate('sm.calls.length'),1);
     await assertWait('explorer-list-unavailable',/探险列表暂不可核对/,true);
@@ -154,12 +155,15 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
   await t.test('探险归来：用户正在废土页操作时撤销排队领取，等待一分钟后再检查',async()=>{
     await setupShelter(`${scene}${flag}`);
     await drive(`/随机等待.*归来的探险奖励/.test(${panel}.getElementById('status').textContent)`,'queued before manual interaction');
+    await evaluate(`game.tabIndex=-1;game.focus();`);
+    assert.equal(await evaluate('document.activeElement===game'),true,'keyboard takeover starts in the game, outside the script panel');
     await trustedStaffKey();await pulse(10000);assert.deepEqual(await evaluate('sm.calls'),[]);assert.match(await expStatus(),/等待一分钟/);
-    await pulse(61000);await drive(done,'manual work gets time');assert.deepEqual(await evaluate('sm.calls'),[]);
-    await evaluate(`${panel}.getElementById('shelter-check').click();`);await drive('sm.calls.length===1','later check may resume');
+    await pulse(49000);assert.deepEqual(await evaluate('sm.calls'),[],'the full manual minute is protected');
+    await pulse(2000);await drive(done,'automatic work resumes after the manual minute');
+    assert.equal(await evaluate('sm.calls.length'),1);
   });
   await t.test('探险归来：本次返回状态证明跨刷新保留，不因居民随后再次出发重复领取旧探险',async()=>{
-    await setupShelter(`${scene}${flag}`);await drive('sm.calls.length===1','explorer claim sent');
+    await setupShelter(`${scene}${flag}${holdClaimReads}`);await drive('sm.calls.length===1','explorer claim sent');
     await until(()=>evaluate(`Boolean(${pending}?.result?.proof)`),'explorer response proof');
     await evaluate(`sm.view.state.residents[0].away={kind:'explore'};sm.view.state.explorers=[{id:22,residentId:1,startedAt:clock,
       returnAt:clock+3600000,tier:0,abyss:false,stimpaks:0,loot:{scrap:0,parts:0,stimpak:0,items:[]}}];`);
@@ -174,9 +178,19 @@ export async function shelterExplorationTests({t,setupShelter,reloadShelter,eval
   await t.test('探险归来：重名、缺失或新增背包字段只停止该领取，其他产出继续收取',async()=>{
     for(const extra of [`s.residents.push({...s.residents[0],id:2});`, `delete s.explorers[0].loot.parts;`,
       `s.explorers[0].loot.unknownResource=3;`, `delete s.explorers;`]){
-      await setupShelter(`${scene}${flag}s.rooms[0].stored=30;${extra}`);await drive(done,'optional exploration fields isolated');
+      await setupShelter(`${scene}${flag}sm.ui20261109=false;s.rooms[0].stored=30;${extra}`);await drive(done,'optional exploration fields isolated');
       assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);assert.equal(await evaluate(enabled),'true');
     }
+  });
+  await t.test('探险归来：新版编号区分同名居民，只领取原探险且刷新不重发',async()=>{
+    await setupShelter(`${scene}${flag}sm.ui20261109=true;sm.fixtureSearch=location.search;s.rooms[0].stored=30;
+      s.residents.push({...s.residents[0],id:2,away:null});`);
+    await drive(done,'native numbered identity disambiguates equal names');
+    assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all','explore_claim']);
+    assert.equal(await evaluate('sm.calls.find(c=>c.type==="explore_claim").explorerId'),11);
+    await pulse();await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(done,'numbered claim survives refresh');
+    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="explore_claim").length'),1);
   });
   await t.test('探险归来：隐藏副本不误点，可见重名卡片不猜测也不来回切页',async()=>{
     for(const hidden of [true,false]){
