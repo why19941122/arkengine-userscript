@@ -51,8 +51,34 @@ export function inspectMarketSchema(schema,present=true){
       }
     }
     visit(schema.shape,'$',0);
-    return {status:'recorded',fields,incompletePaths:[...new Set(incompletePaths)]};
+    return {status:'recorded',fields,incompletePaths:[...new Set(incompletePaths)],
+      stockInventory:inspectStockFieldInventory(schema.stockInventory,Object.hasOwn(schema,'stockInventory'))};
   }catch{return {status:'invalid-schema',fields:[],incompletePaths:[]};}
+}
+
+export function inspectStockFieldInventory(value,present=true){
+  const unavailable=status=>({status,fields:[],complete:false});
+  if(!present)return unavailable('not-collected');
+  if(value===null)return unavailable('capture-failed');
+  if(!value||value.version!==1)return unavailable('unsupported-inventory');
+  try{
+    assert.equal(value.rowLimit,256);assert.equal(value.fieldLimit,48);assert.equal(value.keyLimit,4096);
+    for(const key of ['totalRows','inspectedRows','skippedRows'])assert.ok(Number.isSafeInteger(value[key])&&value[key]>=0);
+    assert.equal(value.inspectedRows+value.skippedRows,Math.min(value.totalRows,value.rowLimit));
+    const base={totalRows:value.totalRows,inspectedRows:value.inspectedRows,skippedRows:value.skippedRows,
+      uninspectedRows:value.totalRows-value.inspectedRows};
+    if(value.issue!==undefined){assert.equal(value.issue,'size-limit');assert.equal(value.shape,null);
+      return {...base,...unavailable('size-limited')};}
+    if(!value.inspectedRows){assert.equal(value.shape,null);
+      return {...base,status:value.totalRows?'partial':'complete',fields:[],complete:value.totalRows===0,incompletePaths:[]};}
+    assert.equal(value.shape.objectSamples,value.inspectedRows);
+    const read=inspectMarketSchema({version:1,arraySampleLimit:8,fieldLimit:96,shape:value.shape});
+    assert.equal(read.status,'recorded');assert.ok(read.fields.length<=value.fieldLimit);
+    const complete=base.uninspectedRows===0&&read.incompletePaths.length===0;
+    return {...base,status:complete?'complete':'partial',complete,
+      fields:read.fields.map(f=>({...f,path:'$.stocks[]'+f.path.slice(1)})),
+      incompletePaths:read.incompletePaths.map(p=>'$.stocks[]'+p.slice(1))};
+  }catch{return unavailable('invalid-inventory');}
 }
 
 function fieldState(stock,key,collectorEvidence){
@@ -77,7 +103,14 @@ export function stockInputReadiness(log){
     assert.equal(new Set(view.stocks.map(s=>String(s.id))).size,view.stocks.length,'Duplicate stock identity');
     assert.equal(new Set(view.stocks.map(s=>s.modelName)).size,view.stocks.length,'Duplicate model identity');
     const schema=inspectMarketSchema(view.marketSchema,Object.hasOwn(view,'marketSchema'));
-    for(const field of schema.fields){
+    if(schema.stockInventory?.totalRows!==undefined&&schema.stockInventory.totalRows!==view.stocks.length)
+      schema.stockInventory={status:'stock-count-mismatch',fields:[],complete:false};
+    const observedFields=new Map();
+    for(const f of [...schema.fields,...(schema.stockInventory?.fields??[])]){
+      if(!observedFields.has(f.path))observedFields.set(f.path,{...f,types:[]});
+      const item=observedFields.get(f.path);item.types=[...new Set([...item.types,...f.types])];
+    }
+    for(const field of observedFields.values()){
       if(!inventory.has(field.path))inventory.set(field.path,{path:field.path,types:new Set(),observations:0,
         firstSeenAt:at,lastSeenAt:at,valuesRetained:false,semanticMeaningVerified:false});
       const item=inventory.get(field.path);field.types.forEach(t=>item.types.add(t));item.observations++;item.lastSeenAt=at;
@@ -92,9 +125,9 @@ export function stockInputReadiness(log){
       else ticks.set(key,tick.priceCents);
       if(!latest.has(id)||latest.get(id)<stamp)latest.set(id,stamp);
     }
-    // The verified 1.17.92–1.17.114 contract copies optional prices for every stock. Its
+    // The verified 1.17.92–1.17.124 contract copies optional prices for every stock. Its
     // sampled field inventory alone cannot prove that a particular stock omitted one.
-    const collectorEvidence=['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103','1.17.104','1.17.105','1.17.106','1.17.107','1.17.108','1.17.109','1.17.110','1.17.111','1.17.112','1.17.113','1.17.114'].includes(sample.sourceVersion)&&Object.hasOwn(view,'marketSchema');
+    const collectorEvidence=['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103','1.17.104','1.17.105','1.17.106','1.17.107','1.17.108','1.17.109','1.17.110','1.17.111','1.17.112','1.17.113','1.17.114','1.17.115','1.17.116','1.17.117','1.17.118','1.17.119','1.17.120','1.17.121','1.17.122','1.17.123','1.17.124'].includes(sample.sourceVersion)&&Object.hasOwn(view,'marketSchema');
     const rows=view.stocks.map(stock=>{
       const id=String(stock.id);assert.ok((positive(stock.id)||typeof stock.id==='string'&&stock.id.trim())&&
         typeof stock.modelName==='string'&&stock.modelName&&positive(stock.priceCents),'Invalid stock');
@@ -138,6 +171,9 @@ export function stockInputReadiness(log){
       versions:count(frames.map(f=>f.version)),maxGapMs:Math.max(0,...frames.slice(1).map((f,i)=>f.at-frames[i].at)),
       ignoredFutureTicks:frames.reduce((n,f)=>n+f.ignoredFutureTicks,0),quoteStates:count(allRows.map(r=>r.quoteStatus))},
     schema:{states:schemaStates,observationsWithSamplingLimits:frames.filter(f=>f.schema.incompletePaths.length>0).length,
+      stockInventory:{states:count(frames.map(f=>f.schema.stockInventory?.status??f.schema.status)),
+        completeObservations:frames.filter(f=>f.schema.stockInventory?.complete).length,
+        meaning:'Coverage of safe stock field names and types only; no unknown metric values or driver semantics are verified.'},
       fields:[...inventory.values()].map(f=>({...f,types:[...f.types].sort()})).sort((a,b)=>a.path.localeCompare(b.path)),
       absenceProven:false,meaning:'Presence is evidence of a field name/type only; absence in an incomplete inventory proves nothing.'},
     optionalPrices:prices.map(key=>({field:key,states:count(allRows.map(r=>r.fields[key]))})),
@@ -145,7 +181,7 @@ export function stockInputReadiness(log){
     readiness:{priceInputCoverage:reasons.length===0?'available-for-descriptive-study':'insufficient-inputs',reasons,
       driverInputs:'unverified',predictiveValue:'unverified',livePromotion:false},
     limitations:['Field names/types cannot establish model-call-count or error-rate semantics; unknown values were not collected.',
-      'Absence is classified as not-returned only under the verified 1.17.92–1.17.114 full-stock optional-price copying contract; other collector versions remain unknown.',
+      'Absence is classified as not-returned only under the verified 1.17.92–1.17.124 full-stock optional-price copying contract; other collector versions remain unknown.',
       'Valid optional prices are observed inputs, not validated predictors or proof of a profitable strategy.',
       'Horizon counts are overlapping coverage checks, not independent trading opportunities; 60/240m are fixed existing research horizons.',
       'The first read after the horizon is used; missing, suspended and gapped evidence is never filled or replaced with a later favourable quote.',

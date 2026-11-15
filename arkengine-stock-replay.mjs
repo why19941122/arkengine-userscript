@@ -159,10 +159,14 @@ export function replayStock({snapshots,initialBalance=10000,initialPositions,ini
       const price=stock?(buy?stock.priceCents:sellPrice(stock.priceCents)):null;
       const amount=stock?(buy?core.quote(price,action.shares,r.buyFeePct,true):core.saleAmount(price,action.shares,r.sellFeePct)):null;
       const pos=positions.find(p=>core.sameStockId(p.stockId,action.stockId)),held=positions.reduce((sum,p)=>sum+p.costBasisTokens,0);
+      // Exclude only this pending reservation; other spending still counts. Research
+      // candidates and S0 must face the same recorded website capacity at fill time.
+      const website=buy?core.websiteLimits(model,ledger.entries.filter(e=>e.id!==order.id||e.result!=='reserved'),at):null;
       let reason=!view.enabled?'market-disabled':!stock?'missing-quote':stock.suspended?'suspended':buy&&stock.stale?'stale-quote':
         amount===null?'unrepresentable-quote':null;
       if(!reason&&buy)reason=amount>balance?'cash':amount>r.maxTradeTokens?'trade-limit':
-        core.spend(ledger.entries.filter(e=>e.id!==order.id||e.result!=='reserved'),'buy',at)+amount>r.maxDailyBuyTokens?'daily-limit':held+amount>r.maxPositionTokens?'position-limit':null;
+        website.remainingDaily===null?'unknown-website-daily-limit':website.remainingPosition===null?'unknown-website-position-limit':
+        amount>website.remainingDaily?'daily-limit':held+amount>r.maxPositionTokens||amount>website.remainingPosition?'position-limit':null;
       if(!reason&&!buy)reason=!pos||pos.shares<action.shares?'position':Date.parse(pos.holdUntil)>at?'holding-period':
         amount>r.maxTradeTokens?'trade-limit':amount>r.reserveTokens?'liquidity':amount===0?'zero-proceeds':null;
       Object.assign(order,{resolvedAt:at,observationLagMs:at-order.dueAt,status:reason?'unfilled':'filled'});
@@ -298,7 +302,7 @@ export function replayStock({snapshots,initialBalance=10000,initialPositions,ini
       '独立试验账本使用40万本金/10万累计净亏损上限（允许更低配置），浮盈和预测不补亏损预算；缺可信尾部界按投入全损预留。触线持久停新增风险，原可退出仓继续由原策略管理；不将此核算称为新盈利策略。七天窗口仅使用恰好相隔168小时的实际观察端点，缺端点不插值认证。',
       'S1/S2仅用首次可见历史生成固定信号，入场低点冻结；计划期限从实际成交起算。fixed只按期及累计风险退出，risk另加净亏6%和信号失效；锁仓中的触发只作记录，解锁重评。原有仓及起点未决买单对所有候选均用S0退出。S3不开新仓。研究排序按股票ID，不冒充已有经验收益分布或获准的实号策略。',
       '退出压力按exitPriceHaircutBps下调实际卖价及持仓清算估值；它不是实际滑点估计。锁定时长按原生截止时间、不可交易时长按观测状态延续至下一快照估算，多仓时长可重叠，二者不能相加当墙钟时间。周转收益使用已释放历史成本，不等于本窗口净资产收益。',
-      '网站日额度暂按既有滚动24小时spend模拟，尚无服务器日界线及起点前已用额度证据；所有报告保持未通过实号验证，不能把本地成交模型当作网站规则证明。',
+      '网站日额度按记录的dailyBoughtTokens与模拟本地滚动24小时支出取较严余量；字段缺失才用本地值，非法或未知时不买。网站持仓上限按模拟持仓当前市值核对，历史成本上限独立保留；入场和延迟成交均复核。这是记录账户额度下的保守条件回放，不重建不同策略自己的服务器日账，也未证明服务器日界线；不能作为实号成交或盈利证明。',
       '预测未参与模拟；结果不能作为真实收益或未来盈利证明。'
     ]};
 }

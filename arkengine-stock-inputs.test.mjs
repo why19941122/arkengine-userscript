@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
-import {stockInputReadiness,inspectMarketSchema} from './arkengine-stock-inputs.mjs';
+import {stockInputReadiness,inspectMarketSchema,inspectStockFieldInventory} from './arkengine-stock-inputs.mjs';
 
 const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const segment=source.split('// STOCK_CORE_BEGIN')[1].split('// STOCK_CORE_END')[0];
@@ -45,10 +45,10 @@ test('input readiness: known collector distinguishes absent, null, zero, invalid
   assert.deepEqual(states(r,'openPriceCents'),{'not-returned':1,null:1,'positive-integer':1,'reported-invalid':1,zero:1});
 });
 
-test('input readiness: 1.17.114 preserves the verified collector contract without trusting unknown future versions',()=>{
-  for(const version of ['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103','1.17.104','1.17.105','1.17.106','1.17.107','1.17.108','1.17.109','1.17.110','1.17.111','1.17.112','1.17.113','1.17.114','1.17.115']){
+test('input readiness: 1.17.124 preserves the verified collector contract without trusting unknown future versions',()=>{
+  for(const version of ['1.17.92','1.17.93','1.17.94','1.17.95','1.17.96','1.17.97','1.17.98','1.17.99','1.17.100','1.17.101','1.17.102','1.17.103','1.17.104','1.17.105','1.17.106','1.17.107','1.17.108','1.17.109','1.17.110','1.17.111','1.17.112','1.17.113','1.17.114','1.17.115','1.17.116','1.17.117','1.17.118','1.17.119','1.17.120','1.17.121','1.17.122','1.17.123','1.17.124','1.17.125']){
     const r=stockInputReadiness(fixture({n:1,version,edit(v){delete v.stocks[0].openPriceCents;}}));
-    assert.deepEqual(states(r,'openPriceCents'),{[version==='1.17.115'?'not-collected':'not-returned']:1});
+    assert.deepEqual(states(r,'openPriceCents'),{[version==='1.17.125'?'not-collected':'not-returned']:1});
   }
 });
 
@@ -79,6 +79,68 @@ test('input readiness: truncated stock inventory never proves absence in unsampl
   const r=inspectMarketSchema(plain(core.marketShape(v)));
   assert.equal(r.status,'recorded');assert.ok(r.incompletePaths.includes('$.stocks[]'));
   assert.ok(!r.fields.some(f=>f.path.endsWith('.usageCount')));
+});
+
+test('input readiness: full stock inventory adds late and nested field evidence without metric values or double counting',()=>{
+  const log=fixture({n:2,edit(v){v.stocks=Array.from({length:70},(_,i)=>({...v.stocks[0],id:i+1,modelName:'model-'+i,
+    ...(i===69?{usageCount:987654321,metrics:{errorRate:.123456789}}:{})}));}});
+  const r=stockInputReadiness(log);
+  assert.deepEqual(r.schema.stockInventory.states,{complete:2});assert.equal(r.schema.stockInventory.completeObservations,2);
+  for(const path of ['$.stocks[].usageCount','$.stocks[].metrics.errorRate']){
+    const f=r.schema.fields.find(f=>f.path===path);assert.ok(f);assert.deepEqual(f.types,['number']);
+    assert.equal(f.valuesRetained,false);assert.equal(f.semanticMeaningVerified,false);assert.equal(f.observations,2);
+  }
+  assert.equal(r.schema.fields.find(f=>f.path==='$.stocks[].priceCents').observations,2);
+  assert.ok(!JSON.stringify(r).includes('987654321'));assert.ok(!JSON.stringify(r).includes('123456789'));
+  assert.equal(r.readiness.driverInputs,'unverified');assert.equal(r.qualifiedForLive,false);
+});
+
+test('input readiness: older schema remains explicitly sampled and cannot acquire full coverage from export version',()=>{
+  const log=fixture({n:1});delete log.events[0].data.snapshot.marketSchema.stockInventory;
+  log.version='1.17.123';
+  const r=stockInputReadiness(log);assert.deepEqual(r.schema.stockInventory.states,{'not-collected':1});
+  assert.equal(r.schema.stockInventory.completeObservations,0);
+});
+
+test('input readiness: row limits, filtering and nested array samples remain incomplete',()=>{
+  for(const view of [
+    {stocks:Array.from({length:300},(_,i)=>({id:i+1}))},
+    {stocks:[{id:1,accessToken:'private'}]},
+    {stocks:[{id:1,metrics:Array.from({length:9},(_,i)=>({count:i}))}]}
+  ]){
+    const inventory=inspectMarketSchema(plain(core.marketShape(view))).stockInventory;
+    assert.equal(inventory.status,'partial');assert.equal(inventory.complete,false);
+  }
+});
+
+test('input readiness: exhausting the key budget exactly between rows cannot claim full coverage',()=>{
+  const row=Object.fromEntries(Array.from({length:32},(_,i)=>['metric'+i,i]));
+  const view={stocks:Array.from({length:129},(_,i)=>({...row,...(i===128?{lastRowMetric:123456789}:{})}))};
+  const inventory=inspectMarketSchema(plain(core.marketShape(view))).stockInventory;
+  assert.equal(inventory.status,'partial');assert.equal(inventory.complete,false);
+  assert.ok(!inventory.fields.some(f=>f.path.endsWith('.lastRowMetric')));
+});
+
+test('input readiness: malformed or failed full inventory does not taint the original schema',()=>{
+  const original=plain(core.marketShape({stocks:[{id:1}]}));
+  for(const edit of [
+    v=>v.totalRows++,v=>v.inspectedRows=257,v=>v.shape.objectSamples=2,
+    v=>v.shape.fields[0].name='accessToken',v=>v.keyLimit=999999
+  ]){
+    const schema=structuredClone(original);edit(schema.stockInventory);
+    const r=inspectMarketSchema(schema);assert.equal(r.status,'recorded');assert.ok(r.fields.length);
+    assert.equal(r.stockInventory.status,'invalid-inventory');assert.deepEqual(r.stockInventory.fields,[]);
+  }
+  assert.equal(inspectStockFieldInventory(null).status,'capture-failed');
+  const limited={...original.stockInventory,shape:null,issue:'size-limit'};
+  assert.equal(inspectStockFieldInventory(limited).status,'size-limited');
+});
+
+test('input readiness: full inventory counts must match the complete snapshot stocks',()=>{
+  const log=fixture({n:1}),snapshot=log.events[0].data.snapshot;
+  snapshot.marketSchema.stockInventory=plain(core.marketShape({stocks:[{id:1},{id:2}]})).stockInventory;
+  const r=stockInputReadiness(log);assert.deepEqual(r.schema.stockInventory.states,{'stock-count-mismatch':1});
+  assert.equal(r.schema.stockInventory.completeObservations,0);
 });
 
 test('input readiness: malformed, failed and unsupported schemas are separate and cannot contribute field evidence',()=>{

@@ -71,9 +71,10 @@ export function replayStrategy(core,input={}){
     if(policy.candidate==='S3'){checks.push({at,stage:'wait',reason:'no-new-position-control'});return null;}
     const funded=core.funding(m,cfg),held=v.positions.reduce((n,p)=>n+p.costBasisTokens,0);
     const used=core.spend(ledger.entries,'buy',at),managed=v.positions.filter(p=>!ledger.owned[String(p.stockId)]?.manual).length;
+    const website=core.websiteLimits(m,ledger.entries,at);
     const bounds={cash:m.balance-funded.reserve,scriptDaily:funded.tradeLimit-used,scriptPosition:funded.positionLimit-held,
-      perStock:funded.perStockLimit,websiteTrade:r.maxTradeTokens,websiteDaily:r.maxDailyBuyTokens-used,
-      websitePosition:r.maxPositionTokens-held,accountRisk:report.newRiskCapacity,
+      perStock:funded.perStockLimit,websiteTrade:r.maxTradeTokens,websiteDaily:website.remainingDaily,
+      websitePosition:website.remainingPosition,websitePositionCost:r.maxPositionTokens-held,accountRisk:report.newRiskCapacity,
       ...(funded.riskLimit!=null?{configuredRisk:funded.riskLimit-core.riskExposure(m,ledger)}:{})};
     const budget=Math.max(0,Math.floor(Math.min(...Object.values(bounds))));
     let selected=null;
@@ -81,6 +82,8 @@ export function replayStrategy(core,input={}){
       const signal=stockResearchSignal({...s,status:s.suspended?'suspended':s.stale?'stale':null},ticks(s.id),at,policy.candidate);
       if(!signal.eligible){checks.push({at,stage:'signal',stockId:s.id,eligible:false,reason:signal.reason,features:signal.features??null});continue;}
       const reasons=[];
+      if(website.remainingDaily===null)reasons.push('unknown-website-daily-limit');
+      if(website.remainingPosition===null)reasons.push('unknown-website-position-limit');
       if(!v.enabled)reasons.push('market-disabled');
       if(executionHalt||report.halt)reasons.push('persistent-risk-stop');
       if(core.riskReason(m,funded,ledger,at))reasons.push('configured-risk-stop');

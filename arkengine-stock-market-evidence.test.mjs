@@ -18,6 +18,67 @@ function fixture(){
 }
 const field=(shape,name)=>shape.fields?.find(f=>f.name===name);
 
+test('market evidence: full stock inventory finds fields on row 70 without copying their values',()=>{
+  const {v}=fixture();v.stocks=Array.from({length:70},(_,i)=>({id:i+1,modelName:'stock-'+i,priceCents:1200,
+    ...(i===69?{lastRowMetric:987654321,providerStats:{requestCount:123456789,errorRate:.123456789},accessToken:'private-value'}:{})}));
+  const before=JSON.stringify(v),schema=plain(core.marketShape(v)),inventory=schema.stockInventory;
+  assert.equal(inventory.totalRows,70);assert.equal(inventory.inspectedRows,70);assert.equal(inventory.skippedRows,0);
+  assert.equal(inventory.shape.objectSamples,70);
+  assert.deepEqual(field(inventory.shape,'lastRowMetric').types,['number']);
+  assert.equal(field(inventory.shape,'lastRowMetric').presentInSamples,1);
+  assert.deepEqual(field(field(inventory.shape,'providerStats'),'errorRate').types,['number']);
+  assert.equal(field(field(schema.shape,'stocks').items,'lastRowMetric'),undefined,'legacy sampled shape remains compatible');
+  for(const text of ['987654321','123456789','accessToken','private-value','stock-69'])assert.ok(!JSON.stringify(schema).includes(text),text);
+  assert.equal(JSON.stringify(v),before);
+});
+
+test('market evidence: full stock inventory keeps row and property budgets explicit',()=>{
+  const v={stocks:Array.from({length:300},(_,i)=>({id:i+1,...(i===299?{beyondLimit:12345}:{})}))};
+  let inventory=plain(core.marketShape(v)).stockInventory;
+  assert.equal(inventory.rowLimit,256);assert.equal(inventory.totalRows,300);assert.equal(inventory.inspectedRows,256);
+  assert.equal(field(inventory.shape,'beyondLimit'),undefined);
+  v.stocks=Array.from({length:70},()=>Object.fromEntries(Array.from({length:80},(_,i)=>['metric'+i,i])));
+  inventory=plain(core.marketShape(v)).stockInventory;
+  assert.equal(inventory.fieldLimit,48);assert.equal(inventory.keyLimit,4096);
+  assert.equal(inventory.shape.truncated,true);assert.ok(inventory.shape.fields.length<=48);
+});
+
+test('market evidence: stock array accessors are not invoked and skipped rows are reported',()=>{
+  let reads=0;const v={stocks:Array.from({length:70},(_,i)=>({id:i+1}))};
+  for(const i of [0,69])Object.defineProperty(v.stocks,String(i),{enumerable:true,get(){reads++;throw Error('private getter');}});
+  const schema=plain(core.marketShape(v));assert.equal(reads,0);
+  assert.equal(schema.stockInventory.totalRows,70);assert.equal(schema.stockInventory.inspectedRows,68);
+  assert.equal(schema.stockInventory.skippedRows,2);
+});
+
+test('market evidence: optional full inventory failure preserves the original sampled evidence',()=>{
+  const v={stocks:Array.from({length:70},(_,i)=>({id:i+1}))};
+  v.stocks[69]=new Proxy({},{ownKeys(){throw Error('unreadable row');}});
+  const schema=plain(core.marketShape(v));assert.equal(schema.version,1);
+  assert.equal(field(schema.shape,'stocks').sampledItems,8);assert.equal(schema.stockInventory,null);
+});
+
+test('market evidence: oversized inventory is explicitly dropped while raw observations remain importable',()=>{
+  const {v,m,ledger}=fixture();
+  const wide=Object.fromEntries(Array.from({length:48},(_,i)=>['metric'+String(i).padStart(40,'0'),123456789]));
+  v.stocks=Array.from({length:70},(_,i)=>({...v.stocks[0],id:i+1,modelName:'model-'+i,...wide}));
+  for(const [i,value] of [null,123456789,true,'not-copied',{},[]].entries())
+    for(const key of Object.keys(wide))v.stocks[i][key]=value;
+  Object.assign(v,Object.fromEntries(Array.from({length:60},(_,i)=>['extra'+String(i).padStart(40,'0'),123456789])));
+  const parts=plain(core.observationParts(m,ledger)),schema=parts[0].marketSchema;
+  assert.equal(schema.version,1);assert.equal(schema.stockInventory.issue,'size-limit');
+  assert.equal(schema.stockInventory.shape,null);assert.equal(schema.stockInventory.totalRows,70);
+  assert.ok(!JSON.stringify(schema).includes('123456789'));
+  assert.ok(!JSON.stringify(schema).includes('not-copied'));
+  assert.ok(parts.every(p=>Buffer.byteLength(JSON.stringify(p))<24000));
+  const events=parts.map((snapshot,part)=>({type:'stock-observation',data:{observationVersion:2,
+    observationId:'wide-read',part,totalParts:parts.length,at:now,
+    reading:{generation:1,phase:'scan',marketAt:now,balanceAt:now,freshnessAt:now},snapshot}}));
+  const restored=stockSnapshotsFromLog({events})[0];
+  assert.equal(restored.view.stocks.length,70);assert.equal(restored.view.stocks[69].priceCents,1200);
+  assert.equal(restored.view.marketSchema.stockInventory.issue,'size-limit');
+});
+
 test('market evidence: actual response fields/types are recorded without unknown field values or credentials',()=>{
   const {v}=fixture();v.providerStats={requestCount:987654321,errorRate:.123456789,note:'private-value'};
   v.apiKey='secret-key';v.stocks[0].accessToken='private-token';v.stocks[0].unverifiedMetric=87654321;
