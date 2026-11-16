@@ -4,18 +4,83 @@ import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
+const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const declarations=['shelterRooms','shelterBuildRules','campaignDefaults'].map(name=>source.match(new RegExp(`const ${name} =?[^;]*;`.replace(' =?','\\s*=')))[0]).join('\n');
 const code=source.slice(source.indexOf('  function shelterWorkerRate('),source.indexOf('  function readShelter('));
 const actions=source.slice(source.indexOf('  function shelterRequestAction('),source.indexOf('  function shelterSubmit('));
 const api=vm.runInNewContext(`${declarations}\n${code}\n${actions}\n({model:shelterModel,plan:shelterCampaignPlan,development:shelterDevelopmentPlan,combat:shelterCombat,
-  growth:shelterQuestGrowth,value:shelterQuestValue,better:shelterQuestBetter,
-  efficiency:shelterExploreEfficiency,chance:shelterQuestChance,loadout:shelterCombatLoadout,defaults:campaignDefaults,proof:shelterCampaignProof,confirmed:shelterCampaignConfirmed,valid:validCampaignPending,record:validCampaignRecord,action:shelterRequestAction,matches:shelterActionMatches,
+  growth:shelterQuestGrowth,value:shelterQuestValue,better:shelterQuestBetter,guard:shelterGuardPlan,defense:shelterDefensePlan,
+  adopt:shelterAdoptTrip,
+  efficiency:shelterExploreEfficiency,chance:shelterQuestChance,loadout:shelterCombatLoadout,departure:shelterDepartureLoadout,transfer:shelterWeaponTransferAllowed,defaults:campaignDefaults,proof:shelterCampaignProof,confirmed:shelterCampaignConfirmed,valid:validCampaignPending,record:validCampaignRecord,action:shelterRequestAction,matches:shelterActionMatches,
   income:shelterIncomeReward,manualIncome:shelterManualIncomePending,sodaProof:shelterSodaProof,sodaReceipt:shelterSodaReceipt,sodaQuota:shelterSodaQuota,sodaLedger:shelterSodaLedger,sodaValid:validShelterSodaReceipts})`,{
   objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const now=2_000_000_000;
 
 const cfg=extra=>({...api.defaults,...extra});
+test('日常装备：没有出征也为健康留守成人穿闲置武器，原强武器、外出和幼儿不动',()=>{
+  const v=campaignView(),s=v.state;
+  s.items=[{id:173,slot:'weapon',damage:[11,18]},{id:169,slot:'weapon',damage:[1,3]},
+    {id:171,slot:'weapon',damage:[1,3]},{id:200,slot:'weapon',damage:[99,99]}];
+  s.residents[0].weaponId=200;s.residents[4].away={kind:'explore',id:9};s.residents[5].adultAt=v.serverTime+3600000;
+  const flags=cfg({development:true,combatGear:true}),changes=[];
+  for(let i=0;i<5;i++){
+    const snapshot=JSON.stringify(v),a=api.plan(api.model(v),flags,{},14).choice;
+    assert.equal(JSON.stringify(v),snapshot);if(!a)break;
+    assert.equal(a.kind,'equip');assert.equal(a.slot,'weapon');assert.ok(![1,5,6].includes(a.id));
+    assert.ok(!s.residents.some(p=>p.weaponId===a.item));s.residents.find(p=>p.id===a.id).weaponId=a.item;changes.push(a);
+  }
+  assert.equal(changes.length,3);assert.equal(changes[0].item,173);assert.equal(s.residents[0].weaponId,200);
+  assert.equal(api.plan(api.model(v),flags,{},14).choice,null);
+  s.residents.find(p=>p.weaponId===173).weaponId=null;
+  assert.equal(api.plan(api.model(v),cfg({development:true,combatGear:false}),{},14).choice,null);
+  assert.equal(api.plan(api.model(v),flags,{pending:{kind:'equip'}},14).choice,null);
+});
+test('日常装备：魅力服用于服装工坊，不虚构电台和生育加速，也不降级其他属性',()=>{
+  const v=campaignView(),s=v.state;s.rooms.push({...s.rooms[0],id:90,type:'tailor'});s.residents[4].roomId=90;
+  s.items=[{id:71,slot:'outfit',bonus:{cha:2}}];
+  const run=()=>api.plan(api.model(v),cfg({development:true,combatGear:true}),{},14).choice;
+  assert.equal(run().item,71);assert.equal(run().id,5);
+  s.rooms.find(r=>r.id===90).type='radio';assert.notEqual(run()?.kind,'equip');
+  s.rooms.find(r=>r.id===90).type='tailor';s.items.push({id:100,slot:'outfit',bonus:{end:3}});s.residents[4].outfitId=100;
+  assert.equal(run(),null);
+});
+test('探险装备：同战力优先闲置幸运服，确认后才出发，不把幸运计入汽水或战力',()=>{
+  const v=campaignView(),s=v.state;s.items=[{id:136,slot:'outfit',bonus:{lck:1}}];
+  const flags=cfg({explore:true,combatGear:true}),first=api.plan(api.model(v),flags,{},14);
+  const a=first.actions[0];assert.equal(a.kind,'equip');assert.equal(a.item,136);
+  const p=s.residents.find(p=>p.id===a.id),combat=api.combat(s,p);p.outfitId=136;
+  assert.equal(api.combat(s,p),combat);assert.equal(api.plan(api.model(v),flags,{},14).actions[0].kind,'explore-start');
+});
+test('发展工坊补员沿用普通调岗60%健康门槛，外出与其他养成仍需90%',()=>{
+  const v=campaignView(),s=v.state;
+  for(const p of s.residents){p.xp=300;p.stats.end=6;p.hp=100;}
+  s.rooms.push({...s.rooms[0],id:90,type:'workshop',level:1,floor:3,col:2,stored:0});
+  const record={roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
+  const run=extra=>api.plan(api.model(v),cfg({development:true,workshop:true,partsTarget:12,workshopScrapReserve:100,...extra}),record,14);
+  const before=JSON.stringify(v),planned=run({explore:true,training:true,medical:true,reserve:10});
+  assert.ok(planned.actions.some(a=>a.role==='workshop'&&a.room===90),'生产缺口不能因复用外出血量门槛而停工');
+  assert.ok(!planned.actions.some(a=>['explore-start','quest-start'].includes(a.kind)||['training','medical'].includes(a.role)));
+  assert.equal(JSON.stringify(v),before,'规划不能治疗、降级或修改当前血量');
+  assert.ok(!run({development:false}).actions.some(a=>a.role==='workshop'),'非发展模式保留原养成门槛');
+  for(const p of s.residents)p.hp=90; // Level 11, END 6 => max HP 150.
+  assert.ok(run().actions.some(a=>a.role==='workshop'),'恰好60%仍可正常调岗');
+  for(const p of s.residents)p.hp=89;
+  assert.ok(!run().actions.some(a=>a.role==='workshop'),'低于普通调岗门槛仍拒绝');
+});
+
+test('发展工坊健康可用不绕过供料预算、身份与联合供给检查',()=>{
+  for(const blocked of ['feed','identity','supply']){
+    const v=campaignView(),s=v.state;
+    for(const p of s.residents){p.xp=300;p.stats.end=6;p.hp=100;}
+    s.rooms.push({...s.rooms[0],id:90,type:'workshop',level:1,floor:3,col:2,stored:0});
+    if(blocked==='feed')s.resources.scrap=100;
+    if(blocked==='identity')s.residents[1].id=s.residents[0].id;
+    if(blocked==='supply')s.rooms.find(r=>r.type==='water').unpowered=true;
+    const result=api.plan(api.model(v),cfg({development:true,workshop:true,partsTarget:12,workshopScrapReserve:100}),{},14);
+    assert.ok(!result.actions.some(a=>a.role==='workshop'),blocked);
+  }
+});
+
 test('手动收入前证据：缺少原状态、原房无整批、已领取奖励或付费档都不能生成领取凭据',()=>{
   const view=campaignView(),request={idempotencyKey:'manual-income-key',action:{type:'collect',roomId:1}};
   assert.equal(api.manualIncome(null,request),null);
@@ -43,6 +108,48 @@ test('收入统计核心：只解析原领取回执，支持数字顺序与千�
   view.state.tutorial.claimed=[];assert.equal(api.income(p,200,request,body),null);
 });
 const run=(v,c={},record={})=>api.plan(api.model(v),cfg(c),record,14);
+
+test('医疗携针修复：先扣本轮出发携针再决定撤岗，连续派遣不反复派回护士',()=>{
+  const v=campaignView(),s=v.state;
+  s.rooms.push({...s.rooms[0],id:30,type:'medbay',floor:3,col:2,level:1});
+  s.residents[4].roomId=30;s.resources.stimpak=7.8;
+  const record={roles:[{id:5,room:30,role:'medical',at:now-1000}]},flags={medical:true,explore:true};
+  const first=run(v,flags,record),trip=first.actions.find(a=>a.kind==='explore-start');assert.ok(trip);
+  assert.ok(!first.actions.some(a=>a.role==='medical-release'));
+  s.resources.stimpak-=trip.targets[2];s.residents.find(p=>p.id===trip.id).away={kind:'explore'};
+  s.explorers=[{id:99,residentId:trip.id,startedAt:now,recalledAt:null,returnAt:null,abyss:false,tier:0}];
+  const second=run(v,flags,record);assert.ok(!second.actions.some(a=>a.id===5));assert.ok(second.reserved.includes(5));
+});
+
+test('医疗携针修复：未能实际选出派遣或携针后仍充足时可以释放护士',()=>{
+  const v=campaignView(),s=v.state;
+  s.rooms.push({...s.rooms[0],id:30,type:'medbay',floor:3,col:2,level:1});s.residents[4].roomId=30;
+  const record={roles:[{id:5,room:30,role:'medical',at:now-1000}]};s.resources.stimpak=7.8;
+  s.residents[5].away={kind:'explore'};
+  s.explorers=[{id:99,residentId:6,startedAt:now,recalledAt:null,returnAt:null,abyss:false,tier:0}];
+  const held=run(v,{medical:true,explore:true},record);
+  assert.ok(!held.actions.some(a=>a.kind==='explore-start'));assert.ok(held.actions.some(a=>a.role==='medical-release'));
+  s.resources.stimpak=10;s.residents[5].away=null;s.explorers=[];
+  const enough=run(v,{medical:true,explore:true},record);
+  assert.ok(enough.actions.some(a=>a.kind==='explore-start'));assert.ok(enough.actions.some(a=>a.role==='medical-release'));
+});
+test('组合身份：同名居民按编号规划治疗、防守和外出，DOM层另核对编号',()=>{
+  const v=campaignView(),s=v.state,a=s.residents[4],b=s.residents[5];a.name=b.name='吴木木';a.xp=27;a.hp=118;
+  let guard=api.guard(api.model(v),cfg({defense:true}),[],[],{},true);
+  assert.ok(guard.residents.includes(a.id)&&guard.residents.includes(b.id));
+  s.rooms[3].incident={kind:'raiders'};
+  const defense=api.defense(api.model(v),cfg({defense:true}));
+  assert.ok(defense.actions.some(c=>c.id===a.id)&&defense.actions.some(c=>c.id===b.id));
+  s.rooms[3].incident=null;a.hp=20;
+  assert.equal(run(v,{medical:true}).actions.find(c=>c.kind==='stimpak')?.id,a.id);
+  a.hp=118;
+  assert.ok(run(v,{explore:true,quests:true}).actions.some(action=>
+    action.kind==='explore-start'&&[a.id,b.id].includes(action.id)||action.kind==='quest-start'&&action.team.some(id=>[a.id,b.id].includes(id))));
+  a.xp=b.xp;
+  guard=api.guard(api.model(v),cfg({defense:true}),[],[],{},true);
+  assert.ok(guard.residents.includes(a.id)&&guard.residents.includes(b.id));
+  a.hp=20;assert.ok(run(v,{medical:true}).actions.some(c=>c.kind==='stimpak'&&c.id===a.id));
+});
 test('收入统计核心：每日与成就必须对应已领取目标，日切后旧每日回执不归入新日奖励',()=>{
   const view=campaignView();view.state.daily.claimed=[0];view.state.achievements=['first'];
   const p={id:'income-daily',kind:'daily',targets:[0],vaultNo:77,before:{serverTime:now-1000,day:'2026-10-10'}};
@@ -272,7 +379,7 @@ test('收益完善：满级且满赛季的纯废料任务不抵离岗损失时�
   s.residents[4].roomId=null;s.residents[5].roomId=null;
   assert.ok(run(v,{quests:true}).actions.some(a=>a.kind==='quest-start'),'有零废料离岗成本的人选，正收益任务可选');
   for(const p of s.residents.filter(p=>p.id>=4))p.roomId=4;
-  s.season.points=4499;assert.ok(run(v,{quests:true}).actions.some(a=>a.kind==='quest-start'),'仍需有效积分时沿用积分优先');
+  s.season.points=1799;assert.ok(run(v,{quests:true}).actions.some(a=>a.kind==='quest-start'),'仍需有效积分时沿用积分优先');
   s.season.points=4500;v.env.quests[0].rewards.parts=1;
   assert.ok(run(v,{quests:true}).actions.some(a=>a.kind==='quest-start'),'未给零件虚构废料兑换价');
 });
@@ -336,6 +443,52 @@ test('汽水效率：资格时长随网页变化，包含一半返程；旧自�
   v.drops.minMinutes=360;const p=v.state.residents[3];p.away={kind:'explore'};
   v.state.explorers=[{id:11,residentId:4,tier:0,abyss:false,startedAt:now-7*3600000,recalledAt:null,returnAt:null}];
   assert.ok(!api.plan(api.model(v),c,{trips:[{id:11,resident:4,hours:12,at:now-7*3600000}]},14).actions.some(a=>a.kind==='explore-recall'));
+});
+const adoptionScene=()=>{
+  const v=campaignView();v.drops.minMinutes=120;
+  v.state.residents[4].away={kind:'explore'};
+  const e={id:194,residentId:5,tier:0,abyss:false,startedAt:now-3*3600000,recalledAt:null,returnAt:null};
+  v.state.explorers=[e];return {v,e,c:cfg({explore:true,sodaEfficiency:true,hours:6})};
+};
+test('接管时长：新派遣和接管共同使用网页两小时资格，固定模式也共用规则',()=>{
+  const {v,e,c}=adoptionScene(),m=api.model(v);
+  for(const sodaEfficiency of [true,false]){
+    const flags={...c,sodaEfficiency},trip=api.adopt(m,e,flags);
+    assert.equal(trip.hours,api.efficiency(m,flags).hours);assert.equal(trip.hours,sodaEfficiency?2:6);
+    const fresh=campaignView();fresh.drops.minMinutes=120;
+    assert.equal(api.plan(api.model(fresh),flags,{},14).actions.find(a=>a.kind==='explore-start')?.hours,trip.hours);
+    assert.equal(trip.startedAt,e.startedAt);assert.equal(trip.durationPolicy,1);
+  }
+});
+test('接管时长：旧六小时修成两小时后立即到期，保留出发和接管时点且不重复迁移',()=>{
+  const {v,e,c}=adoptionScene(),m=api.model(v),old={id:e.id,resident:e.residentId,hours:6,at:e.startedAt+60000,
+    startedAt:e.startedAt,vaultNo:v.vaultNo,source:'existing-state'},before=JSON.stringify(old);
+  const trip=api.adopt(m,e,c,old);
+  assert.equal(trip.hours,2);assert.equal(trip.startedAt,old.startedAt);assert.equal(trip.at,old.at);
+  assert.equal(JSON.stringify(old),before);assert.equal(api.adopt(m,e,c,trip),null);
+  const plan=api.plan(m,c,{trips:[trip]},14);
+  assert.ok(plan.actions.some(a=>a.kind==='explore-recall'&&a.targets[0]===194));
+  assert.equal(plan.trips[0].recallAt,e.startedAt+2*3600000);
+  assert.equal(api.record({roles:[],trips:[trip],attempts:[],heals:[],trainingRest:[]}),true);
+  v.serverTime+=3600000;v.drops.minMinutes=360;
+  assert.equal(api.adopt(api.model(v),e,c,trip),null);
+  assert.equal(api.adopt(m,e,c,{...old,hours:1}).hours,1,'迁移不得延长旧期限');
+});
+test('接管时长：有原计划、已返程、深渊、身份不符和不可读规则均不改写',()=>{
+  for(const change of ['original','returning','abyss','vault','startedAt','resident','invalid-rules','unknown-policy']){
+    const {v,e,c}=adoptionScene(),old={id:e.id,resident:e.residentId,hours:6,at:e.startedAt+60000,
+      startedAt:e.startedAt,vaultNo:v.vaultNo,source:'existing-state'};
+    if(change==='original')delete old.source;
+    if(change==='returning'){e.recalledAt=now-1000;e.returnAt=now+3600000;}
+    if(change==='abyss')e.abyss=true;
+    if(change==='vault')old.vaultNo++;
+    if(change==='startedAt')old.startedAt++;
+    if(change==='resident')old.resident++;
+    if(change==='invalid-rules')v.drops.enabled=false;
+    if(change==='unknown-policy')old.durationPolicy=2;
+    const before=JSON.stringify([v,old]);assert.equal(api.adopt(api.model(v),e,c,old),null,change);
+    assert.equal(JSON.stringify([v,old]),before);
+  }
 });
 test('汽水效率：只比较原上限与已解锁范围内概率，非单调和并列概率不盲选更深区域',()=>{
   const v=campaignView();v.state.depth=30;v.drops.tierPermille=[50,80,60,80];
@@ -413,6 +566,7 @@ test('综合发展：医疗保留线和用针间隔，电台尊重目标与15人
   const plan=run(v,{medical:true});assert.equal(plan.choice.kind,'stimpak');
   assert.notEqual(run(v,{medical:true},{heals:[{id:5,at:now}]}).choice?.kind,'stimpak');
   v.state.resources.stimpak=2;assert.notEqual(run(v,{medical:true}).choice?.kind,'stimpak');
+  v.state.rooms.find(r=>r.type==='scrap').width=2;v.state.residents.slice(4).forEach(p=>p.roomId=4);
   const radio=run(v,{radio:true});assert.ok(radio.projects.some(p=>p.type==='radio'));
   assert.equal(api.plan(api.model(v),cfg({radio:true}),{},6).projects.some(p=>p.type==='radio'),false);
 });
@@ -424,9 +578,82 @@ test('综合发展：预留人手驱动医疗/训练建设，下挖为探险位�
   assert.ok(campaign.projects.some(p=>p.milestone===8));assert.ok(plan.candidates.some(c=>c.kind==='dig'&&c.floor===8));
   const reserved=new Set(campaign.reserved);assert.ok(campaign.projects.filter(p=>p.person).every(p=>!reserved.has(p.person)));
 });
-test('综合发展：武器和战斗服只用闲置装备，不能把别人的装备抢走',()=>{
+test('出征武器交接：生产者持有的好武器优先交给实际探险者，岗位不变且确认后不反复倒手',()=>{
   const v=campaignView();v.state.items=[{id:1,slot:'weapon',damage:[4,8]},{id:2,slot:'weapon',damage:[99,99]}];v.state.residents[0].weaponId=2;
-  const plan=run(v,{explore:true,combatGear:true});assert.equal(plan.choice.kind,'equip');assert.equal(plan.choice.slot,'weapon');assert.equal(plan.choice.item,1);
+  const before=JSON.stringify(v),plan=run(v,{explore:true,combatGear:true}),a=plan.choice;
+  assert.equal(a.kind,'equip');assert.equal(a.slot,'weapon');assert.equal(a.item,2);assert.equal(a.fromOwner,1);
+  assert.equal(JSON.stringify(v),before);assert.ok(plan.actions.some(c=>c.kind==='explore-start'&&c.id===a.id));
+  v.state.residents[0].weaponId=null;v.state.residents.find(p=>p.id===a.id).weaponId=2;
+  const next=run(v,{explore:true,combatGear:true});assert.equal(next.choice.kind,'explore-start');assert.equal(next.choice.id,a.id);
+  assert.equal(v.state.residents[0].roomId,1);
+});
+test('出征武器交接：最强武器影响留守时比较次强武器，原持有者战力必须扣除',()=>{
+  const v=guardedView(),s=v.state;s.residents[4].weaponId=null;
+  s.items=[{id:10,slot:'weapon',damage:[30,30]},{id:11,slot:'weapon',damage:[5,5]}];
+  s.residents[0].weaponId=10;s.residents[1].weaponId=11;
+  const team=[s.residents[4]],flags=cfg({defense:true}),m=api.model(v);
+  const strong=api.guard(m,flags,[5],[{id:5,slot:'weapon',item:10}],{});
+  assert.equal(strong.totalPower,118);assert.equal(strong.power,50);assert.equal(strong.allowed,false);
+  const plan=api.departure(m,team,true,[],new Map(),{},[],p=>api.guard(m,flags,[5],p.changes,{}).allowed);
+  assert.equal(plan.changes[0].item,11);assert.equal(plan.changes[0].fromOwner,2);
+  assert.equal(api.guard(m,flags,[5],plan.changes,{}).power,100);
+  assert.ok(api.transfer(m,plan.changes[0],cfg({combatGear:true,defense:true}),{}));
+});
+test('出征武器交接边界：外出、事件、重复归属、先前出征预留、未知原单及关闭装备均不转交',()=>{
+  for(const kind of ['away','incident','duplicate','reserved','pending','off','manual','dead','child']){
+    const v=campaignView(),s=v.state;s.items=[{id:10,slot:'weapon',damage:[11,18]}];s.residents[0].weaponId=10;
+    const record={},departing=[];
+    if(kind==='away')s.residents[0].away={kind:'explore',id:1};
+    if(kind==='incident')s.rooms[0].incident={kind:'leak'};
+    if(kind==='duplicate')s.residents[1].weaponId=10;
+    if(kind==='reserved')departing.push(1);
+    if(kind==='pending')record.pending={kind:'equip'};
+    if(kind==='manual')record.defenseManual=[1];
+    if(kind==='dead')s.residents[0].deadAt=v.serverTime-1;
+    if(kind==='child')s.residents[0].adultAt=v.serverTime+3600000;
+    const plan=api.departure(api.model(v),[s.residents[4]],kind!=='off',[],new Map(),record,departing,()=>true);
+    assert.equal(plan.changes.length,0,kind);
+  }
+});
+test('出征武器交接：闲置最强枪也须通过留守检查，不能挡住更弱但安全的枪',()=>{
+  const v=guardedView(),s=v.state;s.residents[4].weaponId=null;s.items=[{id:10,slot:'weapon',damage:[99,99]},{id:11,slot:'weapon',damage:[1,3]}];
+  const team=[s.residents[4]],m=api.model(v),flags=cfg({defense:true});
+  const result=api.departure(m,team,true,[],new Map(),{},[],p=>api.guard(m,flags,[5],p.changes,{}).allowed);
+  assert.equal(result.changes[0].item,11);assert.ok(api.guard(m,flags,[5],result.changes,{}).allowed);
+});
+test('出征武器交接：同轮前一队已带走的现持武器不得被下一队缓存借用',()=>{
+  const v=campaignView(),s=v.state;s.residents[4].weaponId=10;s.items=[{id:10,slot:'weapon',damage:[11,18]}];
+  const plan=run(v,{explore:true,quests:true,combatGear:true,chance:75});
+  assert.ok(plan.actions.some(a=>a.kind==='explore-start'&&a.id===5));
+  assert.ok(!plan.actions.some(a=>a.kind==='equip'&&a.item===10));
+});
+test('出征武器交接回执：必须确认唯一新归属，重复占用及错误原请求不算成功',()=>{
+  const v=campaignView(),s=v.state;s.items=[{id:10,slot:'weapon',damage:[11,18]}];s.residents[0].weaponId=10;
+  const choice=run(v,{explore:true,combatGear:true}).choice;
+  const p={id:'transfer',kind:'equip',targets:choice.targets,vaultNo:77,campaignKey:'native-key',
+    before:{serverTime:now,campaign:{choice,ids:[],hp:142}}};
+  assert.ok(api.valid(p));assert.ok(!api.valid({...p,before:{...p.before,campaign:{...p.before.campaign,choice:{...choice,departureTeam:[1,choice.id]}}}}));
+  const request={idempotencyKey:'native-key',action:api.action('equip',choice.targets)};
+  const receiver=s.residents.find(p=>p.id===choice.id);receiver.weaponId=10;
+  assert.equal(api.proof(p,200,request,{view:v}),null,'原持有者未卸下不能确认交接');
+  s.residents[0].weaponId=null;
+  const proof=api.proof(p,200,request,{view:v});assert.ok(proof);p.result={campaignProof:proof};
+  assert.ok(api.confirmed(p,api.model(v)));s.residents[0].weaponId=10;assert.equal(api.confirmed(p,api.model(v)),false);
+  assert.equal(api.proof(p,200,{...request,idempotencyKey:'different-key'},{view:v}),null);
+});
+test('出征武器交接：三人队每枪仅用一次，归来武器可交下一队，出发后不可挪用',()=>{
+  const v=campaignView(),s=v.state;
+  s.items=[{id:10,slot:'weapon',damage:[11,18]},{id:11,slot:'weapon',damage:[8,10]}];
+  s.residents[0].weaponId=10;s.residents[1].weaponId=11;
+  const team=s.residents.slice(3),before=JSON.stringify(v);
+  const plan=api.departure(api.model(v),team,true,[],new Map(),{},[],()=>true);
+  assert.equal(plan.changes.length,2);assert.equal(new Set(plan.changes.map(c=>c.item)).size,2);assert.equal(JSON.stringify(v),before);
+  for(const c of plan.changes){s.residents.find(p=>p.id===c.fromOwner).weaponId=null;s.residents.find(p=>p.id===c.id).weaponId=c.item;}
+  for(const p of team)p.away={kind:'quest',id:99};
+  assert.equal(api.departure(api.model(v),[s.residents[0]],true,[],new Map(),{},[],()=>true).changes.length,0);
+  for(const p of team)p.away=null;
+  const next=api.departure(api.model(v),[s.residents[0]],true,[],new Map(),{},[],()=>true);
+  assert.equal(next.changes[0].item,10);assert.ok(team.some(p=>p.id===next.changes[0].fromOwner));
 });
 
 test('规则纠正：先计入闲置装备再判断任务门槛，关闭装备仍按当前战力',()=>{
@@ -473,10 +700,10 @@ test('规则纠正：三人争用服装的结果与小库存穷举一致，封�
   }
 });
 
-test('规则纠正：待产父母可以继续外出；未确认父母的待产房间与正在恋爱的另一对仍保护',()=>{
+test('家庭外出承诺：待产父母、未确认父母的待产房间与正在恋爱的另一对均保护',()=>{
   const v=campaignView();v.state.births=[{id:1,roomId:5,parents:[5,6],dueAt:now+3600000}];
   for(const p of v.state.residents.filter(p=>p.id>=5)){p.roomId=5;p.familyCooldownUntil=now+3600000;}
-  assert.equal(run(v,{explore:true}).choice?.id,5);
+  assert.equal(run(v,{explore:true}).choice?.id,4);
   v.state.births[0].parents=undefined;assert.equal(run(v,{explore:true}).choice?.id,4);
   v.state.births[0].parents=[1,2];v.state.residents[4].romance={partnerId:6};v.state.residents[5].romance={partnerId:5};
   assert.equal(run(v,{explore:true}).choice?.id,4);
@@ -557,10 +784,10 @@ test('发展决策：比较成功率、已知关卡耗时和人数后的积分�
 });
 
 test('发展决策：积分效率显示可复算且不把满档后的溢出积分当收益，0档装备归来可领取',()=>{
-  const v=campaignView();v.state.season.points=4495;
+  const v=campaignView();v.state.season.points=1795;
   const p=run(v,{quests:true}).choice,a=p.assessment;
   assert.equal(a.hours,3);assert.equal(a.personHours,a.hours*p.team.length);
-  assert.equal(a.seasonRate,a.chance*5/a.personHours);assert.equal(a.nextSodaPoints,4500);
+  assert.equal(a.seasonRate,a.chance*5/a.personHours);assert.equal(a.nextSodaPoints,1800);
   assert.match(p.reason,/未计返程和疗伤/);
   const team=[5,6];for(const id of team)v.state.residents.find(p=>p.id===id).away={kind:'quest'};
   v.state.quests=[{id:99,team,status:'returning',returnAt:now-1,questId:'w1',snapshot:{...v.env.quests[0],rewards:{scrap:1,parts:0,itemTier:0}}}];

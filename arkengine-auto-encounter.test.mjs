@@ -19,6 +19,8 @@ import { shelterStaffTests } from './arkengine-shelter-staff.tests.mjs';
 import { shelterRevivalTests } from './arkengine-shelter-revival.tests.mjs';
 import { shelterFutureEmploymentTests } from './arkengine-shelter-future-employment.tests.mjs';
 import { shelterParentTraining72Tests } from './arkengine-shelter-parent-training72.tests.mjs';
+import { shelterParentPreparationTests } from './arkengine-shelter-parent-preparation.tests.mjs';
+import { shelterLog127Tests } from './arkengine-shelter-log127.tests.mjs';
 import { shelterPlanningBrowserTests } from './arkengine-shelter-planning-browser.tests.mjs';
 import { shelterConfirmationTests } from './arkengine-shelter-confirmation.tests.mjs';
 import { shelterProductionTests } from './arkengine-shelter-production.tests.mjs';
@@ -683,6 +685,8 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     await shelterRevivalTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey});
     await shelterFutureEmploymentTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterParentTraining72Tests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
+    await shelterParentPreparationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
+    await shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterPlanningBrowserTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey});
     await shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey,secondShelter});
     await shelterProductionTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive });

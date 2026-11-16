@@ -22,6 +22,29 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
             hash:e.data.content.sha256,readings:e.data.readings.length})),bytes:rows.reduce((n,e)=>n+e.bytes,0),rows:rows.length});};
         tx.oncomplete=()=>db.close();};});`;
   const setup=async()=>{await setupStock(quiet);await evaluate(helpers);};
+  await t.test('日志127留存：旧版高优先级页面噪声重新分类，规划计时与股市现场刷新后完整保留',async()=>{
+    await setup();await evaluate(`(async()=>{
+      for(let i=0;i<9;i++)await __arkTestLogs.append({at:clock++,group:'expedition',type:'page-lifecycle',
+        data:{event:'load',online:true,gapMs:1,payload:'x'.repeat(1900000)}},null,false);
+      await __arkTestLogs.append({at:clock++,group:'expedition',type:'shelter-confirmed',receiptId:'keep-receipt',data:{}},null,false);
+      await new Promise((resolve,reject)=>{const r=indexedDB.open('arkengine-auto-log',1);r.onsuccess=()=>{
+        const db=r.result,tx=db.transaction(['events','meta'],'readwrite'),c=tx.objectStore('events').openCursor();
+        c.onsuccess=()=>{const x=c.result;if(!x)return;if(x.value.type==='page-lifecycle')x.update({...x.value,priority:2});x.continue();};
+        const b=tx.objectStore('meta').get('budget');b.onsuccess=()=>{b.result.priorityVersion=5;tx.objectStore('meta').put(b.result);};
+        tx.oncomplete=()=>{db.close();resolve();};tx.onabort=()=>reject(tx.error);};});
+      for(const type of ['shelter-planning','shelter-family-planning'])await __arkTestLogs.append({at:clock++,group:'expedition',type,
+        data:{status:'ready',requestedAt:clock-3000,finishedAt:clock-1,timingScope:'request-to-result-wall-clock'}},null,false);
+      await __arkTestLogs.append({at:clock++,group:'expedition',pageId:'priority-test',type:'stock-decision',data:{diagnosticId:'kept-stock',totalParts:1}},null,false);
+      await __arkTestLogs.append({at:clock++,group:'expedition',pageId:'priority-test',type:'stock-decision-detail',data:{diagnosticId:'kept-stock',part:0,totalParts:1,rows:[{reason:'holding'}]}},null,false);
+      for(let i=0;i<4;i++)await retentionPut(clock++,'pressure-'+i,{price:1300+i,padding:'x'.repeat(1900000)});
+    })()`);
+    await reloadStock();const full=await evaluate('__arkTestLogs.export()'),events=full.days.flatMap(d=>d.events);
+    assert.equal(full.stockDiagnosticCoverage.frames.find(f=>f.diagnosticId==='kept-stock')?.complete,true);
+    for(const type of ['shelter-planning','shelter-family-planning'])assert.ok(events.some(e=>e.type===type&&e.data.requestedAt<e.data.finishedAt));
+    assert.equal(events.filter(e=>e.receiptId==='keep-receipt').length,1);
+    assert.ok(events.filter(e=>e.type==='page-lifecycle'&&e.data.payload).length<9);
+    assert.ok(full.estimatedEventBytes<=full.budgetBytes);
+  });
   await t.test('跨玩法日志留存：旧行情不能挤掉较新避难所现场，整轮淘汰明确告警且回执保留',async()=>{
     await setup();
     await evaluate(`(async()=>{
@@ -138,7 +161,7 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
     finally{await evaluate('IDBObjectStore.prototype.get=originalSummaryGet;');}
     assert.equal(await evaluate(`(await window.__arkTestLogs.summary('expedition')).totals['代币']`),19);
   });
-  await t.test('股市诊断留存：迁移旧优先级后容量压力保留成套明细与原始行情，真实缺片可见',async()=>{
+  await t.test('股市诊断留存：迁移旧优先级后成套明细与行情同级留存，真实缺片可见',async()=>{
     await setup();await evaluate(`(async()=>{
       await retentionPut(clock,'original');
       window.putDiagnostic=async(id,payload='')=>{
@@ -173,8 +196,9 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
     assert.equal(coverage.frames.find(f=>f.diagnosticId==='pressure-11').complete,true);
     assert.equal(coverage.frames.find(f=>f.diagnosticId==='broken').missingParts,2);
     assert.ok(last.warnings.some(w=>/股市.*诊断分片不完整/.test(w)));
-    assert.equal(last.stockObservationCoverage.droppedReadings,0);
-    assert.equal(stockSnapshotsFromLog(last).length,1);assert.ok(last.estimatedEventBytes<=last.budgetBytes);
+    assert.equal(last.stockObservationCoverage.droppedReadings,1,'原始行情与诊断同级，容量不足时淘汰更早行情且报告缺口');
+    assert.throws(()=>stockSnapshotsFromLog(last),/No observation snapshots/,'无行情时不能以决策摘要冒充行情回放');
+    assert.ok(last.estimatedEventBytes<=last.budgetBytes);
   });
   await t.test('股市留存：相同行情合并读取，账户与设置变化分块，刷新不依赖旧页面基准',async()=>{
     await setup();const start=await evaluate('clock');
@@ -220,10 +244,10 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
       window.retentionError=await window.__arkTestLogs.export().then(()=>null,e=>e.message);})()`);
     assert.match(await evaluate('retentionError'),/integrity/);assert.equal((await evaluate('retentionPhysical()')).blocks.length,1);
   });
-  await t.test('股市留存：连续168小时变化行情与重复诊断在20MiB内保留，跨日不截掉起点',async()=>{
+  await t.test('股市留存：168小时同级诊断压力按时间淘汰，最新行情连续且缺口准确',async()=>{
     await setup();
     // Synthetic traffic: 67 models, twelve points each, changing every five minutes.
-    // Ordinary detail pressure is explicitly injected; this is capacity evidence, not a
+    // Equal-priority diagnostic pressure is explicitly injected; this is capacity evidence, not a
     // real 24-hour background run or real market profitability.
     await evaluate(`clock=Date.parse('2026-11-02T12:00:00+08:00');retentionOrigin=clock;
       window.retentionBusy=true;window.retentionRunError=null;window.retentionProgress=0;
@@ -235,15 +259,23 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
     await until(()=>evaluate('!retentionBusy'),'168-hour retention workload',300000);
     assert.equal(await evaluate('retentionRunError'),null);
     const summary=await evaluate(`(async()=>{const x=await window.__arkTestLogs.export(),f=x.days.flatMap(d=>d.events).filter(e=>e.type==='stock-observation');
-      const ids=new Set(f.map(e=>e.data.observationId));return {coverage:x.stockObservationCoverage,bytes:x.estimatedEventBytes,budget:x.budgetBytes,
+      const ids=new Set(f.map(e=>e.data.observationId)),details=x.days.flatMap(d=>d.events).filter(e=>e.type==='stock-decision-detail');
+      return {coverage:x.stockObservationCoverage,bytes:x.estimatedEventBytes,budget:x.budgetBytes,
         droppedDetails:x.days.reduce((n,d)=>n+d.dropped,0),frames:ids.size,allParts:f.every(e=>e.data.totalParts===1),
         first:f[0].data.at,last:f.at(-1).data.at,stocks:f[0].data.snapshot.stocks.length,ticks:f[0].data.snapshot.ticks.length,
+        origin:retentionOrigin,details:details.length,latestDetail:details.at(-1).data.diagnosticId,
         days:x.days.map(d=>d.day),mode:x.retentionMode};})()`);
-    assert.equal(summary.frames,2017);assert.equal(summary.last-summary.first,168*3600000);
+    assert.ok(summary.frames>0&&summary.frames<2017,'同级明细与行情超出20MiB后，不能再宣称七天行情完整');
+    assert.equal(summary.last,summary.origin+168*3600000);
+    assert.equal(summary.last-summary.first,(summary.frames-1)*300000,'保留的每五分钟行情必须连续');
+    assert.equal(summary.first,summary.origin+summary.coverage.droppedReadings*300000,'仅淘汰最早行情，首点与缺口计数严格一致');
+    assert.ok(summary.details>=summary.frames&&summary.details<=summary.frames+1,'同级明细与行情都保留最近记录');
+    assert.equal(summary.latestDetail,'synthetic-2016');
     assert.equal(summary.stocks,67);assert.equal(summary.ticks,804);assert.equal(summary.allParts,true);
     assert.ok(summary.bytes<=summary.budget);assert.ok(summary.droppedDetails>0);
-    assert.equal(summary.coverage.droppedReadings,0);assert.equal(summary.coverage.accounts[0].gapsOverTenMinutes.length,0);
-    assert.equal(summary.coverage.retainedPackedReadings,2017);assert.ok(summary.days.includes('2026-11-02'));
+    assert.equal(summary.coverage.acceptedReadings,2017);assert.equal(summary.coverage.droppedReadings,2017-summary.frames);
+    assert.equal(summary.coverage.accounts[0].gapsOverTenMinutes.length,0);
+    assert.equal(summary.coverage.retainedPackedReadings,summary.frames);assert.ok(summary.days.includes('2026-11-02'));
     console.log(JSON.stringify({kind:'stock-retention-168h',...summary,scope:'synthetic capacity and export, not real background continuity'}));
   });
 }

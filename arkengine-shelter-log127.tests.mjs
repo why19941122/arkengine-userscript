@@ -1,0 +1,70 @@
+import assert from 'node:assert/strict';
+import {campaignView,workshopChurnView} from './arkengine-shelter-campaign.fixture.mjs';
+import {readyCampaignConstructionScene} from './arkengine-shelter-growth-investment.fixture.mjs';
+
+export async function shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,drive,pulse}){
+  const state=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`,
+    pending=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))`,
+    done=`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`;
+  const flags={explore:false,quests:false,training:false,parentPreparation:false,medical:false,radio:false,combatGear:false,
+    defense:false,dailyGoals:false,help:false,craftDaily:false,caravanDaily:false,tier:0,hours:6,stimpaks:2,reserve:2,chance:70,attempts:1,trainTarget:6};
+  const scene=f=>`sm.view=${JSON.stringify(f.view)};clock=sm.view.serverTime;sm.fixtureSearch=location.search;
+    sm.ui20261109=true;sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;
+    localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+    localStorage.setItem('arkengine:auto-shelter:population:v1','17');
+    localStorage.setItem('arkengine:auto-shelter:population-continuous:v1','false');
+    localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(${JSON.stringify({...flags,...f.campaign})}));
+    localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(${JSON.stringify(f.construction)}));
+    localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(${JSON.stringify({...f.state,vaultNo:f.view.vaultNo,nextAt:0,note:'log127 fixture'})}));`;
+  const record=()=>({families:[],campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]}});
+  const disabled={build:false,upgrade:false,dig:false,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0};
+  await t.test('日志127浏览器：下挖期间旧楼层实际开工并补员，刷新不重复建房',async()=>{
+    const view=workshopChurnView(),s=view.state;s.resources.scrap=800;s.residents.find(p=>p.id===21).roomId=4;
+    for(const p of s.residents.filter(p=>[35,36].includes(p.id))){p.roomId=5;p.parents=[1,2];}
+    s.digging={floor:s.depth+1,doneAt:view.serverTime+3*3600000};
+    await setupShelter(scene({view,state:record(),campaign:{},construction:{...disabled,build:true}}));
+    await drive(`sm.calls.some(c=>c.type==='build'&&c.room==='scrap')`,'old-floor employment starts',220);
+    await drive(done,'construction visit completes',220);
+    const builds=await evaluate(`sm.calls.filter(c=>c.type==='build')`);assert.equal(builds.length,1);
+    assert.ok(builds[0].floor<=s.depth);
+    await pulse(11*60000);await evaluate(`sm.view.state.lastSettledAt=clock;
+      document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+sm.fixtureSearch);`);
+    await reloadShelter();await drive(`sm.calls.some(c=>c.type==='assign'&&[35,36].includes(c.residentId))`,'employment after construction',220);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='build').length`),1);
+  });
+  await t.test('日志127浏览器：探险携针跨六支阈值，护士保持原岗且刷新不重复派遣',async()=>{
+    const view=campaignView(),s=view.state;s.resources.stimpak=7.8;
+    s.rooms.push({...s.rooms[0],id:30,type:'medbay',floor:3,col:2,level:1});s.residents[4].roomId=30;
+    const stateValue=record();stateValue.campaign.roles=[{id:5,room:30,role:'medical',at:view.serverTime-1000}];
+    await setupShelter(scene({view,state:stateValue,campaign:{explore:true,medical:true},construction:disabled}));
+    await drive(`sm.calls.some(c=>c.type==='explore_start')`,'departure takes needles',200);await drive(done,'nurse kept',220);
+    assert.equal(await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===5)`),false);
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===5).roomId'),30);
+    const count=await evaluate(`sm.calls.filter(c=>c.type==='explore_start').length`);
+    // Let the completed SPA return clear its navigation journal before a new visit.
+    await pulse(1000);
+    await evaluate(`document.querySelector('a[href="/shelter"]').click();history.replaceState({},'','/shelter'+sm.fixtureSearch);`);
+    await reloadShelter();await drive(done,'reload keeps nurse',220);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='explore_start').length`),count);
+    assert.equal(await evaluate(`sm.calls.some(c=>c.type==='assign'&&c.residentId===5)`),false);
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===5).roomId'),30);
+  });
+  await t.test('日志127浏览器：已完成生产训练跨原截止边界仍一次返岗，未知原单保持防重',async()=>{
+    for(const unknown of [false,true]){
+      const f=readyCampaignConstructionScene(),s=f.view.state,p=s.residents.find(p=>p.id===5);
+      Object.assign(p,{roomId:90,training:0});p.stats.end=2;f.construction=disabled;
+      f.state.campaign.roles=[{id:5,room:90,role:'training',purpose:'production',stat:'end',base:1,
+        at:f.view.serverTime-3600000,until:f.view.serverTime+620000,windowEnd:f.view.serverTime+86400000,destination:4}];
+      await setupShelter(scene(f)+`sm.quickAssign=false;sm.assignUnknown=${unknown};`);
+      await drive(`!!document.querySelector('[data-staff-dialog="5"]')`,'completed training return dialog',180);
+      await pulse(30000);
+      await drive(unknown?`!!${pending}&&sm.calls.some(c=>c.type==='assign'&&c.residentId===5)`:
+        `sm.view.state.residents.find(p=>p.id===5).roomId===4&&!${pending}`,'return submitted across old timer',220);
+      assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
+        e.type==='shelter-execution-evidence'&&e.data.targets?.[0]===5&&e.data.reason==='deadline')`),false);
+      await reloadShelter();await drive(done,'return refresh',220);
+      assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.residentId===5&&c.roomId===4).length`),1);
+      if(unknown)assert.deepEqual(await evaluate(`${pending}.targets`),[5,4]);
+    }
+  });
+}

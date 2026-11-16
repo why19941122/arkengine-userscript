@@ -27,6 +27,28 @@ function scene(stat='end',base=5){
     run:()=>api.plan(api.model(v),cfg,record,14)};
 }
 
+test('人口训练协调修复：普通生产训练不能吃掉下一人口口粮，补足后恢复入训',()=>{
+  const x=scene('agi'),diner=x.s.rooms.find(r=>r.id===2),worker=x.s.residents.find(p=>p.id===2);
+  diner.level=1;worker.stats.agi=4;x.p.roomId=2;
+  Object.assign(x.s.rooms.find(r=>r.type==='storage'),{width:3,level:3});
+  const before=x.run().actions.find(a=>a.purpose==='production');assert.ok(before,'普通生产模式有真实可回本方案');
+  x.cfg.populationGrowth=true;
+  assert.ok(!x.run().actions.some(a=>a.purpose==='production'));
+  worker.stats.agi=6;
+  assert.ok(x.run().actions.some(a=>a.id===x.p.id&&a.purpose==='production'),'下一人口口粮补足后恢复');
+});
+
+test('人口训练协调修复：已开始的生产训练不因下一人口余量而中断',()=>{
+  const x=scene('agi'),worker=x.s.residents.find(p=>p.id===2);worker.stats.agi=4;
+  x.s.rooms.find(r=>r.id===2).level=1;x.p.roomId=2;
+  Object.assign(x.s.rooms.find(r=>r.type==='storage'),{width:3,level:3});
+  const a=x.run().actions.find(a=>a.purpose==='production');assert.ok(a);
+  x.p=x.s.residents.find(p=>p.id===a.id);x.p.roomId=a.room;x.p.training=.2;x.cfg.populationGrowth=true;
+  x.record.roles.push({id:a.id,room:a.room,role:'training',stat:a.stat,base:a.base,at:x.v.serverTime,
+    purpose:a.purpose,until:a.until,windowEnd:a.windowEnd,destination:a.destination});
+  assert.ok(!x.run().actions.some(a=>a.id===x.p.id&&a.role==='training-release'));
+});
+
 test('生产训练机会成本：长期能回本仍不能推迟当前实际工程攒料，资金就绪后重新准入',()=>{
   const x=scene();x.p.roomId=4;x.s.residents.find(p=>p.id===4).stats.end=10;
   x.s.residents.find(p=>p.id===6).away={kind:'explore'};

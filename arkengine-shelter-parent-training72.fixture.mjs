@@ -15,7 +15,9 @@ export function parentTraining72Scene(){
       p.stats={str:5,per:5,end:p.id===5?9:8,cha:9,int:5,agi:5,lck:5};p.familyCooldownUntil=now+6*3600000;
     }
   }
-  f.state.families=[{a:5,b:6,room:5}];f.campaign.training=true;f.campaign.trainTarget=10;
+  // This fixture isolates post-birth cooldown training; pre-breeding cohorts
+  // have their own end-to-end fixture and must not replace this baseline family.
+  f.state.families=[{a:5,b:6,room:5}];f.campaign.training=true;f.campaign.trainTarget=10;f.campaign.parentPreparation=false;
   return f;
 }
 export function setupParentTraining72(source,seed=parentTraining72Scene()){
