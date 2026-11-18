@@ -1396,6 +1396,36 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
       old.innerHTML='<h2>旧居民窗口</h2><button>关闭</button>';old.querySelector('button').onclick=()=>sm.calls.push({type:'old-dialog'});document.body.append(old);`);
     await drive(done,'hidden old dialog ignored');assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
   });
+  const retainedDialog=`const portal=document.createElement('div');portal.style.opacity='0';
+    portal.innerHTML='<div role="dialog" data-state="closed" style="pointer-events:none"><h2>旧居民窗口</h2><button>关闭</button></div>';
+    document.body.append(portal);portal.onclick=()=>sm.calls.push({type:'old-dialog'});`;
+  await t.test('避难所弹窗核验：已关闭且完全透明的残留窗口不阻断收取，也不点击残留按钮',async()=>{
+    for(const change of ['',`portal.firstChild.removeAttribute('data-state');portal.firstChild.setAttribute('data-closed','')`]){
+      await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;${retainedDialog}${change}`);
+      await drive(done,'retired portal does not block shelter');assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
+    }
+  });
+  await t.test('避难所弹窗核验：透明不等于关闭，未关闭、仍能拦截点击或背景仍锁定时继续等待',async()=>{
+    for(const change of [`portal.firstChild.dataset.state='open'`,`portal.querySelector('button').style.pointerEvents='auto'`,
+      `document.body.style.pointerEvents='none'`,`document.documentElement.setAttribute('data-base-ui-scroll-locked','')`,
+      `portal.insertAdjacentHTML('beforebegin','<div data-slot="dialog-overlay" style="position:fixed;inset:0"></div>')`]){
+      await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;${retainedDialog}${change}`);
+      for(let step=0;step<4;step++)await pulse(5000);
+      assert.equal(await evaluate('location.pathname'),'/shelter');assert.deepEqual(await evaluate('sm.calls'),[]);
+      const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-dialog-blocked')`);
+      assert.equal(events.length,1);assert.equal(events[0].data.transparent,1);
+      await evaluate(`document.body.style.pointerEvents='';document.documentElement.removeAttribute('data-base-ui-scroll-locked');
+        document.querySelector('[data-slot="dialog-overlay"]')?.remove();document.querySelector('[role="dialog"]').parentElement.remove();`);
+      await drive(done,'real blocker removed');assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all']);
+    }
+  });
+  await t.test('避难所弹窗核验：切页前的未知远征原单单独提示，不报弹窗也不清单',async()=>{
+    await setupShelter(`${quiet}sessionStorage.setItem('arkengine:auto-expedition:navigation:v1',JSON.stringify({from:'/shelter',to:'/activities/expedition',at:clock,reloaded:false}));
+      sessionStorage.setItem('expedition:99:manual',JSON.stringify({original:true}));`);
+    await drive(`${panel}.getElementById('status').textContent.includes('原生远征请求仍待核对')`,'navigation wait names pending request');
+    assert.equal(await evaluate('location.pathname'),'/shelter');assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem('expedition:99:manual'))`),{original:true});
+  });
   await t.test('避难所弹窗核验：普通公告自动关闭后继续，暂停避难所时保留公告',async()=>{
     const modal=`const d=document.createElement('div');d.setAttribute('role','dialog');
       d.innerHTML='<h2>公告</h2><p>今日更新说明</p><button>知道了</button>';

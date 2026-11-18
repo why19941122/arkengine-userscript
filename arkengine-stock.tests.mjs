@@ -409,6 +409,13 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     const splitLedger=JSON.parse(localStorage.getItem('arkengine:auto-stock:ledger:v1'));
     splitLedger.owned['1'].shares=26;splitLedger.owned['1'].cost=400;
     localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify(splitLedger));`;
+  await t.test('股市退出优化：停滞旧仓净赚2代币时整仓退出，只以原生回执入账',async()=>{
+    await setupStock(settings+owned+`km.saleReceipt=true;km.view.stocks[0].priceCents=1050;km.view.stocks[0].stale=true;`);
+    await drive(done,'stalled positive exit reconciled');
+    assert.deepEqual(await evaluate('km.calls.map(c=>[c.action,c.shares])'),[['sell',10]]);
+    assert.equal(await evaluate(`${ledger}.pending`),null);
+    assert.equal(await evaluate(`(${incomeTotals})['股市已实现盈亏']`),2);
+  });
   await t.test('股市退出优化：盈利仓列在前面也先实际卖出止损仓',async()=>{
     await setupStock(settings+owned+`km.saleReceipt=true;
       km.view.stocks.push({id:2,modelName:'止损仓',priceCents:800,volume24h:1000});

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.128
+// @version      1.17.129
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -870,15 +870,19 @@
       if(!m.view.enabled || !o || o.manual || !p || p.shares!==o.shares || p.costBasisTokens!==o.cost || !o.cost ||
           s.suspended || p.holdUntil && time(p.holdUntil)>now)return null;
       const net=quote(s.priceCents,p.shares,r.sellFeePct,false),t=trend(m.view,s,now);
-      if(net===null || !(net/o.cost>=1.08 || net/o.cost<=.94 || t?.direction==='down'))return null;
+      if(net===null)return null;
+      const stalledProfit=s.stale===true&&s.modelName===o.modelName&&net>o.cost&&net/o.cost<1.08;
+      if(!(stalledProfit || net/o.cost>=1.08 || net/o.cost<=.94 || t?.direction==='down'))return null;
       const shares=saleSharesFor(s.priceCents,r.sellFeePct,Math.min(r.maxTradeTokens,r.reserveTokens),p.shares);
+      if(stalledProfit&&shares!==p.shares)return {blocked:true,status:'liquidity',reason:`${s.modelName}停滞报价有净收益，但当前额度不足以整仓兑现，不拆单追微利`};
       if(shares<=0)return null;
       const proceeds=quote(s.priceCents,shares,r.sellFeePct,false);
       if(proceeds===null)return null;
       // Whole-token rounding applies to each partial sale, not to the original full position.
       if(proceeds===0)return {blocked:true,reason:`${s.modelName}当前可卖 ${shares} 股，扣费取整后预计净到账为0代币，暂不卖出`};
       return {action:'sell',stockId:s.id,modelName:s.modelName,shares,debit:0,
-        reason:net/o.cost<=.94?'净亏损达到6%':t?.direction==='down'?'行情转弱':'净收益达到8%'};
+        ...(stalledProfit?{exitPolicy:'stalled-profit'}:{}),
+        reason:stalledProfit?'停滞旧仓可整仓兑现扣费后净收益':net/o.cost<=.94?'净亏损达到6%':t?.direction==='down'?'行情转弱':'净收益达到8%'};
     }
     function exitPlans(m,ledger,now) {
       const rows=[];
@@ -922,14 +926,14 @@
         if(p.holdUntil&&time(p.holdUntil)>now)return result('locked','尚在持有期，到期后重新评估退出条件');
         if(!o.cost)return result('unconfirmed','原持仓成本为零，等待核对');
         const sale=sellPlan(m,s,ledger.owned,now);
-        if(sale?.blocked)return result('rounding',sale.reason);
+        if(sale?.blocked)return result(sale.status??'rounding',sale.reason);
         if(sale?.action){
           row.sellShares=sale.shares;row.estimatedSaleNet=quote(s.priceCents,sale.shares,m.rules.sellFeePct,false);
           return result('sell',`${sale.reason}，本次计划卖 ${sale.shares} 股${sale.shares<o.shares?'（按净到账额度分批，同额保留余股）':''}`);
         }
         const net=row.estimatedNet/o.cost,t=trend(m.view,s,now);
         return net>=1.08||net<=.94||t?.direction==='down'?result('liquidity','已触发退出条件，单笔额度、系统储备或金额范围暂不支持卖出'):
-          result('holding',s.stale?'行情停滞，按当前网站报价尚未触发净收益8%或净亏损6%的退出条件':
+          result('holding',s.stale?`行情停滞，整仓净到账高于成本 ${o.cost} 才兑现盈利；降至 ${Number(BigInt(o.cost)*94n/100n)} 或以下触发6%止损`:
             '尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
       });
     }
@@ -1242,6 +1246,9 @@
         if(saleAmount(stock.priceCents,a.shares,m.rules.sellFeePct)===null)return '原卖出金额超过网站整数范围，保留原请求等待核对';
         if(proceeds>m.rules.maxTradeTokens)return '原卖出当前净到账超过网站单笔额度，保留原请求等待恢复';
         if(proceeds>m.rules.reserveTokens)return '网站储备不足以支付原卖单，保留原请求等待恢复';
+        if(a.exitPolicy==='stalled-profit'&&position?.shares===p.beforeShares&&
+            (a.shares!==position.shares||proceeds<=position.costBasisTokens||!sellPlan(m,stock,ledger.owned,now)?.action))
+          return '原停滞获利卖单当前不满足整仓净收益退出条件，保留原单等待';
         return null;
       }
       const risk=riskReason(m,config,ledger,now);if(risk)return risk;
@@ -1509,7 +1516,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.128';
+  const SCRIPT_VERSION = '1.17.129';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -15671,7 +15678,7 @@
   },true);
   function closeShelterWork() {
     const work = shelterWork, dialog = work?.dialog;
-    if (!dialog?.isConnected) {
+    if (shelterDialogGone(dialog)) {
       shelterWork = null;
       // Retiring the previous job is a state transition, not proof that no work
       // remains. Re-enter the scheduler before it can finish this visit, including
@@ -15758,7 +15765,7 @@
   }
   function closeShelterSocial() {
     const w=shelterSocialWork;if(!w)return false;
-    if(w.dialog?.isConnected){
+    if(!shelterDialogGone(w.dialog)){
       const button=currentElement([...w.dialog.querySelectorAll('button')].filter(b=>/^(关闭|Close)$/.test(b.getAttribute('aria-label')||textOf(b))));
       return shelterCloseWindow(w,button,'shelter:help-close','关闭本轮参观窗口');
     }
@@ -16387,7 +16394,7 @@
     const work=shelterRescueWork,stops=shelterState.rescueStops||[],roster=stops.length?shelterRescueRoster(m):null;
     const choice=actions.find(action=>action.kind==='rescue'&&!shelterRescueSkipped.has(`${action.room}:${action.incidentKind}`)&&
       !stops.some(stop=>stop.room===action.room&&stop.kind===action.incidentKind&&stop.roster===roster));
-    if(work?.manual){shelterRescueSkipped.add(`${work.room}:${work.incidentKind}`);if(!work.dialog?.isConnected)shelterRescueWork=null;else say('事件房间已由你接手，等待关闭');return true;}
+    if(work?.manual){shelterRescueSkipped.add(`${work.room}:${work.incidentKind}`);if(shelterDialogGone(work.dialog))shelterRescueWork=null;else say('事件房间已由你接手，等待关闭');return true;}
     if(!choice||shelterStaffHold||shelterCampaignHeld||!shelterDefenseEnabled(shelterCampaign)){
       if(closeShelterRescue())return true;
       if(actions.some(action=>action.kind==='rescue')){finishShelter(m,'本轮无可继续核对的房间救援，不改走居民调岗',60000);return true;}
@@ -16396,7 +16403,7 @@
     if(work&&(work.room!==choice.room||work.incidentKind!==choice.incidentKind)){closeShelterRescue();return true;}
     const defer=note=>{shelterRescueSkipped.add(`${choice.room}:${choice.incidentKind}`);log.add('shelter-rescue-deferred',note,{room:choice.room});return true;};
     if(work){
-      if(!dialogs.length&&work.dialog&&!work.dialog.isConnected){shelterRescueWork=null;return true;}
+      if(!dialogs.length&&work.dialog&&shelterDialogGone(work.dialog)){shelterRescueWork=null;return true;}
       if(!work.dialog){if(Date.now()-work.at>5000)return defer('未能确认本轮打开的事件房间');return true;}
       if(dialogs.length!==1||dialogs[0]!==work.dialog||textOf(work.dialog.querySelector('h2'))!==work.title)return defer('事件房间身份变化');
       const button=buttonIn(work.dialog,/^一键救援\(最多\s*3\s*人\)$/);
@@ -16594,7 +16601,7 @@
   }
   function closeShelterRecall() {
     const w=shelterRecallWork;if(!w)return false;
-    if(w.dialog?.isConnected){
+    if(!shelterDialogGone(w.dialog)){
       const cancel=buttonIn(w.dialog,'取消');
       return shelterCloseWindow(w,cancel,'shelter:recall-cancel','撤销尚未发送的召回');
     }
@@ -17015,7 +17022,7 @@
       return closeShelterWork();
     }
     if (work.dialog) {
-      if (!work.dialog.isConnected) {
+      if (shelterDialogGone(work.dialog)) {
         if (!work.closing && !work.submitted) {
           if (shelterStaffMode === 'population' && shelterState.pair) stopPopulationPlan('居民窗口已关闭，本轮停止安排新配对');
           else holdShelterStaff('居民窗口已关闭，本轮尊重手动操作');
@@ -17931,6 +17938,7 @@
       shelterOpenDialog(shelterBuildWork,()=>button.click());
     });return true;
   }
+  let lastShelterDialogLog=null;
   function shelterStep() {
     const planningCache=shelterCampaignSchedule.cache={};
     queueMicrotask(()=>{if(shelterCampaignSchedule.cache===planningCache)delete shelterCampaignSchedule.cache;});
@@ -17942,6 +17950,16 @@
     if(shelterRecoverDialogs(dialogs))return;
     const ownDialog=dialogs.length===1&&[shelterWork,shelterBuildWork,shelterRecallWork,shelterSocialWork,shelterRescueWork].some(w=>w?.dialog===dialogs[0]);
     if (dialogs.length && !ownDialog) {
+      const transparent=dialogs.filter(shelterDialogTransparent).length;
+      const detail={count:dialogs.length,transparent,closed:dialogs.filter(shelterDialogClosed).length,
+        focused:dialogs.some(dialog=>dialog.contains(document.activeElement))};
+      const signature=JSON.stringify(detail),now=Date.now();
+      if(!lastShelterDialogLog||lastShelterDialogLog.signature!==signature&&now-lastShelterDialogLog.at>=60000){
+        lastShelterDialogLog={signature,at:now};log.add('shelter-dialog-blocked','避难所仍有未归属窗口，记录网页状态，不代点确认',detail);
+      }
+      if(transparent){
+        say('避难所仍有透明窗口未解除交互或背景锁定；等待网页关闭，不点击确认');return;
+      }
       if(shelterEnabled&&!stateFault('shelter'))handleNotice(dialogs,'避难所弹窗需要先处理，自动操作等待');
       else say('避难所弹窗需要先处理，自动操作等待');
       return;
@@ -18438,11 +18456,32 @@
     return Boolean(el?.isConnected && !el.closest('[hidden]') &&
       el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden');
   }
+  function shelterDialogTransparent(dialog) {
+    for(let node=dialog;node;node=node.parentElement)if(getComputedStyle(node).opacity==='0')return true;
+    return false;
+  }
+  function shelterDialogClosed(dialog) {
+    return (dialog.hasAttribute('data-closed')||dialog.dataset.state==='closed')&&
+      !dialog.hasAttribute('data-open')&&dialog.dataset.state!=='open';
+  }
+  function shelterDialogGone(dialog) {
+    if(!dialog?.isConnected)return true;
+    if(!shelterDialogClosed(dialog)||!shelterDialogTransparent(dialog)||dialog.contains(document.activeElement)||
+      dialog.querySelector('[role="dialog"],[role="alertdialog"],dialog[open]')||
+      document.querySelector(':modal,body[data-scroll-locked],[data-base-ui-scroll-locked]')||getComputedStyle(document.body).pointerEvents==='none'||
+      [...document.querySelectorAll('main,[role="main"],[role="tablist"][aria-label="避难所"]')].some(main=>main.getClientRects().length&&main.closest('[inert],[aria-hidden="true"],[data-base-ui-inert]'))||
+      [...document.querySelectorAll('[data-slot="dialog-overlay"],[data-slot="alert-dialog-overlay"]')].some(overlay=>rendered(overlay)&&getComputedStyle(overlay).pointerEvents!=='none'))return false;
+    return Boolean(dialog.closest('[inert]'))||[dialog,...dialog.querySelectorAll('*')].every(node=>getComputedStyle(node).pointerEvents==='none');
+  }
   function visible(el) {
-    return rendered(el) && !el.closest('[aria-hidden="true"]');
+    if(!rendered(el)||el.closest('[aria-hidden="true"]'))return false;
+    const closed=inShelter()&&el.closest(':is([role="dialog"],[role="alertdialog"]):is([data-state="closed"],[data-closed])');
+    return !closed||!shelterDialogGone(closed);
   }
   function usable(el) {
-    return visible(el) && !el.closest('[inert]') && !el.matches(':disabled, [aria-disabled="true"]');
+    if(!visible(el)||el.closest('[inert]')||el.matches(':disabled, [aria-disabled="true"]'))return false;
+    const dialog=inShelter()&&el.closest('[role="dialog"],[role="alertdialog"]');
+    return !dialog||!shelterDialogClosed(dialog)&&!shelterDialogTransparent(dialog);
   }
   function currentElement(elements) { return locator.pick(elements); }
   function section(title) {
@@ -18723,10 +18762,11 @@
     }
     const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : navigation.to === '/stock' ? '股市' : '远征';
     if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
-    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible) ||
-      plan || claimWait || farmEnabled&&farmPlan || nativePending().length) {
-      say(`等待切换${target}；先核对当前弹窗或原操作`); return true;
+    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)) {
+      say(`等待切换${target}；网页弹窗尚未关闭`);return true;
     }
+    const pendingReason=plan?'远征派遣':claimWait?'远征领取':farmEnabled&&farmPlan?'农场操作':nativePending().length?'原生远征请求':'';
+    if(pendingReason){say(`等待切换${target}；${pendingReason}仍待核对，不重复操作`);return true;}
     if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
       navigation = { ...navigation, reloaded: true, at: Date.now() };
       sessionStorage.setItem(NAV_JOURNAL, JSON.stringify(navigation));
