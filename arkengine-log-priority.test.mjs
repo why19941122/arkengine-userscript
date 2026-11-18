@@ -22,3 +22,9 @@ test('诊断优先级修复：真实故障、长等待、页面丢弃与所有�
     assert.equal(api.critical(event),true,JSON.stringify(event));assert.equal(api.priority(event),2);
   }
 });
+test('修炼低频心跳和长等待结束与业务摘要同级，不挤占原单',()=>{
+  for(const event of [{type:'heartbeat'},{type:'page-wait-ended',data:{blockedMs:90000}}]){
+    assert.equal(api.priority({...event,group:'cultivate'}),1.5);
+    assert.ok(api.priority({...event,group:'expedition'})<1.5);
+  }
+});

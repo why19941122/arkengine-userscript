@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.129
+// @version      1.17.131
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
@@ -258,6 +258,7 @@
     let state = loadState(sessionStorage, key, null, scope, v => timedState(v) &&
       (v.refreshes === undefined || Number.isInteger(v.refreshes) && v.refreshes >= 0 && v.refreshes <= PAGE_REFRESH_DELAYS.length) &&
       (v.since === undefined || Number.isFinite(v.since) && v.since >= 0) &&
+      ['heldAt','lastRefreshAt'].every(field=>v[field]==null||Number.isFinite(v[field])&&v[field]>=0) &&
       ['recoverable', 'exhaustedLogged'].every(key => v[key] === undefined || typeof v[key] === 'boolean'));
     let waiting = false;
     function snapshot() {
@@ -267,12 +268,19 @@
       const delay = state.recoverable === true ? PAGE_REFRESH_DELAYS[attempt] :
         state.recoverable === false && !attempt ? 90000 : null;
       return { scope, observedSince: state.since ?? state.at, blockedMs: Math.max(0, Date.now() - (state.since ?? state.at)),
-        attempt, limit, nextAt: delay == null ? null : state.at + delay,
-        lastRefreshAt: attempt ? state.at : null };
+        attempt, limit, nextAt: delay == null || state.heldAt != null ? null : state.at + delay,
+        lastRefreshAt: attempt ? (state.lastRefreshAt ?? state.at) : null };
     }
     return {
       snapshot,
       begin() { waiting = false; },
+      suspend() {
+        waiting = true;
+        if (state && state.heldAt == null) {
+          state = {...state, heldAt:Date.now(), lastRefreshAt:snapshot().lastRefreshAt};
+          sessionStorage.setItem(key, JSON.stringify(state));
+        }
+      },
       finish() { if (!waiting) this.clear('check-advanced'); },
       clear(cause = 'manual') {
         if (!state) return;
@@ -282,6 +290,10 @@
       },
       wait(reason, safe, say, pause, recoverable = false, beforeReload = null) {
         waiting = true;
+        if (state?.heldAt != null) {
+          state.at += Math.max(0, Date.now() - state.heldAt); delete state.heldAt;
+          sessionStorage.setItem(key, JSON.stringify(state));
+        }
         if (!navigator.onLine) { say('网络离线，等待连接恢复'); return; }
         if (recoverable) safe &&= !document.querySelector('[role="dialog"], [role="alertdialog"]');
         if (!state || state.path !== location.pathname) {
@@ -310,7 +322,7 @@
             return;
           }
           beforeReload?.();
-          state = { ...state, reloaded: true, refreshes: refreshes + 1, at: Date.now() };
+          state = { ...state, reloaded: true, refreshes: refreshes + 1, at: Date.now(), lastRefreshAt:Date.now() };
           sessionStorage.setItem(key, JSON.stringify(state));
           log.add('page-refresh', reason, { ...snapshot(), runtime: runtimeDiagnostic() });
           location.reload();
@@ -1314,7 +1326,11 @@
       if(riskFree<=0)return '总风险本金已到上限（含持仓成本和未结算预测），停止新增投入';
       const blocked=config.trade&&m.view.stocks.map(s=>sellPlan(m,s,ledger.owned,now)).find(s=>s?.blocked);
       if(blocked)return blocked.reason;
-      if(config.newBuy===false&&!config.predict)return '新买入等待扣费后对照验证；继续管理旧仓、符合条件的卖出和行情记录';
+      if(config.newBuy===false&&!config.predict){
+        const positions=positionReport(m,ledger,now);
+        return '新买入等待扣费后对照验证；预测关闭；'+(positions.length?
+          positions.map(p=>`${p.modelName}：${p.unrealized==null?'估值待核对':`扣费后浮动 ${p.unrealized}`}，${p.reason}`).join('；'):'暂无脚本管理的持仓');
+      }
       const messages=[],free=Math.max(0,m.balance-config.reserve),r=m.rules;
       const budgetWait=(action,limit,needed,label)=>{
         let used=spend(ledger.entries,action,now);
@@ -1516,7 +1532,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.129';
+  const SCRIPT_VERSION = '1.17.131';
   function mountPanelControls(shadow,group) {
     const box=shadow.querySelector('.box'),title=box.querySelector('strong'),fullTitle=title.textContent;
     const key=`arkengine:auto-panel:${group}:collapsed:v1`;
@@ -1594,7 +1610,7 @@
       !(event.data?.blockedMs>=90000)&&!(event.data?.attempt>0));
   const normalLog = event => routineLog(event)||['state', 'heartbeat'].includes(event.type) ||
     event.type === 'request-result' && event.data?.status >= 200 && event.data.status < 400;
-  const LOG_PRIORITY_VERSION = 6;
+  const LOG_PRIORITY_VERSION = 7;
   const criticalLog = event => Boolean(event.receiptId) || !routineLog(event)&&([
     'stock-submit','stock-response','stock-confirmed','stock-income','stock-prediction-settled',
     'shelter-submitted','shelter-prepared','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed','shelter-work-cancelled','shelter-assignment-reconciled',
@@ -1605,7 +1621,7 @@
     event.type==='request-result' && Number.isFinite(event.data?.status) && event.data.status>=400);
   // Shelter decisions cannot be reconstructed from stock observations. Retain
   // both on equal terms, oldest first; receipts still have the highest priority.
-  const logPriority = event => criticalLog(event)?2:normalLog(event)?0:
+  const logPriority = event => criticalLog(event)?2:event.group==='cultivate'&&(event.type==='heartbeat'||event.type==='page-wait-ended'&&event.data?.blockedMs>=90000)?1.5:normalLog(event)?0:
     ['stock-observation-block','stock-check','stock-decision','stock-decision-detail',
       'shelter-planning','shelter-family-planning','shelter-decision','shelter-decision-detail','shelter-check','shelter-check-detail'].includes(event.type)?1.5:1;
   function diagnosticCoverage(days,types) {
@@ -11314,6 +11330,7 @@
     // Keep these proposals identifiable even when family planning defers the actions.
     // An idle adult has not started training and can first fill a real production seat.
     result.idleTraining=actions.filter(a=>a.kind==='assign'&&a.role==='training'&&a.purpose==='production'&&a.from===null).map(a=>a.id);
+    result.departureResidents=actions.filter(a=>a.kind==='explore-start').map(a=>a.id);
     result.reserved=[...reserved];
     result.populationDefense.supply=projection(projectedIds());
     notes.unshift(`普通探险位 ${s.explorers.length}/${slots}；综合计划预留 ${reserved.size} 人。周任务最低成功率 ${cfg.chance}%，每任务每周最多 ${cfg.attempts} 次，出发间隔至少6小时。`);
@@ -14643,7 +14660,7 @@
     const held=new Set([...(campaign.reserved||[]),...(campaign.dailyReserved||[]),...romance,
       ...shelterGrowthEmployment(m,shelterState).protectedResidents,...(shelterState.campaign?.defense||[]).map(d=>d.id),
       ...s.births.flatMap(b=>shelterBirthParents(s,b)||[])]),dorm=new Set(shelterDormWorkers(m,campaign));
-    const pool=s.residents.filter(p=>(p.roomId===null||dorm.has(p.id))&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
+    let pool=s.residents.filter(p=>(p.roomId===null||dorm.has(p.id))&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
       (p.familyCooldownUntil==null||Number.isFinite(p.familyCooldownUntil))&&
       !p.romance&&!held.has(p.id)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&shelterResidentIdentity(s,p));
     if(!pool.length)return null;
@@ -14655,6 +14672,11 @@
     const rooms=s.rooms.filter(r=>staffRoomTypes.includes(r.type)&&resources.includes(shelterRooms[r.type][1])&&
       r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
       s.residents.filter(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id).length<shelterStaffCapacity(model,r));
+    if(campaign.checkSoloDeparture&&rooms.length){
+      const departing=new Set(shelterCampaignSchedule(m).departureResidents);
+      pool=pool.filter(person=>!departing.has(person.id));
+      if(!pool.length)return null;
+    }
     for(const resource of resources){
       const choices=rooms.filter(r=>shelterRooms[r.type][1]===resource).flatMap(r=>pool.map(p=>({p,r,
         gain:shelterWorkerRate(s,m.now,m.view.env,p,r)}))).filter(c=>Number.isFinite(c.gain)&&c.gain>0)
@@ -15531,18 +15553,37 @@
     w.dialogBefore=new Set(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
     perform();queueMicrotask(()=>shelterBindDialog(w));
   }
+  document.addEventListener('visibilitychange',()=>{if(shelterRecallWork)shelterRecallWork.visibleWaitAt=null;});
+  function shelterRecallControlExpired(w,phase,button) {
+    if(w.waitControl!==phase){w.waitControl=phase;w.visibleWaitAt=null;}
+    const foreground=document.visibilityState==='visible',now=Date.now();
+    if(foreground)w.visibleWaitAt??=now;else w.visibleWaitAt=null;
+    if(w.reportedWait!==phase){
+      w.reportedWait=phase;
+      log.add('shelter-recall-control-wait','等待原召回窗口控件可用',{explorer:w.id,phase,foreground,
+        found:Boolean(button),transparent:shelterDialogTransparent(w.dialog),inert:Boolean(button?.closest('[inert]')),
+        disabled:Boolean(button?.matches(':disabled,[aria-disabled="true"]'))});
+    }
+    if(foreground&&now-w.visibleWaitAt>=15000)return true;
+    say(`${foreground?'前台重新核对':'后台暂不计时，等待'}原召回窗口的${phase==='confirm'?'确认':'取消'}按钮`);return false;
+  }
   function shelterCloseWindow(w,button,key,label,perform=()=>button.click()) {
     if(w.manual){say('本轮窗口已由你接手，等待处理');return true;}
-    if(w.closeFailed){say('本轮窗口关闭失败，等待手动处理');return true;}
+    if(w.closeFailed){say(w===shelterRecallWork&&w.waitControl==='cancel'?'前台持续未能核对召回取消按钮，等待手动处理':'本轮窗口关闭失败，等待手动处理');return true;}
     if(w.closeAt&&Date.now()-w.closeAt<5000){say('等待本轮窗口关闭');return true;}
     if((w.closeAttempts||0)>=2){
       w.closeFailed=true;pauseShelter('本轮窗口两次关闭均未生效，已停止自动点击；请手动关闭窗口后开启避难所');return true;
     }
     if(!usable(button)){
-      w.closeUnavailableAt??=Date.now();
-      if(Date.now()-w.closeUnavailableAt>=15000){w.closeFailed=true;pauseShelter('本轮窗口15秒未能核对取消或关闭按钮，请手动关闭窗口后开启避难所');}
-      else say('本轮窗口的取消或关闭按钮不可核对，等待处理');return true;
+      if(w===shelterRecallWork){
+        if(!shelterRecallControlExpired(w,'cancel',button))return true;
+      }else{
+        w.closeUnavailableAt??=Date.now();
+        if(Date.now()-w.closeUnavailableAt<15000){say('本轮窗口的取消或关闭按钮不可核对，等待处理');return true;}
+      }
+      w.closeFailed=true;pauseShelter('本轮窗口15秒未能核对取消或关闭按钮，请手动关闭窗口后开启避难所');return true;
     }
+    if(w===shelterRecallWork)w.waitControl=null;
     offer(key,label,()=>{
       if(w.manual||!w.dialog?.isConnected||!visible(w.dialog)||!usable(button))return;
       w.closeAt=Date.now();w.closeAttempts=(w.closeAttempts||0)+1;perform();
@@ -15558,9 +15599,20 @@
       return closeShelterWork();
     }
     const recall=shelterRecallWork;
-    const recallFailure=own(recall)&&!shelterPending?(recall.cancelled?'cancelled':
-      textOf(recall.dialog.querySelector('h2'))!==recall.title?'identity':
-      !usable(buttonIn(recall.dialog,'确认'))&&Date.now()-recall.at>15000?'control-unavailable':null):null;
+    let recallFailure=null;
+    if(own(recall)&&!shelterPending){
+      if(recall.cancelled)recallFailure='cancelled';
+      else if(textOf(recall.dialog.querySelector('h2'))!==recall.title)recallFailure='identity';
+      else if(shelterEnabled&&!shelterLeave&&!stateFault('shelter')){
+        const confirm=buttonIn(recall.dialog,'确认');
+        if(!usable(confirm)){
+          if(shelterRecallControlExpired(recall,'confirm',confirm))recallFailure='control-unavailable';
+          else if(Date.now()-shelterEntryAt<=shelterVisitBudget().finishLimitMs)return true;
+        }else if(recall.waitControl==='confirm'){
+          recall.waitControl=null;cancelQueued();cancelShelterRead();
+        }
+      }
+    }
     if(recallFailure){
       if(!recall.cancelReason){
         recall.cancelReason=recallFailure==='identity'?'召回窗口标题变化，本轮撤销':
@@ -16435,6 +16487,9 @@
     // the return seats of actual trainees remain protected, including those due back.
     const roles=shelterState.campaign?.roles||[],defense=shelterState.campaign?.defense||[];
     return {...maintenance,choice:maintenance.choice||(maintenance.healing?{...maintenance.healing,maintenanceMedical:true}:null),
+      checkSoloDeparture:shelterCampaign.explore&&m.view.drops?.enabled===true&&
+        m.state.resources.stimpak>=shelterCampaign.reserve+shelterCampaign.stimpaks&&
+        m.state.explorers.length<Math.min(6,1+Math.floor(m.state.depth/8)),
       reserved:[...new Set([...(maintenance.reserved||[]),...roles.map(r=>r.id),...defense.map(r=>r.id)])],
       trainingDestinations:[...(maintenance.trainingDestinations||[]),...shelterTrainingDestinations(m,roles)]};
   }
@@ -16634,10 +16689,12 @@
       if(!abyss||abyss.type!=='checkbox'||abyss.checked)return holdShelterCampaign('页面深渊选项已勾选或不可核对，保留手动设置，不出发');
       for(const [pattern,value,key] of [[/^探险者/,c.id,'person'],[/^区域/,c.targets[1],'tier'],[/^带治疗针/,c.targets[2],'stimpaks']]){
         const control=labelControl(pattern);
-        if(key==='tier'&&!shelterCampaign.tier){
-          const options=control?.tagName==='SELECT'?[...control.options].filter(option=>!option.disabled):[];
-          if(!options.length||options.some(option=>!/^\d+$/.test(option.value))||Math.max(...options.map(option=>Number(option.value)))!==value)
+        if(key==='tier'){
+          const options=control?.tagName==='SELECT'?[...control.options].filter(option=>!option.matches(':disabled')):[];
+          const highest=options.length&&options.every(option=>/^\d+$/.test(option.value))?Math.max(...options.map(option=>Number(option.value))):null;
+          if(!shelterCampaign.tier&&highest!==value)
             return holdShelterCampaign('原生区域与解锁深度不一致，本轮不改区、不出发');
+          if(shelterCampaignWork)shelterCampaignWork.nativeTier={highest,selected:Number(control?.value),configuredCap:shelterCampaign.tier};
         }
         const ready=shelterFormValue(control,value,`shelter:campaign-${key}`,`设置普通探险${key==='person'?'人选':key==='tier'?'区域':'补给'}`);
         if(ready!==true)return ready===false?true:holdShelterCampaign('普通探险的原生人选、区域或补给选项不可核对，稍后再检查');
@@ -16747,12 +16804,13 @@
   }
   function shelterExecutionDeferred(choice) {
     if(!choice)return false;
-    if(shelterExecutionDeferrals.has(shelterExecutionKey(choice)))return true;
+    const entry=shelterExecutionDeferrals.get(shelterExecutionKey(choice));
+    if(entry&&!entry.released)return true;
     // A cancelled transfer must not immediately become another transfer for the
     // same person, or a departure relying on the cancelled equipment. Healing
     // and emergency defense remain available through their own safety checks.
     return !['stimpak','revive'].includes(choice.kind)&&[...shelterExecutionDeferrals.values()].some(d=>
-      shelterExecutionResidents(choice).some(id=>d.residents.includes(id)));
+      !d.released&&shelterExecutionResidents(choice).some(id=>d.residents.includes(id)));
   }
   function shelterExecutionResidents(choice) {
     const kind=choice.kind||'assign';
@@ -16765,10 +16823,27 @@
     // sent requests remain governed by the pending journal, never by this set.
     if(!work?.execution||!work.executionFailure||work.submitted||shelterPending)return;
     const key=shelterExecutionKey(work.execution.choice);
-    if(shelterExecutionDeferrals.has(key))return;
-    shelterExecutionDeferrals.set(key,{residents:shelterExecutionResidents(work.execution.choice),note});
-    log.add('shelter-execution-deferred','本轮已撤销的未发送动作先让路，下次访问重新核对',
+    const prior=shelterExecutionDeferrals.get(key),now=Date.now(),execution=work.execution;
+    if(prior&&!prior.released)return;
+    const recheck=!prior&&work.executionFailure.reason==='deadline'&&['assign','stimpak'].includes(execution.kind)&&
+      now>=execution.localAt&&now<execution.localDeadline&&shelterRead?.model?.now>=execution.serverAt;
+    shelterExecutionDeferrals.set(key,{residents:shelterExecutionResidents(execution.choice),note,
+      ...(recheck?{retry:{after:now,deadline:execution.deadline,model:shelterRead.model}}:{})});
+    log.add('shelter-execution-deferred',recheck?'原动作已撤销；以新读取重新规划一次，不重发旧动作':'本轮已撤销的未发送动作先让路，下次访问重新核对',
       {kind:work.execution.kind,targets:work.execution.targets,...work.executionFailure});
+  }
+  function shelterRecheckExpiredWork(m){
+    if(shelterPending||shelterStaffHold||shelterCampaignHeld||Date.now()<shelterExploreManualUntil)return false;
+    for(const entry of shelterExecutionDeferrals.values()){
+      const retry=entry.retry;if(!retry)continue;
+      if(m!==retry.model&&shelterRead?.startedAt>=retry.after){
+        delete entry.retry;
+        if(m.now>=retry.deadline)entry.released=true;
+      }else if(!retry.requested){
+        retry.requested=true;readShelter();return Boolean(shelterController);
+      }else if(shelterController)return true;
+    }
+    return false;
   }
   function shelterConstructionExecutionBasis(m) {
     const s=m.state;
@@ -17406,7 +17481,8 @@
       delay=Math.min(delay,60000);
       if(note==='本轮检查完成')note=shelterConstructionNote||'本轮建设已撤销，一分钟后重新核对';
     }
-    if(shelterExecutionDeferrals.size&&!shelterPending){
+    const deferred=[...shelterExecutionDeferrals.values()].filter(entry=>!entry.released);
+    if(deferred.length&&!shelterPending){
       delay=Math.min(delay,60000);
       if(note==='本轮检查完成')note='已撤销动作本轮先让路，一分钟内重新核对';
     }
@@ -17417,7 +17493,7 @@
     const collection=shelterCollection || (m?shelterCollectionInfo(m):null);
     if (m) {
       try { const campaign=shelterCampaignSchedule(m);shelterCampaignNote=[...(shelterCampaignHeld?[shelterCampaignHeld]:[]),
-        ...[...shelterExecutionDeferrals.values()].map(d=>d.note),...campaign.notes,...(campaign.choice?[`下一项：${campaign.choice.reason}`]:[])].join('\n');
+        ...deferred.map(d=>d.note),...campaign.notes,...(campaign.choice?[`下一项：${campaign.choice.reason}`]:[])].join('\n');
         urgentDefense=Boolean(campaign.defense?.busy);
         const job=shelterIdleEmploymentChoice(m,campaign);
         if(job)employmentContinuation={residentId:job.id,roomId:job.room,recheckMs:5000};
@@ -17774,6 +17850,7 @@
       }
       log.add(shelterWorkConfirm?.id===id?'shelter-prepared':'shelter-submitted',label,
         {kind,targets,phase:shelterWorkConfirm?.id===id?'awaiting-confirmation':'native-control',
+          ...(kind==='explore-start'&&work?.nativeTier?{nativeTier:work.nativeTier}:{}),
           ...(independent?{independent:true,blockedKind:shelterPending.kind}:{})});
       try { if(shelterWorkConfirm?.id===id)shelterOpenDialog(shelterWorkConfirm,perform);else perform(); } finally {
         // 下挖原生确认先 resolve，再在紧随的微任务发送；只覆盖这一轮确认。
@@ -18152,6 +18229,7 @@
       else {executing.closing=true;if(closeShelterWork())return;}
       schedule();return;
     }
+    if(!defending&&!visitBudget.handoffOnly&&!dialogs.length&&!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&shelterRecheckExpiredWork(m))return;
     if(shelterRescueWork&&(visitBudget.handoffOnly||maintenance.choice?.kind==='stimpak')&&closeShelterRescue())return;
     if((shelterRescueWork||maintenance.defense?.actions.some(choice=>choice.kind==='rescue'))&&!visitBudget.handoffOnly&&maintenance.choice?.kind!=='stimpak'){
       if(closeShelterBuild()||closeShelterRecall()||closeShelterWork())return;
@@ -18360,6 +18438,11 @@
       return;
     }
     if (!navigator.onLine) { say(`${reason}；网络离线，等待连接恢复`); return; }
+    if(document.hidden&&detail.missing?.quota&&Object.values(detail.missing).filter(Boolean).length===1&&
+        detail.quotaRead?.candidates===1&&!detail.quotaRead.readable&&detail.quotaRead.layout?.[0]?.connected&&
+        detail.quotaRead.layout[0].blockers.some(b=>b.hidden||b.display==='none'||b.visibility==='hidden'||b.ariaHidden||b.inert)){
+      expeditionLoadWait.suspend();say(`${reason}；额度区域在后台隐藏，等待可见，不刷新或提交`);return;
+    }
     // 已结束的领取请求可保留原记录、重新加载只读页面；不把进行中的派遣或未知请求当作安全刷新。
     const settledClaim = claimWait && (transientClaim(claimWait.result) || claimWait.result?.outcome === 'ok');
     const recoverClaimLoad = settledClaim && !plan && !farmPlan && !nativePending().length && !stateFault('farm');

@@ -355,6 +355,13 @@ test('运行修复：股市等待说明区分历史不足、停滞和上涨不�
   assert.equal(c.choose(m,cfg,l,now),null);assert.match(c.waitReason(m,cfg,l,now),/上涨1只.*含费门槛0只/);
   assert.match(c.waitReason(m,cfg,l,now),/停牌或停滞1只/);
 });
+test('股市只管旧仓时说明实际扣费后浮亏和卖出门槛，不为消除等待而开仓',()=>{
+  const {v,m,l}=fixture(),cfg={...config,predict:false,newBuy:false};v.stocks[0].stale=true;
+  v.positions.push({stockId:1,shares:10,costBasisTokens:120,holdUntil:null});
+  l.owned['1']={shares:10,cost:120,modelName:v.stocks[0].modelName};
+  assert.equal(c.choose(m,cfg,l,now),null);
+  assert.match(c.waitReason(m,cfg,l,now),/模型甲：扣费后浮动 -3，行情停滞.*成本 120.*112 或以下/);
+});
 
 test('股市净信号：含费取整后的净幅度优先，价格涨幅最高者不必排第一；换序结果一致',()=>{
   const {v,l}=fixture();v.rules.buyFeePct=0;v.rules.sellFeePct=0;

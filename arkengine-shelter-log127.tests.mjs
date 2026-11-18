@@ -24,6 +24,23 @@ export async function shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,
     await drive(`sm.calls.some(c=>c.type==='explore_start')&&!${pending}`,'native highest departure');
     assert.deepEqual(await evaluate(`sm.calls.filter(c=>c.type==='explore_start').map(c=>[c.tier,c.abyss])`),[[2,false]]);
     assert.equal(await evaluate('sm.exploreTier===undefined'),true);
+    const submitted=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.find(e=>e.type==='shelter-submitted'&&e.data.kind==='explore-start')`);
+    assert.deepEqual(submitted.data.nativeTier,{highest:2,selected:2,configuredCap:0});
+    const calls=await evaluate('sm.calls'),departure=calls.findIndex(c=>c.type==='explore_start');
+    assert.ok(!calls.slice(0,departure).some(c=>c.type==='assign'&&c.residentId===calls[departure].residentId));
+  });
+  await t.test('131过期调岗：跨业务期限后在同次访问重读重选，只发一次',async()=>{
+    const view=campaignView();view.state.resources.scrap=10;view.state.rooms.find(r=>r.id===4).width=2;
+    view.state.residents[0].familyCooldownUntil=view.serverTime+630000;
+    await setupShelter(scene({view,state:record(),campaign:{},construction:disabled})+`sm.quickAssign=false;`);
+    await drive(`!!document.querySelector('[data-staff-dialog]')`,'first resident dialog');
+    const id=await evaluate(`Number(document.querySelector('[data-staff-dialog]').dataset.staffDialog)`);
+    await pulse(31000);
+    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===${id})&&!${pending}`,'fresh choice sent in same visit');
+    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.map(e=>[e.type,e.data?.reason,e.data?.targets])`);
+    assert.ok(events.some(([type,reason,targets])=>type==='shelter-execution-evidence'&&reason==='deadline'&&targets[0]===id));
+    assert.ok(!events.some(([type])=>type==='shelter-check'));
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.residentId===${id}).length`),1);
   });
   for(const mode of ['full','target','ended','no-progress','unknown','missing'])await t.test(`128原生：房间一键救援 ${mode}`,async()=>{
     const view=campaignView(),room=view.state.rooms[0];room.type='door';room.incident={kind:'raiders',hp:98,maxHp:100};

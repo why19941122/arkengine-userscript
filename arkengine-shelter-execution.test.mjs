@@ -13,7 +13,7 @@ function setup(fixture=readyCampaignConstructionScene()){
     shelterExecutionDeferrals:new Map(),
     Date:class extends Date{static now(){return local;}}});
   const api2=vm.runInContext(source.slice(source.indexOf('  function shelterExecutionFacts('),source.indexOf('  function shelterWorkStep('))+
-    '\n({capture:shelterExecutionCapture,current:shelterExecutionCurrent,defer:shelterExecutionDefer,deferred:shelterExecutionDeferred})',c);
+    '\n({capture:shelterExecutionCapture,current:shelterExecutionCurrent,defer:shelterExecutionDefer,deferred:shelterExecutionDeferred,recheck:shelterRecheckExpiredWork})',c);
   const model=()=>{const m=api.model(f.view);c.shelterRead={model:m,at:local};return m;};
   const choice={kind:'upgrade',id:4,type:'scrap',level:2,cost:{scrap:400,parts:0},priority:1};
   const capture=(selected=choice)=>{
@@ -416,4 +416,19 @@ test('执行耗时：合法导航和慢读取超过30秒仍续接，真实结算
   assert.equal(w.execution.deadline,deadline,'没有靠重复续期改写真实业务期限');
   x.advance(deadline-x.f.view.serverTime);
   assert.equal(x.api.current(x.model(),w),null);assert.equal(w.executionFailure.reason,'deadline');
+});
+test('过期动作只在新读取越过边界后重新选一次，重复过期或存在原单时不放行',()=>{
+  for(const kind of ['assign','stimpak']){
+    const x=setup(),choice=kind==='assign'?{kind,id:5,room:4,from:90}:{kind,id:5,targets:[5]};
+    const w=x.capture(choice);let reads=0;
+    x.c.readShelter=()=>{reads++;x.c.shelterController={};};x.c.shelterController=null;
+    x.advance(w.execution.deadline-x.f.view.serverTime);const old=x.model();
+    assert.equal(x.api.current(old,w),null);x.api.defer(w);assert.ok(x.api.deferred(choice));
+    assert.ok(x.api.recheck(old));assert.ok(x.api.recheck(old));assert.equal(reads,1);
+    const fresh=x.model();x.c.shelterRead.startedAt=x.f.view.serverTime;x.c.shelterController=null;
+    x.c.shelterPending={id:'unknown'};x.api.recheck(fresh);assert.ok(x.api.deferred(choice));
+    x.c.shelterPending=null;x.api.recheck(fresh);assert.equal(x.api.deferred(choice),false);
+    assert.equal(x.api.current(fresh,w),null);x.api.defer(w);assert.ok(x.api.deferred(choice));
+    x.api.recheck(fresh);assert.equal(reads,1);
+  }
 });

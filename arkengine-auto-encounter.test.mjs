@@ -679,7 +679,19 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     };
     await shelterExplorationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
     await shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,trustedStaffKey});
-    await shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey});
+    const withShelterBackground=async run=>{
+      const foreground=await createTab();
+      try{
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});
+        await until(()=>evaluate(`document.visibilityState==='hidden'`),'shelter tab hidden');
+        await run();
+      }finally{
+        await cdp.send('Target.closeTarget',{targetId:foreground.targetId});
+        await cdp.send('Target.activateTarget',{targetId:tab.targetId});
+        await until(()=>evaluate(`document.visibilityState==='visible'`),'shelter tab visible');
+      }
+    };
+    await shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground});
     await currentGrowthTests({t,setupShelter,reloadShelter,evaluate,drive,pulse});
     await shelterStaffTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
     await shelterRevivalTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey});
@@ -3767,6 +3779,7 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(saved));
         const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();
           document.querySelector('[aria-label="远征派遣额度"]').remove();};`);
+      await until(()=>evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-page-wait:expedition:v1'))?.recoverable===true`),'recoverable load timer started before advancing clock');
       const snapshot=await evaluate('({model,clock:clock+92000})');
       const requests=expeditionRequests;
       await pulse(92000);
@@ -4075,6 +4088,18 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
         await drive('model.runs.length===6','background dispatch after notice gone');
       } finally {await cdp.send('Target.closeTarget',{targetId:foreground.targetId});}
     });
+    await t.test('额度诊断：后台隐藏的额度不触发刷新，恢复可见后继续派遣', async () => {
+      await setupExp(`const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();if(!window.showQuota){const quota=document.querySelector('[aria-label="远征派遣额度"]'),wrapper=document.createElement('div');wrapper.hidden=true;quota.before(wrapper);wrapper.append(quota);}};`);
+      const foreground=await createTab();
+      try{
+        await cdp.send('Target.activateTarget',{targetId:foreground.targetId});await until(()=>evaluate('document.hidden'),'hidden expedition');
+        const initial=expeditionRequests;await pulse(90001);await pulse(300001);
+        assert.equal(expeditionRequests,initial);assert.deepEqual(await evaluate('model.calls'),[]);
+        await cdp.send('Target.activateTarget',{targetId:tab.targetId});await evaluate('window.showQuota=true;renderExp()');
+        await drive('model.runs.length===6','restored quota dispatch');
+      }finally{await cdp.send('Target.closeTarget',{targetId:foreground.targetId});}
+    });
+
     await t.test('额度诊断：记录不可读祖先原因且不读取隐藏额度，恢复后继续', async () => {
       for(const hidden of ['hidden','display','aria-hidden','visibility']) {
         await setupExp(`const renderCurrent=renderExp;window.renderExp=()=>{renderCurrent();

@@ -8,7 +8,7 @@ import {parent72Scene} from './arkengine-shelter-parent72.fixture.mjs';
 import {createShelterResourceSimulation} from './arkengine-shelter-resource-simulation.mjs';
 import {campaignView,levelGateView,upperStageView,materialCycleView,storageChoiceView,handyMaterialView,capacityRouteView,powerPrerequisiteView,digPowerPrerequisiteView,fullPowerPrerequisiteView,workshopUpgradeView,multiWorkshopView,workshopBuildView,workshopPowerCycleView,materialProducerCycleView,populationGrowthView,familyGrowthView,workshopChurnView,dormWorkshopCycleView,familyWorkshopCycleView,workshopFamilyReturnView} from './arkengine-shelter-campaign.fixture.mjs';
 
-export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey}){
+export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground}){
   const key='arkengine:auto-shelter:campaign:v1',state=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`,
     pending=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))`,panel=`document.getElementById('ark-auto-expedition').shadowRoot`,
     done=`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`;
@@ -4622,6 +4622,69 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       append(...nodes);for(const d of nodes)if(d.querySelector?.('h2')?.textContent.startsWith('召回 ')){
         sm.recallOpens++;d.querySelector('p').textContent='返程需要 1小时0分（已出门时间的一半），到家后领取。';
         d.querySelector('button').focus();}};`;
+  const delayedRecall=recallScreenshotScene+`const appendRecall=document.body.append.bind(document.body);document.body.append=(...nodes)=>{
+    appendRecall(...nodes);const dialog=nodes.find(node=>node.querySelector?.('h2')?.textContent.startsWith('召回 '));
+    if(dialog){window.recallDialog=dialog;dialog.style.opacity='0';sm.recallClicks=[];
+      dialog.addEventListener('click',event=>sm.recallClicks.push(event.target.textContent));}};`;
+  const recallEnabled=`localStorage.getItem('arkengine:auto-shelter:enabled:v1')`;
+  await t.test('后台召回：确认与取消均不可用四十秒，前台再等动画后只确认原单一次',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));
+    await drive('window.recallDialog?.isConnected','script opened the owned recall');
+    await withShelterBackground(async()=>{
+      for(let pass=0;pass<4;pass++)await pulse(10000);
+      assert.equal(await evaluate(recallEnabled),'true');assert.deepEqual(await evaluate('sm.recallClicks'),[]);
+      assert.equal(await evaluate(pending),null);
+    });
+    await pulse(5000);assert.deepEqual(await evaluate('sm.recallClicks'),[]);
+    await evaluate(`recallDialog.style.opacity='1'`);
+    await drive(`sm.calls.some(c=>c.type==='explore_recall')&&!${pending}`,'foreground revalidates original recall');
+    assert.deepEqual(await evaluate('sm.calls.map(c=>[c.type,c.explorerId])'),[['explore_recall',11]]);
+    assert.deepEqual(await evaluate('sm.recallClicks'),['确认']);assert.equal(await evaluate('sm.recallOpens'),1);
+  });
+  await t.test('后台召回：已决定撤销时等待前台可用的取消按钮，绝不改点确认',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));
+    await drive('window.recallDialog?.isConnected','owned recall before changed title');
+    await withShelterBackground(async()=>{
+      await evaluate(`recallDialog.querySelector('h2').textContent='身份已变化'`);
+      for(let pass=0;pass<4;pass++)await pulse(10000);
+      assert.equal(await evaluate(recallEnabled),'true');assert.deepEqual(await evaluate('sm.recallClicks'),[]);
+    });
+    await evaluate(`recallDialog.style.opacity='1'`);await drive('!recallDialog.isConnected','cancel only after foreground');
+    assert.deepEqual(await evaluate('sm.recallClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.equal(await evaluate(pending),null);assert.equal(await evaluate('sm.recallOpens'),1);
+  });
+  await t.test('后台召回：控件在后台恢复即可继续，不要求切回标签页',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));await drive('window.recallDialog?.isConnected','owned recall awaiting paint');
+    await withShelterBackground(async()=>{
+      await pulse(18000);await evaluate(`recallDialog.style.opacity='1'`);
+      await drive(`sm.calls.some(c=>c.type==='explore_recall')&&!${pending}`,'background recovers once interactive');
+      assert.deepEqual(await evaluate('sm.recallClicks'),['确认']);assert.equal(await evaluate(recallEnabled),'true');
+    });
+  });
+  await t.test('后台召回：其他页面已让原队返程，恢复后重读并只取消',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));await drive('window.recallDialog?.isConnected','owned recall before changed trip');
+    await withShelterBackground(async()=>{
+      await pulse(20000);await evaluate(`const trip=sm.view.state.explorers.find(e=>e.id===11);trip.recalledAt=clock;trip.returnAt=clock+3600000;`);
+    });
+    await evaluate(`recallDialog.style.opacity='1'`);await drive('!recallDialog.isConnected','changed trip cancels original window');
+    assert.deepEqual(await evaluate('sm.recallClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
+  });
+  await t.test('后台召回：遮挡九分钟不延长访问，回到前台只取消超时访问',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));await drive('window.recallDialog?.isConnected','owned recall before nine-minute absence');
+    await withShelterBackground(async()=>{
+      await pulse(18000);await pulse(9*60000);for(let pass=0;pass<4;pass++)await pulse(5000);
+      assert.equal(await evaluate(recallEnabled),'true');assert.deepEqual(await evaluate('sm.recallClicks'),[]);
+    });
+    await evaluate(`recallDialog.style.opacity='1'`);await drive(done,'expired visit cancels and returns to expedition');
+    assert.deepEqual(await evaluate('sm.recallClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
+  });
+  await t.test('后台召回：前台持续不可用仍有界撤销并暂停，两阶段都不点隐藏按钮',async()=>{
+    await setupShelter(scene({explore:true},delayedRecall));await drive('window.recallDialog?.isConnected','foreground controls unavailable');
+    for(let pass=0;pass<9;pass++)await pulse(5000);
+    assert.equal(await evaluate(recallEnabled),'false');assert.equal(await evaluate('recallDialog.isConnected'),true);
+    assert.deepEqual(await evaluate('sm.recallClicks'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.equal(await evaluate(pending),null);
+  });
   await t.test('召回窗口接续：双名额一人返程、另一人两小时到期，自动聚焦取消不阻止确认',async()=>{
     await setupShelter(scene({explore:true},recallScreenshotScene));
     await drive(`sm.calls.some(c=>c.type==='explore_recall')&&!${pending}`,'screenshot shaped native recall',50);
