@@ -18,6 +18,36 @@ export async function shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(${JSON.stringify({...f.state,vaultNo:f.view.vaultNo,nextAt:0,note:'log127 fixture'})}));`;
   const record=()=>({families:[],campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]}});
   const disabled={build:false,upgrade:false,dig:false,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0};
+  await t.test('128原生：旧设置0不改写晶体平原，原生普通出发及回执都保留区域2',async()=>{
+    const view=campaignView();view.state.depth=20;view.drops.tierPermille=[60,85,108];
+    await setupShelter(scene({view,state:record(),campaign:{explore:true,sodaEfficiency:true},construction:disabled}));
+    await drive(`sm.calls.some(c=>c.type==='explore_start')&&!${pending}`,'native highest departure');
+    assert.deepEqual(await evaluate(`sm.calls.filter(c=>c.type==='explore_start').map(c=>[c.tier,c.abyss])`),[[2,false]]);
+    assert.equal(await evaluate('sm.exploreTier===undefined'),true);
+  });
+  for(const mode of ['full','target','ended','no-progress','unknown','missing'])await t.test(`128原生：房间一键救援 ${mode}`,async()=>{
+    const view=campaignView(),room=view.state.rooms[0];room.type='door';room.incident={kind:'raiders',hp:98,maxHp:100};
+    const initial=mode==='full'?0:96;
+    view.state.residents=Array.from({length:110},(_,index)=>({...structuredClone(view.state.residents[0]),id:index+1,name:'救援'+(index+1),roomId:index<initial?room.id:2}));
+    const init=scene({view,state:record(),campaign:{defense:true},construction:disabled});
+    await setupShelter(init+`localStorage.setItem('arkengine:auto-shelter:staff:v1','off');sm.endRescue=${mode==='ended'};sm.rescueNoProgress=${mode==='no-progress'};sm.hideRescue=${mode==='missing'};sm.mode='${mode==='unknown'?'unknown':'normal'}';`);
+    if(mode==='unknown'){
+      await drive(`sm.calls.some(c=>c.type==='rescue_incident')`,'unknown rescue sent');
+      for(let step=0;step<5;step++)await pulse(4000);
+      assert.equal(await evaluate(`${pending}?.kind`),'rescue');
+    }else await drive(done,'room rescue settles without reassigning',200);
+    if(mode==='no-progress'){
+      const saved=await evaluate(state),history=await evaluate('sm.calls');assert.equal(saved.rescueStops.length,1);assert.equal(history.length,1);
+      await setupShelter(init+`sm.rescueNoProgress=true;sm.calls=${JSON.stringify(history)};localStorage.setItem('arkengine:auto-shelter:staff:v1','off');
+        localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${JSON.stringify(saved)},nextAt:0}));`);
+      await drive(done,'new page with persisted exhausted roster does not retry a no-op',80);
+    }
+    const calls=await evaluate(`sm.calls.map(c=>[c.type,c.roomId])`);
+    assert.equal(calls.filter(([kind])=>kind==='assign').length,0);
+    assert.deepEqual(calls.filter(([kind])=>kind==='rescue_incident'),Array.from({length:mode==='full'?34:mode==='target'?2:mode==='missing'?0:1},()=>['rescue_incident',room.id]));
+    assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===1).length`),['full','target'].includes(mode)?102:initial);
+    assert.deepEqual(await evaluate(`${state}.campaign?.defense||[]`),[]);
+  });
   await t.test('日志127浏览器：下挖期间旧楼层实际开工并补员，刷新不重复建房',async()=>{
     const view=workshopChurnView(),s=view.state;s.resources.scrap=800;s.residents.find(p=>p.id===21).roomId=4;
     for(const p of s.residents.filter(p=>[35,36].includes(p.id))){p.roomId=5;p.parents=[1,2];}

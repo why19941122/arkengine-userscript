@@ -139,7 +139,7 @@ test('组合身份：同名居民按编号规划治疗、防守和外出，DOM�
   assert.ok(guard.residents.includes(a.id)&&guard.residents.includes(b.id));
   s.rooms[3].incident={kind:'raiders'};
   const defense=api.defense(api.model(v),cfg({defense:true}));
-  assert.ok(defense.actions.some(c=>c.id===a.id)&&defense.actions.some(c=>c.id===b.id));
+  assert.deepEqual(Array.from(defense.actions,c=>[c.kind,c.room]),[['rescue',s.rooms[3].id]]);
   s.rooms[3].incident=null;a.hp=20;
   assert.equal(run(v,{medical:true}).actions.find(c=>c.kind==='stimpak')?.id,a.id);
   a.hp=118;
@@ -490,13 +490,15 @@ test('接管时长：有原计划、已返程、深渊、身份不符和不可�
     assert.equal(JSON.stringify([v,old]),before);
   }
 });
-test('汽水效率：只比较原上限与已解锁范围内概率，非单调和并列概率不盲选更深区域',()=>{
+test('普通探险：默认及旧配置0均跟随最高解锁区域；概率并列或封顶不会降档，非零自定义上限仍有效',()=>{
   const v=campaignView();v.state.depth=30;v.drops.tierPermille=[50,80,60,80];
   const m=api.model(v),before=JSON.stringify(v);
-  assert.equal(api.efficiency(m,cfg({sodaEfficiency:true,tier:3})).tier,1);
-  assert.equal(api.efficiency(m,cfg({sodaEfficiency:true,tier:0})).tier,0);
+  assert.equal(api.efficiency(m,cfg({sodaEfficiency:true,tier:3})).tier,3);
+  assert.equal(api.efficiency(m,cfg({sodaEfficiency:true,tier:0})).tier,3);
+  assert.equal(api.efficiency(m,cfg({sodaEfficiency:true,tier:2})).tier,2);
   assert.equal(api.efficiency(m,cfg({sodaEfficiency:false,tier:3})).tier,3);
   assert.equal(JSON.stringify(v),before);
+  v.state.depth=40;const deep=api.efficiency(api.model(v),cfg({sodaEfficiency:true}));assert.equal(deep.tier,4);assert.equal(deep.probability,.08);
   v.state.depth=7;assert.equal(api.efficiency(api.model(v),cfg({sodaEfficiency:true,tier:3})).tier,0);
 });
 test('汽水效率：给定相同存活与掉落假设，资格时长方案在可行时长内汽水/占用小时最大',()=>{

@@ -58,10 +58,10 @@ test('防守收尾：低血量未到期也能召回，已返程与关闭探险�
 });
 test('防守收尾：新增援和受袭重伤治疗排在召回前，召回仍保留',()=>{
   const x=scene();x.s.residents[0].roomId=1;
-  let p=run(x);assert.equal(p.choice.role,'defense');assert.equal(p.defense.urgent,true);
+  let p=run(x);assert.equal(p.choice.kind,'rescue');assert.equal(p.defense.urgent,true);
   assert.equal(p.actions.at(-1).kind,'explore-recall');
   x.cfg.medical=true;x.s.residents[1].hp=20;p=run(x);
-  assert.equal(p.choice.kind,'stimpak');assert.equal(p.choice.id,2);assert.equal(p.actions[1].role,'defense');
+  assert.equal(p.choice.kind,'stimpak');assert.equal(p.choice.id,2);assert.equal(p.actions[1].kind,'rescue');
   assert.equal(p.actions.at(-1).kind,'explore-recall');
 });
 test('防守收尾：小队已归来可领取，未到家、仓容不足与关闭任务不领取',()=>{

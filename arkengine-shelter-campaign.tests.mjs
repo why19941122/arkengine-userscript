@@ -1714,7 +1714,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await setupShelter(scene({defense:true},`sm.view=${JSON.stringify(workshopChurnView())};sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
       sm.view.state.rooms.push({...sm.view.state.rooms[0],id:90,type:'door',floor:1,col:0,width:1,level:1,stored:0,incident:{kind:'raiders',hp:80,maxHp:80}});`));
     await drive('sm.calls.length>0','raid reinforcement before collection');
-    const first=await evaluate('sm.calls[0]');assert.equal(first.type,'assign');assert.equal(first.roomId,90);
+    const first=await evaluate('sm.calls[0]');assert.equal(first.type,'rescue_incident');assert.equal(first.roomId,90);
     assert.equal(await evaluate('sm.calls.filter(c=>c.type.startsWith("collect")).length'),0);
   });
   await t.test('产物收取调度：原生收取按钮缺失仍能继续普通调岗，不反复切页',async()=>{
@@ -3935,15 +3935,15 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await settle('returned traveler claimed then reinforces');
     const calls=await evaluate('sm.calls');assert.equal(calls[0].type,'explore_claim');
     assert.equal(calls.filter(c=>c.type==='explore_claim').length,1);
-    assert.ok(calls.some(c=>c.type==='assign'&&c.residentId===6&&c.roomId===90));
-    assert.ok(calls.every(c=>['explore_claim','assign'].includes(c.type)));
+    assert.ok(calls.some(c=>c.type==='rescue_incident'&&c.roomId===90));assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===6).roomId'),90);
+    assert.ok(calls.every(c=>['explore_claim','rescue_incident'].includes(c.type)));
   });
   await t.test('防守收尾浏览器：召回确认前出现新增援需求，先取消未发送召回再增援',async()=>{
     await setupShelter(raidUpkeep());
     await drive(`Boolean(document.querySelector('[role="dialog"],[role="alertdialog"]'))`,'raid recall confirmation');
     await evaluate('sm.view.state.residents[0].roomId=1;');await pulse(2000);
     await drive('sm.calls.length>0','new defense preempts unsubmitted recall');
-    assert.equal(await evaluate('sm.calls[0].type'),'assign');assert.equal(await evaluate('sm.calls[0].roomId'),90);
+    assert.equal(await evaluate('sm.calls[0].type'),'rescue_incident');assert.equal(await evaluate('sm.calls[0].roomId'),90);
     await settle('recall continues after defense confirmed');
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="explore_recall").length'),1);
   });
@@ -3953,8 +3953,8 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       s.quests=[{id:91,questId:'w1',team:[6],status:'returning',returnAt:clock-1,snapshot:structuredClone(sm.view.env.quests[0])}];`));
     await settle('returned quest claimed during raid');
     const calls=await evaluate('sm.calls');assert.equal(calls[0].type,'quest_claim');
-    assert.ok(calls.some(c=>c.type==='assign'&&c.residentId===6&&c.roomId===90));
-    assert.ok(calls.every(c=>['quest_claim','assign'].includes(c.type)));
+    assert.ok(calls.some(c=>c.type==='rescue_incident'&&c.roomId===90));assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===6).roomId'),90);
+    assert.ok(calls.every(c=>['quest_claim','rescue_incident'].includes(c.type)));
     await reloadCampaign();await settle('returned quest receipt survives reload');
     assert.equal(await evaluate('sm.calls.length'),calls.length);
   });
@@ -4021,7 +4021,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   });
   await t.test('停产事件：远征页巡检发现可增援火灾时自动返回避难所',async()=>{
     await setupShelter(fireScene+`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:clock+900000,note:'normal future visit'}));`, '/activities/expedition');
-    await drive('sm.calls.some(c=>c.type==="assign"&&c.residentId===4&&c.roomId===3)','patrol wakes for local incident',35);
+    await drive('sm.calls.some(c=>c.type==="rescue_incident"&&c.roomId===3)','patrol wakes for local incident',35);
   });
   await t.test('停产事件：远征页巡检发现事件结束后提前返岗',async()=>{
     await setupShelter(fireScene);await settle('rescuer waiting for actual incident end');
@@ -4081,7 +4081,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
         stimpaks:0,loot:{scrap:50,parts:0,stimpak:0,items:[]}}];`);
     const start=await evaluate('clock');
     await drive('sm.calls.length>0','first emergency response',12);
-    assert.equal(await evaluate('sm.calls[0].type'),'assign');
+    assert.equal(await evaluate('sm.calls[0].type'),'rescue_incident');
     assert.equal(await evaluate('sm.calls[0].roomId'),90);
     assert.ok(await evaluate(`clock-${start}<=5000`),'首次增援应在新鲜快照后的五秒内提交');
   });

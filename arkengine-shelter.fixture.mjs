@@ -153,6 +153,13 @@ window.fetch=async (url,options)=>{
      const cost=Math.ceil(120*(s.depth+1)**1.4);if(s.digging||s.resources.scrap<cost)throw Error('错误下挖');
      s.resources.scrap-=cost;s.digging={floor:s.depth+1,doneAt:clock+3600000};
    } else if(a.type==='claim_tutorial'){s.tutorial??={claimed:[]};s.tutorial.claimed.push(a.step);s.resources.scrap+=50;}
+   else if(a.type==='rescue_incident'){
+     const room=s.rooms.find(room=>room.id===a.roomId);if(!room?.incident)throw Error('目标房间没有事件');
+     if(!sm.rescueNoProgress)for(const person of s.residents.filter(person=>person.deadAt===null&&person.away===null&&person.adultAt<=clock&&person.hp>0&&person.roomId!==room.id).slice(0,3)){
+       (sm.rescueOrigins??={})[person.id]=person.roomId;person.roomId=room.id;
+     }
+     if(sm.endRescue){room.incident=null;for(const person of s.residents)if(Object.hasOwn(sm.rescueOrigins,person.id))person.roomId=sm.rescueOrigins[person.id];sm.rescueOrigins={};}
+   }
    else if(a.type==='safety_inspection'){
      const d=s.daily,goal=d.picks?.find(p=>p.key==='incident'),count=d.counters?.incident??0;
      if(!goal||count>=goal.target||clock<(d.counters.safety_inspection_at??0)+600000||s.rooms.some(r=>r.incident)||
@@ -173,7 +180,7 @@ window.fetch=async (url,options)=>{
    } else if(a.type==='claim_achievement'){s.achievements.push(a.id);s.resources.scrap+=100;}
    else throw Error('意外写操作 '+a.type);
    if(!sm.simulateResources)s.lastSettledAt=clock;
-   const receipt={view:shelterData(),result:sm.resultMessages?.[a.type]?{message:sm.resultMessages[a.type]}:{}};
+ const receipt={view:shelterData(),result:sm.resultMessages?.[a.type]?{message:sm.resultMessages[a.type]}:a.type==='rescue_incident'?{message:'已核对房间救援'}:{}};
    sm.receipts[envelope.idempotencyKey]=receipt;return new Response(JSON.stringify(receipt));
  }
  return farmFetch(url,options);
@@ -223,7 +230,7 @@ window.shelterAct=async a=>{
  catch{return false;}finally{sm.busy=false;if(location.pathname==='/shelter')renderShelter();}
 };
 window.closeResident=()=>{document.querySelector('[data-staff-dialog]')?.remove();game.removeAttribute('inert');game.removeAttribute('aria-hidden');};
-const shelterLabels={power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍',storage:'仓库',medbay:'医务室',workshop:'工坊',training:'训练室',radio:'电台',armory:'武器工坊',tailor:'服装工坊'};
+const shelterLabels={door:'大门',power:'发电站',diner:'餐厅',water:'净水站',scrap:'废料回收站',quarters:'宿舍',storage:'仓库',medbay:'医务室',workshop:'工坊',training:'训练室',radio:'电台',armory:'武器工坊',tailor:'服装工坊'};
 window.openConstruction=(kind,target)=>{
  const s=sm.view.state,r=kind==='upgrade'?s.rooms.find(r=>r.id===target):null;
  const d=document.createElement('div');d.setAttribute('role',kind==='dig'?'alertdialog':'dialog');d.dataset.constructionDialog=kind;
@@ -248,6 +255,7 @@ window.openConstruction=(kind,target)=>{
      actionButton(row,(cost+(sm.wrongConstructionPrice||0))+' 废料',action);
    }
  }else if(kind==='upgrade'){
+   if(r.incident&&!sm.hideRescue){const rescue=document.createElement('button');rescue.textContent='一键救援（最多 3 人）';rescue.onclick=()=>shelterAct({type:'rescue_incident',roomId:r.id});d.append(rescue);}
    if(['armory','tailor'].includes(r.type)&&!r.craft)actionButton(d,'0 档 · 80 废料',{type:'craft',roomId:r.id,tier:0});
    const base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500,training:400}[r.type],parts=r.level===1?0:15*r.width;
    actionButton(d,'升到 '+(r.level+1)+' 级 · '+(Math.ceil(base*r.width*(r.level===1?2.5:6))+(sm.wrongConstructionPrice||0))+' 废料'+(parts?' '+parts+' 零件':'')+' · 1小时0分',{type:'upgrade',roomId:r.id});
@@ -321,6 +329,7 @@ window.renderShelter=()=>{
    button(content,'全部收取',{type:'collect_all'});
    for(const r of s.rooms){
      const room=document.createElement('div');room.dataset.room=r.id;room.setAttribute('role','button');room.setAttribute('aria-label','废料回收站 可收取 1 批');
+     if(r.incident)room.append(shelterLabels[r.type]||'房间');
      if(shelterLabels[r.type])room.onclick=e=>{if(!e.target.closest('button'))openConstruction('upgrade',r.id);};
      const label={scrap:'废料',power:'电力',diner:'食物',water:'净水',medbay:'治疗针',workshop:'零件'}[r.type];
      if(label&&r.stored>0){const b=button(room,'◆',{type:'collect',roomId:r.id});b.setAttribute('aria-label','收取'+label);}content.append(room);
@@ -339,7 +348,7 @@ window.renderShelter=()=>{
      for(const [v,text] of options){const o=document.createElement('option');o.value=v;o.textContent=text;input.append(o);}l.append(input);root.append(l);input.value=String(value);return input;};
    const people=s.residents.filter(p=>p.away===null&&p.deadAt===null&&p.adultAt<=clock);
    const person=select('探险者',people.map(p=>[p.id,residentName(p)+(sm.ui20261109?' · '+Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)))+' 级 · 战力 99':'')]),sm.explorePerson??people[0]?.id);
-   const tier=select('区域',Array.from({length:1+Math.floor((s.depth||0)/10)},(_,i)=>[i,'区域'+i]),sm.exploreTier??0);
+   const tier=select('区域',Array.from({length:1+Math.floor((s.depth||0)/10)},(_,i)=>[i,'区域'+i]),sm.exploreTier??Math.floor((s.depth||0)/10));
    const supply=document.createElement('label');supply.textContent='带治疗针（库存 '+s.resources.stimpak+'）';supply.innerHTML+='<input type="number">';root.append(supply);
    const needles=supply.querySelector('input');needles.value=sm.exploreStimpaks??2;
    const abyssLabel=document.createElement('label');abyssLabel.innerHTML='深渊门票<input type="checkbox">';root.append(abyssLabel);const abyss=abyssLabel.querySelector('input');abyss.checked=Boolean(sm.abyss);
