@@ -58,12 +58,13 @@ test('父母预培养：共同供给不足不追加，真实断供返岗而非�
   assert.equal(training(plan).length,0);assert.ok(plan.actions.some(r=>r.id===a.id&&r.role==='training-release'));
 });
 
-test('父母预培养：双方七项均达4才放行，装备和另一位高属性不能抵消短板',()=>{
+test('父母预培养：双方七项均达10才放行，装备和另一位高属性不能抵消短板',()=>{
   const x=setupParentPreparation(source);x.schedule();const saved=x.context.shelterState.parentPreparation;
   const pair=x.f.view.state.residents.filter(p=>[4,5].includes(p.id));
   pair[0].stats.cha=10;assert.equal(x.api.pairAllowed(x.m(),pair,saved),false);
-  pair[1].stats.cha=4;assert.equal(x.api.pairAllowed(x.m(),pair,saved),true);
-  pair[1].stats.lck=3;pair[1].outfitId=999;x.f.view.state.items.push({id:999,slot:'outfit',bonus:{lck:10}});
+  pair.forEach(person=>Object.keys(person.stats).forEach(stat=>person.stats[stat]=10));
+  assert.equal(x.api.pairAllowed(x.m(),pair,saved),true);
+  pair[1].stats.lck=9;pair[1].outfitId=999;x.f.view.state.items.push({id:999,slot:'outfit',bonus:{lck:10}});
   assert.equal(x.api.pairAllowed(x.m(),pair,saved),false);
   assert.equal(x.api.pairAllowed(x.m(),[pair[0],x.f.view.state.residents.find(p=>p.id===7)],saved),false);
 });
@@ -77,6 +78,8 @@ test('父母预培养：亲缘不完整或共同祖先均不录用，不借训�
 
 test('父母预培养：缺少目标属性训练室时请求补建，居民继续生产',()=>{
   const x=setupParentPreparation(source);x.f.view.state.rooms=x.f.view.state.rooms.filter(r=>r.trainStat!=='cha');
+  for(const person of x.f.view.state.residents.filter(person=>[4,5,6,7].includes(person.id)))
+    for(const stat of Object.keys(person.stats))if(stat!=='cha')person.stats[stat]=10;
   const plan=x.schedule();assert.equal(training(plan).length,0);
   assert.ok(plan.projects.some(p=>p.type==='training'&&p.trainStat==='cha'&&!p.trainingDeadline));
   assert.ok(x.f.view.state.residents.filter(p=>[4,5,6,7].includes(p.id)).every(p=>p.roomId===4));
@@ -106,7 +109,7 @@ test('父母预培养：旧家庭实际返宿舍选择高属性组合，不再�
 
 test('父母预培养：已达标稳定组合可接替略低属性旧家庭，不再被20%门槛卡住',()=>{
   const x=setupParentPreparation(source);x.schedule();const pair=x.f.view.state.residents.filter(p=>[4,5].includes(p.id));
-  pair.forEach(p=>p.stats.cha=4);
+  pair.forEach(person=>Object.keys(person.stats).forEach(stat=>person.stats[stat]=10));
   const m=x.m(),families=x.context.shelterState.families,c=x.api.pairing(m,families,()=>true);
   // The only usable dorm belongs to the lower-quality bridge family.
   c.rooms=c.rooms.filter(r=>r.id===7);
@@ -128,9 +131,78 @@ test('父母预培养：每项短板都受门槛约束，固定训练期限不�
   const record=plain(x.context.shelterState.campaign.roles[0]);x.tick();x.schedule();
   assert.equal(x.context.shelterState.campaign.roles[0].until,record.until);
   const f=x.context.shelterState.parentPreparation.pairs[0],ps=x.f.view.state.residents.filter(p=>[f.a,f.b].includes(p.id));
-  for(const p of ps)for(const k of Object.keys(p.stats))p.stats[k]=4;
-  for(const stat of ['str','per','end','cha','int','agi','lck']){
-    ps[0].stats[stat]=3;assert.equal(x.api.prepared(x.m(),f),false,stat);ps[0].stats[stat]=4;
+  for(const person of ps)for(const stat of Object.keys(person.stats))person.stats[stat]=10;
+  for(const person of ps)for(const stat of ['str','per','end','cha','int','agi','lck']){
+    person.stats[stat]=9;assert.equal(x.api.prepared(x.m(),f),false,person.id+':'+stat);person.stats[stat]=10;
   }
   assert.equal(x.api.prepared(x.m(),f),true);
+});
+
+test('父母预培养：旧4点目标迁移到10，候选身份与训练期限不变',()=>{
+  const state=setupParentPreparation(source),action=training(state.schedule())[0];state.apply(action);
+  const before=plain(state.context.shelterState.parentPreparation),until=state.context.shelterState.campaign.roles[0].until;
+  state.context.shelterState.parentPreparation.pairs.forEach(pair=>pair.target=4);
+  state.tick();state.schedule();
+  assert.deepEqual(plain(state.context.shelterState.parentPreparation),before);
+  assert.equal(state.context.shelterState.campaign.roles[0].until,until);
+  assert.ok(before.pairs.every(pair=>pair.target===10));
+  const old=state.f.view.state.residents.filter(person=>[8,9].includes(person.id));
+  assert.equal(state.api.pairAllowed(state.m(),old,before,true),false);
+  assert.equal(state.api.pairAllowed(state.m(),old,{version:1,pairs:[]},true),false);
+});
+
+test('父母预培养：关闭训练只暂停培养，未达标父母仍不能新开生育',()=>{
+  const state=setupParentPreparation(source);state.context.shelterCampaign.training=false;
+  const campaign=state.schedule(),pair=state.f.view.state.residents.filter(person=>[4,5].includes(person.id));
+  assert.equal(training(campaign).length,0);
+  assert.equal(state.context.shelterState.parentPreparation.pairs.length,2);
+  assert.equal(state.api.pairAllowed(state.m(),pair,state.context.shelterState.parentPreparation),false);
+});
+
+test('父母预培养：旧父母同宿舍未开始感情时先退出，双方全10及已开始家庭保留',()=>{
+  for(const status of ['below-target','ready','romance','birth','unknown-birth']){
+    const state=setupParentPreparation(source),view=state.f.view.state;
+    state.context.shelterCampaign.training=false;
+    const pair=view.residents.filter(person=>[8,9].includes(person.id));
+    pair.forEach(person=>person.roomId=7);
+    if(status==='ready')pair.forEach(person=>Object.keys(person.stats).forEach(stat=>person.stats[stat]=10));
+    if(status==='romance')pair.forEach((person,index)=>person.romance={partnerId:pair[1-index].id});
+    if(status==='birth'||status==='unknown-birth')view.births=[{roomId:7,dueAt:state.m().now+3600000,
+      ...(status==='birth'?{parents:[8,9]}:{})}];
+    state.schedule();
+    const action=state.api.staff(state.m());
+    if(status==='below-target'){
+      assert.ok([8,9].includes(action?.id));assert.equal(action.room,null);
+      assert.match(action.reason,/七项基础属性.*10/);
+      state.apply(action);state.tick();
+      const next=state.api.staff(state.m());
+      assert.ok(!next||next.room!==7,'未达标不能重新团聚生育');
+    }else assert.ok(!action?.reason.includes('七项基础属性'),status);
+  }
+});
+
+test('父母预培养：已有一级房仍升级空房，排除该房新入训且实际建设可开工',()=>{
+  const state=setupParentPreparation(source);state.context.shelterConstruction.upgrade=true;
+  const campaign=state.schedule(),project=campaign.projects.find(project=>project.upgradeId);
+  assert.ok(project);assert.equal(project.type,'training');
+  assert.ok(!campaign.actions.some(action=>action.room===project.upgradeId));
+  const development=state.api.development(state.m(),18,campaign,null);
+  assert.equal(development.next.status,'ready');assert.equal(development.next.project.id,project.upgradeId);
+  assert.equal(development.next.project.kind,'upgrade');
+});
+
+test('父母预培养：满级、有人训练、预算不足和供电不足均不抢先升级',()=>{
+  for(const condition of ['full','occupied','budget','power']){
+    const state=setupParentPreparation(source);state.context.shelterConstruction.upgrade=true;
+    const rooms=state.f.view.state.rooms.filter(room=>room.type==='training');
+    if(condition==='full')rooms.forEach(room=>room.level=3);
+    if(condition==='occupied'){
+      state.f.view.state.rooms=state.f.view.state.rooms.filter(room=>room.type!=='training'||room.id===93);
+      state.f.view.state.residents.find(person=>person.id===9).roomId=93;
+    }
+    if(condition==='budget')state.context.shelterConstruction.scrapLimit=1;
+    if(condition==='power')state.f.view.state.residents.find(person=>person.id===1).roomId=null;
+    const campaign=state.schedule();assert.ok(!campaign.projects.some(project=>project.upgradeId),condition);
+    if(condition==='occupied')assert.ok(!campaign.actions.some(action=>action.id===9),condition);
+  }
 });

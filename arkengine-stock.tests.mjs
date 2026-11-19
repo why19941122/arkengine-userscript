@@ -87,7 +87,7 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     for(const privateValue of ['123456789','987654321','765432109','876543219','must-not-copy-private','accessToken'])
       assert.equal(JSON.stringify(snapshots).includes(privateValue),false,privateValue);
     await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};
-      [...${panel}.querySelectorAll('details button')].find(b=>b.textContent==='导出两页日志（7 天）').click();`);
+      [...${panel}.querySelectorAll('details button')].find(b=>b.textContent==='导出全部日志（7 天）').click();`);
     await until(()=>evaluate('Boolean(window.exportedBlob)'),'market evidence JSON export');
     const restored=stockSnapshotsFromLog(JSON.parse(await evaluate('exportedBlob.text()')));
     assert.deepEqual(restored,snapshots);assert.equal(await evaluate('km.calls.length'),0);
@@ -1183,7 +1183,7 @@ export async function stockTests({t,setupStock,reloadStock,evaluate,pulse,drive,
     const snapshots=stockSnapshotsFromLog({events});assert.equal(snapshots.length,1);
     assert.equal(snapshots[0].view.stocks.length,67);assert.equal(snapshots[0].view.ticks.length,67*12);
     await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};
-      [...${panel}.querySelectorAll('details button')].find(b=>b.textContent==='导出两页日志（7 天）').click();`);
+      [...${panel}.querySelectorAll('details button')].find(b=>b.textContent==='导出全部日志（7 天）').click();`);
     await until(()=>evaluate('Boolean(window.exportedBlob)'),'native JSON export generated');
     const exportedText=await evaluate('exportedBlob.text()'),exported=JSON.parse(exportedText),restored=stockSnapshotsFromLog(exported);
     assert.deepEqual(restored,snapshots,'actual export bytes must reconstruct the same complete observed market');

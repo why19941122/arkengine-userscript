@@ -3,8 +3,9 @@ import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 import {campaignView} from './arkengine-shelter-campaign.fixture.mjs';
+import {readyConstructionScene} from './arkengine-shelter-growth-investment.fixture.mjs';
 
-const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
+const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const segment=(from,to)=>source.slice(source.indexOf(from),source.indexOf(to));
 const declarations=['shelterRooms','shelterBuildRules','campaignDefaults'].map(n=>source.match(new RegExp(`const ${n}\\s*=[^;]*;`))[0]).join('\n');
 const implementation=[declarations,segment('  function shelterWorkerRate(','  function readShelter('),
@@ -43,10 +44,17 @@ function parents(){
   s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'cha',level:2,floor:2,col:4});
   return scene;
 }
+function multipleFamilies(){
+  const scene=parents(),{v,context}=scene,s=v.state;
+  s.rooms.push({...s.rooms.find(r=>r.id===5),id:91,floor:3,col:2,width:1});
+  for(const id of [7,8])s.residents.push({...structuredClone(s.residents[4]),id,name:`第二家庭${id}`,roomId:91});
+  context.shelterState.families.push({a:7,b:8,room:91});
+  return scene;
+}
 function pairScene(){
   const scene=setup(),s=scene.v.state;
   s.rooms.find(r=>r.id===4).width=3;
-  for(const p of s.residents.slice(4))p.stats=Object.fromEntries(Object.keys(p.stats).map(k=>[k,3]));
+  for(const p of s.residents.slice(4)){p.roomId=4;p.stats=Object.fromEntries(Object.keys(p.stats).map(k=>[k,3]));}
   for(const id of [7,8])s.residents.push({...structuredClone(s.residents[3]),id,name:`优质居民${id}`,roomId:4,parents:[]});
   s.residents[3].stats=Object.fromEntries(Object.keys(s.residents[3].stats).map(k=>[k,3]));
   s.residents[3].xp=0;s.residents[3].hp=100;
@@ -55,11 +63,34 @@ function pairScene(){
   return scene;
 }
 
-test('父母选择：供应可承受时优先高属性生产者，不能仅因低属性居民闲置就选他们',()=>{
+test('就绪工程不饥饿：可支付的普通生产升级先开工，不被可选调岗持续抢占',()=>{
+  const {v,context,api}=setup(),fixture=readyConstructionScene();Object.assign(v,fixture.view);
+  context.shelterStaffMode='production';context.shelterState=fixture.state;
+  const m=api.model(v),campaign=api.campaign(m),plan=api.development(m,14,campaign,8);
+  assert.equal(plan.next.status,'ready',JSON.stringify(plan.next));
+  assert.equal(plan.next.project.type,'scrap');assert.ok(!plan.next.project.levelInvestment);
+  assert.equal(api.allowance(plan.next.project,m,context.shelterConstruction,context.shelterState,null,v.serverTime),'');
+  assert.equal(api.staff(m),null,'do not start another discretionary allocation before this admitted construction');
+});
+
+test('父母选择：就业落实且供应可承受时优先高属性生产者',()=>{
   const {choose,context,events}=pairScene();assert.ok(choose());
   assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
   const assessment=events.find(e=>e[0]==='shelter-population')[2].assessment;
   assert.equal(assessment.baseTotal,56);assert.equal(assessment.midpoint.cha,8);assert.equal(assessment.romanceHours,1.25);
+});
+
+test('父母比较边界：另有闲人尚待就业时先暂停新配对，不用属性或周期绕过就业',()=>{
+  const {v,choose,context,api}=pairScene();
+  for(const p of v.state.residents.filter(p=>p.id>=4)){
+    p.stats=Object.fromEntries(Object.keys(p.stats).map(k=>[k,p.id>=7?5:3]));
+    p.stats.cha=p.id>=7?1:9;
+  }
+  const m=api.model(v),high=v.state.residents.filter(p=>p.id>=7),low=v.state.residents.filter(p=>[5,6].includes(p.id));
+  assert.ok(api.assessment(m,high).baseTotal>api.assessment(m,low).baseTotal);
+  assert.ok(api.assessment(m,high).score<api.assessment(m,low).score,'reproduce the old rate-based ranking conflict');
+  v.state.residents.find(p=>p.id===5).roomId=null;
+  assert.equal(choose(),null);assert.equal(context.shelterState.pair,undefined);assert.match(context.shelterPopulationNote,/岗位/);
 });
 test('父母选择：基础魅力影响周期、装备不影响评估，生产损失会降低同属性组合评分',()=>{
   const {v,api}=setup(),m=api.model(v),pair=v.state.residents.slice(4);
@@ -87,11 +118,13 @@ test('父母换届：旧家庭空宿舍不永久排斥高属性组合，原父�
   context.shelterState=JSON.parse(JSON.stringify(context.shelterState));
   const next=api.population(api.model(v),context.shelterState.families,{eligible:p=>p.id>=4,home:()=>true,healthy:()=>true});
   assert.equal(next.id,8);assert.equal(next.room,5);
-  assert.ok(v.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===null));
+  assert.ok(v.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===4));
 });
 
 test('父母换届：普通调度在旧配对返回前比较属性，不先把低属性父母塞回宿舍',()=>{
   const {v,context,api}=pairScene();context.shelterState.families=[{a:5,b:6,room:5}];
+  for(const person of v.state.residents.filter(person=>[7,8].includes(person.id)))
+    for(const stat of Object.keys(person.stats))person.stats[stat]=10;
   const action=api.staff(api.model(v));assert.equal(action.id,7);assert.equal(action.room,5);
   assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
 });
@@ -101,6 +134,8 @@ test('父母换届：旧父母占基础岗位需要接替时，先执行已有�
   s.residents.find(p=>p.id===1).roomId=4;s.residents.find(p=>p.id===2).roomId=4;
   Object.assign(s.residents.find(p=>p.id===5),{roomId:1,stats:{str:8,per:3,end:3,cha:3,int:3,agi:3,lck:3}});
   Object.assign(s.residents.find(p=>p.id===6),{roomId:2,stats:{str:3,per:3,end:3,cha:3,int:3,agi:8,lck:3}});
+  for(const person of s.residents.filter(person=>[7,8].includes(person.id)))
+    for(const stat of Object.keys(person.stats))person.stats[stat]=10;
   const action=api.staff(api.model(v));assert.ok(action);assert.equal(action.room,5);
   assert.ok([1,2,7,8].includes(action.id));
   assert.ok(context.shelterState.pair);assert.ok(![5,6].includes(context.shelterState.pair.a));
@@ -150,6 +185,77 @@ test('父母训练：现有空位优先、一次最多一名、不会用普通�
   assert.equal(actions[0].purpose,'parent');assert.equal(actions[0].stat,'cha');assert.equal(actions[0].room,90);
   assert.ok(!p.projects.some(p=>p.type==='training'));
 });
+
+test('父母分家庭训练：已入室的家庭不占用另一家庭的空位和冷却窗口',()=>{
+  const {v,context,run,apply}=multipleFamilies();
+  const first=run().choice;assert.equal(first.id,5);apply(first);
+  context.shelterState=JSON.parse(JSON.stringify(context.shelterState));
+  const second=run().actions.find(a=>a.purpose==='parent');assert.ok(second,'second family can train while first continues');
+  assert.equal(second.id,7);assert.equal(second.room,90);apply(second);
+  const p=run();assert.ok(p.reserved.includes(5)&&p.reserved.includes(7));
+  assert.equal(p.actions.filter(a=>a.purpose==='parent').length,0,'both families already have one trainee');
+  assert.deepEqual(v.state.residents.filter(p=>p.roomId===90).map(p=>p.id),[5,7]);
+});
+
+test('父母分家庭训练：手动在训家长也占本家庭轮换名额，其他家庭仍可入室',()=>{
+  const {v,run}=multipleFamilies();v.state.residents.find(p=>p.id===5).roomId=90;
+  const action=run().actions.find(a=>a.purpose==='parent');assert.equal(action?.id,7);
+  assert.ok(!run().actions.some(a=>a.id===5||a.id===6));
+});
+
+test('父母分家庭训练：所有新离岗共用供给余量，第二家庭不能各自重复使用余量',()=>{
+  const {v,run,apply}=multipleFamilies(),s=v.state;
+  s.rooms.find(r=>r.id===3).level=1;s.residents.find(p=>p.id===3).roomId=4;
+  for(const id of [5,7]){const p=s.residents.find(p=>p.id===id);p.roomId=3;p.stats.per=8;}
+  for(const id of [6,8])s.residents.find(p=>p.id===id).hp=1;
+  const first=run().actions.find(a=>a.purpose==='parent');assert.ok(first);apply(first);
+  assert.equal(run().actions.filter(a=>a.purpose==='parent').length,0,'one remaining water worker must stay');
+  s.residents.find(p=>p.id===3).roomId=3;
+  assert.equal(run().actions.find(a=>a.purpose==='parent')?.id,7,'restored supply admits the other family');
+});
+
+test('父母分家庭训练：外出占位、冷却不足、已有感情、换位与目标继续限制新增',()=>{
+  for(const reason of ['seat','cooldown','romance','swap','target']){
+    const {v,context,run,apply}=multipleFamilies(),s=v.state;apply(run().choice);
+    if(reason==='seat')s.residents.push({...structuredClone(s.residents[0]),id:20,name:'外出占位者',roomId:90,away:{kind:'explore'}});
+    if(reason==='cooldown')for(const id of [7,8])s.residents.find(p=>p.id===id).familyCooldownUntil=v.serverTime+600000;
+    if(reason==='romance')for(const id of [7,8])s.residents.find(p=>p.id===id).romance={partnerId:id===7?8:7};
+    if(reason==='swap')context.shelterState.campaign.assignmentInProgress=true;
+    const p=run(reason==='target'?{trainTarget:2}:{});
+    assert.equal(p.actions.filter(a=>a.purpose==='parent').length,0,reason);
+  }
+});
+
+test('父母分家庭训练：本家庭完成后伴侣接续，已完成者本周期不重复入室',()=>{
+  const {v,run,apply}=multipleFamilies(),s=v.state;
+  const first=run().choice;apply(first);
+  const second=run().actions.find(a=>a.purpose==='parent');assert.ok(second);apply(second);
+  v.serverTime+=2*3600000;s.lastSettledAt=v.serverTime;s.residents.find(p=>p.id===5).stats.cha++;
+  const release=run().actions.find(a=>a.id===5);assert.equal(release.role,'training-release');apply(release);
+  const next=run().actions.find(a=>a.purpose==='parent');assert.equal(next?.id,6);
+  assert.ok(!run().actions.some(a=>a.id===5));assert.ok(run().reserved.includes(7));
+});
+
+test('父母分家庭训练：七项属性均能独立选择并跨家庭接续，规划不修改原状态',()=>{
+  for(const stat of ['str','per','end','cha','int','agi','lck']){
+    const {v,context,run,apply}=multipleFamilies(),s=v.state;
+    s.rooms.find(r=>r.id===90).trainStat=stat;
+    for(const p of s.residents.filter(p=>p.id>=5))for(const key of Object.keys(p.stats))p.stats[key]=key===stat?2:6;
+    const before=JSON.stringify({v,state:context.shelterState}),first=run().choice;
+    assert.equal(JSON.stringify({v,state:context.shelterState}),before);
+    assert.equal(first.stat,stat);apply(first);
+    const next=run().actions.find(a=>a.purpose==='parent');assert.equal(next?.id,7,stat);assert.equal(next.stat,stat);
+  }
+});
+
+test('父母分家庭训练：已有家长在训不阻断其他家庭短板训练室的建设评估',()=>{
+  const {v,run,apply}=multipleFamilies();apply(run().choice);
+  for(const p of v.state.residents.filter(p=>[7,8].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=stat==='str'?2:6;
+  const p=run(),project=p.projects.find(r=>r.type==='training');
+  assert.equal(project?.person,7);assert.equal(project.trainStat,'str');
+  assert.ok(!p.reserved.includes(7)&&!p.reserved.includes(8),'waiting for a room must not reserve or remove producers');
+  assert.equal(p.projects.filter(r=>r.type==='training').length,1);
+});
 test('父母训练：进度与期限随成功回执保存，刷新保留，完成一格后本周期不再训练此人',()=>{
   const {v,context,api,run,apply}=parents(),a=run().choice;apply(a);
   assert.equal(api.valid(context.shelterState.campaign),true);
@@ -168,6 +274,32 @@ test('父母训练：冷却到期即退出，关闭训练、切换人员模式�
     if(reason==='mode')cfg.parentTraining=false;
     if(reason==='supply')v.state.resources.food=0;
     assert.equal(run(cfg).actions.find(x=>x.id===a.id)?.role,'training-release',reason);
+  }
+});
+
+test('父母训练边界：冷却结束时当前格剩半小时，余量低于新准入门槛仍可固定收尾，真实缺供给退出',()=>{
+  for(const condition of ['margin','drain','stock']){
+    const {v,context,api,run,apply}=parents(),a=run().choice;apply(a);
+    v.serverTime=a.until;v.state.lastSettledAt=v.serverTime;
+    const p=v.state.residents.find(p=>p.id===a.id);p.training=.75;
+    const m=api.model(v);m.demand.power=condition==='drain'?m.production.power+.1:m.production.power/1.1;
+    if(condition==='stock')m.state.resources.power=0;
+    const cfg={...api.defaults,training:true,parentTraining:true,development:true};
+    const record={...context.shelterState.campaign,families:context.shelterState.families};
+    const first=api.plan(m,cfg,record,14);
+    if(condition!=='margin'){
+      assert.ok(first.actions.some(c=>c.id===p.id&&c.role==='training-release'),condition);continue;
+    }
+    assert.ok(first.reserved.includes(p.id),'允许安全收尾当前格');
+    const finish=first.adoptions.find(r=>r.id===p.id);assert.equal(finish?.finishCurrent,true);
+    assert.ok(finish.until>m.now&&finish.until<=m.now+2*3600000+600000);
+    record.roles=record.roles.map(r=>r.id===p.id?finish:r);
+    for(let i=0;i<3;i++){
+      const again=api.plan(m,cfg,JSON.parse(JSON.stringify(record)),14);
+      assert.ok(again.reserved.includes(p.id));assert.ok(!again.adoptions.some(r=>r.id===p.id),'刷新不能续期');
+    }
+    p.stats.cha++;
+    assert.ok(api.plan(m,cfg,record,14).actions.some(c=>c.id===p.id&&c.role==='training-release'));
   }
 });
 test('父母训练：冷却不足、未知父母待产、人工特殊岗位不参与；训练未开不建房',()=>{
@@ -218,6 +350,17 @@ test('父母训练记录：新增属性仅允许有明确父母用途和有效�
   context.shelterState.campaign.roles=[{id:5,room:90,at:v.serverTime,role:'training',stat:'agi',base:5}];
   assert.equal(api.valid(context.shelterState.campaign),true);
 });
+
+test('父母训练建设：预算恢复晚于冷却窗口时不建本轮用不上的训练房',()=>{
+  const {v,api,run}=parents();v.state.rooms=v.state.rooms.filter(r=>r.id!==90);
+  const plan=run();assert.ok(plan.projects.some(p=>p.type==='training'));
+  plan.constructionPolicy={build:true,upgrade:true,dig:true,budgetMode:'daily',scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0,
+    spent:{scrap:10000,parts:0},budgetReleases:[{at:v.serverTime+12*3600000,scrap:10000,parts:0}]};
+  const development=api.development(api.model(v),14,plan,8);
+  const projects=development.candidates.filter(c=>c.strategy?.trainingDeadline);
+  assert.ok(projects.length);assert.ok(projects.every(c=>c.priority>=70&&c.blocks.some(s=>s.includes('冷却窗口'))));
+  assert.notEqual(development.next.type,'training');assert.equal(plan.reserved.length,0);
+});
 test('家庭诊断：占宿舍成人记录身份与父母，家庭记录包含基础属性评估',()=>{
   const {v,context,api}=parents(),s=v.state;
   s.residents.push({...structuredClone(s.residents[0]),id:100,name:'成年子女',roomId:5,parents:[5,6]});
@@ -244,10 +387,87 @@ test('宿舍就业：冷却父母和另一宿舍成年子女均可直接接岗�
 });
 test('父母训练完整轮换：实际调度读取家庭，训练到期释放后两人返回原宿舍',()=>{
   const {v,context,api,apply}=parents(),s=v.state;
-  context.shelterCampaign={...api.defaults,training:true};
+  context.shelterCampaign={...api.defaults,training:true,parentPreparation:false};
   let a=api.campaign(api.model(v)).choice;assert.equal(a.purpose,'parent');apply(a);
   const id=a.id;v.serverTime=a.until;s.lastSettledAt=v.serverTime;
   a=api.campaign(api.model(v)).choice;assert.equal(a.role,'training-release');apply(a);
   assert.ok(!api.campaign(api.model(v)).actions.some(x=>x.id===id&&x.role==='training'));
   a=api.staff(api.model(v));assert.equal(a.id,id);assert.equal(a.room,5);assert.match(a.reason,/原配对返回/);
+});
+
+function parentRoomChanged(){
+  const x=parents(),first=x.run().choice;x.apply(first);
+  const role=structuredClone(x.context.shelterState.campaign.roles[0]);
+  const p=x.v.state.residents.find(p=>p.id===first.id),room=x.v.state.rooms.find(r=>r.id===90);
+  // Settled post-merge snapshot: the old room no longer exists; resident identity,
+  // training attribute and current progress survive in the wider training room.
+  x.v.serverTime+=600000;x.v.state.lastSettledAt=x.v.serverTime;
+  Object.assign(room,{id:89,width:2});p.roomId=89;p.training=.2;
+  x.context.shelterCampaign={...x.api.defaults,training:true,parentPreparation:false};
+  return {...x,p,room,role};
+}
+
+test('父母训练房间变更：原房消失后沿用原格基线和期限，不重新开始训练承诺',()=>{
+  const x=parentRoomChanged(),before=JSON.stringify(x.context.shelterState),plan=x.run({development:true});
+  const adopted=plan.adoptions.find(r=>r.id===x.p.id);assert.ok(adopted);
+  assert.deepEqual(JSON.parse(JSON.stringify(adopted)),{...x.role,room:89});
+  assert.equal(JSON.stringify(x.context.shelterState),before,'planning remains read-only');
+  x.api.campaign(x.api.model(x.v));x.context.shelterState=JSON.parse(JSON.stringify(x.context.shelterState));
+  const next=x.api.campaign(x.api.model(x.v));
+  assert.ok(next.reserved.includes(x.p.id));assert.equal(next.adoptions.length,0);
+  assert.deepEqual(x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id),{...x.role,room:89});
+});
+
+test('父母训练房间变更：已完成一格随原房消失后仍返岗，不把提升后的属性当作新起点',()=>{
+  const x=parentRoomChanged();x.p.stats.cha++;x.p.training=0;
+  const plan=x.api.campaign(x.api.model(x.v)),release=plan.actions.find(a=>a.id===x.p.id);
+  assert.equal(release?.role,'training-release',JSON.stringify({roles:x.context.shelterState.campaign.roles,actions:plan.actions}));x.apply(release);
+  assert.ok(x.context.shelterState.campaign.trainingRest.some(r=>r.id===x.p.id));
+  assert.ok(!x.run().actions.some(a=>a.id===x.p.id&&a.role==='training'));
+  assert.equal(x.run().actions.find(a=>a.purpose==='parent')?.id,6);
+});
+
+test('父母训练房间变更：有限收尾的固定期限跨房号及刷新不续期',()=>{
+  const x=parentRoomChanged();x.role.finishCurrent=true;x.role.until=x.role.at+600000;
+  x.context.shelterState.campaign.roles=[x.role];
+  const plan=x.api.campaign(x.api.model(x.v));
+  assert.equal(plan.actions.find(a=>a.id===x.p.id)?.role,'training-release');
+  assert.equal(x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id).until,x.role.until);
+});
+
+test('父母训练房间变更：完成后已有下一格进度只生成一次有限收尾记录',()=>{
+  const x=parentRoomChanged();x.p.stats.cha++;x.p.training=.5;
+  const plan=x.run({development:true}),adoptions=plan.adoptions.filter(r=>r.id===x.p.id);
+  assert.equal(adoptions.length,1);assert.equal(adoptions[0].finishCurrent,true);assert.equal(adoptions[0].base,3);
+  x.api.campaign(x.api.model(x.v));
+  assert.equal(x.api.valid(x.context.shelterState.campaign),true);
+  const role=structuredClone(x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id));
+  x.v.serverTime=role.until;x.v.state.lastSettledAt=x.v.serverTime;
+  const next=x.api.campaign(x.api.model(x.v));
+  assert.equal(next.actions.find(a=>a.id===x.p.id)?.role,'training-release');
+  assert.equal(x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id).until,role.until);
+});
+
+test('父母训练房间变更：原房仍在、属性未知、原请求未决或暂停不能自动迁移旧承诺',()=>{
+  for(const reason of ['old-room','unknown-stat','pending','hold']){
+    const x=parentRoomChanged(),before=JSON.stringify(x.context.shelterState);
+    if(reason==='old-room')x.v.state.rooms.push({...x.room,id:90,col:6,width:1});
+    if(reason==='unknown-stat')delete x.room.trainStat;
+    if(reason==='pending')x.context.shelterPending={kind:'assign',targets:[x.p.id,null]};
+    if(reason==='hold')x.context.shelterStaffHold='manual';
+    const plan=x.api.campaign(x.api.model(x.v));
+    const adopted=x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id&&r.room===89);
+    assert.ok(!adopted||adopted.at!==x.role.at,reason);
+    if(['pending','hold'].includes(reason)){
+      assert.equal(JSON.stringify(x.context.shelterState),before,reason);
+      assert.ok(!plan.actions.some(a=>a.id===x.p.id),reason);
+    }
+  }
+});
+
+test('父母训练房间变更：关闭训练后仍能核对原记录并返岗',()=>{
+  const x=parentRoomChanged();x.context.shelterCampaign.training=false;
+  const plan=x.api.campaign(x.api.model(x.v));
+  assert.equal(plan.actions.find(a=>a.id===x.p.id)?.role,'training-release');
+  assert.equal(x.context.shelterState.campaign.roles.find(r=>r.id===x.p.id).base,x.role.base);
 });

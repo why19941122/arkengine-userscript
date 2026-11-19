@@ -1,13 +1,7 @@
 import assert from 'node:assert/strict';
 
-export async function dialogRecoveryTests({t,setupFog,setupDungeon,setupFarm,setupExp,evaluate,drive,pulse,trustedStaffKey}){
+export async function dialogRecoveryTests({t,setupDungeon,setupFarm,setupExp,evaluate,drive,pulse,trustedStaffKey}){
   const noDialog=`!document.querySelector('[role="dialog"],[role="alertdialog"]')`;
-  await t.test('跨玩法弹窗恢复：迷雾标题变化后取消，零消耗并返回主殿',async()=>{
-    await setupFog(`const open=openFog;window.openFog=()=>{open();document.querySelector('[role="alertdialog"] h2').textContent='新版快速探索';};`,'/cultivate/fog');
-    await drive(`location.pathname==='/cultivate'&&${noDialog}`,'changed fog dialog cancelled');
-    assert.equal(await evaluate(`fo.calls.filter(c=>c[0]==='start').length`),0);assert.equal(await evaluate('fo.spirit'),200);
-    assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-fog:pending:v1'))`),null);
-  });
   await t.test('跨玩法弹窗恢复：秘境入场及扫荡说明变化后取消，不买票也不保留虚假进度',async()=>{
     for(const sweep of [false,true]){
       await setupDungeon(`dm.sweep=${sweep};const open=${sweep?'openSweep':'openDun'};window.${sweep?'openSweep':'openDun'}=(...args)=>{
@@ -35,8 +29,6 @@ export async function dialogRecoveryTests({t,setupFog,setupDungeon,setupFarm,set
     }
   });
   const features=[
-    {name:'迷雾',setup:code=>setupFog(code,'/cultivate/fog'),open:'openFog',wait:16000,back:'/cultivate',
-      calls:`fo.calls.filter(c=>c[0]==='start').length`,journal:'arkengine:auto-fog:pending:v1',enabled:'arkengine:auto-encounter:enabled:v1'},
     {name:'秘境',setup:code=>setupDungeon(`dm.sweep=true;${code}`,'/cultivate/dungeon'),open:'openSweep',wait:16000,back:'/cultivate',
       calls:`dm.calls.filter(c=>['enter','sweep'].includes(c[0])).length`,journal:'arkengine:auto-dungeon:pending:v1',enabled:'arkengine:auto-encounter:enabled:v1'},
     {name:'农场',setup:code=>setupFarm(`addRuns(6);${code}`,'/farm'),open:'openSeeds',wait:31000,back:'/activities/expedition',

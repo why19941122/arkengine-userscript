@@ -1,10 +1,10 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.137
+// @version      1.17.138
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
-// @description  双标签页挂机：奇遇秘境迷雾、远征农场避难所与模型股市；独立预算交易预测、人口生产、探险归来领取与发展规划，七日本地日志。
+// @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
 // @match        https://game.arkengine.me/*
 // @run-at       document-start
 // @grant        none
@@ -23,7 +23,7 @@
   started = true;
   bodyObserver?.disconnect();
   const bodyWaitMs = Math.max(0, Math.round(performance.now() - injectedClock));
-  if (window.top !== window.self || document.getElementById('ark-auto-encounter')) return;
+  if (window.top !== window.self || document.getElementById('ark-auto-expedition')) return;
   // 网站 Base UI 的关闭完成回调先等 requestAnimationFrame；后台不绘制时可能一直不卸载。
   // 使用其公开代码中的开关，只在自动化路由启用期间跳过动画等待，不改写 rAF 或移除弹窗。
   const animationProperty = 'BASE_UI_ANIMATIONS_DISABLED';
@@ -66,10 +66,8 @@
   function syncDialogAnimations() {
     let wanted = false;
     try {
-      wanted = /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname)
-        ? localStorage.getItem('arkengine:auto-encounter:enabled:v1') !== 'false'
-        : /^(?:\/activities\/expedition|\/farm|\/shelter|\/stock)\/?$/.test(location.pathname) &&
-          localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
+      wanted = /^\/(?:activities\/expedition|farm|shelter|stock|cultivate(?:\/dungeon)?)\/?$/.test(location.pathname) &&
+        localStorage.getItem('arkengine:auto-expedition:enabled:v1') !== 'false';
       wanted &&= !accountStopReason();
       if (wanted && !animationSaved) {
         animationDescriptor = Object.getOwnPropertyDescriptor(globalThis, animationProperty);
@@ -1506,7 +1504,7 @@
   let captureShelterHelp = null;
   let captureShelterCaravan = null;
   let observeSessionPage = () => {};
-  const pageGroup = path => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(path) ? 'cultivate' :
+  const pageGroup = path => /^\/cultivate(?:\/dungeon)?\/?$/.test(path) ? 'cultivate' :
     /^(?:\/activities\/expedition|\/farm|\/shelter|\/stock)\/?$/.test(path) ? 'expedition' : '';
   const diagnosticPage = (path = location.pathname) => path === '/' || pageGroup(path) ? path : '[其他页面]';
   const logDay = (at = Date.now()) => new Date(at + 8 * 3600000).toISOString().slice(0, 10);
@@ -1549,7 +1547,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.137';
+  const SCRIPT_VERSION = '1.17.138';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -1593,7 +1591,7 @@
     box.append(header,content);
     const render=collapsed=>{
       content.hidden=collapsed;
-      title.textContent=collapsed?(group==='cultivate'?'修仙助手':'远征助手'):fullTitle;
+      title.textContent=collapsed?'方舟挂机助手':fullTitle;
       fold.textContent=collapsed?'展开':'折叠';
       fold.setAttribute('aria-expanded',String(!collapsed));
       fold.title=collapsed?'展开脚本面板':'折叠面板，脚本继续运行';
@@ -2277,12 +2275,15 @@
       const box = shadow.querySelector('.box');
       hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'log-summary';hint.style.whiteSpace='pre-line'; box.append(hint);
       const details = document.createElement('details'); details.id = 'local-log';
-      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">保留前 7 个完整自然日及今天，两组共用约 20 MiB 事件预算。行情压缩保存，关键故障、结果与收益汇总优先于重复详情。容量不足仍可能提前清理；导出注明实际覆盖和缺口。</p><button type="button">导出两页日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
+      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">保留前 7 个完整自然日及今天，全部玩法共用约 20 MiB 事件预算。行情压缩保存，关键故障、结果与收益汇总优先于重复详情。容量不足仍可能提前清理；导出注明实际覆盖和缺口。</p><button type="button">导出全部日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
       details.addEventListener('toggle', async () => {
         if (!details.open) return;
-        const value = await refreshLog(true);
-        details.querySelector('pre').textContent = value ? value.events.map(e =>
-          `${e.beijing?.slice(11,19) || ''} ${e.type || ''} ${e.detail || ''}`).join('\n') || '今天暂无记录' : '日志不可读';
+        try {
+          const values = await Promise.all(['cultivate', 'expedition'].map(name => logStore.read(name)));
+          const events = values.flatMap(value => value?.events || []).sort((left, right) => left.at - right.at).slice(-30);
+          details.querySelector('pre').textContent = events.map(event =>
+            `${event.beijing?.slice(11,19) || ''} ${event.type || ''} ${event.detail || ''}`).join('\n') || '今天暂无记录';
+        } catch { failed(); details.querySelector('pre').textContent = '日志不可读'; }
       });
       details.querySelector('button').onclick = async event => {
         const button = event.currentTarget;
@@ -2300,12 +2301,17 @@
         finally { button.disabled = false; }
       };
       box.append(details); render(); refreshLog();
-      const scopes = group === 'cultivate' ? ['cultivate', 'dungeon', 'fog'] : ['expedition', 'farm', 'shelter', 'stock'];
+      const scopes = ['cultivate', 'dungeon', 'expedition', 'farm', 'shelter', 'stock'];
       for (const [key, scope] of stateFaults) if (scopes.includes(scope)) {
         add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
       }
     }
     const log = { add, observation, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites };
+    log.mountSummary = shadow => {
+      hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'cultivate-log-summary'; hint.style.whiteSpace = 'pre-line';
+      shadow.querySelector('[data-panel-section="cultivate"] .panel-section-body').append(hint);
+      render(); refreshLog();
+    };
 
     diagnosticLogs[group] = log;
     return log;
@@ -2343,7 +2349,7 @@
     observeSessionPage();
     window.addEventListener('pagehide', observeSessionPage);
 
-    const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons', '/api/cultivation/fog',
+    const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons',
       '/api/activities', '/api/activities/expedition-claim-all', '/api/activities/expedition-event',
       '/api/farm', '/api/farm/plant', '/api/farm/plant-all', '/api/farm/harvest', '/api/farm/harvest-all',
       '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action', '/api/stock']);
@@ -2604,15 +2610,18 @@
     };
   }
 
-(() => {
-  'use strict';
-  if (window.top !== window.self || document.getElementById('ark-auto-encounter')) return;
-
-  // 依据 2026-10-10 网站 v1.29.1 的前端结构；不调用游戏接口。
+function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled, schedule, navigate, finishVisit, report }) {
   const PREF = 'arkengine:auto-encounter:enabled:v1';
-  const LOCK = 'arkengine:auto-encounter:tab:v1';
   const RETRY_MS = 30000;
   const ENCOUNTER_ACTION = 'arkengine:auto-encounter:action:v1';
+  const ENCOUNTER_SCHEDULE = 'arkengine:auto-encounter:schedule:v1';
+  let encounterSchedule = loadState(localStorage, ENCOUNTER_SCHEDULE, { nextAt: 0, note: '' }, 'cultivate',
+    value => objectState(value) && Number.isFinite(value.nextAt) && typeof value.note === 'string');
+  function planEncounter(nextAt, note) {
+    encounterSchedule = { nextAt, note };
+    localStorage.setItem(ENCOUNTER_SCHEDULE, JSON.stringify(encounterSchedule));
+    setPanelText(last, note);
+  }
   let encounterAction = loadState(sessionStorage, ENCOUNTER_ACTION, null, 'cultivate', value =>
     timedState(value) && ['seek', 'choose'].includes(value.kind) && typeof value.signature === 'string');
   function saveEncounterAction(value) {
@@ -2624,26 +2633,8 @@
   const CLICK_DELAY_MAX_MS = 5000;
   const RECOVERY_PREFIX = 'cultivation:operation:';
   const inDungeon = () => /^\/cultivate\/dungeon\/?$/.test(location.pathname);
-  const inFog = () => /^\/cultivate\/fog\/?$/.test(location.pathname);
-  const onPage = () => /^\/cultivate(?:\/(?:dungeon|fog))?\/?$/.test(location.pathname);
-  const FOG_PREF = 'arkengine:auto-fog:enabled:v1';
-  const FOG_STATE = 'arkengine:auto-fog:state:v1';
-  const FOG_JOURNAL = 'arkengine:auto-fog:pending:v1';
-  let fogEnabled = true;
-  let fog = { draining: false, nextAt: 0 };
-  let fogPlan = null;
-  let openedFogDialog = false;
-  let fogLeaving = false;
-  let fogResultObserved = false;
-  let fogPageAt = 0;
-  try {
-    fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
-    fog = loadState(localStorage, FOG_STATE, fog, 'fog', v => objectState(v) && Number.isFinite(v.nextAt));
-    fogPlan = loadState(sessionStorage, FOG_JOURNAL, null, 'fog', v => planState(v) && objectState(v.settings) &&
-      ['east', 'south', 'explore'].includes(v.settings.route) && ['guard-heavy', 'strike'].includes(v.settings.strategy) &&
-      Number.isInteger(v.settings.retreatHp) && v.settings.retreatHp >= 0 && v.settings.retreatHp <= 90);
-    if (stateFault('fog')) fogEnabled = false;
-  } catch { fogEnabled = false; }
+  const onPage = () => /^\/cultivate(?:\/dungeon)?\/?$/.test(location.pathname);
+
   const DUNGEON_PREF = 'arkengine:auto-dungeon:enabled:v1';
   const DUNGEON_STATE = 'arkengine:auto-dungeon:state:v1';
   const DUNGEON_JOURNAL = 'arkengine:auto-dungeon:pending:v1';
@@ -2670,20 +2661,16 @@
   } catch { dungeonEnabled = false; }
   let dungeonPageDay = '';
   let openedDungeonDialog = false;
-  let fogWindow=null,dungeonWindow=null;
+  let dungeonWindow=null;
   let returningFromDungeon = false;
   let dungeonProgress = null;
   let dungeonEntryReview = null;
   let enabled = true;
   try { enabled = localStorage.getItem(PREF) !== 'false'; } catch { /* 使用内存设置 */ }
-  let active = false;
-  let acquiring = false;
-  let releaseLock = null;
   let lastAction = null;
   let nextActionAt = 0;
   let pendingClick = null;
   let clickConsidered = false;
-  let scheduled = false;
   let statusText = '';
   const log = createLog('cultivate');
   const handleNotice = createNoticeHandler(log, message => say(message), (button, id, message, before) =>
@@ -2693,68 +2680,12 @@
   const locator = createLocator();
   accountListeners.push(reason => setEnabled(false, reason));
 
-  const host = document.createElement('aside');
-  host.id = 'ark-auto-encounter';
-  host.hidden = !onPage();
-  const shadow = host.attachShadow({ mode: 'open' });
-  shadow.innerHTML = `
-    <style>
-      :host { all: initial; position: fixed; right: 14px; bottom: 18px;
-        z-index: 2147483646; font: 13px/1.6 system-ui, sans-serif; color: #e6edf9; }
-      :host([hidden]) { display: none; }
-      .box { box-sizing: border-box; width: 280px; max-width: calc(100vw - 28px); max-height: 80vh; overflow-y: auto;
-        padding: 12px 14px; background: #1b2033; border: 1px solid #616e9c;
-        border-radius: 6px; box-shadow: 0 4px 18px #0005; }
-      strong { font-size: 14px; } p { margin: 6px 0; overflow-wrap: anywhere; }
-      .hint { color: #acbde1; font-size: 12px; }
-      button { min-height: 32px; padding: 4px 14px; cursor: pointer;
-        color: #102625; background: #62cebd; border: 0; border-radius: 3px; }
-      button:focus-visible { outline: 2px solid white; outline-offset: 3px; }
-      a { color: #acbde1; }
-    </style>
-    <div class="box">
-      <strong>修仙助手</strong>
-      <p id="status" role="status" aria-live="polite"></p>
-      <button type="button" id="toggle"></button>
-      <details class="panel-section" data-panel-section="cultivate" open>
-      <summary>修仙</summary><div class="panel-section-body">
-      <p class="hint">最高钻石优先；无钻石时选最高修为。</p>
-      <p id="last" class="hint">等待下一次奇遇</p>
-      <p id="dungeon-status" class="hint"></p>
-      <button type="button" id="dungeon-toggle"></button>
-      <p id="fog-status" class="hint"></p>
-      <button type="button" id="fog-toggle"></button>
-      </div></details>
-      <p class="hint"><a href="/activities/expedition" target="_blank" rel="noopener">打开远征挂机页</a></p>
-    </div>`;
-  document.body.append(host);
-  const status = shadow.getElementById('status');
+  const status = shadow.getElementById('cultivate-status');
   const last = shadow.getElementById('last');
-  const toggle = shadow.getElementById('toggle');
+  const toggle = shadow.getElementById('cultivate-toggle');
   const dungeonStatus = shadow.getElementById('dungeon-status');
   const dungeonToggle = shadow.getElementById('dungeon-toggle');
-  const fogStatus = shadow.getElementById('fog-status');
-  const fogToggle = shadow.getElementById('fog-toggle');
-  log.mount(shadow);
-  mountPanelControls(shadow,'cultivate');
-  fogToggle.addEventListener('click', () => {
-    if (stateFault('fog')) { say(stateFault('fog')); return; }
-    fogEnabled = !fogEnabled;
-    localStorage.setItem(FOG_PREF, String(fogEnabled));
-    if (fogEnabled) {
-      saveFog({ ...fog, nextAt: 0, deferrals: 0, stalls: 0 });
-      recoveryBudget.clear('fog');
-    }
-    cancelPendingClick(); schedule();
-  });
-  function updateFogHint() {
-    const hint = stateFault('fog') || (!fogEnabled ? '迷雾已暂停' : dungeonPlan ? '迷雾：等待秘境原操作确认' :
-      dungeon.run ? '迷雾：等待本轮秘境结束' : fog.nextAt > Date.now() ?
-      `迷雾：约 ${Math.ceil((fog.nextAt - Date.now()) / 60000)} 分钟后再核对` :
-      fog.draining || fogPlan ? '迷雾：本轮探索到灵力不足 20' : '迷雾：主殿灵力达到 200 后进入');
-    if (fogStatus.textContent !== hint) fogStatus.textContent = hint;
-    setPanelText(fogToggle,fogEnabled ? '暂停迷雾' : '开启迷雾');
-  }
+  log.mountSummary(shadow);
   function updateDungeonHint() {
     const hint = stateFault('dungeon') || (!dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
       dungeon.exhaustedDay === dungeonDay() ? '秘境：次数已用完，北京时间 4 点后再检查' :
@@ -2780,20 +2711,18 @@
   });
 
   function say(text) {
-    if (text === statusText) return;
-    statusText = text;
-    status.textContent = text;
+    if (text !== statusText) { statusText = text; status.textContent = text; }
+    if (onPage()) report(text);
   }
 
   function setEnabled(value, reason = '') {
     if (value && stateFault('cultivate')) { say(stateFault('cultivate')); return; }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 不阻断暂停 */ }
-    toggle.textContent = value ? '暂停修仙自动操作' : '开始修仙自动操作';
+    toggle.textContent = value ? '暂停奇遇与秘境' : '开启奇遇与秘境';
     if (!value) {
-      if (active) log.stop(reason || '人工暂停');
+      if (ownsLock()) log.stop(reason || '人工暂停');
       cancelPendingClick();
-      releaseLock?.();
       say(reason || '已暂停');
     }
     schedule();
@@ -2803,7 +2732,7 @@
     if (!enabled) { clearAccountStop(); recoveryBudget.clear(); pageWait.clear(); }
     setEnabled(!enabled);
   });
-  toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
+  toggle.textContent = enabled ? '暂停奇遇与秘境' : '开启奇遇与秘境';
 
   const textOf = el => (el?.textContent || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
   function visible(el) {
@@ -2874,7 +2803,7 @@
 
   function recordClick(button, kind, signature, message, beforeClick, afterClick) {
     if (accountStopReason()) { setEnabled(false, accountStopReason()); return false; }
-    if (!usable(button) || !enabled || !active || !onPage()) return false;
+    if (!usable(button) || !enabled || !ownsLock() || !onPage()) return false;
     clickConsidered = true;
     if (!pendingClick || pendingClick.kind !== kind || pendingClick.signature !== signature) {
       cancelPendingClick();
@@ -2886,7 +2815,7 @@
     }
     const remaining = pendingClick.dueAt - Date.now();
     if (remaining > 0) {
-      const action = /^(dungeon|fog|notice):/.test(kind) ? message :
+      const action = /^(dungeon|notice|travel):/.test(kind) ? message :
         kind === 'seek' ? '寻找奇遇' : kind === 'choose' ? '选择最高奖励' : '确认原奇遇结果';
       say(`随机等待 ${(Math.ceil(remaining / 100) / 10).toFixed(1)} 秒后${action}`);
       return false;
@@ -2934,7 +2863,7 @@
     try { checkPage(); } finally {
       // 暂停、切页、处理中、重新冷却或选项失效时撤销待执行点击。
       if (!clickConsidered) cancelPendingClick();
-      if (enabled && active && onPage()) pageWait.finish();
+      if (enabled && ownsLock() && onPage()) pageWait.finish();
     }
   }
 
@@ -2944,8 +2873,6 @@
     syncDialogAnimations();
     observeDungeonEntryReview();
     updateDungeonHint();
-    updateFogHint();
-    if (host.hidden === onPage()) host.hidden = !onPage();
     if (accountStopReason()) {
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
       return;
@@ -2955,17 +2882,17 @@
       return;
     }
     if (inDungeon() && stateFault('dungeon')) { say(stateFault('dungeon')); return; }
-    if (inFog() && stateFault('fog')) { say(stateFault('fog')); return; }
     if (!onPage() || !enabled) {
-      releaseLock?.();
       if (!enabled && !statusText) say('已暂停');
+      if (onPage() && !enabled && !encounterAction && !dungeonPlan && !pendingOperation() && !nativeDungeonRequests().length &&
+          !document.querySelector('#cultivation-encounter, [role="dialog"], [role="alertdialog"]')) returnToExpedition();
       return;
     }
     if (!navigator.locks) {
       setEnabled(false, '浏览器不支持标签页互斥，请使用新版 Chrome / Edge / Firefox');
       return;
     }
-    if (!active) { acquire(); return; }
+    if (!ownsLock()) return;
     log.pulse(statusText, { pageRecovery: pageWait.snapshot() });
     const notices = [...document.querySelectorAll('[role="status"]')].filter(visible);
     const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="alert"].text-destructive, [role="status"].bg-destructive, [role="alert"].bg-destructive')]
@@ -2975,9 +2902,6 @@
       return;
     }
     if (inDungeon()) { checkDungeon(notices, errors); return; }
-    if (inFog()) { checkFog(errors); return; }
-    fogPageAt = 0;
-    fogLeaving = false;
     dungeonPageDay = '';
     returningFromDungeon = false;
     dungeonProgress = null;
@@ -3024,19 +2948,42 @@
       return;
     }
 
+    if (pendingOperation()) { say('等待原奇遇请求结束，保留原记录'); return; }
+
+    if (!encounterAction && encounterSchedule.nextAt > Date.now()) {
+      if (!visitDungeon()) returnToExpedition();
+      return;
+    }
+
     const cooldown = [...document.querySelectorAll('button')].find(el =>
       visible(el) && /^奇遇冷却\s/.test(textOf(el)));
     if (cooldown) {
-      // 先确认上一轮已结束，再切秘境/迷雾；否则同样的下一轮选项会被旧重试记录挡住。
+      // 先确认上一轮已结束，避免同样的下一轮选项被旧重试记录挡住。
       lastAction = null;
       if (encounterAction) saveEncounterAction(null);
       recoveryBudget.clear('encounter');
       recoveryBudget.clear('encounter-original');
     }
-    if ((!fogEnabled || !fogPlan || fog.nextAt > Date.now()) && visitDungeon()) return;
-    if (visitFog()) return;
+    const exhausted = [...document.querySelectorAll('button')].filter(visible).some(button =>
+      /(?:今日|每日).*(?:次数.*(?:用完|用尽|耗尽)|(?:已达|达到).*上限)/.test(textOf(button))) ||
+      [...document.querySelectorAll('p, span, [aria-live]')].filter(visible).some(element =>
+        /^(?:今日|每日)\s*(?:奇遇\s*)?(?:剩余|剩余次数)\s*[:：]?\s*0\s*\/\s*24\s*次?$/.test(textOf(element)) ||
+        /^(?:今日|每日)\s*奇遇\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次?$/.test(textOf(element)));
+    if (exhausted && encounterAction?.kind === 'choose') {
+      saveEncounterAction(null);
+      recoveryBudget.clear('encounter');
+      recoveryBudget.clear('encounter-original');
+    }
+    if (exhausted) planEncounter(Date.now() + 3600000, '今日奇遇次数已用完，一小时后核对网页额度');
     if (cooldown) {
-      say(textOf(cooldown));
+      const match = textOf(cooldown).match(/^奇遇冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
+      const seconds = match && +match[2] < 60 && (match[3] === undefined || +match[3] < 60) ?
+        match[3] === undefined ? +match[1] * 60 + +match[2] : +match[1] * 3600 + +match[2] * 60 + +match[3] : null;
+      if (!exhausted) planEncounter(Date.now() + Math.max(360000, seconds === null ? 0 : (seconds + 2) * 1000), '奇遇已预约，六分钟后或网页冷却结束后核对');
+    }
+    if (visitDungeon()) return;
+    if (cooldown || exhausted) {
+      returnToExpedition();
       return;
     }
     const seek = findButton('寻找奇遇');
@@ -3044,95 +2991,15 @@
       pageWait.wait('等待修仙主殿加载', !encounterAction && !pendingOperation(), say,
         reason => setEnabled(false, reason), true); return;
     }
-    if (!usable(seek)) { say('等待游戏允许寻访奇遇'); return; }
+    if (!usable(seek)) {
+      planEncounter(Date.now() + 5 * 60000, '奇遇暂不可用，5 分钟后核对');
+      returnToExpedition(); return;
+    }
     if (!retryReady('seek', 'seek')) return;
     recordClick(seek, 'seek', 'seek', '正在寻找奇遇');
   }
 
-  // 奇遇、秘境与迷雾共享队列和标签页锁，任何时刻只执行当前页面的一步操作。
-  function saveFog(value) {
-    const serialized = JSON.stringify(value);
-    localStorage.setItem(FOG_STATE, serialized);
-    if (localStorage.getItem(FOG_STATE) !== serialized) throw new Error('无法保存迷雾进度');
-    fog = value;
-  }
-  function saveFogPlan(value) {
-    const serialized = JSON.stringify(value);
-    sessionStorage.setItem(FOG_JOURNAL, serialized);
-    if (sessionStorage.getItem(FOG_JOURNAL) !== serialized) throw new Error('无法保存迷雾原操作');
-    fogPlan = value;
-  }
-  function nativeFogRequests() {
-    return Object.keys(sessionStorage).filter(key => /^fog:\d+$/.test(key))
-      .map(key => ({ key, value: JSON.parse(sessionStorage.getItem(key)) })).filter(r => r.value);
-  }
-  function fogSettings() {
-    const route = locator.query('select[aria-label="探索路线"]')?.value;
-    const strategy = locator.query('select[aria-label="战斗策略"]')?.value;
-    const rawHp = locator.query('input[aria-label="生命撤离线"]')?.value;
-    const retreatHp = Number(rawHp);
-    return ['east', 'south', 'explore'].includes(route) && ['guard-heavy', 'strike'].includes(strategy) &&
-      rawHp !== undefined && rawHp !== '' && Number.isInteger(retreatHp) && retreatHp >= 0 && retreatHp <= 90
-      ? { route, strategy, retreatHp } : null;
-  }
-  function bindFogRequest() {
-    if (fogPlan?.phase !== 'submitted' || fogPlan.original) return;
-    const records = nativeFogRequests();
-    if (records.length !== 1) return;
-    const { input, idempotencyKey } = records[0].value;
-    if (!idempotencyKey || typeof idempotencyKey !== 'string' || input?.action !== 'start' ||
-        Object.keys(input).length !== 2 || !input.quick || Object.keys(input.quick).length !== 3 ||
-        Object.keys(fogPlan.settings).some(key => input.quick[key] !== fogPlan.settings[key])) return;
-    saveFogPlan({ ...fogPlan, original: records[0] });
-    fogResultObserved = true;
-  }
-  function afterFogClick() {
-    bindFogRequest();
-    // 原网页先完成确认 Promise，再同步保存原请求，故紧随它的微任务绑定。
-    queueMicrotask(() => {
-      try { bindFogRequest(); } catch { setEnabled(false, '迷雾原操作保存失败，请手动核对结果'); }
-    });
-  }
-  function returnFromFog() {
-    const link = linkTo('/cultivate');
-    if (!usable(link)) { say('等待返回修仙主殿入口'); return; }
-    recordClick(link, 'fog:return', 'hall', '返回主殿继续奇遇', () => { fogResultObserved = false; });
-  }
-  function deferFog(reason, pause = false, stalled = false) {
-    if (!fogLeaving) {
-      const deferrals = Math.min((fog.deferrals || 0) + 1, 4);
-      const stalls = (fog.stalls || 0) + Number(stalled);
-      pause ||= stalls >= 3;
-      const minutes = Math.min(30, 5 * 2 ** (deferrals - 1));
-      saveFog({ ...fog, deferrals, stalls, nextAt: Date.now() + minutes * 60000 });
-      if (pause) {
-        fogEnabled = false;
-        localStorage.setItem(FOG_PREF, 'false');
-      }
-      fogLeaving = true;
-      last.textContent = `${reason}；${pause ? '迷雾已暂停，请手动核对' : `${minutes} 分钟后再核对迷雾`}`;
-      log.add('fog-deferred', reason, { paused: pause, pending: Boolean(fogPlan), retryAt: fog.nextAt });
-    }
-    returnFromFog();
-  }
-  function visitFog() {
-    if (!fogEnabled || fog.nextAt > Date.now() || dungeon.run || dungeonPlan) return false;
-    const link = linkTo('/cultivate/fog');
-    if (!usable(link)) return false;
-    // 严格读取主殿的灵力行，避免误把顶部体力、门票或奖励数字作为灵力。
-    const values = [...document.querySelectorAll('span')].filter(visible).map(textOf)
-      .map(text => text.match(/^灵力\s+(\d+)\s*\/\s*(\d+)$/)).filter(Boolean);
-    const spirit = values.length === 1 && Number(values[0][1]) <= Number(values[0][2]) ? Number(values[0][1]) : null;
-    const shouldEnter = fogPlan || fog.draining || spirit !== null && spirit >= 200;
-    if (Object.keys(sessionStorage).some(key => key.startsWith(RECOVERY_PREFIX) && sessionStorage.getItem(key) !== 'null')) return false;
-    const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
-    if (!cooldown && lastAction && !/^(dungeon|fog):/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) return false;
-    if (!cooldown && !findButton('寻找奇遇')) return false;
-    // 只利用正常奇遇操作或网页自身更新的灵力，不为迷雾定时刷新主殿。
-    if (!shouldEnter) return false;
-    recordClick(link, 'fog:visit', 'fog', '切换到迷雾', () => saveFog({ ...fog, draining: true }));
-    return true;
-  }
+
   function cancelCultivateWindow(w,dialogs,kind) {
     return cancelNativeWindow(w,dialogs,{usable,say,pause:message=>setEnabled(false,message),
       enqueue:(button,before)=>recordClick(button,`${kind}:cancel`,'owned-window',w.cancelReason,before)});
@@ -3140,125 +3007,12 @@
   for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
     if(!event.isTrusted||event.composedPath().includes(host))return;
     const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-    for(const w of [fogWindow,dungeonWindow]){
+    for(const w of [dungeonWindow]){
       if(w?.path!==location.pathname)continue;bindNativeWindow(w,dialogs);
       if(!w.dialog||w.dialog.contains(event.target)){w.manual=true;cancelPendingClick();}
     }
   },true);
-  function checkFog(errors) {
-    fogPageAt ||= Date.now();
-    if (Date.now() < nextActionAt) return;
-    const records = nativeFogRequests();
-    const dialogs = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-    bindNativeWindow(fogWindow,dialogs);
-    if(fogWindow&&!records.length&&fogPlan?.phase==='opening'){
-      const confirm=fogWindow.dialog&&[...fogWindow.dialog.querySelectorAll('button')].find(b=>textOf(b)==='确认');
-      const mismatch=fogWindow.dialog&&(textOf(fogWindow.dialog.querySelector('h2, [data-slot="alert-dialog-title"]'))!=='快速探索'||
-        nativeWindowDescription(fogWindow.dialog)!==fogPlan.description);
-      if(fogWindow.cancelReason||fogWindow.dialog&&(mismatch||!fogEnabled||!usable(confirm)&&Date.now()-fogWindow.at>15000||JSON.stringify(fogSettings())!==JSON.stringify(fogPlan.settings))){
-        fogWindow.cancelReason??='迷雾确认内容变化或等待超时，取消本轮探索';
-        if(cancelCultivateWindow(fogWindow,dialogs,'fog')){
-          const reason=fogWindow.cancelReason;saveFogPlan(null);openedFogDialog=false;fogWindow=null;deferFog(reason);
-        }return;
-      }
-      if(fogWindow.manual){say('迷雾确认已由你接手，等待处理');return;}
-    }
-    if (dialogs.length) {
-      const dialog = dialogs[0];
-      const title = dialog.querySelector('h2, [data-slot="alert-dialog-title"]');
-      const own = dialogs.length === 1 && !records.length && openedFogDialog && fogPlan?.phase === 'opening' &&
-        fogWindow?.dialog===dialog&&!fogWindow.manual&&!fogWindow.ambiguous &&
-        textOf(title) === '快速探索' && nativeWindowDescription(dialog)===fogPlan.description;
-      if (!own) { handleNotice(dialogs, '请先手动处理当前弹窗'); return; }
-      if (JSON.stringify(fogSettings()) !== JSON.stringify(fogPlan.settings)) {
-        say('迷雾预设已变化，请手动核对确认窗口'); return;
-      }
-      const confirm = [...dialog.querySelectorAll('button')].find(b => textOf(b) === '确认');
-      recordClick(confirm, 'fog:confirm', fogPlan.description, '确认快速探索（消耗 20 灵力）', () => {
-        saveFogPlan({ ...fogPlan, phase: 'submitted', at: Date.now(), startedAt: Date.now() });
-        openedFogDialog = false; fogResultObserved = false;
-      }, afterFogClick);
-      return;
-    }
-    if (!fogEnabled || fogLeaving || fog.nextAt > Date.now()) { returnFromFog(); return; }
-    const own = records.length === 1 && fogPlan?.original && JSON.stringify(records[0]) === JSON.stringify(fogPlan.original);
-    if (records.length && !own) { deferFog('存在无法核对归属的迷雾原请求', true); return; }
-    const refresh = findButton('刷新');
-    if (fogPlan?.phase === 'submitted') {
-      if (Date.now() - fogPlan.startedAt > 90000) {
-        if (!fogPlan.deferred) {
-          // 每次返回后仍保留同一原请求，但允许下一次核对获得独立的等待窗口。
-          saveFogPlan({ ...fogPlan, deferred: true });
-          deferFog('迷雾 90 秒未确认结果，保留原请求回主殿', false, true); return;
-        }
-        saveFogPlan({ ...fogPlan, startedAt: Date.now(), deferred: false });
-      }
-      if (own) {
-        const recover = findButton('确认原探索结果');
-        if (Date.now() - fogPlan.at >= RETRY_MS && usable(recover)) {
-          if (!recoveryBudget.ready('fog', records[0].value.idempotencyKey, fogPlan.at,
-            reason => deferFog(reason, true), '原迷雾结果')) return;
-          recordClick(recover, 'fog:recover', records[0].value.idempotencyKey, '确认原探索结果', () => {
-            recoveryBudget.attempted('fog');
-            saveFogPlan({ ...fogPlan, at: Date.now() }); fogResultObserved = true;
-          });
-        } else say('等待原迷雾请求完成，不重复消耗灵力');
-        return;
-      }
-      if (!usable(refresh)) { say('等待迷雾结果同步完成'); return; }
-      if (errors) { deferFog(`迷雾提示：${errors}；本轮结果不能确认`, true); return; }
-      const receipt = [...document.querySelectorAll('[role="status"]')].filter(visible).map(textOf)
-        .find(text => /已到账:修为\s*\d+\s*·\s*法宝碎片\s*\d+$/.test(text));
-      if (fogPlan.original && fogResultObserved && receipt &&
-          (usable(findButton('进入并快速探索 · 20 灵力')) || fogSpirit()?.current < 20)) {
-        const reward = receipt.match(/已到账:修为\s*(\d+)\s*·\s*法宝碎片\s*(\d+)$/);
-        // 原请求已明确结束，才将对应回执计账；连续相同金额也是不同轮次。
-        saveFogPlan(null); fogResultObserved = false;
-        recoveryBudget.clear('fog');
-        saveFog({ ...fog, deferrals: 0, stalls: 0 });
-        log.add('fog-reward', receipt, { reward: { 修为: Number(reward[1]), 法宝碎片: Number(reward[2]) } }, true);
-      } else { deferFog('迷雾结果无法可靠核对，请查看原探索结果', true); return; }
-    }
-    if (fogPlan?.phase === 'opening') {
-      if (Date.now() - fogPlan.at < 10000) { say('等待快速探索确认窗口'); return; }
-      saveFogPlan(null); openedFogDialog = false;
-      deferFog('快速探索确认窗口未打开或已取消'); return;
-    }
-    if (errors) { deferFog(`迷雾提示：${errors}`); return; }
-    if (!usable(refresh)) {
-      if (Date.now() - fogPageAt > 90000) deferFog('迷雾页面超过 90 秒未能加载', false, true);
-      else say('等待迷雾页面加载');
-      return;
-    }
-    if (findButton('确认原探索结果') || findButton('按策略完成本局')) {
-      deferFog('迷雾中有手动探索或其他原操作', true); return;
-    }
-    const spirit = fogSpirit();
-    if (!spirit || spirit.cost !== 20) { deferFog('迷雾灵力或入场费用无法核对'); return; }
-    if (spirit.current < 20 || !fog.draining && spirit.current < 200) {
-      saveFog({ draining: false, nextAt: 0 });
-      fogLeaving = true; returnFromFog(); return;
-    }
-    const quick = findButton('进入并快速探索 · 20 灵力');
-    const settings = fogSettings();
-    if (!usable(quick) || !settings) { deferFog('当前无法快速探索迷雾'); return; }
-    const description = `消耗 20 灵力开始新局,按所选路线逐格探索。沿用当前战斗、补给和奖励规则;生命不高于 ${settings.retreatHp} 时撤离,仍可能在单次受击中失败。不会自动使用背包补品。`;
-    recordClick(quick, 'fog:open', JSON.stringify(settings), '进入并快速探索迷雾', () => {
-      saveFog({ ...fog, draining: true, nextAt: 0 });
-      saveFogPlan({ phase: 'opening', settings, description, at: Date.now() });
-      openedFogDialog = true;
-      fogWindow=beginNativeWindow();
-    }, () => {
-      // 记住实际打开的窗口；手动关闭后重开的同名窗口也不能代为确认。
-      bindNativeWindow(fogWindow,[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible));
-    });
-  }
-  function fogSpirit() {
-    const matches = [...document.querySelectorAll('p[aria-live="polite"]')].filter(visible).map(textOf)
-      .map(text => text.match(/^当前灵力\s+(\d+)\/(\d+)\s*·\s*入场消耗\s+(\d+)\s+灵力$/)).filter(Boolean);
-    if (matches.length !== 1 || Number(matches[0][1]) > Number(matches[0][2])) return null;
-    return { current: Number(matches[0][1]), cost: Number(matches[0][3]) };
-  }
+
 
   function saveDungeon(value) {
     const serialized = JSON.stringify(value);
@@ -3403,20 +3157,10 @@
       catch { setEnabled(false, '秘境回执保存失败，请手动核对原批次'); }
     };
   };
-  function linkTo(path) {
-    return [...document.querySelectorAll('a[href]')].find(link => {
-      try {
-        const url = new URL(link.href, location.href);
-        return url.origin === location.origin && url.pathname.replace(/\/$/, '') === path &&
-          !link.target && usable(link);
-      } catch { return false; }
-    });
-  }
+
   function visitDungeon() {
     if (!dungeonEnabled || dungeon.nextAt > Date.now() ||
         (!dungeon.run && dungeon.exhaustedDay === dungeonDay())) return false;
-    const link = linkTo('/cultivate/dungeon');
-    if (!usable(link)) return false;
     // 等待正在领取的奇遇落定，不在两次修炼请求之间切走。
     for (let i = 0; i < sessionStorage.length; i++) {
       const key = sessionStorage.key(i);
@@ -3425,17 +3169,18 @@
       }
     }
     const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
-    if (!cooldown && lastAction && !/^(dungeon|fog):/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) {
+    if (!cooldown && lastAction && !/^dungeon:/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) {
       say('先等待本次奇遇结果，再进入秘境'); return true;
     }
-    if (!cooldown && !findButton('寻找奇遇')) return false;
-    recordClick(link, 'dungeon:visit', 'dungeon', '切换到秘境');
+    if (!cooldown && !findButton('寻找奇遇') && encounterSchedule.nextAt <= Date.now()) return false;
+    navigate('/cultivate/dungeon');
     return true;
   }
   function returnToHall() {
-    const link = linkTo('/cultivate');
-    if (!usable(link)) { say('等待返回修仙主殿入口'); return; }
-    recordClick(link, 'dungeon:return', 'hall', '返回主殿继续奇遇');
+    navigate('/cultivate');
+  }
+  function returnToExpedition() {
+    finishVisit();
   }
   function deferDungeon(reason, delay = null, stalled = false, pause = false) {
     // 返回主殿不会撤退；保留 run 和原请求，等待返回的几秒内不反复延长预约。
@@ -3791,71 +3536,43 @@
     return true;
   }
 
-  function acquire() {
-    if (acquiring) return;
-    acquiring = true;
-    navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
-      if (!lock || !enabled || !onPage()) {
-        if (enabled && onPage()) say('另一游戏标签页正在自动修仙');
-        return;
-      }
-      active = true;
-      try {
-        await new Promise(resolve => { releaseLock = resolve; schedule(); });
-      } finally {
-        cancelPendingClick();
-        active = false;
-        releaseLock = null;
-      }
-    }).catch(() => setEnabled(false, '无法取得标签页运行锁，请刷新页面后重试'))
-      .finally(() => { acquiring = false; });
-  }
-
-  function schedule() {
-    if (scheduled) return;
-    scheduled = true;
-    // Worker/DOM 事件已经唤醒脚本，不能再转到后台会被节流的 setTimeout。
-    queueMicrotask(() => {
-      scheduled = false;
-      try { observeSessionPage(); tick(); } catch (error) {
-        log.add('runtime-error', '修仙检查异常，已暂停并保留原记录', { name: error?.name || 'Error', stage: 'cultivate-check' });
-        setEnabled(false, '脚本检查失败，已暂停；请刷新后重试');
-      }
-    });
-  }
-
-  log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: statusText,
-    pageRecovery: pageWait.snapshot(),
-    pendingEncounter: Boolean(encounterAction), pendingDungeon: Boolean(dungeonPlan), pendingFog: Boolean(fogPlan) } : null);
-  subscribeWakeup(schedule, onPage, () => enabled, () => {
-    try { observeDungeonEntryReview(); } catch { dungeonEntryReview = null; }
-  });
-  window.addEventListener('pagehide', () => { cancelPendingClick(); releaseLock?.(); });
+  log.observeLifecycle(() => onPage() ? { enabled: enabled && automationEnabled(), ownsLock: ownsLock(), state: statusText,
+    pageRecovery: pageWait.snapshot(), pendingEncounter: Boolean(encounterAction), pendingDungeon: Boolean(dungeonPlan) } : null);
   window.addEventListener('storage', event => {
+    if (![PREF, DUNGEON_STATE, DUNGEON_PREF, ENCOUNTER_SCHEDULE].includes(event.key)) return;
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
-      toggle.textContent = enabled ? '暂停修仙自动操作' : '开始修仙自动操作';
-      if (!enabled) { cancelPendingClick(); releaseLock?.(); say('已暂停'); }
-      schedule();
+      toggle.textContent = enabled ? '暂停奇遇与秘境' : '开启奇遇与秘境';
+      if (!enabled) { cancelPendingClick(); say('已暂停'); }
     }
     if (event.key === DUNGEON_STATE || event.key === DUNGEON_PREF) {
       try {
         dungeon = JSON.parse(localStorage.getItem(DUNGEON_STATE) || 'null') || { nextAt: 0, exhaustedDay: '', run: null };
         dungeonEnabled = localStorage.getItem(DUNGEON_PREF) !== 'false';
       } catch { dungeonEnabled = false; }
-      schedule();
     }
-    if (event.key === FOG_STATE || event.key === FOG_PREF) {
-      try {
-        fog = JSON.parse(localStorage.getItem(FOG_STATE) || 'null') || { draining: false, nextAt: 0 };
-        fogEnabled = localStorage.getItem(FOG_PREF) !== 'false';
-      } catch { fogEnabled = false; }
-      schedule();
+    if (event.key === ENCOUNTER_SCHEDULE) {
+      encounterSchedule = loadState(localStorage, ENCOUNTER_SCHEDULE, { nextAt: 0, note: '' }, 'cultivate',
+        value => objectState(value) && Number.isFinite(value.nextAt) && typeof value.note === 'string');
     }
+    schedule();
   });
-  if (!enabled) say('已暂停');
-  schedule();
-})();
+  return {
+    tick, onPage, cancel: cancelPendingClick,
+    observe() { try { observeDungeonEntryReview(); } catch { dungeonEntryReview = null; } },
+    pending() { return Boolean(encounterAction || dungeonPlan || pendingOperation() || nativeDungeonRequests().length); },
+    update() {
+      updateDungeonHint();
+      if (!onPage()) setPanelText(status, stateFault('cultivate') || (!enabled ? '奇遇与秘境已暂停' : encounterSchedule.note || '等待检查奇遇'));
+    },
+    dueAt() {
+      if (!enabled || sharedGroupPaused(PREF) || stateFault('cultivate')) return Infinity;
+      const dungeonAt = dungeonEnabled && !stateFault('dungeon') &&
+        (dungeon.run || dungeon.exhaustedDay !== dungeonDay()) ? dungeon.nextAt : Infinity;
+      return Math.min(encounterSchedule.nextAt, dungeonAt);
+    }
+  };
+}
 
 // 远征与农场共用标签页、点击队列和锁；平时驻留远征，仅到农场预约时间才切页。
 (() => {
@@ -3869,7 +3586,7 @@
   const inFarm = () => /^\/farm\/?$/.test(location.pathname);
   const inShelter = () => /^\/shelter\/?$/.test(location.pathname);
   const inStock = () => /^\/stock\/?$/.test(location.pathname);
-  const onPage = () => /^\/(?:activities\/expedition|farm|shelter|stock)\/?$/.test(location.pathname);
+  const onPage = () => /^\/(?:activities\/expedition|farm|shelter|stock|cultivate(?:\/dungeon)?)\/?$/.test(location.pathname);
   const FARM_PREF = 'arkengine:auto-farm:enabled:v1';
   const FARM_CROP = 'arkengine:auto-farm:crop:v1';
   const FARM_STATE = 'arkengine:auto-farm:schedule:v1';
@@ -4052,7 +3769,7 @@
   const farmWait = createPageWait('farm', log);
   const expeditionLoadWait = createPageWait('expedition', log);
   const NAV_JOURNAL = 'arkengine:auto-expedition:navigation:v1';
-  const travelPaths = ['/farm', '/activities/expedition', '/shelter', '/stock'];
+  const travelPaths = ['/farm', '/activities/expedition', '/shelter', '/stock', '/cultivate', '/cultivate/dungeon'];
   let navigation = loadState(sessionStorage, NAV_JOURNAL, null, 'expedition', v => timedState(v) &&
     travelPaths.includes(v.from) && travelPaths.includes(v.to) && v.from !== v.to && typeof v.reloaded === 'boolean');
   const locator = createLocator();
@@ -4094,10 +3811,19 @@
       .preset-summary { white-space: pre-line; }
     </style>
     <div class="box">
-      <strong>远征综合助手</strong>
+      <strong>方舟挂机助手</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <button type="button" id="toggle"></button>
-      <p class="hint">总开关控制本组四项玩法，各模块按各自设置运行。</p>
+      <p class="hint">一个页面统一挂机，到期检查奇遇与秘境后返回远征。</p>
+      <details class="panel-section" data-panel-section="cultivate">
+      <summary>奇遇与秘境</summary><div class="panel-section-body">
+      <p class="hint" id="cultivate-status">等待检查奇遇</p>
+      <p class="hint">奇遇每日最多 24 次，以网页剩余次数为准；钻石优先，其次修为。</p>
+      <p class="hint" id="last">等待下一次奇遇</p>
+      <button type="button" id="cultivate-toggle"></button>
+      <p class="hint" id="dungeon-status"></p>
+      <button type="button" id="dungeon-toggle"></button>
+      </div></details>
       <details class="panel-section" data-panel-section="expedition">
       <summary>远征</summary><div class="panel-section-body">
       <p class="hint">常态：边境巡逻，最多 6 队。<br>突发：北京时间 01:00～02:00 优先；错过且额度完整未用时补派深渊。</p>
@@ -4160,7 +3886,7 @@
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-explore"> 普通探险出发、召回与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-quests"> 周任务选队、出发与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-training"> 居民训练：生产培养与父母训练</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation"> 父母预培养：优选两对，七项基础属性均达4后生育</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation"> 父母预培养：优选两对，七项基础属性均达10后生育</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-medical"> 医务室值班、伤员用针及废料救回（共用建设预算，保留安全库存）</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-defense"> 房间一键救援（每批最多3人，目标在场101名成人，游戏自动归岗）</label>
       <label class="staff-option">出发后至少留守健康成人 <input id="shelter-campaign-guardResidents" type="number" min="0" max="200" step="1"> 人</label>
@@ -4181,7 +3907,7 @@
       <label class="staff-option">每任务每周最多尝试 <input id="shelter-campaign-attempts" type="number" min="1" max="3" step="1"></label>
       <label class="staff-option">常规及冷却期训练目标 <input id="shelter-campaign-trainTarget" type="number" min="2" max="10" step="1"></label>
       <button type="button" id="shelter-campaign-save">保存探险与养成设置</button>
-      <p class="hint">人口发展模式默认优选并保存两对无亲缘父母，双方七项基础属性（含魅力）均达4后才开始该配对。每对同时最多一人训练，完成一格回预留岗位、结算后接续；候选培养不受生育冷却期限限制。等待训练室或供给时继续生产，缺房沿用建设开关与预算。培养期间保留合适原家庭维持增长，不拆已有感情或待产。达标后按上方常规目标利用冷却期继续培养，每人每周期新安排一格；已开始的普通父母训练可按原固定期限收尾。刷新不重选候选或延长期限，真实断供优先返岗。普通探险要求血量90%，脚本派出的普通探险低于60%提前召回。不消费汽水。</p>
+      <p class="hint">人口发展模式优选并保存两对无亲缘父母，双方七项基础属性（含魅力）均达10后才开始新的生育安排。每对同时最多一人训练，完成一格回预留岗位、结算后接续；候选培养不受生育冷却期限限制。评估空闲训练室升级以加快培养，沿用建设开关、预算和供给检查，不中断已开始的训练。已有感情或待产继续收尾，未达标家庭不再新开生育。刷新保留候选和固定期限，真实断供优先返岗。普通探险要求血量90%，脚本派出的普通探险低于60%提前召回。不消费汽水。</p>
       </details>
       <details class="panel-subsection" data-panel-section="shelter-development"><summary>发展规划与建设</summary>
       <label class="staff-option"><input type="checkbox" id="shelter-build"> 按规划自动建造</label>
@@ -4235,12 +3961,18 @@
         <p class="hint">交易按市价成交，无最高成交价保证；预留10%报价余量仍可能超出预估。上限只统计脚本支出，卖出及预测返还不补回24小时额度。手动持仓和历史仓由你处理。</p>
         <div class="panel-actions"><button type="button" id="stock-save">保存股市设置</button>
         </div></details></div></details>
-      <p class="hint"><a href="/cultivate" target="_blank" rel="noopener">打开奇遇挂机页</a></p>
+
     </div>`;
   document.body.append(host);
   const status = shadow.getElementById('status');
   const toggle = shadow.getElementById('toggle');
   const say = message => { if (status.textContent !== message) status.textContent = message; };
+  const cultivation = createCultivationAutomation({ host, shadow,
+    automationEnabled: () => enabled && !sharedGroupPaused(PREF),
+    ownsLock: () => active && enabled && !pageFrozen && !sharedGroupPaused(PREF), schedule,
+    finishVisit: () => finishScheduledVisit('cultivate'),
+    navigate: path => offer(`cultivate:travel:${path}`, path === '/cultivate/dungeon' ? '切换到秘境' :
+      path === '/cultivate' ? '返回主殿核对奇遇' : '返回远征，等待下次预约', () => startNavigation(path, travelLink(path))), report: say });
   const farmStatus = shadow.getElementById('farm-status');
   const farmSelect = shadow.getElementById('farm-crop');
   const farmToggle = shadow.getElementById('farm-toggle');
@@ -4697,7 +4429,7 @@
     let check=stockCheckMessage;
     if(stockCheckRequested){
       if(accountStopReason()||stateFault('stock')||stockFault)check=accountStopReason()||stateFault('stock')||stockFault;
-      else if(!enabled||localStorage.getItem(PREF)==='false')check='检查已预约；总开关暂停，请先开始远征组。';
+      else if(!enabled||localStorage.getItem(PREF)==='false')check='检查已预约；总开关暂停，请先开始全部自动操作。';
       else if(!stockEnabled())check='股市已暂停；应用推荐配置或在高级设置开启后再检查。';
       else if(l.hold&&!l.pending?.result&&!stockCapacityWait()&&!stockCanConfirmHere())check=`检查受阻：${reason}；请先核对原交易，检查按钮不会解除保护。`;
       else if(!active)check='检查已预约；等待本页取得远征组运行权。';
@@ -4879,9 +4611,7 @@
     catch{return false;}
   }
   function stockBack() {
-    offer('stock:return','返回远征，股市按预约再检查',()=>{
-      startNavigation('/activities/expedition',travelLink('/activities/expedition'));
-    });
+    finishScheduledVisit('stock');
   }
   function maybeVisitStock(running) {
     if(stockReload(true)){cancelStockRead();cancelQueued();}
@@ -5160,6 +4890,7 @@
   }
   function stockStep() {
     if(stockReload(true)){cancelStockRead();cancelQueued();}
+    if(!stockEntryAt&&stockLedger.nextAt>Date.now()&&!stockLedger.pending){stockBack();return;}
     if(!stockEnabled() && !stockEntryAt){say('股市自动操作未开启，可在面板配置额度与开关');return;}
     if(!stockEntryAt){stockEntryAt=Date.now();stockActions=0;stockReadFailures=0;stockLeave=false;stockUiWait=null;}
     if(stockLeave){stockBack();return;}
@@ -9060,6 +8791,7 @@ installShelterPlanningWorker(self);
       stockPending.responseAt>=Math.max(stockPending.at,stockPending.lastRetryAt||0)&&
       (!stockRequests.length||stockOwnNative(stockPending,stockRequests));
     if(plan||claimWait||farmEnabled&&farmPlan||nativePending().length||
+      cultivation.onPage()&&(cultivation.pending()||document.querySelector('#cultivation-encounter'))||
       (stockPending||stockRequests.length)&&!stockReturned||
       shelterPending&&shelterWatchRaid.confirmedPending!==shelterPending.id&&shelterWatchRaid.independentPending!==shelterPending.id||
       shelterPending?.emergency&&!Number.isFinite(shelterPending.emergency.result?.responseFinishedAt))return false;
@@ -9074,7 +8806,7 @@ installShelterPlanningWorker(self);
         saveShelter({...shelterState,nextAt:0,note:independent?'原请求已结束，保留未知原单并核对独立防守':'来袭巡检发现原操作可确认，提前返回核对后增援'});
         log.add('shelter-defense-reconcile',independent?'保留未知原单，进入后重新核对无冲突的紧急动作':'来袭时提前核对原操作，进入后重新读取，确认前不发送增援',
           {kind:shelterPending.kind,independent});
-      }
+      }else saveShelter({...shelterState,nextAt:0,note:'巡检发现事件或复岗任务，提前进入核对'});
       startNavigation('/shelter',travelLink('/shelter'));
     });
     return true;
@@ -10345,12 +10077,12 @@ installShelterPlanningWorker(self);
   function validShelterParentPreparation(v) {
     const id=n=>Number.isSafeInteger(n)&&n>0;
     return objectState(v)&&v.version===1&&Array.isArray(v.pairs)&&v.pairs.length<=2&&
-      v.pairs.every(f=>objectState(f)&&id(f.a)&&id(f.b)&&f.a<f.b&&f.target===4&&Number.isFinite(f.at)&&f.at>=0)&&
+      v.pairs.every(f=>objectState(f)&&id(f.a)&&id(f.b)&&f.a<f.b&&[4,10].includes(f.target)&&Number.isFinite(f.at)&&f.at>=0)&&
       new Set(v.pairs.flatMap(f=>[f.a,f.b])).size===v.pairs.length*2;
   }
   function shelterParentPrepared(m,f) {
     return ['a','b'].every(k=>{const p=m.state.residents.find(p=>p.id===f[k]);
-      return p&&['str','per','end','cha','int','agi','lck'].every(stat=>Number.isFinite(p.stats[stat])&&p.stats[stat]>=f.target);});
+      return p&&['str','per','end','cha','int','agi','lck'].every(stat=>Number.isFinite(p.stats[stat])&&p.stats[stat]>=10);});
   }
   function shelterRankFamilies(m,families) {
     const scores=new Map(families.map(f=>{const pair=[f.a,f.b].map(id=>m.state.residents.find(p=>p.id===id));
@@ -10359,15 +10091,11 @@ installShelterPlanningWorker(self);
     return [...families].sort((a,b)=>scores.get(b).total-scores.get(a).total||scores.get(b).charm-scores.get(a).charm||a.a-b.a||a.b-b.b);
   }
   function shelterParentPairAllowed(m,pair,preparation,existing=false) {
-    if(!preparation?.pairs?.length)return true;
+    if(!preparation)return true;
+    if(!preparation.pairs?.length)return pair.length===2&&shelterParentPrepared(m,{a:pair[0]?.id,b:pair[1]?.id});
     const ids=pair.map(p=>p?.id),cohort=preparation.pairs.find(f=>[f.a,f.b].some(id=>ids.includes(id)));
     if(cohort)return ids.includes(cohort.a)&&ids.includes(cohort.b)&&shelterParentPrepared(m,cohort);
-    // Only an existing family bridges the initial training stage. Do not start
-    // additional low-quality families while the selected parents are preparing.
-    if(!existing||preparation.pairs.every(f=>shelterParentPrepared(m,f)))return false;
-    const selected=new Set(preparation.pairs.flatMap(f=>[f.a,f.b]));
-    return !m.state.residents.some(p=>p.romance&&!selected.has(p.id)&&!ids.includes(p.id))&&
-      !m.state.births.some(b=>!shelterBirthParents(m.state,b)||b.parents.some(id=>!selected.has(id)&&!ids.includes(id)));
+    return existing&&pair.length===2&&shelterParentPrepared(m,{a:ids[0],b:ids[1]});
   }
   function shelterUpdateParentPreparation(m) {
     if(shelterStaffMode!=='population'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap)return;
@@ -10375,13 +10103,15 @@ installShelterPlanningWorker(self);
       if(shelterState.parentPreparation)saveShelter({...shelterState,parentPreparation:undefined});
       return;
     }
-    if(!shelterCampaign.training)return;
     const s=m.state,previous=shelterState.parentPreparation,unrelated=shelterParentKinship(s);
+    if(previous?.pairs.some(f=>f.target!==10)){
+      saveShelter({...shelterState,parentPreparation:{...previous,pairs:previous.pairs.map(f=>({...f,target:10}))}});
+    }
     const pairs=(previous?.pairs||[]).filter(f=>{
       const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id));
       return unrelated(...pair)&&pair.every((p,i)=>!p.romance||p.romance.partnerId===pair[1-i].id)&&
         !s.births.some(b=>b.parents?.some(id=>[f.a,f.b].includes(id))&&!b.parents.every(id=>[f.a,f.b].includes(id)));
-    });
+    }).map(f=>({...f,target:10}));
     if(pairs.length===2)return;
     const roles=shelterState.campaign?.roles||[],families=shelterState.families||[];
     const protectedIds=new Set([...(shelterState.campaign?.defense||[]).map(r=>r.id),...pairs.flatMap(f=>[f.a,f.b])]);
@@ -10408,7 +10138,7 @@ installShelterPlanningWorker(self);
     });
     const options=[];
     for(let i=0;i<candidates.length;i++)for(let j=i+1;j<candidates.length;j++)if(unrelated(candidates[i],candidates[j])){
-      const [a,b]=[candidates[i].id,candidates[j].id].sort((a,b)=>a-b);options.push({a,b,target:4,at:m.now});
+      const [a,b]=[candidates[i].id,candidates[j].id].sort((a,b)=>a-b);options.push({a,b,target:10,at:m.now});
     }
     for(const f of shelterRankFamilies(m,options)){
       if(pairs.length>=2)break;
@@ -10422,7 +10152,7 @@ installShelterPlanningWorker(self);
       const changed=new Set(pairs.flatMap(f=>[f.a,f.b]));
       const retained=families.filter(f=>![f.a,f.b].some(id=>changed.has(id))||pairs.some(p=>p.a===f.a&&p.b===f.b));
       saveShelter({...shelterState,families:retained,parentPreparation:next});
-      log.add('shelter-population','保存两对父母培养候选；七项基础属性均达4后才开始该配对',
+      log.add('shelter-population','保存两对父母培养候选；七项基础属性均达10后才开始该配对',
         {phase:'parent-preparation',pairs:pairs.map(f=>({...f,ready:shelterParentPrepared(m,f)})),selected:pairs.length,requested:2});
     }
   }
@@ -10696,14 +10426,14 @@ installShelterPlanningWorker(self);
     // that prerequisite into a permanent training ban or rule out longer value.
     return {choice:selected.option,comparison};
   }
-  function shelterParentTrainingEstimate(m,p,room) {
+  function shelterParentTrainingEstimate(m,p,room,demand=null) {
     const stat=room.trainStat,base=p.stats?.[stat],perk=m.state.legacy?.perks?.training??0;
     if(!['str','per','end','cha','int','agi','lck'].includes(stat)||!Number.isFinite(base)||base<0||base>=10||
         !Number.isInteger(perk)||perk<0||perk>10||!Number.isInteger(room.level)||room.level<1||room.level>3)return null;
     // 新入室不假定继承旧进度；额外留一个十分钟结算轮及调岗余量。
     const hours=Math.ceil(((base+1)/(room.level*(1+.05*perk)))*6-1e-9)/6+1/6;
     const resource={str:'power',per:'water',end:'scrap',int:'parts',agi:'food'}[stat];
-    const demand=shelterGrowthNeeds(m).demand;
+    demand??=shelterGrowthNeeds(m).demand;
     const pressure=resource&&demand[resource]>0?Math.min(2,demand[resource]*1.2/Math.max(1,m.production[resource])):0;
     const weight=stat==='cha'?2:stat==='end'?1.5:stat==='int'?1.2:1+pressure;
     return {stat,base,hours,value:weight/hours};
@@ -10907,7 +10637,7 @@ installShelterPlanningWorker(self);
     };
     const expecting=new Set(s.births.flatMap(b=>shelterBirthParents(s,b)||[]));
     const parentIds=new Set([...(record.families||[]),...preparationPairs].flatMap(f=>[f.a,f.b]));
-    if(preparationPairs.length)notes.push(`父母预培养 ${preparationPairs.length}/2 对，${preparationPairs.filter(f=>shelterParentPrepared(m,f)).length} 对七项基础属性已达4；未达标组合暂停生育，按空位分批训练，等待时继续生产。`);
+    if(preparationPairs.length)notes.push(`父母预培养 ${preparationPairs.length}/2 对，${preparationPairs.filter(f=>shelterParentPrepared(m,f)).length} 对七项基础属性已达10；未达标组合暂停生育，按空位分批训练，等待时继续生产。`);
     const protectedIds=new Set(s.residents.filter(p=>p.romance&&!shelterFamilyExpecting(s,p.id,p.romance.partnerId)).flatMap(p=>[p.id,p.romance.partnerId]));
     for(const b of s.births)if(!shelterBirthParents(s,b)){
       for(const p of s.residents)if(p.roomId===b.roomId)protectedIds.add(p.id);
@@ -11180,7 +10910,7 @@ installShelterPlanningWorker(self);
         const parent=role.purpose==='parent',preparing=parent&&role.preparation===true;
         const due=parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||now>=role.until||
           (preparing?!preparationOf(p):!role.finishCurrent&&!(p.familyCooldownUntil>now)));
-        if(due||p.stats[role.stat]>role.base||r?.trainStat!==role.stat||!role.finishCurrent&&p.stats[role.stat]>=(preparing?4:parent?cfg.trainTarget:daily?.goals.some(g=>g.key==='train'&&!g.claimed&&g.remaining)?10:cfg.trainTarget)||!active(r)||!trainingSafe([p.id])){
+        if(due||p.stats[role.stat]>role.base||r?.trainStat!==role.stat||!role.finishCurrent&&p.stats[role.stat]>=(preparing?10:parent?cfg.trainTarget:daily?.goals.some(g=>g.key==='train'&&!g.claimed&&g.remaining)?10:cfg.trainTarget)||!active(r)||!trainingSafe([p.id])){
           if(parent&&!preparing&&cfg.parentTraining&&parentIds.has(p.id)&&active(r)&&r.trainStat===role.stat&&
               finishTraining(p,r,role))continue;
           const destination=parent&&s.rooms.find(d=>d.id===role.destination),hp=shelterHealth(p);
@@ -11189,7 +10919,7 @@ installShelterPlanningWorker(self);
           const returnJob=active(destination)&&['power','diner','water','scrap'].includes(destination.type)&&
             hp?.hp>=.6*hp.max&&(preparing||p.familyCooldownUntil>now+600000)&&!p.romance&&!expecting.has(p.id)&&
             occupied(destination)<shelterStaffCapacity({...m,trainingDestinations:result.trainingDestinations},destination,p.id);
-          actions.push(assign(p,returnJob?destination:null,'training-release',returnJob?(preparing?'候选父母本格训练结束，回预留生产岗后继续核对全项4目标':'父母本格训练结束，直接回到预留生产岗，保留原家庭和冷却期限'):!trainingSafe([p.id])?'训练期间真实供应或两小时储备不足，返岗补供给':role.finishCurrent?'当前训练格已完成、到达固定期限或供应变化，结束收尾并返岗':
+          actions.push(assign(p,returnJob?destination:null,'training-release',returnJob?(preparing?'候选父母本格训练结束，回预留生产岗后继续核对全项10目标':'父母本格训练结束，直接回到预留生产岗，保留原家庭和冷却期限'):!trainingSafe([p.id])?'训练期间真实供应或两小时储备不足，返岗补供给':role.finishCurrent?'当前训练格已完成、到达固定期限或供应变化，结束收尾并返岗':
             parent?'父母本轮训练完成、冷却到期或供应变化，交回人口与生产调度':'训练轮次结束，释放人选回到探险和生产候选池'));
         }
         else {reserve(p);if(parent)result.events.push(role.until-now);}
@@ -11291,6 +11021,12 @@ installShelterPlanningWorker(self);
     const trainingSeats=new Map(),trainingAt=p=>Math.max(0,...(record.trainingRest||[]).filter(r=>r.id===p.id).map(r=>r.at));
     const parentOccupied=r=>s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).length;
     const trainParents=()=>{if(newStaffing&&cfg.training&&cfg.parentTraining){
+      const estimates=new Map();let trainingDemand=null;
+      const estimate=(person,room)=>{
+        const key=`${room.trainStat}:${person.stats[room.trainStat]}:${room.level}`;
+        if(!estimates.has(key))estimates.set(key,shelterParentTrainingEstimate(m,person,room,trainingDemand??=shelterGrowthNeeds(m).demand));
+        return estimates.get(key);
+      };
       // One family's training must not consume every other family's cooldown.
       // Occupancy, including manual training and an unconfirmed return, holds
       // that family's turn until the resident has actually left the room.
@@ -11302,15 +11038,39 @@ installShelterPlanningWorker(self);
       const parents=pool.filter(p=>parentIds.has(p.id)&&!familyBusy.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&healthy(p)&&p.happiness>=50&&
         (preparationOf(p)?trainingAt(p)===0||s.lastSettledAt>trainingAt(p):
           p.familyCooldownUntil>now&&trainingAt(p)<p.familyCooldownUntil-6*3600000)&&safe([...projectedIds(),p.id]));
-      const options=parents.flatMap(p=>s.rooms.filter(r=>r.type==='training'&&active(r)&&parentOccupied(r)<r.width*2).flatMap(r=>{
-        const e=shelterParentTrainingEstimate(m,p,r);
+      const trainees=preparationPairs.flatMap(f=>[f.a,f.b]).map(id=>s.residents.find(p=>p.id===id)).filter(p=>p&&home(p));
+      const policy=record.constructionPolicy;
+      const upgrades=policy?.upgrade&&!policy.pending&&s.rooms.filter(r=>r.builtAt>now||r.upgradeAt!==null).length<2?
+        s.rooms.filter(r=>r.type==='training'&&active(r)&&r.level<3&&parentOccupied(r)===0).flatMap(room=>{
+          const hours=room.width*(room.level===1?1:3),cost={scrap:Math.ceil(400*room.width*(room.level===1?2.5:6)),parts:room.level===2?15*room.width:0};
+          if(!shelterLevelProjectAllowed({kind:'upgrade',cost},policy)||['scrap','parts'].some(key=>
+              s.resources[key]<cost[key]+(policy[key+'Reserve']||0)||!shelterUsesStockBudget(policy)&&cost[key]+(policy.spent?.[key]||0)>policy[key+'Limit'])||
+              m.production.power<(demand.power+.5*room.width)*1.2-1e-9)return [];
+          const candidates=trainees.flatMap(person=>{
+            const current=estimate(person,room);if(!current)return [];
+            let savedHours=0;
+            for(let base=current.base;base<10;base++){
+              const next={...person,stats:{...person.stats,[room.trainStat]:base}};
+              savedHours+=estimate(next,room).hours-estimate(next,{...room,level:room.level+1}).hours;
+            }
+            return savedHours>hours?[{person,room,savedHours:savedHours-hours,trainingHours:current.hours}]:[];
+          });
+          return candidates.sort((left,right)=>right.savedHours-left.savedHours||left.person.id-right.person.id).slice(0,1);
+        }).sort((left,right)=>right.savedHours-left.savedHours||left.room.id-right.room.id):[];
+      const upgrade=upgrades[0];
+      if(upgrade)trainingSeats.set(upgrade.room.id,upgrade.room.width*2);
+      if(upgrade)projects.push({type:'training',trainStat:upgrade.room.trainStat,person:upgrade.person.id,role:'training',priority:25,
+        upgradeId:upgrade.room.id,trainingHours:upgrade.trainingHours,
+        benefit:`升级空闲训练室，加快父母全项10培养；单名候选剩余训练扣除施工后预计节省 ${upgrade.savedHours.toFixed(1)} 小时，施工期间继续生产`});
+      const options=parents.flatMap(p=>s.rooms.filter(r=>r.type==='training'&&active(r)&&r.id!==upgrade?.room.id&&parentOccupied(r)<r.width*2).flatMap(r=>{
+        const e=estimate(p,r);
         const preparing=Boolean(preparationOf(p));
-        return e&&e.base<(preparing?4:cfg.trainTarget)&&(preparing||now+e.hours*3600000<=p.familyCooldownUntil)&&
+        return e&&e.base<(preparing?10:cfg.trainTarget)&&(preparing||now+e.hours*3600000<=p.familyCooldownUntil)&&
           shelterDevelopmentTrainingOpportunity(m,{id:p.id,hours:e.hours,stat:r.trainStat,destination:p.roomId,purpose:'parent'},
              cfg.developmentProject,record.constructionPolicy).allowed?[{p,r,...e,preparing}]:[];
       })).sort((a,b)=>Number(b.preparing)-Number(a.preparing)||(a.preparing&&b.preparing?a.base-b.base:0)||b.value-a.value||loss([a.p.id])-loss([b.p.id])||a.p.id-b.p.id||a.r.id-b.r.id);
       if(options.length){
-        const selected=options[0].preparing?{choice:options[0],comparison:{reason:'prepare-all-base-stats-4'}}:
+        const selected=options[0].preparing?{choice:options[0],comparison:{reason:'prepare-all-base-stats-10'}}:
           shelterParentTrainingChoice(m,options,record,target,trainingTarget);
         result.parentTrainingComparison=selected.comparison;
         const {p,r,hours,preparing}=selected.choice;reserve(p);trainingSeats.set(r.id,1);
@@ -11320,19 +11080,19 @@ installShelterPlanningWorker(self);
         if(destination)reserveTraining(p.id,destination);
         if(['better-in-each-explicit-inheritance-scenario','paired-route-beats-control-continuations'].includes(selected.comparison?.reason))
           notes.push('父母训练：按现有岗位对照原家庭多轮生育、单格训练和继续生产；三个明确遗传情景均不减少三天材料，不将条件结果当实际收益。');
-        actions.push({...assign(p,r,'training',preparing?`候选父母先培养：${r.trainStat} ${p.stats[r.trainStat]}→${p.stats[r.trainStat]+1}，预计 ${hours.toFixed(2)} 小时；七项基础属性均达4后生育`:
+        actions.push({...assign(p,r,'training',preparing?`候选父母先培养：${r.trainStat} ${p.stats[r.trainStat]}→${p.stats[r.trainStat]+1}，预计 ${hours.toFixed(2)} 小时；七项基础属性均达10后生育`:
           `父母冷却期训练：预计 ${hours.toFixed(2)} 小时内提升一格（含结算余量），到期交回人口调度`),
           purpose:'parent',until:preparing?now+hours*3600000+600000:p.familyCooldownUntil,...(preparing?{preparation:true}:{}),...(destination?{destination}:{})});
-      }else if(parents.length){
+      }else if(parents.length&&!upgrade){
         // 不为建房预留居民；施工期间继续生产。只提出一项可在当前冷却窗口内完成的需求。
         const requests=parents.flatMap(p=>['cha','end','str','per','agi','int','lck'].flatMap(stat=>{
           const preparing=Boolean(preparationOf(p));
-          if(p.stats[stat]>=(preparing?4:cfg.trainTarget))return [];
+          if(p.stats[stat]>=(preparing?10:cfg.trainTarget))return [];
           const same=s.rooms.filter(r=>r.type==='training'&&r.trainStat===stat);
           if(same.some(r=>!active(r)||parentOccupied(r)>0))return [];
           const room=same.filter(r=>r.level<3).sort((a,b)=>b.level-a.level||a.width-b.width||a.id-b.id)[0];
           if(same.length&&!room)return [];
-          const proposed={trainStat:stat,level:room?room.level+1:1},e=shelterParentTrainingEstimate(m,p,proposed);
+          const proposed={trainStat:stat,level:room?room.level+1:1},e=estimate(p,proposed);
           const buildHours=room?room.width*(room.level===1?1:3):1/6;
           if(!e||!preparing&&now+(e.hours+buildHours)*3600000>p.familyCooldownUntil)return [];
           const cost=room?Math.ceil(400*room.width*(room.level===1?2.5:6))+6*(room.level===2?15*room.width:0):
@@ -11343,7 +11103,7 @@ installShelterPlanningWorker(self);
           const {p,stat,room,trainingHours,preparing}=requests[0];
           projects.push({type:'training',trainStat:stat,person:p.id,role:'training',priority:25,...(room?{upgradeId:room.id}:{}),
             trainingHours,...(!preparing?{trainingDeadline:p.familyCooldownUntil}:{}),
-            benefit:`为${preparing?'全项4预培养候选':'冷却中的父母'}${p.name}${room?'升级现有':'补建'}${{str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[stat]}训练室；等待期间继续生产，沿用建设开关与预算`});
+            benefit:`为${preparing?'全项10预培养候选':'冷却中的父母'}${p.name}${room?'升级现有':'补建'}${{str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[stat]}训练室；等待期间继续生产，沿用建设开关与预算`});
         }else notes.push('父母训练：现有空位、剩余冷却或建设时长不合适，本轮继续生产与生育轮换。');
       }
     }};
@@ -11575,7 +11335,7 @@ installShelterPlanningWorker(self);
         (r.from===null||positive(r.from))&&at(r.at))&&new Set(v.defense.map(r=>r.id)).size===v.defense.length)&&
       (v.defenseManual===undefined||Array.isArray(v.defenseManual)&&v.defenseManual.length<=200&&v.defenseManual.every(positive))&&
       v.roles.every(r=>positive(r.id)&&positive(r.room)&&at(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
-        (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&!r.finishCurrent&&r.base<4)&&
+        (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&!r.finishCurrent&&r.base<10)&&
         (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production'].includes(r.purpose)&&
           Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
         (r.role!=='training'||(r.purpose==='production'?['str','per','end','agi','int'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
@@ -11592,7 +11352,7 @@ installShelterPlanningWorker(self);
   function validCampaignPending(p) {
     const c=p.before.campaign,choice=c?.choice,positive=x=>Number.isSafeInteger(x)&&x>0;
     if(!objectState(c)||!objectState(choice)||choice.kind!==p.kind||JSON.stringify(choice.targets)!==JSON.stringify(p.targets)||
-        !(choice.preparation===undefined||choice.preparation===true&&choice.role==='training'&&choice.purpose==='parent'&&choice.base<4)||
+        !(choice.preparation===undefined||choice.preparation===true&&choice.role==='training'&&choice.purpose==='parent'&&choice.base<10)||
       !Number.isFinite(p.before.serverTime)||!Array.isArray(c.ids)||!c.ids.every(positive)||!Number.isFinite(c.hp)||c.hp<0||
       !(p.campaignKey===undefined||/^[A-Za-z0-9-]{8,64}$/.test(p.campaignKey))||
       !(choice.materials===undefined||choice.role==='workshop'&&validShelterMaterials(choice.materials)))return false;
@@ -15428,7 +15188,9 @@ installShelterPlanningWorker(self);
       if (old?.type !== 'quarters') return false;
       if (expecting.has(p.id)) return true;
       const f = familyOf(p);
-      if (f && f.room === old.id) return p.familyCooldownUntil > m.now+600000 || population >= (populationMode ? Math.min(shelterPopulationTarget,m.populationCap) : m.populationCap);
+      if (f && f.room === old.id) return populationMode&&!shelterParentPairAllowed(m,
+        [f.a,f.b].map(id=>s.residents.find(person=>person.id===id)),shelterState.parentPreparation,true)||
+        p.familyCooldownUntil > m.now+600000 || population >= (populationMode ? Math.min(shelterPopulationTarget,m.populationCap) : m.populationCap);
       // 历史手动住宿不是永久岗位；真实感情、待产及已预约家庭已在上面保护。
       return true;
     };
@@ -15505,10 +15267,14 @@ installShelterPlanningWorker(self);
     }
     if (populationMode) for (const f of families) {
       const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id));
-      if (birthRooms.has(f.room) || pair.some(p => !home(p) || p.romance || p.roomId !== f.room && !eligible(p)) || populationCanHouse(m,families,pair)) continue;
+      const preparationBlocked=!shelterParentPairAllowed(m,pair,shelterState.parentPreparation,true)&&
+        pair.every(person=>person?.roomId===f.room&&!(person.familyCooldownUntil>m.now));
+      if (birthRooms.has(f.room) || pair.some(p => !home(p) || romanceResidents.has(p.id) || p.roomId !== f.room && !eligible(p)) ||
+          !preparationBlocked&&populationCanHouse(m,families,pair)) continue;
       const p = pair.find(p => p.roomId === f.room && healthy(p) && shelterNameUnique(s,p));
       const room = byRoom(f.room);
-      if (p && room && room.builtAt <= m.now && !room.incident && room.upgradeAt === null) return {id:p.id,room:null,from:p.roomId,name:p.name,reason:'人口或供应已到限制，原配对暂缓新增生育'};
+      if (p && room && room.builtAt <= m.now && !room.incident && room.upgradeAt === null) return {id:p.id,room:null,from:p.roomId,name:p.name,
+        reason:preparationBlocked?'双方七项基础属性尚未全部达到10，原配对暂缓新增生育':'人口或供应已到限制，原配对暂缓新增生育'};
     }
     const gear = shelterGearPlan(staffModel,staffPool);
     if (gear) return gear;
@@ -16282,7 +16048,7 @@ installShelterPlanningWorker(self);
     // 同一次同步检查中的多处防守、人员、建设和提交核对共享同一规划。
     // 下一次检查重新计算；任何设置、记录或读取身份变化也立即使缓存失效。
     if(shelterStaffMode==='population'&&!shelterStaffHold&&!shelterPending&&
-        (shelterCampaign.training&&shelterCampaign.parentPreparation!==false||shelterState.parentPreparation&&shelterCampaign.parentPreparation===false)){
+        (shelterCampaign.parentPreparation!==false||shelterState.parentPreparation)){
       rememberShelterFamilies(m);
       if(!m.state.rooms.some(r=>r.incident)&&!(shelterState.campaign?.defense||[]).length)shelterUpdateParentPreparation(m);
     }
@@ -16892,6 +16658,13 @@ installShelterPlanningWorker(self);
   }
   function closeShelterRecall() {
     const w=shelterRecallWork;if(!w)return false;
+    if(w.manual){say('召回窗口已由你接手，等待处理');return true;}
+    if(!w.dialog&&w.dialogBefore){
+      if(Date.now()-w.at>=15000&&!w.openFailed){
+        w.openFailed=true;pauseShelter('召回窗口持续未出现，保留本轮归属并暂停避难所；窗口出现后仅撤销');
+      }else say('等待本轮召回窗口出现后撤销，不重复打开');
+      return true;
+    }
     if(!shelterDialogGone(w.dialog)){
       const cancel=buttonIn(w.dialog,'取消');
       return shelterCloseWindow(w,cancel,'shelter:recall-cancel','撤销尚未发送的召回');
@@ -16904,7 +16677,13 @@ installShelterPlanningWorker(self);
     if(w&&(w.cancelled||!c||c.kind!=='explore-recall'||c.targets[0]!==w.id||shelterLeave||!shelterCampaignAllowed(c)))return closeShelterRecall();
     if(!c||!shelterCampaignAllowed(c)||['assign','equip','stimpak'].includes(c.kind))return false;
     if(w){
-      if(!w.dialog){if(Date.now()-w.at>5000){shelterRecallWork=null;holdShelterStaff('未能定位召回确认窗口，本轮不继续操作');}return true;}
+      if(!w.dialog){
+        if(Date.now()-w.at>5000){
+          w.cancelled=true;holdShelterCampaign('召回窗口加载超时，保留本轮归属，出现后撤销');
+          return closeShelterRecall();
+        }
+        say('等待本轮召回确认窗口加载');return true;
+      }
       const description=textOf(w.dialog);
       if(dialogs.length!==1||dialogs[0]!==w.dialog||textOf(w.dialog.querySelector('h2'))!==w.title||
         !description.includes('已出门时间的一半')||!description.includes('到家后领取')){w.cancelled=true;return true;}
@@ -17677,26 +17456,37 @@ installShelterPlanningWorker(self);
     try{
       saved=JSON.parse(sessionStorage.getItem(storageKey)||'null');
       if(saved&&!(saved.vaultNo===vaultNo&&Number.isFinite(saved.entryAt)&&saved.entryAt<=entryAt&&
-          Number.isFinite(saved.expeditionAt)&&saved.expeditionAt>saved.entryAt&&
+          (saved.expeditionAt===null||Number.isFinite(saved.expeditionAt)&&saved.expeditionAt>saved.entryAt)&&
+          (saved.regularEnd===undefined||Number.isFinite(saved.regularEnd))&&
           (saved.key===null||typeof saved.key==='string'))){saved=null;storageOK=false;}
       if(saved){entryAt=saved.entryAt;expeditionAt=saved.expeditionAt;}
-      else if(storageOK&&expeditionAt!==null&&Number.isSafeInteger(vaultNo)&&vaultNo>0){
+      else if(storageOK&&Number.isSafeInteger(vaultNo)&&vaultNo>0){
         saved={entryAt,expeditionAt,vaultNo,key:null};
         const raw=JSON.stringify(saved);sessionStorage.setItem(storageKey,raw);
         storageOK=sessionStorage.getItem(storageKey)===raw;
       }
     }catch{storageOK=false;}
-    const regularEnd=entryAt+Math.min(300000,expeditionAt===null?Infinity:Math.max(0,expeditionAt-entryAt-15000));
+    const day=Math.floor((entryAt+8*3600000)/86400000)*86400000-8*3600000;
+    const urgentAt=Math.min(...[day+3600000,day+86400000].filter(at=>at>entryAt));
+    let regularEnd=saved?.regularEnd;
+    if(regularEnd===undefined){
+      const appointment=Math.min(...scheduledVisits().filter(visit=>visit.path!=='/shelter')
+        .map(visit=>Math.max(entryAt+(visit.path==='/stock'?300000:60000),visit.at)));
+      regularEnd=Math.min(expeditionAt===null?entryAt+300000:expeditionAt-15000,appointment,urgentAt-15000);
+    }
+    if(storageOK&&saved&&saved.regularEnd===undefined){
+      saved={...saved,regularEnd};
+      try{const raw=JSON.stringify(saved);sessionStorage.setItem(storageKey,raw);storageOK=sessionStorage.getItem(storageKey)===raw;}
+      catch{storageOK=false;}
+    }
     const result={limitMs:regularEnd-shelterEntryAt,finishLimitMs:regularEnd+30000-shelterEntryAt,actionLimit:60,expeditionAt,
       handoffOnly:false,handoffKey:null,handoffDeadline:null,handoffReturnBy:null};
     if(!storageOK&&Number.isFinite(farmState.expeditionAt)&&farmState.expeditionAt>0&&farmState.expeditionAt<=now)
       return {...result,limitMs:0,finishLimitMs:0,expeditionAt:farmState.expeditionAt};
-    if(expeditionAt===null||regularEnd>=entryAt+300000)return result;
+    const ordinaryLimit=expeditionAt===null||regularEnd<expeditionAt-15000;
     // Cross-day rewards and the 01:00 expedition window keep priority. Reserve
     // fifteen seconds for closing, navigation and claiming inside the 2m grace.
-    const day=Math.floor((entryAt+8*3600000)/86400000)*86400000-8*3600000;
-    const urgentAt=Math.min(...[day+3600000,day+86400000].filter(at=>at>entryAt));
-    const deadline=Math.min(expeditionAt+120000,urgentAt),end=Math.min(entryAt+330000,deadline-15000);
+    const deadline=Math.min(ordinaryLimit?regularEnd+120000:expeditionAt+120000,urgentAt),end=deadline-15000;
     result.handoffDeadline=deadline;
     if(saved?.key)result.handoffReturnBy=end;
     if(now<regularEnd)return result;
@@ -17812,10 +17602,7 @@ installShelterPlanningWorker(self);
     shelterLeave = true; cancelShelterRead();
   }
   function leaveShelter() {
-    const link = travelLink('/activities/expedition');
-    offer('shelter:return','返回远征，等待下一次避难所预约',() => {
-      startNavigation('/activities/expedition',link);
-    });
+    finishScheduledVisit('shelter');
   }
   function maybeVisitShelter(running) {
     if(shelterReload(true)){cancelShelterRead();cancelQueued();}
@@ -17825,8 +17612,6 @@ installShelterPlanningWorker(self);
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt-Date.now() < 75000) return false;
     const link = travelLink('/shelter');
     offer('shelter:visit','切换避难所收取产出和奖励',() => {
-      // Only a real new visit resets timing. A reload inside the shelter does not.
-      try{sessionStorage.removeItem('arkengine:auto-shelter:handoff:v1');}catch{ /* no extended handoff if storage fails */ }
       startNavigation('/shelter',link);
     });
     return true;
@@ -18295,6 +18080,7 @@ installShelterPlanningWorker(self);
       }
       return;
     }
+    if (!shelterEntryAt&&shelterState.nextAt>Date.now()&&!shelterPending) { leaveShelter(); return; }
     if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0;shelterConfirmedActions=0; shelterLeave = false;shelterVisitPeriod=null;
       // Worker proposals belong to one visit. A transient failure is terminal
       // within that visit, but must not poison every later visit at the same facts.
@@ -18322,7 +18108,8 @@ installShelterPlanningWorker(self);
     const finishing=Boolean(shelterBuildWork?.openedAt&&!shelterBuildWork.cancelled&&!shelterConstructionDone||
       shelterWork?.openedAt&&!shelterWork.submitted&&!shelterWork.closing||shelterRecallWork?.at&&!shelterRecallWork.cancelled);
     if (!shelterPending && (Date.now()-shelterEntryAt > (finishing?visitBudget.finishLimitMs:visitBudget.limitMs) || shelterActions >= visitBudget.actionLimit)) {
-      finishShelter(shelterRead?.model,visitBudget.limitMs<5*60000?'远征即将到期，先返回处理，稍后继续避难所':'本轮处理已到上限，稍后继续避难所',60000); return;
+      finishShelter(shelterRead?.model,visitBudget.expeditionAt!==null&&visitBudget.expeditionAt-Date.now()<=15000?
+        '远征即将到期，先返回处理，稍后继续避难所':'本轮处理已到上限，稍后继续避难所',60000); return;
     }
     if (!shelterRead || Date.now()-shelterRead.at > 10000) {
       // Preserve only the wait deadline, never a stale callback. Fresh state
@@ -18741,7 +18528,7 @@ installShelterPlanningWorker(self);
     if (!value) { cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); }
     enabled = value;
     try { localStorage.setItem(PREF, String(value)); } catch { /* 内存开关仍然有效 */ }
-    toggle.textContent = value ? '暂停远征组' : '开始远征组';
+    toggle.textContent = value ? '暂停全部自动操作' : '开始全部自动操作';
     if (!value) { if (active) log.stop(reason || '人工暂停'); cancelQueued(); releaseLock?.(); say(reason || '已暂停'); }
     schedule();
   }
@@ -18762,7 +18549,7 @@ installShelterPlanningWorker(self);
       setEnabled(!enabled);
     } catch { setEnabled(false, '无法保存原领取核对状态，已暂停；请检查站点存储'); }
   });
-  toggle.textContent = enabled ? '暂停远征组' : '开始远征组';
+  toggle.textContent = enabled ? '暂停全部自动操作' : '开始全部自动操作';
 
   function savePlan(value) {
     // 出发前保存本脚本的意图；恢复时只确认属于这次自动派遣的原请求。
@@ -19084,6 +18871,9 @@ installShelterPlanningWorker(self);
   }
   function startNavigation(path, link) {
     navigation = { from: location.pathname.replace(/\/$/, ''), to: path, at: Date.now(), reloaded: false };
+    if(path==='/shelter'&&navigation.from!=='/shelter'){
+      try{sessionStorage.removeItem('arkengine:auto-shelter:handoff:v1');}catch{}
+    }
     sessionStorage.setItem(NAV_JOURNAL, JSON.stringify(navigation));
     if(link)link.click();else location.assign(path);
   }
@@ -19093,12 +18883,14 @@ installShelterPlanningWorker(self);
     if (path !== navigation.from || navigation.to === '/farm' && !farmEnabled || navigation.to === '/shelter' && !shelterEnabled || navigation.to === '/stock' && !stockEnabled()) {
       clearNavigation(); return false;
     }
-    const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : navigation.to === '/stock' ? '股市' : '远征';
+    const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : navigation.to === '/stock' ? '股市' :
+      navigation.to === '/cultivate' ? '奇遇' : navigation.to === '/cultivate/dungeon' ? '秘境' : '远征';
     if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
     if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)) {
       say(`等待切换${target}；网页弹窗尚未关闭`);return true;
     }
-    const pendingReason=plan?'远征派遣':claimWait?'远征领取':farmEnabled&&farmPlan?'农场操作':nativePending().length?'原生远征请求':'';
+    const pendingReason=plan?'远征派遣':claimWait?'远征领取':farmEnabled&&farmPlan?'农场操作':nativePending().length?'原生远征请求':
+      cultivation.onPage()&&cultivation.pending()?'奇遇或秘境原请求':'';
     if(pendingReason){say(`等待切换${target}；${pendingReason}仍待核对，不重复操作`);return true;}
     if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
       navigation = { ...navigation, reloaded: true, at: Date.now() };
@@ -19109,8 +18901,7 @@ installShelterPlanningWorker(self);
     return true;
   }
   function backToExpedition() {
-    const link = travelLink('/activities/expedition');
-    offer('farm:return', '返回远征，按预约时间再检查农场', () => startNavigation('/activities/expedition', link));
+    finishScheduledVisit('farm');
   }
   function planFarmVisit(at, note) {
     // 农场已经确认不足时，记住顶部旧数值；同一旧值不能反复触发往返。
@@ -19136,7 +18927,7 @@ installShelterPlanningWorker(self);
     return values.length && values[0] !== null && values.every(value => value === values[0]) ? values[0] : null;
   }
   function rememberExpeditionTime(running) {
-    // 突发窗口必须在农场等待期间也能被调度；远征平时常驻，因此不依赖这个估算领奖。
+    if (!/^\/activities\/expedition\/?$/.test(location.pathname) || !running) return;
     const dates = [...(running?.querySelectorAll('p') || [])].flatMap(p => {
       const m = textOf(p).match(/完整到达:\s*(\d{4})\/(\d{1,2})\/(\d{1,2})\s*(\d{1,2}):(\d{2}):(\d{2})/);
       if (!m) return [];
@@ -19145,7 +18936,10 @@ installShelterPlanningWorker(self);
       return Number.isFinite(at) && at > Date.now() ? [at] : [];
     });
     const nextAt = dates.length ? Math.min(...dates) : 0;
-    if (farmState.expeditionAt !== nextAt) saveFarmState({ ...farmState, expeditionAt: nextAt });
+    const now=Date.now(),day=Math.floor((now+8*3600000)/86400000)*86400000-8*3600000;
+    const reviewAt=Math.min(now+3600000,...[day+3600000,day+86400000].filter(at=>at>now));
+    if (farmState.expeditionAt !== nextAt || farmState.expeditionReviewAt <= now || !farmState.expeditionReviewAt)
+      saveFarmState({ ...farmState, expeditionAt: nextAt, expeditionReviewAt:reviewAt });
   }
   function overduePatrol(running) {
     // 巡逻卡公开的北京时间只精确到分钟，宽限两分钟再核对。
@@ -19163,18 +18957,55 @@ installShelterPlanningWorker(self);
       return now - at >= 120000;
     });
   }
-  function maybeVisitScheduled(running) {
+  function scheduledVisits() {
+    return [
+      {path:'/farm',at:farmEnabled?farmState.nextAt||0:Infinity,visit:maybeVisitFarm},
+      {path:'/shelter',at:shelterEnabled&&!stateFault('shelter')?shelterState.nextAt||0:Infinity,visit:maybeVisitShelter},
+      {path:'/stock',at:stockEnabled()&&!stockFault&&!stateFault('stock')&&(!stockLedger.hold||stockLedger.pending?.result||stockCapacityWait()||stockCanConfirmHere())?stockLedger.nextAt||0:Infinity,visit:maybeVisitStock},
+      {path:'/cultivate',at:cultivation.dueAt(),visit:maybeVisitCultivation}
+    ];
+  }
+  function finishScheduledVisit(feature) {
+    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)) {
+      say('等待当前弹窗处理完成，再调度到期页面');return;
+    }
+    const now=Date.now(),path='/'+feature;
+    const returnAt=Math.min(farmState.expeditionAt?farmState.expeditionAt-15000:0,farmState.expeditionReviewAt||Infinity);
+    if (returnAt<=now || plan || claimWait || nativePending().length) {
+      offer(`${feature}:return`,'远征临近归来或需要核对，切换远征',()=>startNavigation('/activities/expedition',travelLink('/activities/expedition')));
+      return;
+    }
+    if (maybeVisitScheduled(null,path)) return;
+    const current=scheduledVisits().find(visit=>visit.path===path);
+    if(current?.at<=now){
+      if(feature==='shelter'){
+        sessionStorage.removeItem('arkengine:auto-shelter:handoff:v1');
+        cancelShelterRead();shelterEntryAt=0;shelterLeave=false;
+      }else if(feature==='stock'){cancelStockRead();stockEntryAt=0;stockLeave=false;}
+      schedule();return;
+    }
+    const nextAt=Math.min(returnAt,...scheduledVisits().map(visit=>visit.at));
+    say(`本轮完成，等待下次预约（约 ${Math.max(1,Math.ceil((nextAt-now)/60000))} 分钟）；远征归来前再切换`);
+  }
+  function maybeVisitScheduled(running,excludePath=null) {
     // Every idle expedition path shares explicit requests and ordinary ordering.
     // Ordinary visits compete by their existing due time. A short continuation
     // must not repeatedly overtake an older stock/farm/shelter appointment.
     // Each visitor still checks pending operations, enabled state and return time.
     if(shelterReload(true)){cancelShelterRead();cancelQueued();}
     if(stockReload(true)){cancelStockRead();cancelQueued();}
-    if(stockCheckRequested&&maybeVisitStock(running))return true;
-    const visits=[[farmState.nextAt||0,maybeVisitFarm],[shelterState.nextAt||0,maybeVisitShelter],
-      [stockLedger.nextAt||0,maybeVisitStock]];
-    visits.sort((a,b)=>a[0]-b[0]);
-    return visits.some(([,visit])=>visit(running));
+    if(excludePath!=='/stock'&&stockCheckRequested&&maybeVisitStock(running))return true;
+    const visits=scheduledVisits().filter(visit=>visit.path!==excludePath&&Number.isFinite(visit.at));
+    visits.sort((left,right)=>left.at-right.at);
+    return visits.some(({visit})=>visit(running));
+  }
+  function maybeVisitCultivation(running) {
+    if (cultivation.dueAt() > Date.now() || plan || claimWait || nativePending().length ||
+        farmEnabled && farmPlan || shelterEnabled && shelterPending && !shelterReadOnlyWait() || stockLedger.pending) return false;
+    rememberExpeditionTime(running);
+    if (farmState.expeditionAt > Date.now() && farmState.expeditionAt - Date.now() < 75000) return false;
+    offer('cultivate:visit', '检查到期的奇遇与秘境', () => startNavigation('/cultivate', travelLink('/cultivate')));
+    return true;
   }
   function maybeVisitFarm(running) {
     if (!farmEnabled) return false;
@@ -19457,6 +19288,7 @@ installShelterPlanningWorker(self);
     if (dialogs.length && !ownSeedDialog) {
       handleNotice(dialogs, '等待你处理农场弹窗'); return;
     }
+    if (!farmPlan&&!dialogs.length&&farmState.nextAt>Date.now()) { backToExpedition(); return; }
     if (farmState.readDeferred && !farmPlan) {
       if (farmState.nextAt>Date.now()) {
         if (ownSeedDialog) {
@@ -19610,6 +19442,8 @@ installShelterPlanningWorker(self);
     farmHint();
     shelterHint();
     stockHint();
+    cultivation.update();
+    if (!cultivation.onPage()) cultivation.cancel();
     if (!inStock() && (stockEntryAt || stockController || stockRead)) {
       cancelStockRead();stockEntryAt=0;stockLeave=false;stockActions=0;
     }
@@ -19637,6 +19471,11 @@ installShelterPlanningWorker(self);
       if (stockController) cancelStockRead();
       releaseLock?.(); return;
     }
+    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
+    if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
+      pauseAccount('游戏提示登录、权限或限流异常');
+      return;
+    }
     if (!navigator.locks) { setEnabled(false, '请使用支持标签页互斥的新版浏览器'); return; }
     if (!active) { acquire(); return; }
     log.pulse(status.textContent, { ...diagnostic,
@@ -19644,11 +19483,6 @@ installShelterPlanningWorker(self);
       shelterConfirmation:shelterWorkConfirm?{resident:shelterWorkConfirm.work.id,ageMs:Date.now()-shelterWorkConfirm.at,
         phase:shelterWorkConfirm.manual?'manual':shelterWorkConfirm.cancelling?'cancelling':shelterWorkConfirm.clicked?'clicked':'awaiting'}:null,
       pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot() });
-    const errors = [...document.querySelectorAll('[role="status"].text-destructive, [role="status"].bg-destructive, [role="alert"].text-destructive, [role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
-    if (/(?:\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden)/i.test(errors)) {
-      pauseAccount('游戏提示登录、权限或限流异常');
-      return;
-    }
     // Shelter reads and native-control checks can overlap the click cooldown;
     // offer still enforces that cooldown and the full per-action random wait.
     if (Date.now() < nextStepAt && !inShelter()) return;
@@ -19658,6 +19492,11 @@ installShelterPlanningWorker(self);
     }
     if (waitForNavigation()) return;
     if(shelterWatch())return;
+    if (cultivation.onPage()) {
+      expeditionObserved = false;
+      if (farmEntryAt || farmMarketLoading) { cancelFarmRead(); farmEntryAt = 0; }
+      cultivation.tick(); return;
+    }
     if (inStock()) {
       expeditionObserved=false;
       if(farmEntryAt || farmMarketLoading){cancelFarmRead();farmEntryAt=0;}
@@ -19862,12 +19701,18 @@ installShelterPlanningWorker(self);
     if (acquiring || pageFrozen) return;
     acquiring = true;
     navigator.locks.request(LOCK, { ifAvailable: true }, async lock => {
-      if (!lock || !enabled || !onPage() || pageFrozen) { if (enabled && onPage() && !pageFrozen) say('另一远征标签页正在运行'); return; }
-      if(shelterReload()){cancelShelterRead();cancelQueued();}
-      stockReload();
-      active = true;
-      try { await new Promise(resolve => { releaseLock = resolve; schedule(); }); }
-      finally { active = false; releaseLock = null; cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); }
+      if (!lock || !enabled || !onPage() || pageFrozen) { if (enabled && onPage() && !pageFrozen) say('另一挂机标签页正在运行'); return; }
+      await navigator.locks.request('arkengine:auto-encounter:tab:v1', { ifAvailable: true }, async legacyLock => {
+        if (!legacyLock || !enabled || !onPage() || pageFrozen) {
+          if (enabled && onPage() && !pageFrozen) say('旧修仙标签页仍在运行，请关闭或更新旧页');
+          return;
+        }
+        if(shelterReload()){cancelShelterRead();cancelQueued();}
+        stockReload();
+        active = true;
+        try { await new Promise(resolve => { releaseLock = resolve; schedule(); }); }
+        finally { active = false; releaseLock = null; cultivation.cancel(); cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); }
+      });
     }).catch(() => setEnabled(false, '无法取得远征运行锁，请刷新后重试'))
       .finally(() => { acquiring = false; });
   }
@@ -19899,7 +19744,7 @@ installShelterPlanningWorker(self);
     stockEnabled:stockEnabled(),stockDueAt:stockLedger.nextAt,pendingStock:Boolean(stockLedger.pending),stockHeld:stockLedger.hold,
     shelterStaffMode,shelterGear,shelterOptimize,populationTarget:shelterPopulationTarget,
     pendingStaff:Boolean(shelterWork),pendingSwap:Boolean(shelterState.swap),pendingPair:Boolean(shelterState.pair),diagnostic } : null);
-  subscribeWakeup(schedule, onPage, () => enabled);
+  subscribeWakeup(schedule, onPage, () => enabled, () => cultivation.observe());
   document.addEventListener('freeze', () => {
     pageFrozen = true;
     cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); releaseLock?.();
@@ -19914,7 +19759,7 @@ installShelterPlanningWorker(self);
   window.addEventListener('storage', event => {
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
-      toggle.textContent = enabled ? '暂停远征组' : '开始远征组';
+      toggle.textContent = enabled ? '暂停全部自动操作' : '开始全部自动操作';
       if (!enabled) { cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); releaseLock?.(); say('已暂停'); }
     } else if ([FARM_PREF,FARM_CROP,FARM_STATE].includes(event.key)) {
       try {

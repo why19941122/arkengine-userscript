@@ -74,12 +74,27 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     await drive(`fm.calls.some(c=>c.type==='navigate')`,'normal appointments resume after the claim');
     assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
   });
+  await t.test('跨页巡检时限：远征还有四十分钟，新访问不能继承上轮已过期时限而空转',async()=>{
+    await setupFeatures(raidWatch+`
+      sm.view.state.rooms.at(-1).incident=null;
+      sm.view.state.residents.find(person=>person.id===5).roomId=90;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:clock+900000,note:'等待',
+        campaign:{roles:[],trips:[],attempts:[],heals:[],trainingRest:[],defense:[{id:5,room:90,from:4,at:clock-600000}]}}));
+      localStorage.setItem('arkengine:auto-farm:schedule:v1',JSON.stringify({nextAt:0,note:'等待',expeditionAt:clock+40*60000}));
+      sessionStorage.setItem('arkengine:auto-shelter:handoff:v1',JSON.stringify({vaultNo:sm.view.vaultNo,
+        entryAt:clock-10*60000,expeditionAt:clock+40*60000,key:null}));`, '/stock');
+    await drive(`sm.calls.some(call=>call.type==='assign'&&call.residentId===5&&call.roomId===4)`,'fresh patrol visit performs the pending assignment',35);
+    assert.deepEqual(await evaluate('km.calls'),[]);
+    assert.equal(await evaluate(`fm.calls.filter(call=>call.type==='navigate'&&call.path==='/activities/expedition').length`),0);
+    const checks=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='shelter-check')`);
+    assert.ok(checks.every(event=>event.data.visit.limitMs>=0));
+  });
   await t.test('跨页防守巡检：股市未提交卖出让位于在家增援，不受十五分钟预约限制',async()=>{
     await setupFeatures(raidWatch,'/stock');
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'patrol preempts stock sale',35);
+    await drive(`sm.calls.some(c=>c.type==='rescue_incident'&&c.roomId===90)`,'patrol preempts stock sale',35);
     assert.deepEqual(await evaluate('km.calls'),[]);
     assert.ok(await evaluate('sm.reads>=1'));
-    await drive(`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))?.campaign?.defense?.length>0`,'first defender confirmed',30);
+    await drive(`!JSON.parse(${shelterPending})&&sm.view.state.residents.some(person=>person.roomId===90)`,'native rescue confirmed',30);
     const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
     const found=events.find(e=>e.type==='shelter-raid-detected'),sent=events.find(e=>e.type==='shelter-defense-submitted'),
       confirmed=events.find(e=>e.type==='shelter-defense-confirmed');
@@ -92,7 +107,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.equal(await evaluate('location.pathname'),'/stock');
     assert.deepEqual(await evaluate('sm.calls'),[]);assert.deepEqual(await evaluate('km.calls'),[]);
     await evaluate("document.getElementById('owner-dialog').remove();");
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'raid after manual dialog closed',35);
+    await drive(`sm.calls.some(c=>c.type==='rescue_incident'&&c.roomId===90)`,'raid after manual dialog closed',35);
   });
   await t.test('跨页防守巡检：总暂停阻止迟到读取导航，已返回的未知原交易保留但不拖延增援',async()=>{
     await setupFeatures(raidWatch+'sm.deferRead=true;','/stock');
@@ -111,7 +126,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
       await drive('km.calls.length===1','original response returned with unknown result');
       const original=await evaluate(`${stock}.pending.id`);
       await evaluate("sm.view.state.rooms.at(-1).incident={kind:'raiders',hp:80,maxHp:80};");
-      await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'returned unknown stock yields to raid',45);
+      await drive(`sm.calls.some(c=>c.type==='rescue_incident'&&c.roomId===90)`,'returned unknown stock yields to raid',45);
       assert.equal(await evaluate(`${stock}.pending.id`),original);
       assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate('km.calls[0].action'),action);
       assert.ok(await evaluate(`${stock}.pending.responseAt>=${stock}.pending.at`));
@@ -126,7 +141,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.equal(await evaluate('location.pathname'),'/stock');assert.deepEqual(await evaluate('sm.calls'),[]);
     assert.equal(await evaluate('km.calls.length'),1);
     await evaluate('km.deferPost=false;km.resolvePost();');
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.roomId===90)`,'finished response permits defense',30);
+    await drive(`sm.calls.some(c=>c.type==='rescue_incident'&&c.roomId===90)`,'finished response permits defense',30);
     assert.equal(await evaluate(`${stock}.pending.id`),original);assert.equal(await evaluate('km.calls.length'),1);
   });
 
@@ -323,7 +338,7 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
   });
 
-  await t.test('玩法隔离人员轮换：避难所到时限让股市运行，返回后接续原调岗而不重放',async()=>{
+  await t.test('玩法隔离人员轮换：避难所到时限先完成已开始的换位，再让股市运行且不重放',async()=>{
     const schedule=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`;
     const moves=`sm.calls.filter(c=>c.type==='assign')`;
     await setupFeatures(`localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
@@ -338,11 +353,12 @@ export async function crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate
     await drive(`${moves}.length===1&&JSON.parse(${shelterPending})===null`,'allocation first step confirmed').catch(async error=>{
       error.message+=JSON.stringify(await evaluate(`({calls:sm.calls,schedule:${schedule},pending:${shelterPending},staff:document.getElementById('ark-auto-expedition').shadowRoot.getElementById('shelter-staff-status').textContent})`));throw error;
     });
-    const id=await evaluate(`${schedule}.swap.id`);
-    await pulse(301000);await drive(done,'stock served after the current five-minute visit limit');
-    assert.equal(await evaluate(`${moves}.length`),1);assert.equal(await evaluate(`${schedule}.swap.id`),id);
+    const first=await evaluate(`${moves}[0]`);
+    await pulse(301000);await drive(done,'original swap finishes within the handoff before stock runs');
+    assert.equal(await evaluate(`${moves}.length`),4);assert.equal(await evaluate(`${schedule}.swap`),null);
     assert.deepEqual(await evaluate('km.calls.map(c=>c.action)'),['sell']);
-    await pulse(61000);await drive(`${moves}.length===4&&${schedule}.swap===null&&location.pathname==='/activities/expedition'`,'resume allocation after other feature',240);
+    await pulse(61000);await drive(`${schedule}.swap===null&&location.pathname==='/activities/expedition'`,'later visit does not replay the completed swap',240);
+    assert.equal(await evaluate(`${moves}.length`),4);assert.deepEqual(await evaluate(`${moves}[0]`),first);
     assert.deepEqual(await evaluate('sm.view.state.residents.slice(0,3).map(p=>p.roomId)'),[3,4,2]);
     assert.equal(await evaluate('km.calls.length'),1);assert.equal(await evaluate(`JSON.parse(${shelterPending})`),null);
   });

@@ -4626,6 +4626,23 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     if(dialog){window.recallDialog=dialog;dialog.style.opacity='0';sm.recallClicks=[];
       dialog.addEventListener('click',event=>sm.recallClicks.push(event.target.textContent));}};`;
   const recallEnabled=`localStorage.getItem('arkengine:auto-shelter:enabled:v1')`;
+  await t.test('废土迟到弹窗：召回窗口超过五秒才渲染，仍能撤销本轮窗口并继续',async()=>{
+    await setupShelter(scene({explore:true},recallScreenshotScene+`
+      const appendDelayed=document.body.append.bind(document.body);
+      document.body.append=(...nodes)=>{
+        appendDelayed(...nodes);
+        const dialog=nodes.find(node=>node.querySelector?.('h2')?.textContent.startsWith('召回 '));
+        if(dialog){window.delayedRecallDialog=dialog;dialog.remove();}
+      };`));
+    await drive('!!window.delayedRecallDialog','recall opening requested');
+    await pulse(6000);
+    await evaluate('document.body.appendChild(delayedRecallDialog);');
+    await drive(`!delayedRecallDialog.isConnected&&location.pathname==='/activities/expedition'`,'late recall is cancelled and normal work resumes',70);
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    assert.equal(await evaluate('sm.recallOpens'),1);
+    assert.equal(await evaluate(pending),null);
+    assert.equal(await evaluate(recallEnabled),'true');
+  });
   await t.test('后台召回：确认与取消均不可用四十秒，前台再等动画后只确认原单一次',async()=>{
     await setupShelter(scene({explore:true},delayedRecall));
     await drive('window.recallDialog?.isConnected','script opened the owned recall');
@@ -4920,10 +4937,15 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.equal(await evaluate(`document.querySelector('[role="dialog"],[role="alertdialog"]')`),null);
     assert.equal(await evaluate(pending),null);
     await evaluate('const room=sm.view.state.rooms.find(room=>room.id===2);room.upgradeAt=null;room.level=3;');
+    await evaluate(`clock=Math.max(clock,${state}.nextAt);`);
     await reloadCampaign();await settle('finished upgrade keeps unfinished training');
     assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),0);
     assert.deepEqual(await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`),original);
     await evaluate('const person=sm.view.state.residents.find(person=>person.id===5);person.stats.agi=3;person.training=0;');
+    await reloadCampaign();
+    await settle('early refresh waits for the next scheduled visit');
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),0);
+    await evaluate(`clock=Math.max(clock,${state}.nextAt);`);
     await reloadCampaign();
     await drive(`Boolean(document.querySelector('[role="alertdialog"]'))`,'completed training native return confirmation');
     await settle('completed training returns to original diner');

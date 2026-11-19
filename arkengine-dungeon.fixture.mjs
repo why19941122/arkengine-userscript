@@ -1,5 +1,7 @@
 // 按公开前端的主殿、秘境、alertdialog 和原请求记录构造；只在本机测试。
-export const dungeonMarkup = `<!doctype html><meta charset="utf-8"><title>本地秘境测试</title>
+import { expeditionMarkup } from './arkengine-expedition.fixture.mjs';
+
+const dungeonPageMarkup = `<!doctype html><meta charset="utf-8"><title>本地秘境测试</title>
 <main id="game"></main><script>
 window.clock = Date.parse('2026-10-10T10:00:00+08:00');
 Date.now = () => clock;
@@ -115,6 +117,11 @@ window.openSweep = () => {
  document.body.append(box);
 };
 window.renderDun = () => {
+ if(location.pathname==='/activities/expedition'){
+   renderExp();
+   const link=document.createElement('a');link.href='/cultivate';link.textContent='奇遇';
+   link.onclick=event=>{event.preventDefault();goDun('/cultivate');};game.append(link);return;
+ }
  const isDungeon = location.pathname === '/cultivate/dungeon';
  if (!isDungeon) {
    game.innerHTML = '<a href="/cultivate/dungeon">秘境</a><button aria-label="刷新修炼状态">刷新</button><button id="seek" disabled>奇遇冷却 5:30</button>';
@@ -198,7 +205,13 @@ window.renderDun = () => {
    if(nativeDun()) { const b=document.createElement('button'); b.textContent='确认上次秘境操作'; b.disabled=dm.busy; b.onclick=()=>submitDun(nativeDun().input,true); game.append(b); }
  }
  game.querySelector('a').onclick=e=>{e.preventDefault();goDun(e.currentTarget.getAttribute('href'));};
+ const home=document.createElement('a');home.href='/activities/expedition';home.textContent='返回远征';
+ home.onclick=event=>{event.preventDefault();goDun('/activities/expedition');};game.append(home);
  persistDun();
 };
+if(!model.runs.length)addRuns(6);model.burst=0;
 renderDun();
 </script>`;
+
+export const dungeonScript = dungeonPageMarkup.match(/<script>([\s\S]*)<\/script>/)[1];
+export const dungeonMarkup = expeditionMarkup + `<script>${dungeonScript}</script>`;

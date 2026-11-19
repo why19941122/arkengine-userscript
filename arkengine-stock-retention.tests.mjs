@@ -99,8 +99,8 @@ export async function stockRetentionTests({t,setupStock,reloadStock,evaluate,unt
     const counts=await evaluate('startupReads');
     assert.deepEqual(counts,{buckets:0,decompressions:0},'collapsed panels need totals, not historical payloads');
     for(const group of ['cultivate','expedition']){
-      const id=group==='cultivate'?'encounter':'expedition';
-      assert.match(await evaluate(`document.getElementById('ark-auto-${id}').shadowRoot.getElementById('log-summary').textContent`),/代币 17/);
+      const id=group==='cultivate'?'cultivate-log-summary':'log-summary';
+      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('${id}').textContent`),/代币 17/);
       assert.deepEqual(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-log:v1:${group}:outbox'))`),[]);
     }
     await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('local-log').open=true;`);
