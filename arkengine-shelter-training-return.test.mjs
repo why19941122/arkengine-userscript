@@ -135,6 +135,80 @@ test('训练持续与准入：20%余量下降但实际收支平衡时完成当�
   }
  }
 });
+function upgradingTrainingScene(stat='end'){
+  const context=scene(stat,2),{v,s,p,room,record,cfg}=context;
+  const type={str:'power',per:'water',end:'scrap',agi:'diner',int:'workshop'}[stat];
+  if(stat==='int'){
+    s.rooms.push({...s.rooms[0],id:91,type:'workshop',level:2,floor:4,col:2});
+    cfg.workshop=true;cfg.partsTarget=120;
+  }
+  const destination=s.rooms.find(target=>target.type===type);
+  destination.level=2;p.roomId=room.id;p.training=1/6;
+  record.roles=[{id:p.id,room:room.id,role:'training',at:v.serverTime-hour,stat,base:2,
+    purpose:'production',until:v.serverTime+3*hour,windowEnd:v.serverTime+168*hour,destination:destination.id}];
+  destination.upgradeAt=v.serverTime+hour;
+  return {...context,destination};
+}
+
+test('生产训练返岗房升级：保留当前格、原席位和固定期限，不把施工房计为在产',()=>{
+  for(const stat of ['str','per','end','agi','int']){
+    const context=upgradingTrainingScene(stat),{v,s,p,record,destination}=context;
+    const original=JSON.stringify(record),snapshot=JSON.stringify(v),started=v.serverTime;
+    const resource={str:'power',per:'water',end:'scrap',agi:'food',int:'parts'}[stat];
+    for(const elapsed of [0,hour/4,hour/2]){
+      v.serverTime=started+elapsed;
+      const model=api.model(v),plan=api.plan(model,context.cfg,JSON.parse(original),14);
+      assert.equal(model.production[resource],0,stat+' construction produces nothing');
+      assert.ok(!plan.actions.some(action=>action.id===p.id&&action.role==='training-release'),stat);
+      assert.ok(plan.reserved.includes(p.id),stat);
+      assert.ok(plan.trainingDestinations.some(seat=>seat.id===p.id&&seat.room===destination.id),stat);
+      assert.ok(!plan.adoptions.some(role=>role.id===p.id),stat+' no renewed deadline');
+      assert.ok(plan.events.includes(destination.upgradeAt-v.serverTime),stat+' checks upgrade completion');
+      assert.equal(JSON.stringify(record),original);
+    }
+    v.serverTime=started;assert.equal(JSON.stringify(v),snapshot);
+    destination.upgradeAt=null;destination.level=3;
+    const afterUpgrade=context.run().actions.find(action=>action.id===p.id&&action.role==='training-release');
+    if(stat==='int')assert.match(afterUpgrade?.reason,/no-payback-in-window/);
+    else assert.equal(afterUpgrade,undefined,stat+' upgrade alone does not finish training');
+    p.stats[stat]++;p.training=0;
+    const returned=context.run().actions.find(action=>action.id===p.id&&action.role==='training-release');
+    assert.equal(returned?.room,destination.id,stat+' completed training returns to original job');
+  }
+});
+
+test('生产训练返岗房升级：完成、关闭、到期、断供或岗位真实失效仍释放，不能调入施工房',()=>{
+  for(const reason of ['completed','training-off','development-off','expired','window-ended','supply-low',
+    'destination-lost','wrong-resource','full','unpowered','training-inactive','stat-changed','upgrade-too-late']){
+    const context=upgradingTrainingScene(),{v,s,p,room,record,cfg,destination}=context;
+    if(reason==='completed'){p.stats.end++;p.training=0;}
+    if(reason==='training-off')cfg.training=false;
+    if(reason==='development-off')cfg.development=false;
+    if(reason==='expired')record.roles[0].until=v.serverTime;
+    if(reason==='window-ended')record.roles[0].windowEnd=v.serverTime;
+    if(reason==='supply-low')s.resources.power=0;
+    if(reason==='destination-lost')s.rooms=s.rooms.filter(target=>target.id!==destination.id);
+    if(reason==='wrong-resource')destination.type='diner';
+    if(reason==='full')s.residents[5].roomId=destination.id;
+    if(reason==='unpowered')destination.unpowered=true;
+    if(reason==='training-inactive')room.upgradeAt=v.serverTime+hour;
+    if(reason==='stat-changed')room.trainStat='agi';
+    if(reason==='upgrade-too-late')destination.upgradeAt=record.roles[0].windowEnd;
+    const released=context.run().actions.find(action=>action.id===p.id&&action.role==='training-release');
+    assert.ok(released,reason);assert.equal(released.room,null,reason+' cannot assign into construction');
+  }
+});
+
+test('生产训练返岗房升级：多个训练者仍共享真实容量，不重复预留最后一席',()=>{
+  const context=upgradingTrainingScene(),{s,room,record,destination}=context;
+  const second=s.residents[5];second.roomId=room.id;second.stats.end=2;second.training=1/6;
+  record.roles.push({...record.roles[0],id:second.id});
+  const plan=context.run();
+  assert.equal(plan.trainingDestinations.filter(seat=>seat.room===destination.id).length,1);
+  assert.ok(plan.reserved.includes(record.roles[0].id));
+  assert.ok(plan.actions.some(action=>action.id===second.id&&action.role==='training-release'&&action.room===null));
+});
+
 test('生产训练：训练完成、模式关闭、期限到达和原目标岗位失效时释放',()=>{
   for(const reason of ['completed','training-off','development-off','expired','destination-lost','stat-changed']){
     const x=scene(),a=x.run().actions.find(a=>a.purpose==='production');assert.ok(a);
@@ -147,8 +221,8 @@ test('生产训练：训练完成、模式关闭、期限到达和原目标岗�
     if(reason==='expired')x.v.serverTime=a.until;
     if(reason==='stat-changed')x.room.trainStat='agi';
     if(reason==='destination-lost'){
-      x.s.rooms.find(r=>r.id===a.destination).upgradeAt=x.v.serverTime+hour;
       x.s.rooms.push({...x.s.rooms.find(r=>r.id===4),id:91,upgradeAt:null,floor:4,col:2});
+      x.s.rooms=x.s.rooms.filter(r=>r.id!==a.destination);
     }
     const plan=api.plan(api.model(x.v),x.cfg,x.record,14);
     assert.ok(plan.actions.some(c=>c.id===p.id&&c.role==='training-release'),reason);

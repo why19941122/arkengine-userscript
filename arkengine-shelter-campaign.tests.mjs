@@ -404,22 +404,21 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       assert.ok(await evaluate(`!${state}.assignmentRecovery`),boundary);
     }
   });
-  await t.test('旧调岗状态恢复：历史训练阻塞加回收站漏水，恢复后实际补员并在结束后返岗',async()=>{
+  await t.test('旧调岗状态恢复：历史训练阻塞加回收站漏水，恢复后按房间批量救援并自动返原岗',async()=>{
     const original=await stalledTraining();
     await evaluate(`const p=${pending};p.at=clock-10*3600000;localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify(p));
       const cfg=JSON.parse(localStorage.getItem('${key}'));cfg.defense=true;localStorage.setItem('${key}',JSON.stringify(cfg));
       sm.view.state.rooms.find(r=>r.id===4).incident={kind:'leak',hp:12,maxHp:20};
       sm.view.state.residents.push({...structuredClone(sm.view.state.residents[5]),id:7,name:'漏水增援候选',roomId:null});`);
+    const roster=`sm.view.state.residents.map(p=>[p.id,p.roomId])`,before=await evaluate(roster);
     await reloadShelter();
-    await drive(`sm.view.state.residents.filter(p=>p.roomId===4).length===3&&!${pending}`,'recovered scheduler sends two rescuers to leak');
+    await drive(`Object.keys(sm.rescueOrigins||{}).length===3`,'recovered scheduler sends first native rescue batch');
     assert.equal(await evaluate(`${state}.assignmentRecovery.original.id`),original.id);
-    assert.deepEqual(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.roomId===4).map(c=>c.residentId).sort()`),[6,7]);
-    assert.ok(await evaluate(`sm.view.state.residents.filter(p=>[1,2,3].includes(p.id)).every(p=>p.roomId===p.id)`),'essential supply jobs remain staffed');
-    await evaluate(`sm.view.state.rooms.find(r=>r.id===4).incident=null;`);
-    await drive(`${state}.campaign.defense.length===0&&sm.view.state.residents.find(p=>p.id===6).roomId===1&&
-      sm.view.state.residents.find(p=>p.id===7).roomId===4`,'leak ends and both responders recover useful production jobs');
-    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.residentId===6&&c.roomId===1).length`),1);
-    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.residentId===7&&c.roomId===4).length`),1,'already productive rescuer is retained without another assignment');
+    assert.equal(await evaluate('sm.view.state.residents.filter(p=>p.roomId===4).length'),before.filter(([,room])=>room===4).length+3);
+    await evaluate('sm.endRescue=true;');
+    await drive(`!sm.view.state.rooms.find(r=>r.id===4).incident&&!${pending}`,'next rescue batch ends incident and returns original workers');
+    assert.deepEqual(await evaluate(`sm.calls.map(c=>[c.type,c.roomId])`),[['rescue_incident',4],['rescue_incident',4]]);
+    assert.deepEqual(await evaluate(roster),before);
   });
   const finishingParentScene=(progress='5/7',extra='')=>scene({training:true,trainTarget:6},`sm.ui20261109=true;
     s.rooms.push({id:30,type:'training',trainStat:'cha',floor:3,col:2,width:1,level:1,builtAt:0,stored:0,upgradeAt:null,incident:null,unpowered:false});
@@ -4780,6 +4779,79 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'训练备用返岗',
       campaign:{roles:[{id:5,room:90,role:'training',at:clock-3600000,stat:'end',base:5,purpose:'production',
         until:clock+600000,windowEnd:clock+168*3600000,destination:91}],trips:[],attempts:[],heals:[],trainingRest:[]}}));`);
+  const delayedAssignment=alternativeTrainingReturnScene()+`sm.ui20261109=true;
+    const appendWork=document.body.append.bind(document.body);document.body.append=(...nodes)=>{
+      appendWork(...nodes);const dialog=nodes.find(node=>node.matches?.('[role="alertdialog"]')&&node.querySelector('h2')?.textContent.startsWith('确认调动'));
+      if(dialog){window.assignDialog=dialog;dialog.style.opacity='0';sm.assignClicks=[];
+        dialog.addEventListener('click',event=>sm.assignClicks.push(event.target.textContent));}};`;
+  for(const changed of [false,true])await t.test(`后台调岗：等待四十秒再恢复${changed?'，目标已失效只取消':'，只确认一次'}`,async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned assignment dialog');
+    const original=await evaluate(pending);
+    await pulse(8000);
+    await withShelterBackground(async()=>{
+      for(let pass=0;pass<4;pass++)await pulse(10000);
+      assert.equal(await evaluate(recallEnabled),'true');assert.equal(await evaluate(`${pending}?.id`),original.id);
+      assert.deepEqual(await evaluate('sm.assignClicks'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+    });
+    await pulse(9000);await evaluate(`assignDialog.style.opacity='1';${changed?'sm.view.state.rooms.find(r=>r.id===4).unpowered=true;':''}`);
+    await drive(`!assignDialog.isConnected&&!${pending}`,'resolve original assignment');
+    assert.deepEqual(await evaluate('sm.assignClicks'),[changed?'取消':'确认']);
+    assert.deepEqual(await evaluate(`sm.calls.filter(c=>c.type==='assign').map(c=>[c.residentId,c.roomId])`),changed?[]:[[5,4]]);
+  });
+  await t.test('后台调岗：撤销时短暂隐藏原窗口不算已取消，只能等原窗口恢复',async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned dialog before cancel');
+    const original=await evaluate(pending);
+    await withShelterBackground(async()=>{
+      await evaluate(`assignDialog.querySelector('h2').textContent='标题变化'`);await pulse();
+      await evaluate(`assignDialog.hidden=true;`);await pulse(10000);await pulse(10000);
+      assert.equal(await evaluate(`${pending}?.id`),original.id);assert.deepEqual(await evaluate('sm.calls'),[]);
+      await evaluate(`assignDialog.hidden=false;assignDialog.style.opacity='1';`);
+    });
+    await drive(`!assignDialog.isConnected&&!${pending}`,'cancel only the restored dialog');
+    assert.deepEqual(await evaluate('sm.assignClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('后台调岗：后台访问到期只取消，窗口恢复时不必切回前台',async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned assignment before visit deadline');
+    await withShelterBackground(async()=>{
+      await pulse(9*60000);await pulse(20000);await pulse(20000);
+      assert.equal(await evaluate(recallEnabled),'true');assert.deepEqual(await evaluate('sm.assignClicks'),[]);
+      await evaluate(`assignDialog.style.opacity='1'`);await drive(`!assignDialog.isConnected&&!${pending}`,'cancel expired assignment in background');
+      assert.deepEqual(await evaluate('sm.assignClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);
+    });
+  });
+  await t.test('调岗弹窗归属：叠有其他窗口时不点击下层，移除后只处理原确认',async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned assignment before overlay');
+    await evaluate(`assignDialog.style.opacity='1';window.otherDialog=document.createElement('div');otherDialog.setAttribute('role','dialog');
+      otherDialog.innerHTML='<h2>手动操作</h2><button>确认</button>';document.body.append(otherDialog);`);
+    await pulse(5000);await pulse(5000);assert.deepEqual(await evaluate('sm.assignClicks'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate('otherDialog.remove()');await drive(`!assignDialog.isConnected&&!${pending}`,'only original confirmation after overlay');
+    assert.deepEqual(await evaluate('sm.assignClicks'),['确认']);
+    assert.deepEqual(await evaluate(`sm.calls.map(c=>[c.residentId,c.roomId])`),[[5,4]]);
+  });
+  for(const currentRoom of [4,90])await t.test(`旧指定返岗：${currentRoom===4?'已在目标生产岗则归档但不报成功':'仍在训练不猜测旧单结果'}`,async()=>{
+    await setupShelter(alternativeTrainingReturnScene()+'sm.ui20261109=true;');
+    await drive(`Boolean(document.querySelector('[role="alertdialog"]'))`,'unbound targeted assignment before reload');
+    const original=await evaluate(`const p=${pending};delete p.lifecycle;
+      localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify(p));
+      sm.view.state.residents.find(r=>r.id===5).roomId=${currentRoom};p`);
+    assert.deepEqual(original.targets,[5,4]);await reloadShelter();await settle('old targeted training assignment');
+    assert.deepEqual(await evaluate(`sm.calls.filter(c=>c.type==='assign'&&c.residentId===5)`),[]);
+    if(currentRoom===4){
+      assert.deepEqual(await evaluate(`${state}.assignmentRecovery?.original`),original);
+      assert.equal(await evaluate(`${state}.assignmentRecovery.currentRoom`),4);assert.equal(await evaluate(pending),null);
+      assert.ok(await evaluate(`${state}.campaign.trainingRest.some(entry=>entry.id===5&&entry.at===${state}.assignmentRecovery.snapshotAt)`));
+      assert.ok(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
+        e.type==='shelter-assignment-reconciled'&&e.data.operation==='${original.id}'&&e.data.receiptConfirmed===false)`));
+    }else assert.equal(await evaluate(`${pending}?.id`),original.id);
+  });
+  await t.test('旧指定返岗：已绑定请求但没有成功凭据，即使人已在目标岗也不归档不重发',async()=>{
+    await setupShelter(alternativeTrainingReturnScene()+'sm.ui20261109=true;sm.assignUnknown=true;');
+    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===5)`,'targeted assignment with unknown result');
+    const original=await evaluate(pending);assert.equal(original.lifecycle.phase,'request-bound');
+    await evaluate('sm.view.state.residents.find(r=>r.id===5).roomId=4');await reloadShelter();await settle('unknown receipt already at target');
+    assert.equal(await evaluate(`${pending}?.id`),original.id);assert.ok(await evaluate(`!${state}.assignmentRecovery`));
+    assert.deepEqual(await evaluate(`sm.calls.map(c=>[c.residentId,c.roomId])`),[[5,4]]);
+  });
   await t.test('训练备用返岗浏览器：原生确认后直接补备用空岗，刷新不重发、不立即重训',async()=>{
     await setupShelter(alternativeTrainingReturnScene());
     await drive(`Boolean(document.querySelector('[role="alertdialog"]'))`,'alternative return native confirmation');
@@ -4825,6 +4897,43 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===5).length'),0,JSON.stringify(await diagnose()));
     assert.equal(await evaluate(pending),null);
     assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===5).roomId'),90);
+  });
+  await t.test('生产训练返岗房升级浏览器：施工和刷新不弹提前调岗确认，完工练成后只返岗一次',async()=>{
+    await setupShelter(scene({training:true,trainTarget:10},`sm.ui20261109=true;
+      s.rooms.push({...s.rooms[0],id:90,type:'training',trainStat:'agi',level:1,floor:3,col:2});
+      Object.assign(s.rooms.find(r=>r.id===2),{level:2,upgradeAt:clock+3600000});
+      for(const p of s.residents){p.stats.agi=10;p.training=0;}
+      Object.assign(s.residents[4],{roomId:90,xp:0,hp:100,training:1/6});s.residents[4].stats.agi=2;
+      s.residents[5].roomId=1;
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      localStorage.setItem('arkengine:auto-shelter:optimize:v1','false');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'返岗房升级',
+        campaign:{roles:[{id:5,room:90,role:'training',at:clock-3600000,stat:'agi',base:2,purpose:'production',
+          until:clock+3*3600000,windowEnd:clock+168*3600000,destination:2}],trips:[],attempts:[],heals:[],trainingRest:[]}}));`));
+    const original=await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`);
+    await settle('upgrading destination keeps training');
+    assert.match(await evaluate(`${state}.campaignNote`),/原返岗房正在升级/);
+    await reloadCampaign();await settle('upgrading destination survives reload');
+    assert.deepEqual(await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`),original);
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),0);
+    assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===5).training'),1/6);
+    assert.equal(await evaluate(`document.querySelector('[role="dialog"],[role="alertdialog"]')`),null);
+    assert.equal(await evaluate(pending),null);
+    await evaluate('const room=sm.view.state.rooms.find(room=>room.id===2);room.upgradeAt=null;room.level=3;');
+    await reloadCampaign();await settle('finished upgrade keeps unfinished training');
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),0);
+    assert.deepEqual(await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`),original);
+    await evaluate('const person=sm.view.state.residents.find(person=>person.id===5);person.stats.agi=3;person.training=0;');
+    await reloadCampaign();
+    await drive(`Boolean(document.querySelector('[role="alertdialog"]'))`,'completed training native return confirmation');
+    await settle('completed training returns to original diner');
+    assert.deepEqual(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).map(call=>call.roomId)'),[2]);
+    assert.ok(await evaluate(`${state}.campaign.roles.every(role=>role.id!==5)`));
+    assert.ok(await evaluate(`${state}.campaign.trainingRest.some(role=>role.id===5)`));
+    assert.equal(await evaluate(pending),null);
+    assert.equal(await evaluate(`document.querySelector('[role="dialog"],[role="alertdialog"]')`),null);
+    await reloadCampaign();await settle('completed return survives reload');
+    assert.deepEqual(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).map(call=>call.roomId)'),[2]);
   });
   await t.test('生产训练浏览器：按单格回报入室，刷新保留返岗空位与期限，完成后直接返岗',async()=>{
     await setupShelter(scene({training:true,trainTarget:10},`s.rooms.push({id:30,type:'training',trainStat:'end',floor:3,col:2,width:1,level:1,builtAt:0,stored:0,upgradeAt:null,incident:null,unpowered:false});

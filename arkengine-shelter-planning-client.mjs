@@ -1,9 +1,9 @@
 // Self-contained browser factory. Only one immutable input is in flight; cancelling a
 // worker cannot cancel or confirm a game request. No synchronous fallback on the UI thread.
 export function createShelterPlanningClient({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{}}) {
-  if(typeof source!=='string'||!source||!Number.isFinite(timeoutMs)||timeoutMs<=0)throw Error('Invalid planning worker configuration');
+  if(!(typeof source==='function'||typeof source==='string'&&source)||!Number.isFinite(timeoutMs)||timeoutMs<=0)throw Error('Invalid planning worker configuration');
   const factory=makeWorker??(()=>{
-    const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    const url=URL.createObjectURL(new Blob([typeof source==='function'?source():source],{type:'text/javascript'}));
     try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
   });
   let sequence=0,job=null;

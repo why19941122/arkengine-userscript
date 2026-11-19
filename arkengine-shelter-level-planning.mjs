@@ -2,7 +2,7 @@
 // One Worker runs at a time; a few variants of the same native snapshot may queue.
 export function createShelterLevelPlanning({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{},retainLevelProgress=false,retainFamilyProgress=false}) {
   const factory=makeWorker??(()=>{
-    const url=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));
+    const url=URL.createObjectURL(new Blob([typeof source==='function'?source():source],{type:'text/javascript'}));
     try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
   });
   let epoch=null,sequence=0,active=null,progress=null;

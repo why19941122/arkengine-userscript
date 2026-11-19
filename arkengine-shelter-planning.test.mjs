@@ -4,6 +4,7 @@ import {createHash} from 'node:crypto';
 import {Worker} from 'node:worker_threads';
 import {setTimeout as delay} from 'node:timers/promises';
 import {readFileSync} from 'node:fs';
+import {runInNewContext} from 'node:vm';
 import {createShelterSelectionDigest} from './arkengine-shelter-selection-digest.mjs';
 import {createShelterDevelopmentSelection} from './arkengine-shelter-development-selection.mjs';
 import {createShelterDevelopmentCandidates} from './arkengine-shelter-development-candidates.mjs';
@@ -176,6 +177,12 @@ test('planning: native adapter retains current proposals across revision and pro
 test('planning: userscript embeds exactly the tested local Worker and keeps proposal execution in the native staff path',()=>{
   const source=readFileSync(new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
   assert.ok(source.includes(shelterPlanningBrowserBundle()));
+  const embedded=source.slice(source.indexOf('  const shelterPlanningWorkerSource='),source.indexOf('  const createShelterPlanningClient='));
+  const result=runInNewContext(`let joined=0;const join=Array.prototype.join;
+    Array.prototype.join=function(...args){joined+=this.length;return join.apply(this,args);};
+    ${embedded}\n({worker:shelterPlanningWorkerSource(),joined});`);
+  assert.equal(result.worker,shelterPlanningWorkerSource());
+  assert.equal(result.joined,0,'first worker use should not assemble an array of source lines');
   assert.ok(source.includes('shelterBackgroundAssignment(m,scrapChoices)'));
   assert.ok(source.includes('shelterStartBackgroundPlanning(model)'));
   assert.ok(source.includes('developmentProposal:choice.developmentProposal'));

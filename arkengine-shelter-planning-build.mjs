@@ -47,14 +47,24 @@ export function shelterPlanningWorkerSource(){
   return "'use strict';\n"+chunks.join('\n')+'\ninstallShelterPlanningWorker(self);\n';
 }
 export function shelterPlanningBrowserBundle(){
+  const native=shelterLevelWorkerSource(),fragments=[],functions=[];
+  let offset=0;
+  for(const match of native.matchAll(/^  (function (\w+)\([^\n]*?\}(?=\r?$)|function (\w+)\([^]*?^  \})/gm)){
+    fragments.push(native.slice(offset,match.index+2));functions.push(match[2]??match[3]);
+    offset=match.index+match[0].length;
+  }
+  fragments.push(native.slice(offset));
+  const envelope=Buffer.from(JSON.stringify(fragments),'utf8').toString('base64');
+  const workerLiteral=shelterPlanningWorkerSource().replace(/[\\`\r]|\$\{/g,token=>token==='\r'?'\\r':'\\'+token);
   return '  // BEGIN GENERATED SHELTER PLANNING WORKER\n'+
-    '  const shelterPlanningWorkerSource=[\n    '+shelterPlanningWorkerSource().split('\n').map(line=>JSON.stringify(line)).join(',\n    ')+
-    '\n  ].join("\\n");\n'+
+    '  const shelterPlanningWorkerSource=()=>`'+workerLiteral+'`;\n'+
     '  const createShelterPlanningClient='+createShelterPlanningClient.toString()+';\n'+
     '  const createShelterNativePlanning='+createShelterNativePlanning.toString()+';\n'+
     '  const createShelterLevelPlanning='+createShelterLevelPlanning.toString()+';\n'+
-    '  const shelterLevelWorkerSource=new TextDecoder().decode(Uint8Array.from(atob('+
-    JSON.stringify(Buffer.from(shelterLevelWorkerSource(),'utf8').toString('base64'))+'),c=>c.charCodeAt(0)));\n'+
+    '  const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;\n'+
+    '    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('+JSON.stringify(envelope)+'),char=>char.charCodeAt(0))));\n'+
+    '    const functions=[\n      '+functions.join(',\n      ')+'\n    ];\n'+
+    "    return text=fragments.map((fragment,index)=>fragment+(functions[index]??'')).join('');\n  };})();\n"+
     '  // END GENERATED SHELTER PLANNING WORKER';
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){

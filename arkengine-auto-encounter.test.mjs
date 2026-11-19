@@ -42,9 +42,12 @@ assert.equal(rawSource.match(/const SCRIPT_VERSION\s*=\s*'([^']+)'/)?.[1],script
   '发布标头、面板与日志版本必须一致；请同步更新 SCRIPT_VERSION');
 // 仅测试上下文暴露实际日志存储，等待其事务队列；发布脚本不含此入口。
 const source = rawSource.replace('const logStore = createLogStore();', 'const logStore = createLogStore(); window.__arkTestLogs = logStore;')
+  .replace('function historyTotals(entries,archive={}) {','$& if(window.panelProbe)panelProbe.totals++;')
+  .replace('function spend(entries,action,now) {','$& if(window.panelProbe)panelProbe.spend++;')
+  .replace('function stockHint() {','$& if(window.panelProbe)panelProbe.ticks++;')
   .replace('function shelterCampaignPlan(m,cfg={},record={},target=14) {',
-    'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(window.sm?.planCostMs&&!cfg.maintenanceOnly){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}' +
-    'if(window.sm?.executionPlanCostMs&&!cfg.maintenanceOnly&&(document.querySelector("[data-staff-dialog],[data-construction-dialog]")||sm.slowDeparture&&sm.tab==="废土")){' +
+    'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(typeof window!=="undefined"&&window.sm?.planCostMs&&!cfg.maintenanceOnly){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}' +
+    'if(typeof window!=="undefined"&&window.sm?.executionPlanCostMs&&!cfg.maintenanceOnly&&(document.querySelector("[data-staff-dialog],[data-construction-dialog]")||sm.slowDeparture&&sm.tab==="废土")){' +
     'clock+=sm.executionPlanCostMs;sm.executionPlanCalls=(sm.executionPlanCalls||0)+1;}');
 const executable = [process.env.CHROME_PATH,
   'C:/Program Files/Google/Chrome/Application/chrome.exe',
@@ -531,6 +534,97 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
     };
     const confirmed = `model.calls.filter(c => c.type === 'dispatch')`;
 
+    await t.test('页面性能：空闲远征连续更新不重绘不变面板，不解析未变大记录，仍能识别同页存储变化',async()=>{
+      await setupExp(`addRuns(6);window.perfKey='arkengine:auto-shelter:schedule:v1';window.stockPerfKey='arkengine:auto-stock:ledger:v1';
+        localStorage.setItem(stockPerfKey,JSON.stringify({version:1,userId:null,nextAt:clock+3600000,note:'未交易',hold:false,owned:{},entries:[],pending:null,reportFixture:'perf-stock:'.repeat(12000)}));
+        localStorage.setItem(perfKey,JSON.stringify({nextAt:clock+3600000,note:'等待巡检',development:'perf-journal:'.repeat(12000)}));
+        const decode=window.atob;window.plannerDecodes=0;window.atob=function(text){if(text.length>200000)plannerDecodes++;return decode(text);};`);
+      await pulse();await pulse();
+      const observed=await evaluate(`(async()=>{
+        const root=document.getElementById('ark-auto-expedition').shadowRoot,advice=root.getElementById('shelter-development');
+        let writes=0,parses=0,stockParses=0;const observer=new MutationObserver(batch=>writes+=batch.length);
+        observer.observe(advice,{childList:true,subtree:true,characterData:true});
+        const parse=JSON.parse;JSON.parse=function(raw,...rest){if(typeof raw==='string'&&raw.length>100000){if(raw.includes('perf-journal:'))parses++;if(raw.includes('perf-stock:'))stockParses++;}return parse(raw,...rest);};
+        const probe=document.createTextNode('');document.body.append(probe);
+        try{const start=performance.now();for(let index=0;index<24;index++){
+          probe.data=String(index);await Promise.resolve();await Promise.resolve();
+        }return {writes,parses,stockParses,decodes:plannerDecodes,ms:Math.round(performance.now()-start)};
+        }finally{observer.disconnect();JSON.parse=parse;probe.remove();}
+      })()`);
+      console.log('idle performance '+JSON.stringify(observed));
+      assert.equal(observed.writes,0);assert.equal(observed.parses,0);assert.equal(observed.stockParses,0);assert.equal(observed.decodes,0);
+      await evaluate(`localStorage.setItem(perfKey,JSON.stringify({nextAt:clock+3600000,note:'外部更新',development:'新的发展记录'}))`);
+      await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('shelter-development').textContent==='新的发展记录'`,'refresh updated same-tab journal');
+      await evaluate(`localStorage.setItem(stockPerfKey,'{invalid');`);
+      await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('stock-status').textContent.includes('保存记录不可读')`,'reject corrupt same-tab ledger');
+      assert.equal(await evaluate('localStorage.getItem(stockPerfKey)'),'{invalid');
+    });
+
+    await t.test('页面性能：空闲面板不重复扫描股市历史或改写控件，额度到期和账本更新立即生效',async()=>{
+      await setupExp(`addRuns(6);window.edge=clock+180000;window.ledgerKey='arkengine:auto-stock:ledger:v1';
+        const old=edge-2*86400000,entries=Array.from({length:1000},(_,index)=>({id:'old'+index,at:old,action:'sell',debit:0,result:'success',proceeds:2,releasedCost:1}));
+        entries.push({id:'buy',action:'buy',at:old,confirmedAt:edge-86400000,debit:31,result:'success'},
+          {id:'predict',action:'predict',at:edge-86400000+5000,debit:12,result:'reserved'});
+        localStorage.setItem(ledgerKey,JSON.stringify({version:1,userId:null,nextAt:clock+3600000,note:'测试',hold:false,owned:{},entries,pending:null}));`);
+      await pulse();await pulse();
+      const panel=`document.getElementById('ark-auto-expedition').shadowRoot`,status=`${panel}.getElementById('stock-status').textContent`;
+      assert.match(await evaluate(status),/24小时买入 31\/0；预测 12\/0/);
+      assert.match(await evaluate(`${panel}.getElementById('stock-performance').textContent`),/已知已实现盈亏 1000/);
+      const counts=await evaluate(`(async()=>{const root=${panel},probe=document.createTextNode('');document.body.append(probe);
+        const counts=window.panelProbe={ticks:0,totals:0,spend:0,attributes:0},observer=new MutationObserver(batch=>counts.attributes+=batch.length);
+        for(const id of ['shelter-level-target','shelter-cancel-old-assignment','stock-period-start','stock-period-export','stock-pause'])
+          observer.observe(root.getElementById(id),{attributes:true,attributeFilter:['hidden','disabled']});
+        try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}
+          counts.attributes+=observer.takeRecords().length;return counts;
+        }finally{delete window.panelProbe;observer.disconnect();probe.remove();}})()`);
+      console.log('idle panel work '+JSON.stringify(counts));
+      assert.ok(counts.ticks>=20);assert.deepEqual([counts.totals,counts.spend,counts.attributes],[0,0,0]);
+      const at=offset=>evaluate(`(async()=>{clock=edge+(${offset});document.body.append(document.createTextNode(''));await Promise.resolve();await Promise.resolve();return ${status};})()`);
+      assert.match(await at(-1),/买入 31\/0；预测 12\/0/);assert.match(await at(0),/买入 0\/0；预测 12\/0/);
+      assert.match(await at(5000),/买入 0\/0；预测 0\/0/);assert.match(await at(-1),/买入 31\/0；预测 12\/0/);
+      await evaluate(`const changed=JSON.parse(localStorage.getItem(ledgerKey));changed.userId=7;changed.entries[0].proceeds+=10;
+        changed.entries.at(-1).debit=19;localStorage.setItem(ledgerKey,JSON.stringify(changed));`);
+      await drive(`${status}.includes('预测 19/0')&&${panel}.getElementById('stock-performance').textContent.includes('已知已实现盈亏 1010')&&
+        !${panel}.getElementById('stock-period-start').disabled`,'same-length external ledger change');
+    });
+
+    await t.test('页面性能：避难所面板复用静态控件、阶段报告和建设预算，不延误到期与外部更新',async()=>{
+      await setupExp(`addRuns(6);window.stateKey='arkengine:auto-shelter:schedule:v1';window.configKey='arkengine:auto-shelter:construction:v1';
+        window.edge=clock+180000;window.stamp=clock-3600000;
+        const snap={at:stamp,level:4,score:500,committed:0,resources:{scrap:50,parts:1,power:2,food:3,water:4},netScrap:10,partsRate:1,next:'',reason:'',route:null};
+        const ledger=Array.from({length:500},(_,index)=>({at:edge-86400000,id:'paid'+index,scrap:2,parts:1}));
+        localStorage.setItem(stateKey,JSON.stringify({note:'建设性能测试',nextAt:clock+3600000,constructionLedger:ledger,
+          developmentTrace:{version:1,vaultNo:77,history:[],active:{target:5,finalTarget:10,start:snap,latest:snap}}}));
+        window.setBudget=mode=>localStorage.setItem(configKey,JSON.stringify({build:false,upgrade:false,dig:false,budgetMode:mode,scrapLimit:9000,partsLimit:700,scrapReserve:90,partsReserve:2}));setBudget('daily');
+        const parse=JSON.parse;JSON.parse=function(...args){const value=parse.apply(this,args);
+          if(value?.note==='建设性能测试')for(const entry of value.constructionLedger)for(const key of ['at','id']){
+            const saved=entry[key];Object.defineProperty(entry,key,{get(){if(window.shelterProbe)shelterProbe.reads++;return saved;},enumerable:true});}
+          return value;};`);
+      await pulse();await pulse();
+      const root=`document.getElementById('ark-auto-expedition').shadowRoot`,budget=`${root}.getElementById('shelter-construction-status').textContent`,
+        trace=`${root}.getElementById('shelter-development-trace').textContent`;
+      assert.match(await evaluate(budget),/1000\/9000 废料、500\/700/);assert.match(await evaluate(trace),/目前 500 分/);
+      const measure=()=>evaluate(`(async()=>{const root=${root},lookup=root.getElementById,format=Date.prototype.toLocaleString,probe=document.createTextNode('');document.body.append(probe);
+        const counts=window.shelterProbe={reads:0,formats:0,lookups:0};window.panelProbe={ticks:0,totals:0,spend:0};
+        root.getElementById=function(id){if(id.startsWith('shelter-'))counts.lookups++;return lookup.call(this,id);};
+        Date.prototype.toLocaleString=function(...args){if(+this===stamp)counts.formats++;return format.apply(this,args);};
+        try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}return {...counts,ticks:panelProbe.ticks};}
+        finally{delete root.getElementById;Date.prototype.toLocaleString=format;delete window.shelterProbe;delete window.panelProbe;probe.remove();}})()`);
+      const daily=await measure();
+      const at=offset=>evaluate(`(async()=>{clock=edge+(${offset});document.body.append(document.createTextNode(''));await Promise.resolve();await Promise.resolve();return ${budget};})()`);
+      assert.match(await at(-1),/1000\/9000/);assert.match(await at(0),/0\/9000 废料、0\/700/);assert.match(await at(-1),/1000\/9000/);
+      await evaluate(`setBudget('stock');const record=JSON.parse(localStorage.getItem(stateKey));record.developmentTrace.active.latest.score=510;localStorage.setItem(stateKey,JSON.stringify(record));`);
+      await drive(`${budget}.includes('按实际库存，未决预留 0 废料')&&${trace}.includes('目前 510 分')`,'refresh shelter budget and trace');
+      const stock=await measure();console.log('idle shelter panel '+JSON.stringify({daily,stock}));
+      for(const result of [daily,stock]){assert.ok(result.ticks>=20);assert.deepEqual([result.reads,result.formats,result.lookups],[0,0,0]);}
+      await evaluate(`{const record=JSON.parse(localStorage.getItem(stateKey));record.developmentTrace={version:-1};
+        record.caravan={pending:{id:'cart',day:'fixture',vaultNo:77,slot:0,at:clock,cost:{scrap:36,parts:3}}};localStorage.setItem(stateKey,JSON.stringify(record));}`);
+      await drive(`${trace}.includes('阶段记录无法核对')&&${budget}.includes('未决预留 36 废料 / 3 零件')`,'refresh corrupt report and new reservation');
+      await evaluate(`{const record=JSON.parse(localStorage.getItem(stateKey));delete record.developmentTrace;
+        record.constructionLedger[0]={id:'cart',at:clock,scrap:36,parts:3};localStorage.setItem(stateKey,JSON.stringify(record));}`);
+      await drive(`${trace}===''&&${budget}.includes('未决预留 0 废料 / 0 零件')`,'clear absent report and release already booked reservation');
+    });
+
     await t.test('共享暂停延迟：远征确认前重读总开关，不发送派遣且保留已打开的原计划',async()=>{
       await setupExp();
       await drive(`Boolean(document.querySelector('#confirm-dispatch'))`,'own expedition confirmation open');
@@ -871,6 +965,93 @@ test('自动奇遇、秘境、迷雾、远征与农场：真实 Chromium DOM 集
       assert.equal(await evaluate('fm.filter'),'0');
       assert.equal(await evaluate('fm.all'),true);
     });
+    const additionalFarmCrops = `
+      fc.push(...[
+        {id:31,key:'new-crop-a',name:'测试新作物甲',minutes:60,yieldQuantity:10,price:1},
+        {id:32,key:'new-crop-b',name:'测试新作物乙',minutes:120,yieldQuantity:12,price:50},
+        {id:33,key:'new-crop-c',name:'测试新作物丙',minutes:180,yieldQuantity:14,price:100}
+      ]);
+      fc.forEach(c=>{fm.inventory[c.key]=100;fm.prices[c.id]=c.price;});`;
+    const farmCropSelect = `document.getElementById('ark-auto-expedition').shadowRoot.getElementById('farm-crop')`;
+    await t.test('农场新增作物：动态目录进入下拉框并参与每轮最新收益比较', async () => {
+      await setupFarm(`addRuns(6);${additionalFarmCrops}`);
+      await drive(`fm.crops.length===12&&location.pathname==='/activities/expedition'`,'new crops ranked with existing crops');
+      assert.deepEqual(await evaluate(`${farmCalls('plant')}.map(c=>[c.name,c.count])`),[['测试新作物丙',12]]);
+      assert.deepEqual(await evaluate(`[...${farmCropSelect}.options].slice(1).map(option=>option.value)`),await evaluate('fc.map(c=>c.name)'));
+      assert.match(await evaluate(`${farmState}.selection`),/测试新作物丙.*5760\.0/);
+      assert.equal(await evaluate('fm.reads'),1);
+      await evaluate(`clock=${farmState}.nextAt;fm.stamina=100;fm.prices[32]=200;renderExp();`);
+      await drive(`${farmCalls('plant')}.length===2&&location.pathname==='/activities/expedition'`,'latest prices change new crop winner');
+      assert.deepEqual(await evaluate(`${farmCalls('plant')}.map(c=>c.name)`),['测试新作物丙','测试新作物乙']);
+      assert.equal(await evaluate('fm.reads'),2);
+    });
+    await t.test('农场新增作物：首次读取前保留指定作物，刷新后目录和选择仍可用', async () => {
+      await setupFarm(`addRuns(6);${additionalFarmCrops}localStorage.setItem('arkengine:auto-farm:crop:v1','测试新作物甲');`);
+      assert.equal(await evaluate(`${farmCropSelect}.value`),'测试新作物甲');
+      await drive(`${farmCalls('plant')}.length===1&&location.pathname==='/activities/expedition'`,'saved new crop stays manual');
+      assert.equal(await evaluate(`${farmCalls('plant')}[0].name`),'测试新作物甲');
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-farm:crop:v1')`),'测试新作物甲');
+      const snapshot=await evaluate('({fm,model,clock,fc})');
+      await cdp.send('Page.navigate',{url:`${origin}/activities/expedition?farm-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?farm-fixture=${pageSerial}'&&typeof renderFarm==='function'`),'reload dynamic crop catalog');
+      await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderExp();`);
+      await evaluate(source);
+      assert.equal(await evaluate(`${farmCropSelect}.value`),'测试新作物甲');
+      assert.deepEqual(await evaluate(`[...${farmCropSelect}.options].slice(1).map(option=>option.value)`),snapshot.fc.map(c=>c.name));
+      await evaluate(`${farmCropSelect}.value='测试新作物乙';${farmCropSelect}.dispatchEvent(new Event('change',{bubbles:true}));`);
+      await drive(`location.pathname==='/activities/expedition'&&${farmState}.nextAt===fm.crops[0].at+2000`,'changed selection keeps current growth schedule');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1,'更改作物不铲除现有作物');
+      await evaluate(`clock=Math.max(...fm.crops.map(c=>c.at))+2000;fm.stamina=100;renderExp();`);
+      await drive(`${farmCalls('plant')}.length===2`,'new dropdown selection applies next planting');
+      assert.equal(await evaluate(`${farmCalls('plant')}[1].name`),'测试新作物乙');
+    });
+    await t.test('农场新增作物：库存不足、未解锁和禁用按钮仍不能种植', async () => {
+      for(const restriction of [
+        `fm.inventory['new-crop-c']=11;`,
+        `const baseData=window.farmData;window.farmData=()=>{const data=baseData();data.seeds.find(seed=>seed.id===33).minSoilLevel=11;return data;};`,
+        `const open=window.openSeeds;window.openSeeds=()=>{open();const dialog=document.querySelector('[role="dialog"]');
+          const disable=()=>{for(const button of dialog.querySelectorAll('#seed-buttons button'))if(button.textContent.includes('测试新作物丙'))button.disabled=true;};
+          dialog.addEventListener('click',disable);disable();};`
+      ]) {
+        await setupFarm(`addRuns(6);${additionalFarmCrops}${restriction}`);
+        await drive(`${farmCalls('plant')}.length===1`,'new crop eligibility preserved');
+        assert.equal(await evaluate(`${farmCalls('plant')}[0].name`),'测试新作物乙');
+      }
+    });
+    await t.test('农场新增作物：指定目录外或缺货作物时等待，不切回自动种其他作物', async () => {
+      for(const crop of ['测试已移除作物','测试新作物丙']) {
+        await setupFarm(`addRuns(6);${additionalFarmCrops}fm.inventory['new-crop-c']=0;localStorage.setItem('arkengine:auto-farm:crop:v1',${JSON.stringify(crop)});`);
+        await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'unavailable manual crop stops planting');
+        assert.equal(await evaluate(`${farmCropSelect}.value`),crop);
+        assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+        assert.match(await evaluate(`${farmState}.note`),/未解锁或免费存货不足/);
+      }
+    });
+    await t.test('农场新增作物：缺少售价、同名种子或按钮目录不一致时不猜测种植', async () => {
+      for(const change of [
+        `data.prices=data.prices.filter(price=>price.seedId!==33);`,
+        `data.seeds.push({...data.seeds.find(seed=>seed.id===33),id:34,key:'duplicate-crop'});`,
+        `data.seeds=data.seeds.filter(seed=>seed.id!==33);`
+      ]) {
+        await setupFarm(`addRuns(6);${additionalFarmCrops}const baseData=window.farmData;window.farmData=()=>{const data=baseData();${change}return data;};`);
+        await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'inconsistent new crop stops planting');
+        assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
+        assert.match(await evaluate(`${farmState}.note`),/无法读取|无法核对/);
+      }
+    });
+    await t.test('农场新增作物：目录更新与跨标签页指定选择同步，名称只作为文本显示', async () => {
+      await setupFarm(`addRuns(6);${additionalFarmCrops}
+        fc.push({id:34,key:'text-crop',name:'<b>测试作物</b>',minutes:60,yieldQuantity:6,price:1});
+        fm.inventory['text-crop']=0;fm.prices[34]=1;`);
+      await drive(`${farmCalls('plant')}.length===1&&location.pathname==='/activities/expedition'`,'catalog includes plain text names');
+      assert.equal(await evaluate(`${farmCropSelect}.querySelector('b')`),null);
+      assert.ok(await evaluate(`[...${farmCropSelect}.options].some(option=>option.textContent==='<b>测试作物</b>')`));
+      await evaluate(`localStorage.setItem('arkengine:auto-farm:crop:v1','测试跨页新作物');
+        window.dispatchEvent(new StorageEvent('storage',{key:'arkengine:auto-farm:crop:v1',newValue:'测试跨页新作物'}));`);
+      assert.equal(await evaluate(`${farmCropSelect}.value`),'测试跨页新作物');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1);
+    });
+
     await t.test('农场：体力不足时预约恢复再返回远征，不发出失败的批量种植', async () => {
       await setupFarm('addRuns(6);fm.stamina=5;fm.nextRegen=120;', '/farm');
       await drive(`location.pathname==='/activities/expedition'`,'wait stamina');
