@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.149
+// @version      1.17.150
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1635,7 +1635,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.149';
+  const SCRIPT_VERSION = '1.17.150';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -8473,7 +8473,7 @@ installShelterPlanningWorker(self);
   return {request,invalidate};
 };
   const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;
-    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcblxuICBjb25zdCBzdGFmZlJvb21UeXBlcyA9IFsncG93ZXInLCdkaW5lcicsJ3dhdGVyJywnc2NyYXAnXTtcbiAgY29uc3Qgc3RhZmZSb29tTmFtZXMgPSB7IHBvd2VyOiflj5HnlLXnq5knLGRpbmVyOifppJDljoUnLHdhdGVyOiflh4DmsLTnq5knLHNjcmFwOiflup/mlpnlm57mlLbnq5knLHF1YXJ0ZXJzOiflrr/oiI0nIH07XG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5qih5ouf5q+P5LiA5q2l55qE5oi/6Ze05a656YeP5LiO5L6b5bqU77yb5LiN6IO95a6J5YWo6IW+5L2N55qE5ruh5ZGY5oi/6Ze05L+d55WZ5Y6f5a6J5o6S44CCXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICBjb25zdCBmYW1pbHlLZXkgPSAoYSxiKSA9PiBbYSxiXS5zb3J0KCh4LHkpPT54LXkpLmpvaW4oJzonKTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG5cbiAgIiwiXG5sZXQgc2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGU7XG5jb25zdCBzYXZlU2hlbHRlcj0oKT0+e3Rocm93IEVycm9yKFwiUmVhZC1vbmx5IGZhbWlseSBwcmV2aWV3IGNhbm5vdCBzYXZlIHN0YXRlXCIpO307XG5mdW5jdGlvbiBpbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKGVuZHBvaW50LG1vZGVsLHJvdXRlcyxmYW1pbHlTdXBwbHk9bnVsbCkge1xuICBlbmRwb2ludC5vbm1lc3NhZ2U9KHtkYXRhfSk9PntcbiAgICB0cnl7XG4gICAgICBpZihkYXRhLmtpbmQ9PT0nbmF0aXZlLWZhbWlseS1zdXBwbHknKXtcbiAgICAgICAgaWYoIWZhbWlseVN1cHBseSl0aHJvdyBFcnJvcignRmFtaWx5LXN1cHBseSBrZXJuZWwgdW5hdmFpbGFibGUnKTtcbiAgICAgICAgZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsa2luZDpkYXRhLmtpbmQsc3VwcGx5OmZhbWlseVN1cHBseShkYXRhKX0pO3JldHVybjtcbiAgICAgIH1cbiAgICAgIGNvbnN0IHJlc3VsdD1yb3V0ZXMobW9kZWwoZGF0YS52aWV3KSxkYXRhLm9wdGlvbnMsZGF0YS50YXJnZXRTY29yZSxkYXRhLmZpcnN0LGRhdGEucGxhbm5pbmcpO1xuICAgICAgZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsa2luZDonbmF0aXZlLWxldmVsLXJvdXRlcycscm91dGVzOnJlc3VsdH0pO1xuICAgIH1jYXRjaChlKXtlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxlcnJvcjpTdHJpbmcoZT8ubWVzc2FnZT8/ZSl9KTt9XG4gIH07XG59XG5pbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKHNlbGYsc2hlbHRlck1vZGVsLHNoZWx0ZXJMZXZlbFJvdXRlcyxkYXRhPT57XG4oe3NoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxzaGVsdGVyT3B0aW1pemUsc2hlbHRlclN0YXRlfT1kYXRhLnBvbGljeSk7XG5yZXR1cm4gc2hlbHRlclBvcHVsYXRpb25GYW1pbHlTdXBwbHkoc2hlbHRlck1vZGVsKGRhdGEudmlldyksZGF0YS5jYW1wYWlnbik7XG59KTtcbiJd"),char=>char.charCodeAt(0))));
+    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG5cbiAgY29uc3Qgc3RhZmZSb29tVHlwZXMgPSBbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ107XG4gIGNvbnN0IHN0YWZmUm9vbU5hbWVzID0geyBwb3dlcjon5Y+R55S156uZJyxkaW5lcjon6aSQ5Y6FJyx3YXRlcjon5YeA5rC056uZJyxzY3JhcDon5bqf5paZ5Zue5pS256uZJyxxdWFydGVyczon5a6/6IiNJyB9O1xuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gIC8vIOaooeaLn+avj+S4gOatpeeahOaIv+mXtOWuuemHj+S4juS+m+W6lO+8m+S4jeiDveWuieWFqOiFvuS9jeeahOa7oeWRmOaIv+mXtOS/neeVmeWOn+WuieaOkuOAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgY29uc3QgZmFtaWx5S2V5ID0gKGEsYikgPT4gW2EsYl0uc29ydCgoeCx5KT0+eC15KS5qb2luKCc6Jyk7XG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuXG4gICIsIlxubGV0IHNoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxzaGVsdGVyT3B0aW1pemUsc2hlbHRlclN0YXRlO1xuY29uc3Qgc2F2ZVNoZWx0ZXI9KCk9Pnt0aHJvdyBFcnJvcihcIlJlYWQtb25seSBmYW1pbHkgcHJldmlldyBjYW5ub3Qgc2F2ZSBzdGF0ZVwiKTt9O1xuZnVuY3Rpb24gaW5zdGFsbFNoZWx0ZXJMZXZlbFdvcmtlcihlbmRwb2ludCxtb2RlbCxyb3V0ZXMsZmFtaWx5U3VwcGx5PW51bGwpIHtcbiAgZW5kcG9pbnQub25tZXNzYWdlPSh7ZGF0YX0pPT57XG4gICAgdHJ5e1xuICAgICAgaWYoZGF0YS5raW5kPT09J25hdGl2ZS1mYW1pbHktc3VwcGx5Jyl7XG4gICAgICAgIGlmKCFmYW1pbHlTdXBwbHkpdGhyb3cgRXJyb3IoJ0ZhbWlseS1zdXBwbHkga2VybmVsIHVuYXZhaWxhYmxlJyk7XG4gICAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6ZGF0YS5raW5kLHN1cHBseTpmYW1pbHlTdXBwbHkoZGF0YSl9KTtyZXR1cm47XG4gICAgICB9XG4gICAgICBjb25zdCByZXN1bHQ9cm91dGVzKG1vZGVsKGRhdGEudmlldyksZGF0YS5vcHRpb25zLGRhdGEudGFyZ2V0U2NvcmUsZGF0YS5maXJzdCxkYXRhLnBsYW5uaW5nKTtcbiAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6J25hdGl2ZS1sZXZlbC1yb3V0ZXMnLHJvdXRlczpyZXN1bHR9KTtcbiAgICB9Y2F0Y2goZSl7ZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsZXJyb3I6U3RyaW5nKGU/Lm1lc3NhZ2U/P2UpfSk7fVxuICB9O1xufVxuaW5zdGFsbFNoZWx0ZXJMZXZlbFdvcmtlcihzZWxmLHNoZWx0ZXJNb2RlbCxzaGVsdGVyTGV2ZWxSb3V0ZXMsZGF0YT0+e1xuKHtzaGVsdGVyU3RhZmZNb2RlLHNoZWx0ZXJTdGFmZkhvbGQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsc2hlbHRlck9wdGltaXplLHNoZWx0ZXJTdGF0ZX09ZGF0YS5wb2xpY3kpO1xucmV0dXJuIHNoZWx0ZXJQb3B1bGF0aW9uRmFtaWx5U3VwcGx5KHNoZWx0ZXJNb2RlbChkYXRhLnZpZXcpLGRhdGEuY2FtcGFpZ24pO1xufSk7XG4iXQ=="),char=>char.charCodeAt(0))));
     const functions=[
       shelterWorkerRate,
       shelterStoredItems,
@@ -8544,6 +8544,10 @@ installShelterPlanningWorker(self);
       shelterCampaignPlan,
       validShelterMaterials,
       shelterAssignmentHeld,
+      shelterEquipmentHeld,
+      shelterOperationHeld,
+      shelterEquipmentObserved,
+      validShelterEquipmentHolds,
       shelterAssignmentObservation,
       validShelterAssignmentHolds,
       validCampaignRecord,
@@ -8982,7 +8986,8 @@ installShelterPlanningWorker(self);
           !active?'；防守巡检等待本页运行权':shelterWatchFailures?'；防守巡检读取失败，退避后重查':'；在线运行时每30秒只读巡检事件及复岗':'';
     const message = stateFault('shelter') || shelterStopFault || `避难所${shelterEnabled ? '' : '已暂停'}：${shelterState.note}${
       shelterEnabled && left ? `；约 ${Math.ceil(left / 60000)} 分钟后检查` : ''}${watchNote}${
-      shelterAssignmentHeld(shelterState.campaign).length?`；异常调岗隔离 #${shelterAssignmentHeld(shelterState.campaign).join('、#')}，岗位变化或本格训练完成后重评`:''}`;
+      shelterAssignmentHeld(shelterState.campaign).length?`；异常调岗隔离 #${shelterAssignmentHeld(shelterState.campaign).join('、#')}，岗位变化或本格训练完成后重评`:''}${
+      shelterEquipmentHeld(shelterState.campaign).length?'；异常装备操作已留档，相关人员及装备等待归属核对':''}`;
     setPanelText(shelterFields.status,message);
     const recoverable=shelterUnsentTrainingRelease(shelterPending)&&!shelterWorkConfirm&&!shelterWork;
     const blocked=Boolean(shelterPending&&!shelterWorkConfirm&&!shelterWork&&Date.now()-shelterPendingWaitStart(shelterPending)>=30000);
@@ -9844,8 +9849,8 @@ installShelterPlanningWorker(self);
     }
     return choices.sort((a,b)=>b.gain-a.gain||b.secondary-a.secondary||a.item-b.item)[0]||null;
   }
-  function shelterHomeGear(m,held=new Set()) {
-    const s=m.state,used=new Set(s.residents.flatMap(p=>[p.weaponId,p.outfitId])),choices=[];
+  function shelterHomeGear(m,held=new Set(),blocked=[]) {
+    const s=m.state,used=new Set([...blocked,...s.residents.flatMap(p=>[p.weaponId,p.outfitId])]),choices=[];
     for(const p of s.residents){
       const room=s.rooms.find(r=>r.id===p.roomId),hp=shelterHealth(p),combat=shelterCombat(s,p);
       if(held.has(p.id)||p.deadAt!==null||p.away!==null||p.adultAt>m.now||!hp||hp.hp<.6*hp.max||combat===null||
@@ -9858,7 +9863,7 @@ installShelterPlanningWorker(self);
       const stat={medbay:'int',workshop:'int',armory:'str',tailor:'cha'}[room?.type];
       const working=stat&&s.residents.filter(other=>other.roomId===room.id&&other.deadAt===null&&
         other.away===null&&other.adultAt<=m.now).slice(0,room.width*2).includes(p);
-      const outfit=working&&shelterUtilityOutfit(s,p,stat);
+      const outfit=working&&shelterUtilityOutfit(s,p,stat,blocked);
       if(outfit)choices.push({...outfit,priority:['armory','tailor'].includes(room.type)&&!room.craft?3:1,
         combat,guard:0,reason:'穿戴闲置服装，提高当前制作或加工岗位属性，不改变岗位'});
     }
@@ -9916,7 +9921,7 @@ installShelterPlanningWorker(self);
   function shelterDepartureLoadout(m,team,enabled,blocked,options,record,departing,accept) {
     const s=m.state,base=shelterCombatLoadout(s,team,enabled,blocked,options);
     if(!base||!enabled||record.pending||s.rooms.some(r=>r.incident))return base;
-    const unavailable=new Set([...departing,...team.map(p=>p.id),...shelterAssignmentHeld(record),...(record.defenseManual||[]),...(record.defense||[]).map(r=>r.id)]);
+    const unavailable=new Set([...departing,...team.map(p=>p.id),...shelterOperationHeld(record,s),...(record.defenseManual||[]),...(record.defense||[]).map(r=>r.id)]);
     const excluded=new Set(blocked);
     // options 与当前快照共用，归属/身份只读一次；队伍及已出发预留每次单独过滤。
     if(!options.has('transfer-inventory')){
@@ -10178,7 +10183,7 @@ installShelterPlanningWorker(self);
   }
   function shelterDefensePlan(m,cfg,record={}) {
     const s=m.state,now=m.now,actions=[],notes=[],settled=[],reserved=new Set(),journal=record.defense||[];
-    const assignmentHeld=new Set(shelterAssignmentHeld(record));
+    const assignmentHeld=new Set(shelterOperationHeld(record,s));
     const raids=s.rooms.filter(r=>r.incident?.kind==='raiders'),local=s.rooms.filter(shelterLocalIncident),active=raids.length>0||local.length>0;
     const enabled=shelterDefenseEnabled(cfg),name=p=>String(p.name).normalize('NFKC').replace(/\s+/g,' ').trim();
     if(!enabled)return {active,busy:false,actions,notes,settled,reserved:journal.map(r=>r.id)};
@@ -10812,11 +10817,11 @@ installShelterPlanningWorker(self);
   }
   function shelterExploreSlots(m,record={}) {
     const observed=record.exploreSlots,depth=m.state.depth;
-    if(observed?.depth===depth&&Number.isSafeInteger(observed.limit)&&observed.limit>0)return observed.limit;
+    if(observed&&observed.depth===depth&&Number.isSafeInteger(observed.limit)&&observed.limit>0)return observed.limit;
     return Number.isInteger(depth)&&depth>=1?Math.min(6,1+Math.floor(depth/8)):0;
   }
   function shelterCampaignPlan(m,cfg={},record={},target=14) {
-    const assignmentHeld=new Set(shelterAssignmentHeld(record));
+    const assignmentHeld=new Set(shelterOperationHeld(record,m.state));
     const s=m.state,now=m.now,notes=[],reserved=new Set(assignmentHeld),actions=[],projects=[],roles=[...(record.roles||[])];
     const preparationPairs=record.parentPreparation?.pairs||[],preparingPairs=preparationPairs.filter(f=>!shelterParentPrepared(m,f));
     const preparationOf=p=>preparingPairs.find(f=>[f.a,f.b].includes(p.id));
@@ -10916,7 +10921,7 @@ installShelterPlanningWorker(self);
         (['power','diner','water','scrap'].includes(s.rooms.find(r=>r.id===p.roomId).type)||Boolean(owned(p))||
           s.rooms.find(r=>r.id===p.roomId).type==='quarters'&&(cfg.development||expecting.has(p.id)||cfg.parentTraining&&parentIds.has(p.id)&&p.familyCooldownUntil>now)));
     const pool=s.residents.filter(available),growth=shelterGrowthNeeds(m,record.populationPreparation,target,true),demand=growth.demand;
-    const departures=new Map(),combatValues=new Map(),loadouts=new Map(),gearReserved=new Set(),gearOptions=new Map();
+    const departures=new Map(),combatValues=new Map(),loadouts=new Map(),gearReserved=new Set(shelterEquipmentHeld(record)),gearOptions=new Map();
     const departureOutput=shelterProductionEvaluator(m);
     const loadout=team=>{
       const ordered=[...team].sort((a,b)=>a.id-b.id),key=ordered.map(p=>p.id).join(',')+'|'+[...gearReserved].join(',')+'|'+departing.join(',');
@@ -10969,7 +10974,7 @@ installShelterPlanningWorker(self);
     result.populationDefense.guard=evaluateGuard([],[],true);
     let guardRejected=false;
     const guarded=(team,gear)=>{const check=guard(team,gear);if(!check.allowed)guardRejected=true;return check.allowed;};
-    const projectedIds=()=>[...reserved];
+    const projectedIds=()=>[...reserved].filter(id=>!assignmentHeld.has(id));
     const healthy=p=>shelterHealth(p).hp>=.9*shelterHealth(p).max;
     const combatOrder=(a,b)=>combat(b)-combat(a)||loss([a.id])-loss([b.id])||a.id-b.id;
     const occupied=r=>s.residents.filter(p=>p.deadAt===null&&p.away===null&&p.adultAt<=now&&p.roomId===r.id).length;
@@ -11541,7 +11546,7 @@ installShelterPlanningWorker(self);
     notes.unshift(`普通探险位 ${s.explorers.length}/${slots}；综合计划预留 ${reserved.size} 人。周任务最低成功率 ${cfg.chance}%，每任务每周最多 ${cfg.attempts} 次，出发间隔至少6小时。`);
     if(projects.length)notes.push(...projects.map(p=>p.benefit));
     if(newStaffing&&cfg.combatGear&&cfg.development&&!record.pending&&!actions.length){
-      const gear=shelterHomeGear(m,assignmentHeld);if(gear)actions.push(gear);
+      const gear=shelterHomeGear(m,assignmentHeld,shelterEquipmentHeld(record));if(gear)actions.push(gear);
     }
     result.choice=actions[0]||null;return result;
   }
@@ -11553,6 +11558,43 @@ installShelterPlanningWorker(self);
   }
   function shelterAssignmentHeld(record) {
     return (record?.assignmentHolds||[]).filter(entry=>entry.resolvedAt===undefined).map(entry=>entry.id);
+  }
+  function shelterEquipmentHeld(record) {
+    return [...new Set((record?.equipmentHolds||[]).filter(entry=>entry.resolvedAt===undefined).flatMap(entry=>entry.items))];
+  }
+  function shelterOperationHeld(record,state) {
+    const entries=(record?.equipmentHolds||[]).filter(entry=>entry.resolvedAt===undefined),items=new Set(entries.flatMap(entry=>entry.items));
+    return [...new Set([...shelterAssignmentHeld(record),...entries.flatMap(entry=>entry.residents),
+      ...(state?.residents||[]).filter(person=>items.has(person.weaponId)||items.has(person.outfitId)).map(person=>person.id)])];
+  }
+  function shelterEquipmentObserved(model,pending) {
+    const [residentId,itemId,kind]=pending.targets,slot=kind==='weapon'?'weapon':'outfit';
+    const owners=model.state.residents.filter(person=>person.weaponId===itemId||person.outfitId===itemId);
+    return model.state.items.filter(item=>item.id===itemId).length===1&&
+      model.state.items.some(item=>item.id===itemId&&item.slot===slot)&&owners.length===1&&
+      owners[0].id===residentId&&owners[0][slot+'Id']===itemId&&Boolean(shelterResidentIdentity(model.state,owners[0]));
+  }
+  function validShelterEquipmentHolds(entries) {
+    const positive=value=>Number.isSafeInteger(value)&&value>0,stamp=value=>Number.isFinite(value)&&value>=0;
+    const ids=values=>Array.isArray(values)&&values.length>0&&values.length<=2000&&values.every(positive)&&new Set(values).size===values.length;
+    return Array.isArray(entries)&&entries.length<=2000&&entries.every(entry=>{
+      const pending=entry?.original,result=pending?.result,targets=pending?.targets,snapshot=pending?.before?.equipment;
+      const choice=pending?.before?.campaign?.choice,fromItem=snapshot?snapshot.fromItem:
+        choice&&Object.hasOwn(choice,'fromItem')?choice.fromItem:targets?.[2]!=='weapon'?pending?.before?.outfit:undefined;
+      return objectState(entry)&&stamp(entry.at)&&stamp(entry.snapshotAt)&&ids(entry.residents)&&ids(entry.items)&&
+        (entry.resolvedAt===undefined||stamp(entry.resolvedAt)&&entry.resolvedAt>=entry.snapshotAt)&&
+        objectState(pending)&&pending.kind==='equip'&&typeof pending.id==='string'&&pending.id.length>0&&positive(pending.vaultNo)&&
+        Array.isArray(targets)&&(targets.length===2||targets.length===3&&targets[2]==='weapon')&&targets.slice(0,2).every(positive)&&
+        entry.residents.includes(targets[0])&&entry.items.includes(targets[1])&&
+        (fromItem===undefined||fromItem===null||positive(fromItem)&&entry.items.includes(fromItem))&&
+        (snapshot===undefined||objectState(snapshot)&&Array.isArray(snapshot.owners)&&snapshot.owners.every(id=>positive(id)&&entry.residents.includes(id)))&&
+        (choice?.fromOwner===undefined||entry.residents.includes(choice.fromOwner))&&
+        pending.lifecycle?.phase==='request-bound'&&/^[A-Za-z0-9-]{8,64}$/.test(pending.lifecycle.requestKey||'')&&
+        stamp(pending.at)&&stamp(pending.before?.serverTime)&&stamp(pending.lifecycle.boundAt)&&pending.lifecycle.boundAt>=pending.at&&
+        stamp(result?.responseFinishedAt)&&pending.lifecycle.boundAt<=result.responseFinishedAt&&
+        result.outcome==='http-error'&&!result.campaignProof&&Number.isInteger(result.status)&&result.status>=500&&result.status<=599&&
+        (!pending.before.campaign||validCampaignPending(pending)&&pending.campaignKey===pending.lifecycle.requestKey);
+    })&&new Set(entries.map(entry=>entry.original.id)).size===entries.length;
   }
   function shelterAssignmentObservation(model,resident) {
     const room=model.state.rooms.find(candidate=>candidate.id===resident.roomId),stat=room?.type==='training'?room.trainStat:null;
@@ -11576,6 +11618,7 @@ installShelterPlanningWorker(self);
     const positive=x=>Number.isSafeInteger(x)&&x>0,at=x=>Number.isFinite(x)&&x>=0;
     return objectState(v)&&['roles','trips','attempts','heals','trainingRest'].every(k=>Array.isArray(v[k])&&v[k].length<=2000)&&
       (v.assignmentHolds===undefined||validShelterAssignmentHolds(v.assignmentHolds))&&
+      (v.equipmentHolds===undefined||validShelterEquipmentHolds(v.equipmentHolds))&&
       (v.exploreSlots===undefined||objectState(v.exploreSlots)&&positive(v.exploreSlots.depth)&&positive(v.exploreSlots.limit))&&
       (v.rejections===undefined||Array.isArray(v.rejections)&&v.rejections.length<=400&&v.rejections.every(entry=>
         objectState(entry)&&['explore-start','explore-recall'].includes(entry.kind)&&positive(entry.id)&&at(entry.at)&&
@@ -14049,7 +14092,7 @@ installShelterPlanningWorker(self);
   }
   function shelterGearPlan(m,pool) {
     if (!shelterGear) return null;
-    const s = m.state, used = new Set(s.residents.flatMap(p => [p.weaponId,p.outfitId]));
+    const s = m.state, used = new Set([...shelterEquipmentHeld(shelterState.campaign),...s.residents.flatMap(p => [p.weaponId,p.outfitId])]);
     if (s.residents.some(p => ![p.weaponId,p.outfitId].every(id => id === null || Number.isSafeInteger(id) && id > 0)) ||
         new Set(s.items.map(item => item.id)).size !== s.items.length) throw new Error('装备归属无法核对');
     const outfits = s.items.filter(item => item.slot === 'outfit' && !used.has(item.id));
@@ -14934,7 +14977,7 @@ installShelterPlanningWorker(self);
   function shelterEmploymentReservations(m,campaign) {
     const idle=new Set((campaign.idleTraining||[]).filter(id=>m.state.residents.some(p=>p.id===id&&p.roomId===null&&
       p.deadAt===null&&p.away===null&&p.adultAt<=m.now)&&
-      !shelterAssignmentHeld(shelterState.campaign).includes(id)&&
+      !shelterOperationHeld(shelterState.campaign,m.state).includes(id)&&
       !shelterState.campaign?.roles.some(r=>r.id===id)&&!shelterState.campaign?.defense?.some(r=>r.id===id)));
     if(!idle.size)return campaign;
     return {...campaign,reserved:(campaign.reserved||[]).filter(id=>!idle.has(id)),
@@ -16006,7 +16049,7 @@ installShelterPlanningWorker(self);
     if (!work.dialogBefore && !shelterWorkTitle(dialog,work)) {
       shelterWork = null; holdShelterStaff('居民窗口已被更改，本轮人员管理等待你处理'); return true;
     }
-    const close = currentElement([...dialog.querySelectorAll('button')].filter(b => b.getAttribute('aria-label') === '关闭' || textOf(b) === '关闭'));
+    const close = nativeCancelButton(dialog,usable);
     return shelterCloseWindow(work,close,'shelter:staff-close','关闭本轮居民窗口',() => { work.closing = true;close.click(); });
   }
   function validShelterAuxLifecycle(p) {
@@ -16082,7 +16125,7 @@ installShelterPlanningWorker(self);
   function closeShelterSocial() {
     const w=shelterSocialWork;if(!w)return false;
     if(!shelterDialogGone(w.dialog)){
-      const button=currentElement([...w.dialog.querySelectorAll('button')].filter(b=>/^(关闭|Close)$/.test(b.getAttribute('aria-label')||textOf(b))));
+      const button=nativeCancelButton(w.dialog,usable);
       return shelterCloseWindow(w,button,'shelter:help-close','关闭本轮参观窗口');
     }
     shelterSocialWork=null;return false;
@@ -16811,15 +16854,79 @@ installShelterPlanningWorker(self);
     return true;
   }
   function shelterAssignmentBlocked(kind,targets) {
-    const held=shelterAssignmentHeld(shelterState.campaign);
+    if(kind==='equip'&&shelterEquipmentHeld(shelterState.campaign).includes(targets[1]))return true;
+    const held=shelterOperationHeld(shelterState.campaign,shelterRead?.model?.state);
     if(!held.length)return false;
     return kind==='rescue'||(kind==='quest-start'?targets.slice(1):['assign','equip','explore-start'].includes(kind)?targets.slice(0,1):[])
       .some(id=>held.includes(id));
   }
+  function reconcileShelterEquipment(model,dialogs) {
+    const pending=shelterPending,result=pending?.result;
+    if(pending?.kind!=='equip'||pending.emergency||pending.blockedBy||pending.lifecycle?.phase!=='request-bound'||
+      !/^[A-Za-z0-9-]{8,64}$/.test(pending.lifecycle.requestKey||'')||
+      !Number.isFinite(pending.lifecycle.boundAt)||pending.lifecycle.boundAt<pending.at||
+      pending.lifecycle.boundAt>result?.responseFinishedAt||!Number.isFinite(pending.before.serverTime)||
+      !Number.isInteger(result?.status)||result.status<500||result.status>599||result.outcome!=='http-error'||
+      result.campaignProof||pending.before.campaign&&(!validCampaignPending(pending)||pending.campaignKey!==pending.lifecycle.requestKey)||
+      continueShelterAction||awaitingShelterConfirmation||shelterWorkConfirm||accountStopReason()||
+      !shelterRead||Date.now()-shelterRead.at>1500||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
+    if(dialogs.length)return dialogs.length===1&&shelterWork?.submitted&&!shelterWork.manual&&
+      shelterWork.dialog===dialogs[0]?closeShelterWork():false;
+    const [residentId,itemId,kind]=pending.targets,slot=kind==='weapon'?'weapon':'outfit',state=model.state;
+    const choice=pending.before.campaign?.choice,snapshot=pending.before.equipment;
+    const fromItem=snapshot?snapshot.fromItem:choice&&Object.hasOwn(choice,'fromItem')?choice.fromItem:
+      slot==='outfit'?pending.before.outfit:undefined;
+    const positive=value=>Number.isSafeInteger(value)&&value>0;
+    if(fromItem!==undefined&&fromItem!==null&&!positive(fromItem)||snapshot&&(!Array.isArray(snapshot.owners)||
+      !snapshot.owners.every(positive))||!Array.isArray(pending.targets)||
+      !(pending.targets.length===2||pending.targets.length===3&&kind==='weapon')||!positive(residentId)||!positive(itemId))return false;
+    const requested=state.items.filter(item=>item.id===itemId);
+    if(requested.length!==1||requested[0].slot!==slot)return false;
+    const items=[...new Set([itemId,...(positive(fromItem)?[fromItem]:[]),
+      ...(fromItem===undefined?state.items.filter(item=>item.slot===slot).map(item=>item.id):[])])];
+    const residents=[...new Set([residentId,...(choice?.fromOwner?[choice.fromOwner]:[]),...(snapshot?.owners||[]),
+      ...state.residents.filter(person=>items.includes(person.weaponId)||items.includes(person.outfitId)).map(person=>person.id)])];
+    if(residents.some(id=>{const matches=state.residents.filter(person=>person.id===id);
+      return matches.length!==1||!shelterResidentIdentity(state,matches[0]);}))return false;
+    const resident=state.residents.find(person=>person.id===residentId);
+    if(choice?.name&&String(resident.name).normalize('NFKC').replace(/\s+/g,' ').trim()!==choice.name)return false;
+    const campaign=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
+    const entries=(campaign.equipmentHolds||[]).filter(entry=>entry.resolvedAt===undefined||model.now-entry.resolvedAt<7*86400000);
+    const resolved=shelterEquipmentObserved(model,pending),pair=shelterState.pair,swap=shelterState.swap;
+    const interruptedPair=pair&&residents.some(id=>[pair.a,pair.b].includes(id));
+    const interruptedSwap=swap&&swap.people?.some(person=>residents.includes(person.id));
+    if(!entries.some(entry=>entry.original.id===pending.id))entries.push({at:Date.now(),snapshotAt:model.now,residents,items,original:pending,
+      ...(resolved?{resolvedAt:model.now}:{}),...(interruptedPair?{pair}:{}),...(interruptedSwap?{swap}:{})});
+    if(!validShelterEquipmentHolds(entries))return false;
+    shelterWriteGuard();if(shelterPending?.id!==pending.id)return false;
+    saveShelter({...shelterState,campaign:{...campaign,equipmentHolds:entries},
+      ...(interruptedPair?{pair:undefined}:{}),...(interruptedSwap?{swap:undefined}:{}),
+      nextAt:0,pendingReadOnly:undefined,note:'异常装备原单已留档，按当前归属隔离依赖，其他工作继续'});
+    saveShelterPending(null);cancelQueued();cancelShelterRead();schedule();
+    log.add('shelter-equipment-recovered','装备服务端异常已留档，解除全局等待；不补造成功、不重放原单',
+      {original:pending,residents,items,snapshotAt:model.now,held:!resolved});
+    return true;
+  }
+  function reconcileShelterEquipmentHolds(model) {
+    const campaign=shelterState.campaign,entries=campaign?.equipmentHolds;
+    if(!entries?.some(entry=>entry.resolvedAt===undefined)||shelterPending||accountStopReason()||
+      model.view.switches.frozen||model.view.nameRequired||!shelterRead||Date.now()-shelterRead.at>1500)return false;
+    let changed=false;
+    const equipmentHolds=entries.map(entry=>{
+      if(entry.resolvedAt!==undefined||entry.original.vaultNo!==model.view.vaultNo||model.now<entry.snapshotAt||
+        !Number.isFinite(shelterRead.startedAt)||shelterRead.startedAt<entry.at||!shelterEquipmentObserved(model,entry.original))return entry;
+      changed=true;return {...entry,resolvedAt:model.now};
+    });
+    if(!changed)return false;
+    saveShelter({...shelterState,campaign:{...campaign,equipmentHolds}});
+    log.add('shelter-equipment-rechecked','当前装备归属已满足原目标，解除相关隔离；原错误请求继续留档',
+      {held:shelterEquipmentHeld({equipmentHolds}),snapshotAt:model.now});
+    return true;
+  }
   function closeShelterRescue() {
     const work=shelterRescueWork;if(!work)return false;
     if(work.dialog?.isConnected&&visible(work.dialog)){
-      const close=locator.pick([...work.dialog.querySelectorAll('button')].filter(button=>button.getAttribute('aria-label')==='关闭'||textOf(button)==='关闭'));
+      const close=nativeCancelButton(work.dialog,usable);
       return shelterCloseWindow(work,close,'shelter:rescue-close','关闭本轮事件房间');
     }
     shelterRescueWork=null;return false;
@@ -16973,6 +17080,7 @@ installShelterPlanningWorker(self);
       heals:previous.heals.filter(r=>m.now-r.at<86400000),trainingRest:previous.trainingRest.filter(r=>m.now-r.at<86400000)};
     if(previous.exploreSlots)record.exploreSlots=previous.exploreSlots;
     if(previous.assignmentHolds)record.assignmentHolds=previous.assignmentHolds;
+    if(previous.equipmentHolds)record.equipmentHolds=previous.equipmentHolds;
     if(previous.rejections)record.rejections=previous.rejections.filter(entry=>m.now-entry.at<86400000&&
       !(entry.kind===p.kind&&entry.id===p.targets[0]));
     if(previous.materials)record.materials=previous.materials;
@@ -17219,7 +17327,8 @@ installShelterPlanningWorker(self);
   }
   function shelterExecutionDeferred(choice) {
     if(!choice)return false;
-    if(!['stimpak','revive'].includes(choice.kind)&&shelterExecutionResidents(choice).some(id=>shelterAssignmentHeld(shelterState.campaign).includes(id)))return true;
+    if(choice.kind==='equip'&&shelterEquipmentHeld(shelterState.campaign).includes(choice.item??choice.targets?.[1]))return true;
+    if(!['stimpak','revive'].includes(choice.kind)&&shelterExecutionResidents(choice).some(id=>shelterOperationHeld(shelterState.campaign,shelterRead?.model?.state).includes(id)))return true;
     const entry=shelterExecutionDeferrals.get(shelterExecutionKey(choice));
     if(entry&&!entry.released)return true;
     // A cancelled transfer must not immediately become another transfer for the
@@ -18118,7 +18227,9 @@ installShelterPlanningWorker(self);
           ...(kind === 'inspection' ? {incident:m.state.daily.counters.incident??0,inspectionAt:m.state.daily.counters.safety_inspection_at??0} : {}),
           ...(kind === 'rescue' ? {incidentKind:shelterRescueWork.incidentKind,present:shelterRescueCount(m,targets[0])} : {}),
           ...(kind === 'revive' ? {revival:structuredClone(execution.choice)} : {}),
-          ...(kind === 'equip' ? {outfit:m.state.residents.find(p => p.id === targets[0]).outfitId} : {}),
+          ...(kind === 'equip' ? {outfit:m.state.residents.find(p => p.id === targets[0]).outfitId,
+            equipment:{fromItem:m.state.residents.find(person=>person.id===targets[0])[targets[2]==='weapon'?'weaponId':'outfitId'],
+              owners:m.state.residents.filter(person=>person.weaponId===targets[1]||person.outfitId===targets[1]).map(person=>person.id)}} : {}),
           ...(kind === 'explore' ? {explorer:shelterExplorerCandidates(m).ready.find(e=>e.id===targets[0]&&e.residentId===targets[1])?.before} : {}),
           ...(kind === 'collect' ? { rooms:m.rooms.filter(r => r.batch && r.stored >= r.batch &&
             (targets[0] === 'all' || targets.includes(r.id))).map(r => ({id:r.id,stored:r.stored})) } : {}) } });
@@ -18181,7 +18292,7 @@ installShelterPlanningWorker(self);
         const confirmation=shelterWorkConfirm?.id===id?shelterWorkConfirm:null,manual=Boolean(confirmation?.manual);
         if(manual)shelterReload();
         shelterWriteGuard();
-        if(!manual&&shelterAssignmentBlocked(kind,targets))throw Error('该居民的异常调岗仍在隔离核对，不能发送新操作');
+        if(!manual&&shelterAssignmentBlocked(kind,targets))throw Error('相关居民或装备的异常操作仍在隔离核对，不能发送新操作');
         if(kind==='season'&&submitted&&!capture.current())
           throw Object.assign(Error('避难所旧批次已被接管，取消后续请求'),{code:'shelter-batch-obsolete'});
         if(!independent&&shelterReadOnlyWait())throw Object.assign(Error('避难所原批次等待核对，不继续发送'),{code:'shelter-read-only'});
@@ -18363,7 +18474,7 @@ installShelterPlanningWorker(self);
   function closeShelterBuild() {
     const w=shelterBuildWork;if(!w)return false;
     if(w.dialog&&visible(w.dialog)){
-      const close=locator.pick([...w.dialog.querySelectorAll('button')].filter(b=>b.getAttribute('aria-label')==='关闭'||textOf(b)==='取消'));
+      const close=nativeCancelButton(w.dialog,usable);
       return shelterCloseWindow(w,close,'shelter:build-close','关闭本轮建设窗口');
     }
     shelterBuildWork=null;return false;
@@ -18548,6 +18659,7 @@ installShelterPlanningWorker(self);
       if(reconcileShelterRescue(m))return;
       if(reconcileShelterExpedition(m))return;
       if(reconcileShelterAssignment(m,dialogs))return;
+      if(reconcileShelterEquipment(m,dialogs))return;
       if(reconcileShelterOldAssignment(m,dialogs))return;
       if(constructionKind(shelterPending.kind)&&closeShelterBuild())return;
       if(shelterPending.kind==='season'&&shelterPending.sentCount<shelterPending.targets.length&&
@@ -18626,6 +18738,7 @@ installShelterPlanningWorker(self);
       return;
     }
     if(reconcileShelterAssignmentHolds(m)){schedule();return;}
+    if(reconcileShelterEquipmentHolds(m)){schedule();return;}
     if(shelterVisitPeriod.day!==m.state.daily.day||shelterVisitPeriod.month!==m.state.season.month) {
       finishShelter(null,'避难所奖励周期已变化，取消未发送目标；一分钟后重新核对',60000);return;
     }
