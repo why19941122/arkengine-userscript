@@ -75,6 +75,44 @@ test('生产训练：已有进度只计剩余时间；未知进度不当成零�
   delete x.p.training;assert.equal(x.estimate().reason,'unknown-training');
   x.p.stats.end=10;assert.equal(x.estimate().reason,'attribute-maxed');
 });
+
+function advancedTrainingCell(){
+  const context=scene('per',4),{v,p,room,record}=context;
+  room.level=2;p.roomId=room.id;p.training=.9;
+  record.roles=[{id:p.id,room:room.id,role:'training',at:v.serverTime-2*hour,stat:'per',base:3,
+    until:v.serverTime-hour,finishCurrent:true,purpose:'production',windowEnd:v.serverTime+156*hour,destination:3}];
+  assert.equal(api.valid(record),true);
+  return context;
+}
+
+test('跨格训练保护：上一格收尾已过期，当前90%仍保留；同一格刷新不续期',()=>{
+  const context=advancedTrainingCell(),{v,p,record}=context,before=JSON.stringify(record);
+  const plan=context.run(),adopted=plan.adoptions.find(role=>role.id===p.id);
+  assert.ok(adopted);assert.equal(adopted.base,4);assert.equal(adopted.finishCurrent,true);
+  assert.equal(adopted.destination,3);assert.equal(adopted.windowEnd,record.roles[0].windowEnd);
+  assert.ok(adopted.until>v.serverTime&&adopted.until<=v.serverTime+130*60000);
+  assert.ok(!plan.actions.some(action=>action.id===p.id));assert.ok(plan.reserved.includes(p.id));
+  assert.equal(JSON.stringify(record),before);
+  record.roles=[JSON.parse(JSON.stringify(adopted))];v.serverTime+=60000;
+  const refreshed=context.run();assert.ok(refreshed.reserved.includes(p.id));assert.equal(refreshed.adoptions.length,0);
+  assert.equal(record.roles[0].until,adopted.until);
+  p.stats.per=5;p.training=0;
+  assert.equal(context.run().actions.find(action=>action.id===p.id)?.room,3);
+});
+
+test('跨格训练保护：同格超期、零进度、未知进度、关闭、断供及投资到期仍按条件释放',()=>{
+  for(const condition of ['same-cell','zero','unknown','disabled','supply','window']){
+    const context=advancedTrainingCell(),{v,p,cfg,record,s}=context;
+    if(condition==='same-cell')p.stats.per=3;
+    if(condition==='zero')p.training=0;
+    if(condition==='unknown')delete p.training;
+    if(condition==='disabled')cfg.training=false;
+    if(condition==='supply')s.resources.power=0;
+    if(condition==='window')record.roles[0].windowEnd=v.serverTime;
+    const plan=context.run();assert.ok(plan.actions.some(action=>action.id===p.id&&action.role==='training-release'),condition);
+    assert.ok(!plan.adoptions.some(role=>role.id===p.id),condition);
+  }
+});
 test('生产训练：限时加成分段计算，不把前一小时活动外推七天',()=>{
   const x=scene(),plain=x.estimate();
   x.v.env.events=[{kind:'production',startsAt:x.v.serverTime,endsAt:x.v.serverTime+hour,percent:150}];

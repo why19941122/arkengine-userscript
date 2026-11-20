@@ -269,6 +269,31 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
     await reloadShelter();for(let i=0;i<20;i++)await pulse();
     assert.equal(await evaluate('sm.calls.length'),1);assert.equal(await evaluate(`${pending}.id`),p.id);
   });
+  await t.test('人工取消恢复：明确取消原确认后释放未发送准备，仍保留人工操作等待',async()=>{
+    await open();const original=await evaluate(pending);
+    await evaluate(`Array.from(document.querySelector('[role="alertdialog"]').querySelectorAll('button')).find(button=>button.textContent==='取消').focus();`);
+    await trustedStaffKey('Enter');await pulse(1000);
+    assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false,'trusted cancellation closes the native dialog');
+    assert.equal(await evaluate('sm.calls.length'),0);assert.equal(await evaluate(pending),null);
+    const cancelled=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.find(event=>event.type==='shelter-work-cancelled'&&event.data.operation===${JSON.stringify(original.id)})`);
+    assert.equal(cancelled?.data.ownerCancelled,true);
+    assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent`),/自动操作等待/);
+    await pulse(65000);
+    await drive(`!document.querySelector('[role="dialog"],[role="alertdialog"]')&&!${pending}`,'cancelled operation stops blocking the visit',20);
+    assert.equal(await evaluate(`${originalCalls}.length`),0);
+  });
+  for(const action of ['takeover','removed','hidden','cancel-blocked'])await t.test('人工取消恢复：未观察到明确取消并关闭时保留原记录 '+action,async()=>{
+    await open();const original=await evaluate(pending);
+    await evaluate(`document.querySelector('[role="alertdialog"] button').focus();`);await trustedStaffKey();
+    if(action==='removed')await evaluate(`document.querySelector('[role="alertdialog"]').remove();`);
+    if(action==='hidden')await evaluate(`document.querySelector('[role="alertdialog"]').hidden=true;`);
+    if(action==='cancel-blocked'){
+      await evaluate(`const button=Array.from(document.querySelector('[role="alertdialog"]').querySelectorAll('button')).find(button=>button.textContent==='取消');button.onclick=()=>{};button.focus();`);
+      await trustedStaffKey('Enter');
+    }
+    await pulse(1000);assert.equal(await evaluate(`${pending}?.id`),original.id);
+    assert.equal(await evaluate('sm.calls.length'),0);
+  });
   await t.test('确认生命周期：新标签接管准备后，旧标签原确认不能重发或停掉新标签',async()=>{
     await open();const original=await evaluate(pending);
     const second=await secondShelter('sm.assignUnknown=true;');

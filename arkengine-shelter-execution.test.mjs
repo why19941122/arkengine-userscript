@@ -53,6 +53,15 @@ test('完成返岗期限修复：岗位占用、属性回退、供给下降、�
   }
 });
 
+test('跨格训练保护：返岗最终确认发现当前格已到90%则撤销旧动作',()=>{
+  const context=completedReturn();context.c.shelterCampaign.training=true;
+  context.c.shelterState.campaign.roles[0].finishCurrent=true;
+  const work=context.capture(context.returnChoice);
+  context.advance(4000);context.f.view.state.residents.find(person=>person.id===5).training=.9;
+  assert.equal(context.api.current(context.model(),work),null);
+  assert.equal(work.executionFailure.reason,'training-in-progress');
+});
+
 test('等级工程交接：保留实际完整路线依据，正常产出增长后仍可确认原工程',()=>{
   const x=setup(growthInvestmentScene());x.c.shelterPopulationTarget=7;x.c.shelterLevelTarget=5;
   x.c.shelterConstruction.scrapLimit=200;

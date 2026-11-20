@@ -58,6 +58,20 @@ test('父母预培养：共同供给不足不追加，真实断供返岗而非�
   assert.equal(training(plan).length,0);assert.ok(plan.actions.some(r=>r.id===a.id&&r.role==='training-release'));
 });
 
+test('跨格训练保护：预培养父母下一格90%继续训练，全项10门槛与原岗位保留',()=>{
+  const context=setupParentPreparation(source),first=training(context.schedule())[0];context.apply(first);
+  const person=context.f.view.state.residents.find(entry=>entry.id===first.id);
+  person.stats[first.stat]++;person.training=.9;context.tick(6);
+  const plan=context.schedule(),role=context.context.shelterState.campaign.roles.find(entry=>entry.id===person.id);
+  assert.ok(!plan.actions.some(action=>action.id===person.id&&action.role==='training-release'));
+  assert.equal(role.base,person.stats[first.stat]);assert.equal(role.preparation,true);assert.equal(role.destination,4);
+  assert.equal(context.api.valid(context.context.shelterState.campaign),true);
+  const saved=plain(role);context.tick();context.schedule();
+  assert.deepEqual(plain(context.context.shelterState.campaign.roles.find(entry=>entry.id===person.id)),saved);
+  person.stats[first.stat]++;person.training=0;context.tick();
+  assert.equal(context.schedule().actions.find(action=>action.id===person.id&&action.role==='training-release')?.room,4);
+});
+
 test('父母预培养：双方七项均达10才放行，装备和另一位高属性不能抵消短板',()=>{
   const x=setupParentPreparation(source);x.schedule();const saved=x.context.shelterState.parentPreparation;
   const pair=x.f.view.state.residents.filter(p=>[4,5].includes(p.id));

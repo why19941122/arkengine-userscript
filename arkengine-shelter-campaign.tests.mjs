@@ -428,7 +428,7 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       families:[{a:5,b:6,room:5}],campaign:{roles:[{id:5,room:30,role:'training',purpose:'parent',stat:'cha',base:5,
         at:clock-6*3600000,until:clock-1000}],trips:[],attempts:[],heals:[],trainingRest:[]}}));${extra}`);
   for(const margin of ['normal','continuation'])await t.test(margin==='normal'?
-    '训练收尾浏览器：71.4%先完成当前格，刷新不续期，升到7后真实离岗且不接着练8':
+    '训练收尾浏览器：71.4%先完成当前格，刷新不续期，升到7且下一格未开始时真实离岗':
     '训练收尾浏览器：电力仅有11%余量时冷却到期仍完成当前格，刷新不续期且完成后真实离岗',async()=>{
     const extra=margin==='continuation'?`s.rooms.find(r=>r.id===1).level=1;`:'';
     await setupShelter(finishingParentScene('5/7',extra));await settle('finish parent current cell');
@@ -443,7 +443,8 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     assert.equal(await evaluate('sm.calls.filter(c=>c.residentId===5).length'),0);
     await reloadCampaign();await settle('completion commitment survives refresh');
     assert.equal(await evaluate(`${state}.campaign.roles.find(r=>r.id===5).until`),role.until);
-    await evaluate('const p=sm.view.state.residents.find(p=>p.id===5);p.stats.cha=7;p.training=.9;');
+    await evaluate(`const p=sm.view.state.residents.find(p=>p.id===5);p.stats.cha=7;p.training=0;
+      const schedule=${state};schedule.nextAt=0;localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(schedule));`);
     await reloadCampaign();
     await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===5&&c.roomId===null)&&!${pending}`,'completed current cell actually released');
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===5&&c.roomId===null).length'),1);
@@ -4796,6 +4797,49 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'训练备用返岗',
       campaign:{roles:[{id:5,room:90,role:'training',at:clock-3600000,stat:'end',base:5,purpose:'production',
         until:clock+600000,windowEnd:clock+168*3600000,destination:91}],trips:[],attempts:[],heals:[],trainingRest:[]}}));`);
+  const advancedProductionScene=(progress=.9)=>alternativeTrainingReturnScene()+`sm.ui20261109=true;
+    s.residents.find(person=>person.id===5).training=${progress};
+    const schedule=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));
+    Object.assign(schedule.campaign.roles[0],{destination:4,finishCurrent:true,at:clock-2*3600000,until:clock-3600000});
+    localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(schedule));`;
+  await t.test('跨格训练浏览器：旧收尾过期但下一格90%不弹调岗确认，刷新不续期',async()=>{
+    await setupShelter(advancedProductionScene());await settle('retain advanced production cell');
+    const role=await evaluate(`${state}.campaign.roles.find(entry=>entry.id===5)`);
+    assert.equal(role.base,6);assert.equal(role.finishCurrent,true);assert.equal(role.destination,4);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0);
+    assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false);
+    await reloadCampaign();await settle('same cell deadline survives reload');
+    assert.equal(await evaluate(`${state}.campaign.roles.find(entry=>entry.id===5).until`),role.until);
+    await evaluate('const person=sm.view.state.residents.find(person=>person.id===5);person.stats.end=7;person.training=0;');
+    await reloadCampaign();await drive(`sm.calls.some(action=>action.type==='assign'&&action.residentId===5&&action.roomId===4)&&!${pending}`,'return after current cell completes');
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),1);
+  });
+  for(const sent of [false,true])await t.test('跨格训练浏览器：旧指定返岗'+(sent?'已发送则保持未知原单':'未绑定且当前90%则归档旧意图并保留训练'),async()=>{
+    await setupShelter(advancedProductionScene(0)+(sent?'sm.assignUnknown=true;':''));
+    await drive(sent?`sm.calls.some(action=>action.type==='assign'&&action.residentId===5)`:
+      `!!document.querySelector('[role="alertdialog"]')`,'old return before next cell observation');
+    const original=await evaluate(`const pending=${pending};${sent?'':'delete pending.lifecycle;pending.at=clock-60000;'}
+      localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify(pending));
+      sm.view.state.residents.find(person=>person.id===5).training=.9;pending`);
+    await reloadShelter();await settle('reconcile current training without replay');
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),sent?1:0);
+    if(sent)assert.equal(await evaluate(`${pending}.id`),original.id);
+    else{
+      assert.equal(await evaluate(pending),null);
+      assert.equal(await evaluate(`${state}.assignmentRecovery.original.id`),original.id);
+      assert.equal(await evaluate(`${state}.campaign.roles.find(entry=>entry.id===5).base`),6);
+      assert.ok(await evaluate(`!${state}.campaign.trainingRest.some(entry=>entry.id===5)`));
+      assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===5).roomId'),90);
+    }
+  });
+  await t.test('跨格训练浏览器：确认前当前格变成90%则取消未发送调岗',async()=>{
+    await setupShelter(advancedProductionScene(0));
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'return confirmation before progress changes');
+    await evaluate('sm.view.state.residents.find(person=>person.id===5).training=.9;');
+    await drive(`!document.querySelector('[role="alertdialog"]')&&!${pending}`,'cancel stale return confirmation');
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0);
+    assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===5).roomId'),90);
+  });
   const delayedAssignment=alternativeTrainingReturnScene()+`sm.ui20261109=true;
     const appendWork=document.body.append.bind(document.body);document.body.append=(...nodes)=>{
       appendWork(...nodes);const dialog=nodes.find(node=>node.matches?.('[role="alertdialog"]')&&node.querySelector('h2')?.textContent.startsWith('确认调动'));

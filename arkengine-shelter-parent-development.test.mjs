@@ -298,7 +298,7 @@ test('父母训练边界：冷却结束时当前格剩半小时，余量低于�
       const again=api.plan(m,cfg,JSON.parse(JSON.stringify(record)),14);
       assert.ok(again.reserved.includes(p.id));assert.ok(!again.adoptions.some(r=>r.id===p.id),'刷新不能续期');
     }
-    p.stats.cha++;
+    p.stats.cha++;p.training=0;
     assert.ok(api.plan(m,cfg,record,14).actions.some(c=>c.id===p.id&&c.role==='training-release'));
   }
 });

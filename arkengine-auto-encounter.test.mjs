@@ -799,10 +799,10 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       withDelayedShelterNavigation:run=>withDelayedFeatureNavigation('/shelter',run) });
     const trustedStaffKey = async (key='Tab',modifiers=0) => {
       const codes={Shift:['ShiftLeft',16],Control:['ControlLeft',17],Alt:['AltLeft',18],Meta:['MetaLeft',91],
-        Escape:['Escape',27],Tab:['Tab',9],PrintScreen:['PrintScreen',44],s:['KeyS',83]};
+        Escape:['Escape',27],Tab:['Tab',9],Enter:['Enter',13],PrintScreen:['PrintScreen',44],s:['KeyS',83]};
       const [code,windowsVirtualKeyCode]=codes[key]||[key,0];
       for (const type of ['keyDown','keyUp']) await cdp.send('Input.dispatchKeyEvent',
-        {type,key,code,windowsVirtualKeyCode,modifiers},tab.sessionId);
+        {type,key,code,windowsVirtualKeyCode,modifiers,...(key==='Enter'&&type==='keyDown'?{text:'\r'}:{})},tab.sessionId);
     };
     await shelterExplorationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
     await shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,trustedStaffKey});
