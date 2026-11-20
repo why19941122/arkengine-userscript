@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.140
+// @version      1.17.141
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1547,7 +1547,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.140';
+  const SCRIPT_VERSION = '1.17.141';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -9074,21 +9074,29 @@ installShelterPlanningWorker(self);
   }
   for(const name of ['pointerdown','keydown','input','change'])document.addEventListener(name,event=>{
     if(!shelterUserInteraction(event))return;
+    let dialogs,handled=false;
     for(const work of [shelterWorkConfirm,shelterWork,shelterRecallWork,shelterSocialWork,shelterBuildWork,shelterRescueWork]){
-      shelterBindDialog(work);
+      dialogs=shelterBindDialog(work,dialogs);
       if(work?.dialogBefore&&(!work.dialog||work.dialog.contains(event.target)))work.manual=true;
     }
     if(event.type!=='input'&&shelterWorkConfirm){shelterWorkConfirm.manual=true;cancelQueued();}
-    if(shelterCampaignEditing||!(campaignActive()||shelterExploreClaim||['build','upgrade','dig'].some(k=>shelterConstruction[k])))return;
-    if(shelterBuildWork)shelterBuildWork.cancelled=true;
-    if(shelterRecallWork){
-      shelterBindDialog(shelterRecallWork);
-      if(shelterRecallWork.dialog?.contains(event.target)){shelterRecallWork=null;shelterCampaignHeld='你已接手召回窗口，等待你处理';}
-      else shelterRecallWork.cancelled=true;
+    if(!shelterCampaignEditing&&(campaignActive()||shelterExploreClaim||['build','upgrade','dig'].some(k=>shelterConstruction[k]))){
+      if(shelterBuildWork)shelterBuildWork.cancelled=true;
+      if(shelterRecallWork){
+        if(shelterRecallWork.dialog?.contains(event.target)){shelterRecallWork=null;shelterCampaignHeld='你已接手召回窗口，等待你处理';}
+        else shelterRecallWork.cancelled=true;
+      }
+      log.add('shelter-user-interaction','检测到页面实际操作，暂停自动操作；窗口内操作交由用户处理',
+        {eventType:event.type,targetScope:event.target?.closest?.('[role="dialog"],[role="alertdialog"]')?'dialog':'page'});
+      shelterExploreManualUntil=Date.now()+60000;cancelQueued();handled=true;
     }
-    log.add('shelter-user-interaction','检测到页面实际操作，暂停自动操作；窗口内操作交由用户处理',
-      {eventType:event.type,targetScope:event.target?.closest?.('[role="dialog"],[role="alertdialog"]')?'dialog':'page'});
-    shelterExploreManualUntil=Date.now()+60000;cancelQueued();schedule();
+    if(event.type!=='input'&&shelterWork?.dialog?.contains(event.target)){
+      shelterWork=null;
+      if(shelterStaffMode==='population'&&shelterState.pair)stopPopulationPlan('你已接手居民窗口，取消剩余新配对安排');
+      else holdShelterStaff('你已接手居民窗口，本轮暂停人员管理');
+      handled=true;
+    }
+    if(handled)schedule();
   },true);
   shelterControl('staff','change', event => {
     shelterStaffMode = event.target.value;
@@ -15500,9 +15508,7 @@ installShelterPlanningWorker(self);
     else say(`等待避难所“${label}”页签加载，出现后继续本轮检查`);
     return null;
   }
-  function shelterRewardTabDue(stage,m) {
-    const label = stage === 1 ? '目标' : '图鉴', tab = shelterTab(label);
-    if (!tab) return false;
+  function shelterRewardTabDue(stage,m,tab) {
     const badge = textOf(tab).match(/(\d+)$/);
     if (stage === 2) return Boolean(badge && +badge[1] > 0);
     const season = m.state.season;
@@ -15556,12 +15562,14 @@ installShelterPlanningWorker(self);
     // Legacy confirmation markup used a paragraph without an accessible description ID.
     const paragraphs=[...dialog.querySelectorAll('p')];return paragraphs.length===1?textOf(paragraphs[0]):'';
   }
-  function shelterBindDialog(w,dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible)) {
+  function shelterBindDialog(work,dialogs) {
     // 归属来自本轮原生操作前后的DOM变化；标题/身份只决定能否提交，不决定能否取消。
-    if(!w?.dialogBefore||w.dialog||w.manual||w.dialogAmbiguous)return;
-    const added=dialogs.filter(d=>!w.dialogBefore.has(d));
-    if(added.length>1){w.dialogAmbiguous=true;return;}
-    if(added.length===1)w.dialog=added[0];
+    if(!work?.dialogBefore||work.dialog||work.manual||work.dialogAmbiguous)return dialogs;
+    dialogs??=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+    const added=dialogs.filter(dialog=>!work.dialogBefore.has(dialog));
+    if(added.length>1)work.dialogAmbiguous=true;
+    else if(added.length===1)work.dialog=added[0];
+    return dialogs;
   }
   function shelterOpenDialog(w,perform) {
     w.dialogBefore=new Set(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
@@ -16364,7 +16372,7 @@ installShelterPlanningWorker(self);
         offer('shelter:production-tab','先收取已满批产物，再安排普通事务',()=>tab.click());return true;
       }
     }
-    const all=locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b)==='全部收取'));
+    const all=ready.length?locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b)==='全部收取')):null;
     const bulkReady=Boolean(ready.length&&usable(all)&&shelterFits(m,reward));
     shelterCollection=shelterCollectionInfo(m,{projected,bulkReady});
     if(bulkReady){shelterSubmit(all,'collect',['all'],m,'收取避难所已满批产出');return true;}
@@ -17302,15 +17310,6 @@ installShelterPlanningWorker(self);
     });
     return true;
   }
-  // 用户接手脚本打开的窗口后，不再自动改动或关闭该窗口。
-  for (const event of ['pointerdown','keydown','change']) document.addEventListener(event,e => {
-    if (shelterUserInteraction(e) && shelterWork?.dialog?.contains(e.target)) {
-      shelterWork = null;
-      if (shelterStaffMode === 'population' && shelterState.pair) stopPopulationPlan('你已接手居民窗口，取消剩余新配对安排');
-      else holdShelterStaff('你已接手居民窗口，本轮暂停人员管理');
-      schedule();
-    }
-  },true);
   function shelterAdvice(m) {
     const deficits = Object.keys(m.demand).filter(k => m.production[k] < m.demand[k]);
     const waiting = m.state.residents.filter(p => p.away === null && p.deadAt === null && p.adultAt <= m.now && p.roomId === null).length;
@@ -17328,13 +17327,12 @@ installShelterPlanningWorker(self);
       rooms:rooms.slice(0,80).map(r=>{
         const amount=projected.amounts[r.id] || 0;
         const freeCapacity=Math.max(0,m.caps[r.resource]-m.state.resources[r.resource]-(projected.automatic[r.resource] || 0));
-        const button=assessment && locator.query(`[data-room="${r.id}"]`)?.querySelector(`button[aria-label="收取${shelterResources[r.resource]}"]`);
         const reason=!assessment?'not-checked':r.projectionUncertain&&r.stored<r.batch&&r.storedUpper>=r.batch?
           'shared-projection':r.stored<r.batch?
           r.resource==='parts'&&m.state.resources.scrap<6*(r.batch-r.stored)?'materials-short':
           !r.workers?'no-workers':r.rate<=0?'production-stopped':'not-full':
           amount>freeCapacity || shelterStoredItems(m.state)>m.itemCap?'capacity-blocked':
-          assessment.bulkReady || usable(button)?'ready':'controls-not-ready';
+          assessment.bulkReady || usable(locator.query(`[data-room="${r.id}"]`)?.querySelector(`button[aria-label="收取${shelterResources[r.resource]}"]`))?'ready':'controls-not-ready';
         return {id:r.id,resource:r.resource,stored:r.stored,storedUpper:r.storedUpper,
           projectionUncertain:r.projectionUncertain,projectionReason:r.projectionReason,batch:r.batch,rate:r.rate,workers:r.workers,
           automatic:r.automatic,projectedAmount:amount,freeCapacity,reason};
@@ -18425,7 +18423,7 @@ installShelterPlanningWorker(self);
     while(shelterStage<names.length) {
       tab=shelterReadyTab(m,names[shelterStage]);
       if(!tab)return true;
-      if(shelterStage===0 || shelterRewardTabDue(shelterStage,m))break;
+      if(shelterStage===0 || shelterRewardTabDue(shelterStage,m,tab))break;
       shelterStage++;
     }
     if (shelterStage >= names.length) return false;
