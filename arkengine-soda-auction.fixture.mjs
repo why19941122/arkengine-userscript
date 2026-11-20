@@ -39,10 +39,17 @@ window.auctionConfirmNative=(price,quantity)=>new Promise(resolve=>{
     '</h2><div id="auction-description">合计 '+amount.toLocaleString('en-US')+' 代币。价格只会往下走，成交价不会高于这个数。买到的汽水 24 小时后才能上架。</div>'+
     '<button id="auction-cancel">取消</button><button id="auction-confirm">确认</button>';
   document.body.append(dialog);game.setAttribute('aria-hidden','true');
-  const close=accepted=>{dialog.remove();game.removeAttribute('aria-hidden');resolve(accepted);};
+  const close=accepted=>{
+    const finish=()=>{dialog.remove();game.removeAttribute('aria-hidden');resolve(accepted);};
+    if(am.animationClose&&!globalThis.BASE_UI_ANIMATIONS_DISABLED)requestAnimationFrame(finish);else finish();
+  };
   document.getElementById('auction-cancel').onclick=()=>{am.clicks.push({type:'cancel',at:clock});close(false);};
   document.getElementById('auction-confirm').disabled=am.confirmDisabled;
-  document.getElementById('auction-confirm').onclick=()=>{am.clicks.push({type:'confirm',at:clock,wall:performance.now()});close(true);};
+  document.getElementById('auction-confirm').onclick=()=>{
+    am.clicks.push({type:'confirm',at:clock,wall:performance.now()});
+    if(am.holdConfirm){window.finishAuctionConfirm=()=>close(true);return;}
+    close(true);
+  };
 });
 window.refreshAuction=async()=>{
   const response=await fetch('/api/shelter/auction',{cache:'no-store'});am.visible=await response.json();
@@ -66,6 +73,7 @@ window.renderAuction=()=>{
         am.clicks.push({type:'buy',at:clock,wall:performance.now()});
         const count=Math.min(am.quantity,available),price=auction.price;
         if(!await auctionConfirmNative(price,count))return;
+        if(am.holdBeforeRequest)await new Promise(resolve=>{window.sendHeldAuction=resolve;});
         am.busy=true;
         const input={quantity:count,maxUnitPrice:price,...am.requestPatch};
         const fingerprint=JSON.stringify(input),key=auctionKeys.get(fingerprint)||crypto.randomUUID();auctionKeys.set(fingerprint,key);

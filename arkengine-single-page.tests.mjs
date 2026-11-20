@@ -11,6 +11,24 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
       const date=new Date(returnAt),pad=value=>String(value).padStart(2,'0'),time=document.createElement('p');
       time.textContent='完整到达: '+date.getFullYear()+'/'+(date.getMonth()+1)+'/'+date.getDate()+' '+pad(date.getHours())+':'+pad(date.getMinutes())+':'+pad(date.getSeconds());
       document.getElementById('running').append(time);}};`;
+  await t.test('单页精简：同轮复用奇遇按钮，动画与秘境提示只更新一次，页面替换仍取新控件',async()=>{
+    await setupUnified(`${disableDungeon}${timedExpedition}cm.cooldownAt=clock+360000;`);
+    await drive(`location.pathname==='/cultivate'&&${schedule}?.nextAt>clock`,'cultivation cooldown ready');
+    const counts=await evaluate(`(async()=>{
+      const probe=document.createTextNode(''),query=document.querySelectorAll;document.body.append(probe);
+      const counts=window.cultivateProbe={checks:0,animations:0,hints:0,buttons:0};
+      document.querySelectorAll=function(selector){if(selector==='button')counts.buttons++;return query.call(this,selector);};
+      try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}return counts;}
+      finally{document.querySelectorAll=query;delete window.cultivateProbe;probe.remove();}
+    })()`);
+    console.log('cultivation repeated work '+JSON.stringify(counts));
+    assert.ok(counts.checks>=20);assert.equal(counts.buttons,counts.checks);
+    assert.equal(counts.animations,counts.checks);assert.equal(counts.hints,counts.checks);
+    await evaluate(`window.oldSeek=document.getElementById('seek');oldSeek.onclick=()=>{throw Error('Stale control');};clock=${schedule}.nextAt;cm.cooldownAt=0;renderFeature();`);
+    await drive(`cm.calls.includes('choose')&&${schedule}?.nextAt>clock`,'new controls finish encounter');
+    assert.deepEqual(await evaluate('cm.calls'),['seek','choose']);
+    assert.equal(await evaluate('oldSeek.isConnected'),false);
+  });
   await t.test('单页预约：远征四十分钟后归来，奇遇六分钟预约不滚动，提前十五秒回远征',async()=>{
     await setupUnified(`${disableDungeon}${timedExpedition}`);
     await drive(`location.pathname==='/cultivate'&&cm.calls.length===2&&${schedule}?.nextAt>clock`,'encounter finished and stays until appointment');

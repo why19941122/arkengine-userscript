@@ -49,6 +49,9 @@ const source = rawSource.replace('const logStore = createLogStore();', 'const lo
   .replace('function historyTotals(entries,archive={}) {','$& if(window.panelProbe)panelProbe.totals++;')
   .replace('function spend(entries,action,now) {','$& if(window.panelProbe)panelProbe.spend++;')
   .replace('function stockHint() {','$& if(window.panelProbe)panelProbe.ticks++;')
+  .replace('function checkPage() {','$& if(window.cultivateProbe)cultivateProbe.checks++;')
+  .replace('function syncDialogAnimations() {','$& if(window.cultivateProbe)cultivateProbe.animations++;')
+  .replace('function updateDungeonHint() {','$& if(window.cultivateProbe)cultivateProbe.hints++;')
   .replace('function shelterCampaignPlan(m,cfg={},record={},target=14) {',
     'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(typeof window!=="undefined"&&window.sm?.maintenanceCostMs&&cfg.maintenanceOnly){clock+=sm.maintenanceCostMs;sm.maintenanceCalls=(sm.maintenanceCalls||0)+1;}' +
     'if(typeof window!=="undefined"&&window.sm?.planCostMs&&!cfg.maintenanceOnly){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}' +

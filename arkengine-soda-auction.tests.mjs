@@ -6,6 +6,92 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  await t.test('拍卖加固：按钮只亮500毫秒，连续12轮亮起到付款请求均在窗口内',async testContext=>{
+    await setupAuction(`am.busy=true;am.tokens=10000000;am.view.auction.supply=100;am.view.auction.remaining=100;
+      am.view.auction.perUserDaily=30;am.view.auction.endsAt='2026-11-20T23:00:00+08:00';
+      localStorage.setItem('arkengine:auto-farm:enabled:v1','true');localStorage.setItem('arkengine:auto-shelter:enabled:v1','true');
+      localStorage.setItem('arkengine:auto-encounter:enabled:v1','true');`);
+    const timings=[];
+    for(let round=0;round<12;round++){
+      await fresh(`am.busy=true;am.quantity=3;clock=Date.parse('2026-11-20T20:00:00+08:00')+${round}*600000;
+        am.view.auction.released=${(round+1)*3};am.view.auction.available=3;`);
+      await until(()=>evaluate('!!document.getElementById("auction-buy")?.disabled'),'disabled auction button');
+      const calls=await evaluate('({exp:model.calls.length,farm:fm.calls.length,stock:km.calls.length,shelter:sm.calls.length,cultivate:cm.calls.length})');
+      await evaluate(`{am.readyWall=performance.now();am.busy=false;const button=document.getElementById('auction-buy');button.disabled=false;
+        setTimeout(()=>{button.disabled=true;},500);}`);
+      await until(()=>evaluate(`am.posts.length===${round+1}`),'purchase within fleeting button window');
+      const elapsed=await evaluate(`am.posts[${round}].wall-am.readyWall`);timings.push(elapsed);
+      assert.ok(elapsed>=0&&elapsed<500,'button enabled to POST: '+elapsed+'ms');
+      assert.equal(await evaluate(`am.posts[${round}].body.quantity`),1);
+      assert.deepEqual(await evaluate('({exp:model.calls.length,farm:fm.calls.length,stock:km.calls.length,shelter:sm.calls.length,cultivate:cm.calls.length})'),calls);
+      await until(()=>evaluate(`${state}.pending===null`),'settled fast purchase');
+      await evaluate('am.busy=true;');
+    }
+    testContext.diagnostic('button enabled -> POST ms: '+timings.map(value=>value.toFixed(1)).join(', '));
+    assert.equal(await evaluate('am.market'),0);
+  });
+  await t.test('拍卖加固：重新开启后定时器和动画帧受限，确认按钮延后变亮仍在500毫秒内付款',async testContext=>{
+    await setupAuction(`am.busy=true;am.confirmDisabled=true;am.animationClose=true;globalThis.BASE_UI_ANIMATIONS_DISABLED=false;
+      localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');
+      window.auctionFixtureTimeout=window.setTimeout.bind(window);
+      window.setTimeout=(callback,milliseconds,...args)=>auctionFixtureTimeout(callback,Math.max(milliseconds||0,60000),...args);
+      window.requestAnimationFrame=()=>0;`);
+    await evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click();");
+    await until(()=>evaluate('!!document.getElementById("auction-buy")?.disabled'),'auction entered after enabling');
+    await evaluate(`am.readyWall=performance.now();am.busy=false;document.getElementById('auction-buy').disabled=false;`);
+    await until(()=>evaluate('!!document.getElementById("auction-confirm")'),'native confirmation rendered');
+    await evaluate("auctionFixtureTimeout(()=>{document.getElementById('auction-confirm').disabled=false;},30);");
+    await ready();
+    const elapsed=await evaluate('am.posts[0].wall-am.readyWall');
+    assert.ok(elapsed>=0&&elapsed<500,'throttled timer enabled -> POST: '+elapsed+'ms');
+    assert.equal(await evaluate('BASE_UI_ANIMATIONS_DISABLED'),true);
+    testContext.diagnostic('throttled timers, button enabled -> POST ms: '+elapsed.toFixed(1));
+  });
+  for(const page of ['远征','农场','秘境'])await t.test('拍卖加固：接管时尚未渲染的'+page+'窗口迟到后仍可取消',async()=>{
+    const config=page==='远征'?`model.runs=[];`:
+      page==='农场'?`localStorage.setItem('arkengine:auto-farm:enabled:v1','true');history.replaceState({},'','/farm');`:
+      `localStorage.setItem('arkengine:auto-encounter:enabled:v1','true');history.replaceState({},'','/cultivate/dungeon');dm.sweep=false;`;
+    await setupAuction(`localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','false');${config}
+      const append=document.body.append.bind(document.body);
+      document.body.append=(...nodes)=>{
+        if(!window.finishLateDialog&&nodes.some(node=>node.matches?.('[role=dialog],[role=alertdialog]'))){
+          window.finishLateDialog=()=>append(...nodes);am.deferredPath=location.pathname;
+          localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','true');
+          queueMicrotask(()=>{game.removeAttribute('inert');game.removeAttribute('aria-hidden');});
+          document.body.setAttribute('data-auction-preempt','true');return;
+        }
+        append(...nodes);
+      };`);
+    await drive('typeof finishLateDialog==="function"','deferred original dialog');
+    assert.equal(await evaluate('location.pathname'),await evaluate('am.deferredPath'));
+    await evaluate('finishLateDialog();');
+    await until(()=>evaluate("location.pathname==='/shelter'&&sm.tab==='汽水交易'&&!document.querySelector('[role=dialog],[role=alertdialog]')"),'late original dialog yielded');
+    assert.equal(await evaluate('model.calls.filter(call=>call.type==="dispatch").length+fm.calls.filter(call=>call.type==="plant").length+dm.calls.filter(call=>call[0]==="enter").length'),0);
+    await ready();
+  });
+  await t.test('拍卖加固：确认后的网页异步回调跨过离场时间不得漏发付款',async()=>{
+    await setupAuction('am.holdBeforeRequest=true;');
+    await until(()=>evaluate('typeof sendHeldAuction==="function"'),'native delayed POST');
+    await evaluate("clock=Date.parse('2026-11-20T20:01:00+08:00');");await pulse(0);
+    await drive("location.pathname==='/activities/expedition'",'release while native callback waits');
+    await evaluate('sendHeldAuction();');await pulse(0);
+    assert.equal(await evaluate('am.posts.length'),0);
+    await until(()=>evaluate(`${state}.pending===null`),'cancelled callback cleared');
+    await evaluate('am.holdBeforeRequest=false;');
+    await fresh("clock=Date.parse('2026-11-20T20:10:00+08:00');am.view.auction.released=6;");await ready();
+  });
+  await t.test('拍卖加固：确认点击被吞时限次取消，迟到回调不付款且按时让出页面',async()=>{
+    await setupAuction('am.holdConfirm=true;');
+    await until(()=>evaluate('typeof finishAuctionConfirm==="function"'),'swallowed native confirmation');
+    await pulse(5000);
+    await until(()=>evaluate('!document.getElementById("auction-confirm")'),'bounded native cancellation');
+    assert.equal(await evaluate('am.clicks.filter(click=>click.type==="confirm").length'),1);
+    assert.equal(await evaluate('am.clicks.filter(click=>click.type==="cancel").length'),1);
+    await evaluate('finishAuctionConfirm();');await pulse(0);
+    assert.equal(await evaluate('am.posts.length'),0);
+    await evaluate("clock=Date.parse('2026-11-20T20:01:00+08:00');");await pulse(0);
+    await drive("location.pathname==='/activities/expedition'",'yield after cancelled confirmation');
+  });
   await t.test('汽水拍卖：20:01离场继续奇遇，20:08回来，连续两轮按窗口抢占',async()=>{
     await setupAuction(`localStorage.setItem('arkengine:auto-encounter:enabled:v1','true');
       localStorage.setItem('arkengine:auto-dungeon:enabled:v1','false');

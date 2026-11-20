@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.145
+// @version      1.17.147
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -172,6 +172,18 @@
     const added=dialogs.filter(d=>!w.before.has(d));
     if(added.length>1)w.ambiguous=true;
     else if(added.length===1)w.dialog=added[0];
+  }
+  function handleNativeWindowInteraction(event,host,windows,visible,cancel) {
+    if(!event.isTrusted||event.composedPath().includes(host))return;
+    let dialogs;
+    for(const work of windows){
+      if(!work||work.path!==location.pathname||work.manual)continue;
+      if(!work.dialog&&!work.ambiguous){
+        dialogs??=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
+        bindNativeWindow(work,dialogs);
+      }
+      if(!work.dialog||work.dialog.contains(event.target)){work.manual=true;cancel();}
+    }
   }
   function nativeWindowDescription(dialog) {
     const text=el=>(el?.textContent||'').normalize('NFKC').replace(/\s+/g,' ').trim();
@@ -1524,7 +1536,7 @@
         nextReleaseAt:auction.nextReleaseAt==null?null:Date.parse(auction.nextReleaseAt)};
     }
     function round(auction,now) {
-      return `${auction.startsAt}:${auction.released??Math.max(0,Math.floor((now-auction.startsAt)/600000))}`;
+      return `${auction.startsAt}:slot:${Math.max(0,Math.floor((now-auction.startsAt)/600000))}`;
     }
     function visit(auction,now) {
       const current=auction?.day===day(now)?auction:null;
@@ -1540,13 +1552,14 @@
       const window=visit(auction,now);
       if(!window.active||now<window.releaseAt||!auction.live)return {kind:'wait',reason:'等待本轮开拍'};
       const batch=round(auction,now);
-      if(state.rounds.includes(batch))return {kind:'wait',reason:'本轮已买 1 瓶，守候下一轮'};
+      const legacy=`${auction.startsAt}:${auction.released??Math.max(0,Math.floor((now-auction.startsAt)/600000))}`;
+      if(state.rounds.includes(batch)||state.rounds.includes(legacy))return {kind:'wait',reason:'本轮已买 1 瓶，守候下一轮'};
       if(!auction.available)return {kind:'wait',reason:'本轮已售罄，守候下一批'};
       if(!whole(auction.price)||auction.price<=0||auction.price>=400000)return {kind:'wait',reason:'等待单价低于 400000 代币'};
       if(!Number.isFinite(balance)||balance<auction.price)return {kind:'wait',reason:'代币不足，等待降价或余额恢复'};
-      const signature=JSON.stringify([batch,auction.price,auction.available,auction.boughtToday,balance]);
+      const signature=JSON.stringify([legacy,auction.price,auction.available,auction.boughtToday,balance]);
       if(state.rejected===signature)return {kind:'wait',reason:'本次未成交，等待新价格或新一批'};
-      return {kind:'buy',round:batch,price:auction.price,signature};
+      return {kind:'buy',round:batch,batch:legacy,price:auction.price,signature};
     }
     function outcome(pending,status,body) {
       if(status>=200&&status<300&&body?.code!=='retry'&&body?.quantity===1&&whole(body.unitPrice)&&body.unitPrice>0&&
@@ -1618,7 +1631,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.145';
+  const SCRIPT_VERSION = '1.17.147';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -2842,8 +2855,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   function usable(el) {
     return visible(el) && !el.matches(':disabled, [aria-disabled="true"]');
   }
-  function findButton(label) {
-    return locator.pick([...document.querySelectorAll('button')].filter(el => textOf(el) === label && visible(el)));
+  function findButton(label, buttons = null) {
+    return locator.pick((buttons || [...document.querySelectorAll('button')]).filter(el => textOf(el) === label && (buttons !== null || visible(el))));
   }
 
   function amount(reward, label) {
@@ -2970,9 +2983,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   function checkPage() {
     // storage 通知可能迟到；已保存的人工暂停应先于本轮点击、刷新或切页生效。
     if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
-    syncDialogAnimations();
     observeDungeonEntryReview();
-    updateDungeonHint();
     if (accountStopReason()) {
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
       return;
@@ -3021,7 +3032,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       return;
     }
 
-    const recovery = findButton('确认原修炼结果');
+    const buttons = [...document.querySelectorAll('button')].filter(visible);
+    const recovery = findButton('确认原修炼结果', buttons);
     if (recovery) {
       const operation = pendingOperation();
       if (!operation) { say('原操作不是可确认的寻访奇遇，请手动处理'); return; }
@@ -3050,7 +3062,6 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
 
     if (pendingOperation()) { say('等待原奇遇请求结束，保留原记录'); return; }
 
-    const buttons = [...document.querySelectorAll('button')].filter(visible);
     const quotaTexts = [...document.querySelectorAll('p, span, [aria-live]')].filter(visible).map(textOf);
     const exhausted = buttons.some(button =>
       /(?:今日|每日).*(?:次数.*(?:用完|用尽|耗尽)|(?:已达|达到).*上限)/.test(textOf(button))) ||
@@ -3059,7 +3070,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         /^(?:今日|每日)\s*奇遇\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次?$/.test(text) ||
         /^(?:今日|每日)\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次\s*奇遇(?:\s*[,。;]|$)/.test(text));
     if (!encounterAction && encounterSchedule.nextAt > Date.now() && !exhausted) {
-      if (!visitDungeon()) returnToExpedition();
+      if (!visitDungeon(buttons)) returnToExpedition();
       return;
     }
     const cooldown = buttons.find(el => /^奇遇冷却\s/.test(textOf(el)));
@@ -3087,12 +3098,12 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         match[3] === undefined ? +match[1] * 60 + +match[2] : +match[1] * 3600 + +match[2] * 60 + +match[3] : null;
       if (!exhausted) planEncounter(Date.now() + Math.max(360000, seconds === null ? 0 : (seconds + 2) * 1000), '奇遇已预约，六分钟后或网页冷却结束后核对');
     }
-    if (visitDungeon()) return;
+    if (visitDungeon(buttons)) return;
     if (cooldown || exhausted) {
       returnToExpedition();
       return;
     }
-    const seek = findButton('寻找奇遇');
+    const seek = findButton('寻找奇遇', buttons);
     if (!seek) {
       pageWait.wait('等待修仙主殿加载', !encounterAction && !pendingOperation(), say,
         reason => setEnabled(false, reason), true); return;
@@ -3111,12 +3122,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       enqueue:(button,before)=>recordClick(button,`${kind}:cancel`,'owned-window',w.cancelReason,before)});
   }
   for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
-    if(!event.isTrusted||event.composedPath().includes(host))return;
-    const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-    for(const w of [dungeonWindow]){
-      if(w?.path!==location.pathname)continue;bindNativeWindow(w,dialogs);
-      if(!w.dialog||w.dialog.contains(event.target)){w.manual=true;cancelPendingClick();}
-    }
+    handleNativeWindowInteraction(event,host,[dungeonWindow],visible,cancelPendingClick);
   },true);
 
 
@@ -3264,7 +3270,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     };
   };
 
-  function visitDungeon() {
+  function visitDungeon(buttons) {
     if (!dungeonEnabled || dungeon.nextAt > Date.now() ||
         (!dungeon.run && dungeon.exhaustedDay === dungeonDay())) return false;
     // 等待正在领取的奇遇落定，不在两次修炼请求之间切走。
@@ -3274,11 +3280,11 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         say('先等待原修炼请求结束，再进入秘境'); return true;
       }
     }
-    const cooldown = [...document.querySelectorAll('button')].some(el => visible(el) && /^奇遇冷却\s/.test(textOf(el)));
+    const cooldown = buttons.some(el => /^奇遇冷却\s/.test(textOf(el)));
     if (!cooldown && lastAction && !/^dungeon:/.test(lastAction.kind) && Date.now() - lastAction.at < RETRY_MS) {
       say('先等待本次奇遇结果，再进入秘境'); return true;
     }
-    if (!cooldown && !findButton('寻找奇遇') && encounterSchedule.nextAt <= Date.now()) return false;
+    if (!cooldown && !findButton('寻找奇遇', buttons) && encounterSchedule.nextAt <= Date.now()) return false;
     navigate('/cultivate/dungeon');
     return true;
   }
@@ -3668,10 +3674,14 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     yieldForAuction(dialogs,cancel) {
       cancelPendingClick();
       if(!dungeonWindow||dungeonPlan?.phase!=='opening'||nativeDungeonRequests().length)return false;
+      bindNativeWindow(dungeonWindow,dialogs);
       if(dungeonWindow.dialog?.isConnected)return cancel(dungeonWindow,dialogs);
       if(dungeonWindow.auctionCancelAt){
         if(dungeonPlan.action!=='sweep')saveDungeon({...dungeon,run:null});
         saveDungeonPlan(null);openedDungeonDialog=false;dungeonWindow=null;
+      }
+      if(dungeonWindow&&!dungeonWindow.manual&&!dungeonWindow.ambiguous&&Date.now()-dungeonWindow.at<5000){
+        say('拍卖优先，等待取消刚打开的秘境窗口');return true;
       }
       return false;
     },
@@ -19534,12 +19544,7 @@ installShelterPlanningWorker(self);
     return { ...best, description: `当前选 ${best.name}：留种后约 ${best.income.toFixed(1)} 代币/小时（普通品质）` };
   }
   for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
-    if(!event.isTrusted||event.composedPath().includes(host))return;
-    const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
-    for(const w of [seedWindow,dispatchWindow]){
-      if(w?.path!==location.pathname)continue;bindNativeWindow(w,dialogs);
-      if(!w.dialog||w.dialog.contains(event.target)){w.manual=true;cancelQueued();}
-    }
+    handleNativeWindowInteraction(event,host,[seedWindow,dispatchWindow],visible,cancelQueued);
   },true);
   function closeFeatureWindow(w,dialogs,kind,pause) {
     return cancelNativeWindow(w,dialogs,{usable,say,pause,
@@ -19743,7 +19748,7 @@ installShelterPlanningWorker(self);
   const emptyAuction=()=>({version:1,vault:null,day:'',rounds:[],doneDay:'',pending:null,receipts:[],rejected:''});
   const auctionPendingValid=p=>objectState(p)&&typeof p.id==='string'&&auctionCore.whole(p.at)&&
     ['opening','submitted'].includes(p.phase)&&auctionCore.whole(p.vault)&&p.price>0&&p.price<400000&&auctionCore.whole(p.price)&&
-    typeof p.round==='string'&&typeof p.day==='string'&&typeof p.signature==='string'&&
+    typeof p.round==='string'&&(p.batch===undefined||typeof p.batch==='string')&&typeof p.day==='string'&&typeof p.signature==='string'&&
     (p.phase==='opening'||typeof p.key==='string'&&/^[a-zA-Z0-9-]{8,64}$/.test(p.key));
   const auctionValid=value=>objectState(value)&&value.version===1&&(value.vault===null||auctionCore.whole(value.vault))&&
     typeof value.day==='string'&&typeof value.doneDay==='string'&&typeof value.rejected==='string'&&
@@ -19793,10 +19798,10 @@ installShelterPlanningWorker(self);
   }
   function auctionContext() {
     if(auctionContextRead||Date.now()<auctionReadAt||!auctionAllowed())return;
-    auctionReadAt=Date.now()+15000;
+    const now=Date.now(),visit=auctionCore.visit(auctionView?.model,now);
+    auctionReadAt=Math.min(now+15000,visit.releaseAt>now?visit.releaseAt:Infinity);
     const controller=createReadSession(10000,()=>auctionAllowed()&&auctionExclusive);auctionContextRead=controller;
-    const paths=['/api/shelter','/api/me/balance'];
-    if(!auctionView||Date.now()-auctionView.at>30000)paths.push('/api/shelter/auction');
+    const paths=['/api/shelter','/api/me/balance','/api/shelter/auction'];
     void Promise.allSettled(paths.map(async path=>{
       const response=await controller.fetch(path,{cache:'no-store'});await controller.json(response);
     })).finally(()=>{controller.close();if(auctionContextRead===controller)auctionContextRead=null;schedule();});
@@ -19812,12 +19817,24 @@ installShelterPlanningWorker(self);
       const receipts=[...auctionState.receipts],rounds=[...auctionState.rounds];
       if(outcome==='success'){
         if(!rounds.includes(pending.round))rounds.push(pending.round);
+        if(pending.batch&&!rounds.includes(pending.batch))rounds.push(pending.batch);
+        const startsAt=Number(pending.round.split(':')[0]);
+        if(Number.isFinite(startsAt)&&startsAt<=pending.at){
+          const slot=auctionCore.round({startsAt},pending.at);
+          if(!rounds.includes(slot))rounds.push(slot);
+        }
         receipts.push({id:pending.id,at:Date.now(),quantity:1,unitPrice:body.unitPrice,vault:pending.vault});
       }else log.add('soda-auction-rejected','本次未成交，继续驻留等待新的购买条件',{status});
       auctionSave({...auctionState,pending:null,rounds,receipts,rejected:outcome==='rejected'?pending.signature:''});
       auctionWindow=null;auctionRecord();
     }
     schedule();
+  }
+  function auctionPurchaseReady(pending,now=Date.now()) {
+    if(!pending||!auctionIdentity||!auctionBalance||!auctionView||pending.day!==auctionCore.day(now)||
+        auctionIdentity.vault!==pending.vault||now-auctionIdentity.at>30000||now-auctionBalance.at>30000||now-auctionView.at>20000)return false;
+    const choice=auctionCore.decision(auctionView.model,auctionState,auctionBalance.tokens,now);
+    return choice.kind==='buy'&&choice.round===pending.round&&choice.price===pending.price;
   }
   observeAuctionRequest=(args,at)=>{
     const input=args[0],url=new URL(typeof input==='string'?input:input instanceof URL?input.href:input?.url,document.baseURI);
@@ -19841,18 +19858,21 @@ installShelterPlanningWorker(self);
         (captureShelterAction||continueShelterAction||captureStockAction||captureShelterCaravan&&!captureShelterCaravan.sent||captureShelterHelp&&!captureShelterHelp.sent))
       throw Error('汽水拍卖优先，取消尚未提交的其他自动操作');
     const work=auctionWindow;
-    if(work?.confirming&&!work.sent&&method!=='GET'){
+    if(work?.confirming&&!work.sent&&method!=='GET'&&(auctionExclusive||url.pathname==='/api/shelter/auction')){
       auctionReload();const pending=auctionState.pending;
       let body;try{body=JSON.parse(args[1]?.body);}catch{}
-      const visit=auctionCore.visit(auctionView?.model,Date.now());
-      const valid=auctionAllowed()&&auctionExclusive&&visit.active&&Date.now()>=visit.releaseAt&&inShelter()&&!work.manual&&pending?.id===work.id&&
-        pending.phase==='opening'&&auctionIdentity?.vault===pending.vault&&Date.now()-auctionIdentity.at<=30000&&
+      const valid=pending?.id===work.id&&pending.phase==='opening'&&
         url.pathname==='/api/shelter/auction'&&method==='POST'&&body?.quantity===1&&body.maxUnitPrice===pending.price&&
         /^[a-zA-Z0-9-]{8,64}$/.test(body.idempotencyKey||'')&&
         Object.keys(body).every(key=>['quantity','maxUnitPrice','idempotencyKey'].includes(key));
       if(!valid){
         auctionIssue='拍卖请求与确认内容不一致，已阻止提交';work.confirming=false;
         schedule();throw Error(auctionIssue);
+      }
+      if(!auctionAllowed()||!auctionExclusive||!inShelter()||work.manual||work.expired||!auctionPurchaseReady(pending)){
+        work.confirming=false;work.expired=true;
+        log.add('soda-auction-aborted','付款前条件已变化，已阻止未提交的原请求');
+        schedule();throw Error('汽水拍卖付款条件已过期');
       }
       try{auctionSave({...auctionState,pending:{...pending,phase:'submitted',key:body.idempotencyKey}});}
       catch(error){auctionIssue='拍卖原请求无法持久保存，已阻止提交';work.confirming=false;schedule();throw error;}
@@ -19895,6 +19915,8 @@ installShelterPlanningWorker(self);
   }
   const auctionNotice=createNoticeHandler(log,say,(button,key,label,before)=>{before();button.click();schedule();},usable);
   function auctionClearOtherDialogs(dialogs) {
+    for(const work of [dispatchWindow,seedWindow])bindNativeWindow(work,dialogs);
+    if(inShelter())for(const work of [shelterWorkConfirm,shelterWork,shelterRecallWork,shelterBuildWork,shelterRescueWork,shelterSocialWork])shelterBindDialog(work,dialogs);
     const confirmation=shelterWorkConfirm;
     if(dialogs.length===2&&confirmation?.work===shelterWork&&confirmation.dialog&&shelterWork?.dialog&&confirmation.dialog!==shelterWork.dialog&&
         !confirmation.manual&&!shelterWork.manual&&!confirmation.clicked&&!confirmation.sent()&&
@@ -19902,7 +19924,10 @@ installShelterPlanningWorker(self);
       return auctionCancelWindow(confirmation,[confirmation.dialog]);
     for(const work of [dispatchWindow,seedWindow,shelterWorkConfirm,shelterWork,shelterRecallWork,shelterBuildWork,shelterRescueWork,shelterSocialWork]){
       if(auctionCancelWindow(work,dialogs))return true;
+      if(work&&(work.before||work.dialogBefore)&&!work.dialog&&!work.manual&&!work.ambiguous&&!work.dialogAmbiguous&&
+          Date.now()-(work.openedAt??work.at)<5000){say('拍卖优先，等待取消刚打开的窗口');return true;}
     }
+    if(!dialogs.length)return false;
     auctionNotice(dialogs,'拍卖等待你处理人工窗口');return true;
   }
   function auctionConfirm(dialogs) {
@@ -19913,7 +19938,13 @@ installShelterPlanningWorker(self);
     }
     if(!work){auctionSave({...auctionState,pending:null});return true;}
     bindNativeWindow(work,dialogs);
-    if(work.confirming){say('正在提交汽水原单');return true;}
+    if(work.confirming){
+      if(Date.now()-work.confirmAt>=5000){
+        work.expired=true;auctionCancelWindow(work,dialogs);
+        say('原确认未提交，等待原回调结束，不重复付款');
+      }else say('正在提交汽水原单');
+      return true;
+    }
     if(!dialogs.length){
       if(work.dialog||Date.now()-work.at>5000){auctionSave({...auctionState,pending:null,rejected:pending.signature});auctionWindow=null;}
       else say('等待汽水原生确认框');
@@ -19922,12 +19953,9 @@ installShelterPlanningWorker(self);
     const dialog=work.dialog,title=textOf(dialog?.querySelector('h2,[data-slot="alert-dialog-title"],[data-slot="dialog-title"]'));
     const match=title.match(/^以 ([\d,]+) 代币\/瓶买入 (\d+) 瓶$/);
     const amount=dialog&&nativeWindowDescription(dialog).match(/^合计 ([\d,]+) 代币[。\.]/);
-    const current=auctionView?.model,choice=auctionCore.decision(current,auctionState,auctionBalance?.tokens,Date.now());
-    const valid=dialogs.length===1&&dialogs[0]===dialog&&!work.manual&&!work.ambiguous&&auctionAllowed()&&
+    const valid=dialogs.length===1&&dialogs[0]===dialog&&!work.manual&&!work.ambiguous&&!work.expired&&auctionAllowed()&&
       match&&Number(match[1].replaceAll(',',''))===pending.price&&Number(match[2])===1&&
-      amount&&Number(amount[1].replaceAll(',',''))===pending.price&&choice.kind==='buy'&&choice.round===pending.round&&
-      choice.price===pending.price&&auctionIdentity?.vault===pending.vault&&Date.now()-auctionIdentity.at<=30000&&
-      Date.now()-(auctionBalance?.at||0)<=30000&&Date.now()-(auctionView?.at||0)<=20000;
+      amount&&Number(amount[1].replaceAll(',',''))===pending.price&&auctionPurchaseReady(pending);
     if(!valid){
       say('汽水确认条件已变化，撤销本次等待新行情');
       if(!work.manual)auctionCancelWindow(work,dialogs);
@@ -19935,7 +19963,7 @@ installShelterPlanningWorker(self);
     }
     const buttons=[...dialog.querySelectorAll('button')].filter(button=>textOf(button)==='确认');
     if(buttons.length!==1||!usable(buttons[0])){say('等待汽水确认按钮可用');return true;}
-    work.confirming=true;buttons[0].click();return true;
+    work.confirming=true;work.confirmAt=Date.now();buttons[0].click();return true;
   }
   function auctionRelease() {
     if(!auctionExclusive)return;
@@ -19953,6 +19981,12 @@ installShelterPlanningWorker(self);
     const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
     if(!requested){
       if(auctionWindow&&!auctionWindow.sent&&auctionState.pending?.phase==='opening'){
+        bindNativeWindow(auctionWindow,dialogs);
+        if(auctionWindow.confirming){
+          auctionWindow.expired=true;
+          if(dialogs.length){auctionCancelWindow(auctionWindow,dialogs);return true;}
+          auctionRelease();return false;
+        }
         if(dialogs.length){auctionCancelWindow(auctionWindow,dialogs);return true;}
         auctionSave({...auctionState,pending:null});auctionWindow=null;
       }
@@ -19975,7 +20009,7 @@ installShelterPlanningWorker(self);
     auctionContext();
     if(cultivation.yieldForAuction(dialogs,auctionCancelWindow))return true;
     if((auctionState.pending?.phase!=='submitted'||dialogs.length)&&auctionConfirm(dialogs))return true;
-    if(dialogs.length)return auctionClearOtherDialogs(dialogs);
+    if(auctionClearOtherDialogs(dialogs))return true;
     if(dispatchWindow?.auctionCancelAt&&plan?.phase==='opening'&&!nativePending().length){savePlan(null);dispatchWindow=null;}
     if(seedWindow?.auctionCancelAt){seedWindow=null;ownSeedDialog=null;openingSeedsAt=0;}
     if(!inShelter()){
@@ -20015,7 +20049,7 @@ installShelterPlanningWorker(self);
       quantity.dispatchEvent(new Event('input',{bubbles:true}));quantity.dispatchEvent(new Event('change',{bubbles:true}));schedule();return true;
     }
     const pending={id:crypto.randomUUID(),at:now,phase:'opening',vault:auctionIdentity.vault,day:today,
-      round:choice.round,price:choice.price,signature:choice.signature};
+      round:choice.round,batch:choice.batch,price:choice.price,signature:choice.signature};
     auctionSave({...auctionState,pending});auctionWindow={...beginNativeWindow(),id:pending.id};
     say('立即买入 1 瓶汽水');button.click();
     bindNativeWindow(auctionWindow,[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible));
@@ -20032,6 +20066,7 @@ installShelterPlanningWorker(self);
 
   function step() {
     if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
+    syncDialogAnimations();
     if(enabled&&active&&onPage()&&!pageFrozen&&!accountStopReason()&&!stateFault('expedition')){
       try{if(auctionStep()){
         if(auctionExclusive)log.pulse(status.textContent,{auction:true,pendingAuction:Boolean(auctionState.pending),rounds:auctionState.rounds.length});
@@ -20039,7 +20074,6 @@ installShelterPlanningWorker(self);
       }}catch{auctionIssue='拍卖状态无法安全核对，保留原单；可关闭拍卖开关恢复其他功能';say(auctionIssue);return;}
     }
     pollReadSessions();
-    syncDialogAnimations();
     farmHint();
     shelterHint();
     stockHint();

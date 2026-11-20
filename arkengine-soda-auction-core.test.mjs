@@ -11,6 +11,15 @@ const view=(overrides={})=>({enabled:true,auction:{startsAt:'2026-11-20T20:00:00
   nextReleaseAt:'2026-11-20T20:20:00+08:00',...overrides}});
 const state={rounds:[],rejected:''};
 
+test('拍卖加固：同一十分钟轮次的释放数变化不能再买，旧版批次记录仍防重',()=>{
+  const auction=core.model(view()),first=core.decision(auction,state,2000000,now);
+  const bought={...state,rounds:[first.round,first.batch]};
+  assert.equal(core.decision(core.model(view({released:9})),bought,1600001,now+1000).kind,'wait');
+  assert.equal(core.decision(core.model(view({released:9})),bought,1600001,now+600000).kind,'buy');
+  assert.equal(core.decision(auction,bought,1600001,now+600000).kind,'wait');
+  assert.equal(core.decision(auction,{...state,rounds:[`${auction.startsAt}:6`]},2000000,now).kind,'wait');
+});
+
 test('汽水拍卖：每轮只在提前两分钟至开拍一分钟内独占，间隔七分钟恢复其他玩法',()=>{
   const auction=core.model(view());
   for(const [time,active,release] of [
