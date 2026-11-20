@@ -23,6 +23,7 @@ import { shelterParentPreparationTests } from './arkengine-shelter-parent-prepar
 import { shelterLog127Tests } from './arkengine-shelter-log127.tests.mjs';
 import { shelterPlanningBrowserTests } from './arkengine-shelter-planning-browser.tests.mjs';
 import { shelterConfirmationTests } from './arkengine-shelter-confirmation.tests.mjs';
+import { shelterAssignmentRecoveryTests } from './arkengine-shelter-assignment-recovery.tests.mjs';
 import { shelterProductionTests } from './arkengine-shelter-production.tests.mjs';
 import { shelterPopulationTests } from './arkengine-shelter-population.tests.mjs';
 import { stockMarkup, stockOwnedPosition } from './arkengine-stock.fixture.mjs';
@@ -855,6 +856,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     await shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterPlanningBrowserTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey});
     await shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey,secondShelter});
+    await shelterAssignmentRecoveryTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterProductionTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive });
     await shelterPopulationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, trustedStaffKey, secondShelter, until });
     const setupStock=async(code='',path='/stock')=>{
