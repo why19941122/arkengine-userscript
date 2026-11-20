@@ -3,7 +3,7 @@ import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
-const code=source.slice(source.indexOf('  const normalLog ='),source.indexOf('  // STOCK_OBSERVATION_CODEC_BEGIN'));
+const code=source.slice(source.indexOf('  const routineLog ='),source.indexOf('  // STOCK_OBSERVATION_CODEC_BEGIN'));
 const api=vm.runInNewContext(code+'\n({priority:logPriority,coverage:shelterDiagnosticCoverage,stockCoverage:typeof stockDiagnosticCoverage===\'function\'?stockDiagnosticCoverage:null})');
 const summary={type:'shelter-decision',pageId:'p',at:1,data:{diagnosticId:'d',totalParts:2}};
 const part=n=>({type:'shelter-decision-detail',pageId:'p',data:{diagnosticId:'d',part:n,totalParts:2,rows:[]}});
@@ -25,10 +25,10 @@ test('诊断覆盖：摘要被整体淘汰也报告损失，旧桶缺汇总时�
   assert.equal(unknown.summaries.missing,0,'缺少每日计数不能编造损失数量');
 });
 
-test('股市诊断：摘要与明细同等保留，原始行情优先于可重建诊断',()=>{
-  assert.equal(api.priority({type:'stock-decision'}),api.priority({type:'stock-decision-detail'}));
+test('股市诊断：摘要、明细与原始行情同等保留，操作回执优先',()=>{
+  for(const type of ['stock-decision','stock-decision-detail','stock-observation-block'])assert.equal(api.priority({type}),1.5);
   assert.ok(api.priority({type:'stock-decision-detail'})>api.priority({type:'heartbeat'}));
-  assert.ok(api.priority({type:'stock-decision'})<api.priority({type:'stock-observation-block'}));
+  assert.ok(api.priority({type:'stock-confirmed'})>api.priority({type:'stock-observation-block'}));
 });
 
 test('股市诊断：缺片、重复、截断和跨页混片均明确报告',()=>{

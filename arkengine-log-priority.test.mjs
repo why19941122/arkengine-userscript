@@ -18,7 +18,7 @@ test('诊断优先级修复：真实故障、长等待、页面丢弃与所有�
   for(const event of [{type:'page-lifecycle',data:{discarded:true}}, {type:'page-lifecycle',data:{online:false}},
     {type:'page-lifecycle',data:{gapMs:90000}}, {type:'page-blocked',data:{blockedMs:90000}},
     {type:'page-blocked',data:{attempt:1}}, {type:'runtime-error'}, {type:'shelter-execution-evidence'}, {type:'shelter-paused'},
-    {type:'page-lifecycle',receiptId:'actual-receipt'}, {type:'stock-confirmed'}]){
+    {type:'page-lifecycle',receiptId:'actual-receipt'}, {type:'stock-confirmed'}, {type:'shelter-rescue-rejected'}]){
     assert.equal(api.critical(event),true,JSON.stringify(event));assert.equal(api.priority(event),2);
   }
 });

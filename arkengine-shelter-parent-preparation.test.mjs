@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
 import {setupParentPreparation,parentPreparationScene} from './arkengine-shelter-parent-preparation.fixture.mjs';
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const plain=x=>JSON.parse(JSON.stringify(x));
@@ -70,6 +71,23 @@ test('跨格训练保护：预培养父母下一格90%继续训练，全项10门
   assert.deepEqual(plain(context.context.shelterState.campaign.roles.find(entry=>entry.id===person.id)),saved);
   person.stats[first.stat]++;person.training=0;context.tick();
   assert.equal(context.schedule().actions.find(action=>action.id===person.id&&action.role==='training-release')?.room,4);
+});
+
+test('训练连续生命周期：父母收尾直接使用训练计时，不扫描无关生产返岗收益',()=>{
+  const instrumented=source.replace('function shelterTrainingReturn(m,p,room,horizonHours=168,commitments={}) {',
+    '$& globalThis.trainingReturnEvaluations=(globalThis.trainingReturnEvaluations||0)+1;');
+  const context=setupParentPreparation(instrumented),first=training(context.schedule())[0];context.apply(first);
+  const person=context.f.view.state.residents.find(entry=>entry.id===first.id),role=context.context.shelterState.campaign.roles[0];
+  person.stats[first.stat]++;person.training=.9;context.tick();
+  const finish=vm.runInContext('shelterTrainingFinish',context.context);
+  const room=context.f.view.state.rooms.find(entry=>entry.id===person.roomId);
+  const cfg={...context.f.campaign,development:true,parentTraining:true};
+  const record={...context.context.shelterState.campaign,parentPreparation:context.context.shelterState.parentPreparation};
+  context.context.trainingReturnEvaluations=0;
+  const retained=finish(context.m(),person,room,cfg,record,role);
+  assert.equal(retained.base,person.stats[first.stat]);assert.equal(retained.preparation,true);assert.equal(retained.destination,4);
+  assert.equal(context.context.trainingReturnEvaluations,0);
+  assert.equal(finish(context.m(),person,room,{...cfg,parentPreparation:false},record,role),null);
 });
 
 test('父母预培养：双方七项均达10才放行，装备和另一位高属性不能抵消短板',()=>{

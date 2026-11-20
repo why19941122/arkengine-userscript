@@ -4814,6 +4814,35 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     await reloadCampaign();await drive(`sm.calls.some(action=>action.type==='assign'&&action.residentId===5&&action.roomId===4)&&!${pending}`,'return after current cell completes');
     assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),1);
   });
+  await t.test('训练连续生命周期浏览器：升级返岗房、后台等待、两次跨格与刷新后只返岗一次',async()=>{
+    const revisit=async()=>{
+      await evaluate(`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${state},nextAt:0}));`);
+      await reloadCampaign();
+    };
+    await setupShelter(advancedProductionScene()+`Object.assign(s.rooms.find(room=>room.id===4),{level:2,upgradeAt:clock+3600000});`);
+    await settle('retain training while return room upgrades');
+    const first=await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`);
+    assert.equal(first.base,6);assert.equal(first.destination,4);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0);
+    await withShelterBackground(async()=>{await pulse(20000);await pulse(20000);});
+    await revisit();await settle('same cell survives background and reload');
+    assert.equal(await evaluate(`${state}.campaign.roles.find(role=>role.id===5).until`),first.until);
+    await evaluate(`clock+=3600000;sm.view.state.lastSettledAt=clock;
+      Object.assign(sm.view.state.rooms.find(room=>room.id===4),{upgradeAt:null,level:3});
+      const person=sm.view.state.residents.find(person=>person.id===5);person.stats.end=7;person.training=.9;`);
+    await revisit();await settle('next completed cell binds new progress');
+    const second=await evaluate(`${state}.campaign.roles.find(role=>role.id===5)`);
+    assert.equal(second.base,7);assert.equal(second.windowEnd,first.windowEnd);assert.ok(second.until>first.until);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0);
+    await revisit();await settle('second cell keeps its own fixed deadline');
+    assert.equal(await evaluate(`${state}.campaign.roles.find(role=>role.id===5).until`),second.until);
+    await evaluate('const person=sm.view.state.residents.find(person=>person.id===5);person.stats.end=8;person.training=0;');
+    await revisit();await drive(`sm.calls.some(action=>action.type==='assign'&&action.residentId===5&&action.roomId===4)&&!${pending}`,'one final return after settlement');
+    await settle('finish final return visit');
+    await revisit();await settle('completed return survives refresh');
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),1);
+    assert.equal(await evaluate(`${state}.campaign.roles.some(role=>role.id===5&&role.role==='training')`),false);
+  });
   for(const sent of [false,true])await t.test('跨格训练浏览器：旧指定返岗'+(sent?'已发送则保持未知原单':'未绑定且当前90%则归档旧意图并保留训练'),async()=>{
     await setupShelter(advancedProductionScene(0)+(sent?'sm.assignUnknown=true;':''));
     await drive(sent?`sm.calls.some(action=>action.type==='assign'&&action.residentId===5)`:

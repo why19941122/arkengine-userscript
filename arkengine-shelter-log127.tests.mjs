@@ -65,6 +65,81 @@ export async function shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,
     assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===1).length`),['full','target'].includes(mode)?102:initial);
     assert.deepEqual(await evaluate(`${state}.campaign?.defense||[]`),[]);
   });
+  const rescueScene=()=>{
+    const view=campaignView();view.state.rooms[0].type='door';view.state.rooms[0].incident={kind:'raiders',hp:98,maxHp:100};
+    return scene({view,state:record(),campaign:{defense:true},construction:disabled})+
+      `localStorage.setItem('arkengine:auto-shelter:staff:v1','off');`;
+  };
+  for(const legacy of [false,true])await t.test(`救援拒绝浏览器：${legacy?'旧139原单':'当前400响应'}归档后恢复，刷新与岗位变化不重复救援`,async()=>{
+    const original={id:'legacy-rescue-400',kind:'rescue',targets:[1],vaultNo:campaignView().vaultNo,
+      at:campaignView().serverTime-28*60000,
+      lifecycle:{version:1,phase:'request-bound',page:'old-page',requestKey:'legacy-rescue-key',boundAt:campaignView().serverTime-28*60000},
+      before:{serverTime:campaignView().serverTime-28*60000,present:69,incidentKind:'raiders',collected:campaignView().state.stats.collected,
+        day:campaignView().state.daily.day,month:campaignView().state.season.month},
+      result:{status:400,outcome:'http-error',responseFinishedAt:campaignView().serverTime-28*60000+847}};
+    const reject=`const rescueFetch=window.fetch;window.fetch=async(url,options)=>{
+      if(url==='/api/shelter/action'&&JSON.parse(options?.body||'{}').action?.type==='rescue_incident'){
+        const request=JSON.parse(options.body);sm.calls.push({...request.action,idempotencyKey:request.idempotencyKey});
+        return new Response(JSON.stringify({error:'本轮无法执行该操作'}),{status:400});}
+      return rescueFetch(url,options);};`;
+    await setupShelter(rescueScene()+(legacy?`localStorage.setItem('arkengine:auto-shelter:pending:v1',JSON.stringify(${JSON.stringify(original)}));
+      const schedule=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));schedule.pendingReadOnly='${original.id}';
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(schedule));`:reject));
+    await drive(`!!${state}.rescueRecovery&&!${pending}`,'archive failed rescue',120);
+    const recovered=await evaluate(`${state}.rescueRecovery`);
+    assert.equal(recovered.outcome,'http-rejected');
+    assert.equal(recovered.original.result.status,400);
+    if(legacy)assert.deepEqual(recovered.original,original);
+    else assert.equal(recovered.original.result.error,'本轮无法执行该操作');
+    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(event=>event.type==='shelter-confirmed'&&event.data.kind==='rescue')`),false);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.type==="rescue_incident").length'),legacy?0:1);
+    await drive(done,'finish failed rescue visit',120);
+    await pulse(1000);
+    await evaluate(`sm.view.state.residents[0].roomId=3;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${state},nextAt:0}));
+      history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(done,'rejected rescue remains stopped across refresh',120);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.type==="rescue_incident").length'),legacy?0:1);
+    await pulse(1000);
+    await evaluate(`sm.view.state.rooms[0].incident=null;sm.view.state.rooms[1].stored=500;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${state},nextAt:0}));
+      history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();await drive(`sm.calls.some(action=>action.type==='collect_all'||action.type==='collect')&&!${pending}`,'ordinary work resumes after incident',140);
+    assert.equal(await evaluate(`${state}.rescueStops.length`),0);
+    assert.deepEqual(await evaluate(`${state}.rescueRecovery.original`),recovered.original);
+  });
+  for(const response of [{status:503,body:{}},{status:400,body:{code:'retry',error:'稍后重试'}}])
+    await t.test(`救援拒绝浏览器：${response.status}${response.body.code||''}保留未知原单，刷新不重发`,async()=>{
+      await setupShelter(rescueScene()+`const rescueFetch=window.fetch;window.fetch=async(url,options)=>{
+        if(url==='/api/shelter/action'&&JSON.parse(options?.body||'{}').action?.type==='rescue_incident'){
+          const request=JSON.parse(options.body);sm.calls.push({...request.action,idempotencyKey:request.idempotencyKey});
+          return new Response(JSON.stringify(${JSON.stringify(response.body)}),{status:${response.status}});}
+        return rescueFetch(url,options);};`);
+      await drive(`${pending}?.result?.responseFinishedAt>0`,'failed transport journal');
+      const original=await evaluate(pending);
+      await drive(done,'unknown rescue remains read only',120);
+      await pulse(1000);
+      await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+      await reloadShelter();await drive(done,'unknown rescue survives reload',120);
+      assert.equal(await evaluate(`${pending}.id`),original.id);
+      assert.equal(await evaluate(`${state}.rescueRecovery===undefined`),true);
+      assert.equal(await evaluate('sm.calls.filter(action=>action.type==="rescue_incident").length'),1);
+    });
+  await t.test('访问收尾浏览器：旧期限导致结束后立即清理，新预约能真正处理产出',async()=>{
+    const view=campaignView();view.state.rooms.forEach(room=>room.stored=0);
+    await setupShelter(scene({view,state:record(),campaign:{},construction:disabled})+
+      `localStorage.setItem('arkengine:auto-shelter:staff:v1','off');
+      sessionStorage.setItem('arkengine:auto-shelter:handoff:v1',JSON.stringify({vaultNo:sm.view.vaultNo,
+        entryAt:clock-30*60000,expeditionAt:clock+40*60000,regularEnd:clock-25*60000,key:null}));`);
+    await drive(done,'finish visit with historical deadline');
+    assert.equal(await evaluate(`sessionStorage.getItem('arkengine:auto-shelter:handoff:v1')`),null);
+    await pulse(1000);
+    await evaluate(`sm.view.state.rooms[1].stored=500;
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${state},nextAt:0}));
+      history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);
+    await reloadShelter();
+    await drive(`sm.calls.some(action=>action.type==='collect_all'||action.type==='collect')&&!${pending}`,'new visit collects after expired budget');
+  });
   await t.test('日志127浏览器：下挖期间旧楼层实际开工并补员，刷新不重复建房',async()=>{
     const view=workshopChurnView(),s=view.state;s.resources.scrap=800;s.residents.find(p=>p.id===21).roomId=4;
     for(const p of s.residents.filter(p=>[35,36].includes(p.id))){p.roomId=5;p.parents=[1,2];}

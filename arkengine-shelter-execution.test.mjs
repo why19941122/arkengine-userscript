@@ -62,6 +62,16 @@ test('跨格训练保护：返岗最终确认发现当前格已到90%则撤销�
   assert.equal(work.executionFailure.reason,'training-in-progress');
 });
 
+test('训练连续生命周期：旧返岗确认遇到已保存的当前90%训练也必须撤销',()=>{
+  const context=completedReturn();context.c.shelterCampaign.training=true;
+  const person=context.f.view.state.residents.find(entry=>entry.id===5),role=context.c.shelterState.campaign.roles[0];
+  Object.assign(role,{base:person.stats.end,finishCurrent:true,until:context.f.view.serverTime+3600000});
+  const work=context.capture(context.returnChoice);context.advance(4000);person.training=.9;
+  assert.equal(context.api.current(context.model(),work),null);
+  assert.equal(work.executionFailure.reason,'training-in-progress');
+  assert.equal(context.c.shelterState.campaign.roles[0].until,role.until);
+});
+
 test('等级工程交接：保留实际完整路线依据，正常产出增长后仍可确认原工程',()=>{
   const x=setup(growthInvestmentScene());x.c.shelterPopulationTarget=7;x.c.shelterLevelTarget=5;
   x.c.shelterConstruction.scrapLimit=200;

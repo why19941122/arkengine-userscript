@@ -294,6 +294,21 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
     await pulse(1000);assert.equal(await evaluate(`${pending}?.id`),original.id);
     assert.equal(await evaluate('sm.calls.length'),0);
   });
+  await t.test('取消连续生命周期：明确取消后出现另一人工弹窗，立即清理旧准备且不碰新窗口',async()=>{
+    await open();const original=await evaluate(pending);
+    await evaluate(`const button=Array.from(document.querySelector('[role="alertdialog"]').querySelectorAll('button')).find(button=>button.textContent==='取消');
+      button.addEventListener('click',()=>{const next=document.createElement('div');next.id='owner-next-dialog';next.setAttribute('role','dialog');
+        next.innerHTML='<h2>主人自己的窗口</h2><button>确认</button>';document.body.append(next);});button.focus();`);
+    await trustedStaffKey('Enter');await pulse(1000);
+    assert.equal(await evaluate(pending),null);
+    assert.equal(await evaluate('sm.calls.length'),0);
+    assert.equal(await evaluate(`!!document.getElementById('owner-next-dialog')`),true);
+    const cancelled=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='shelter-work-cancelled'&&event.data.operation===${JSON.stringify(original.id)})`);
+    assert.equal(cancelled.length,1);assert.equal(cancelled[0].data.ownerCancelled,true);
+    await pulse(65000);
+    assert.equal(await evaluate(`!!document.getElementById('owner-next-dialog')`),true);
+    assert.equal(await evaluate('sm.calls.length'),0);
+  });
   await t.test('确认生命周期：新标签接管准备后，旧标签原确认不能重发或停掉新标签',async()=>{
     await open();const original=await evaluate(pending);
     const second=await secondShelter('sm.assignUnknown=true;');

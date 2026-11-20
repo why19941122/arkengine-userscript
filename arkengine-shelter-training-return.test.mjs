@@ -113,6 +113,14 @@ test('跨格训练保护：同格超期、零进度、未知进度、关闭、�
     assert.ok(!plan.adoptions.some(role=>role.id===p.id),condition);
   }
 });
+
+test('训练连续生命周期：普通生产记录同一格到期也不能重新延长',()=>{
+  const context=advancedTrainingCell(),{p,record}=context;
+  p.stats.per=record.roles[0].base;delete record.roles[0].finishCurrent;
+  const plan=context.run();
+  assert.ok(plan.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  assert.ok(!plan.adoptions.some(role=>role.id===p.id));
+});
 test('生产训练：限时加成分段计算，不把前一小时活动外推七天',()=>{
   const x=scene(),plain=x.estimate();
   x.v.env.events=[{kind:'production',startsAt:x.v.serverTime,endsAt:x.v.serverTime+hour,percent:150}];
@@ -212,6 +220,25 @@ test('生产训练返岗房升级：保留当前格、原席位和固定期限�
     p.stats[stat]++;p.training=0;
     const returned=context.run().actions.find(action=>action.id===p.id&&action.role==='training-release');
     assert.equal(returned?.room,destination.id,stat+' completed training returns to original job');
+  }
+});
+
+test('训练连续生命周期：返岗房升级时跨到90%的新格，保留席位且不提前计产',()=>{
+  for(const stat of ['str','per','end','agi']){
+    const context=upgradingTrainingScene(stat),{v,p,record,destination}=context;
+    p.stats[stat]++;p.training=.9;record.roles[0].finishCurrent=true;
+    record.roles[0].until=v.serverTime-1;
+    const plan=context.run(),role=plan.adoptions.find(entry=>entry.id===p.id);
+    assert.ok(role,stat);assert.equal(role.base,p.stats[stat]);assert.equal(role.destination,destination.id);
+    assert.ok(!plan.actions.some(action=>action.id===p.id));
+    assert.ok(plan.trainingDestinations.some(seat=>seat.id===p.id&&seat.room===destination.id));
+    const resource={str:'power',per:'water',end:'scrap',agi:'food'}[stat];
+    assert.equal(api.model(v).production[resource],0);
+    record.roles=[JSON.parse(JSON.stringify(role))];v.serverTime+=60000;
+    const refreshed=context.run();assert.ok(!refreshed.actions.some(action=>action.id===p.id));
+    assert.equal(refreshed.adoptions.length,0);assert.equal(record.roles[0].until,role.until);
+    destination.upgradeAt=null;destination.level=3;p.stats[stat]++;p.training=0;
+    assert.equal(context.run().actions.find(action=>action.id===p.id)?.room,destination.id);
   }
 });
 
