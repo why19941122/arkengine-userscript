@@ -6,6 +6,16 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  await t.test('农场阻塞修复：双关闭选种窗口及时给汽水拍卖让路',async()=>{
+    await setupAuction(`localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','false');
+      localStorage.setItem('arkengine:auto-farm:enabled:v1','true');history.replaceState({},'','/farm');
+      const open=openSeeds;window.openSeeds=()=>{open();const dialog=document.querySelector('[role=dialog]');
+        const close=document.createElement('button');close.setAttribute('aria-label','关闭');close.onclick=closeSeeds;dialog.prepend(close);
+        localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','true');};`);
+    await drive('am.posts.length===1','auction clears farm sheet and buys');
+    assert.equal(await evaluate("fm.calls.filter(call=>call.type==='plant').length"),0);
+    assert.equal(await evaluate('am.posts[0].body.quantity'),1);
+  });
   await t.test('拍卖加固：按钮只亮500毫秒，连续12轮亮起到付款请求均在窗口内',async testContext=>{
     await setupAuction(`am.busy=true;am.tokens=10000000;am.view.auction.supply=100;am.view.auction.remaining=100;
       am.view.auction.perUserDaily=30;am.view.auction.endsAt='2026-11-20T23:00:00+08:00';

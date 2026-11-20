@@ -37,6 +37,7 @@ import { auctionMarkup } from './arkengine-soda-auction.fixture.mjs';
 import { sodaAuctionTests } from './arkengine-soda-auction.tests.mjs';
 import { readLifecycleTests } from './arkengine-read-lifecycle.tests.mjs';
 import { dialogRecoveryTests } from './arkengine-dialog-recovery.tests.mjs';
+import { farmRecoveryTests } from './arkengine-farm-recovery.tests.mjs';
 import { currentGrowthTests } from './arkengine-shelter-current-growth.tests.mjs';
 
 // 无第三方依赖。使用独立的无头浏览器和本地模拟页面，不连接游戏、不使用玩家账号。
@@ -931,6 +932,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     };
     await crossFeatureTests({t,setupFeatures,reloadFeatures,evaluate,pulse,drive,until,withDelayedStockNavigation});
     await readLifecycleTests({t,setupShelter,setupFarm,setupFeatures,reloadFeatures,evaluate,pulse,drive,until});
+    await farmRecoveryTests({t,setupFarm,evaluate,drive,pulse});
     await t.test('启动恢复：正文迟到且页面一直加载时仍启动农场，保留人工暂停', async () => {
       // 此项在文档头部注入，不能像普通 setup 那样注入前清库；先卸载上一页并隔离其日志。
       await cdp.send('Page.navigate', { url:`${origin}/?test=${++pageSerial}` },tab.sessionId);

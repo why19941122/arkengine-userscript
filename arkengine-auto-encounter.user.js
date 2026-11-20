@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.147
+// @version      1.17.148
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -196,6 +196,11 @@
     const nodes=marked.length?marked:[...dialog.querySelectorAll(':scope > div')];
     return nodes.length===1?text(nodes[0]):'';
   }
+  function nativeCancelButton(dialog,usable) {
+    return [...dialog.querySelectorAll('button')].find(button=>
+      button.closest('[role="dialog"], [role="alertdialog"]')===dialog&&
+      /^(取消|关闭|Close)$/.test(button.getAttribute('aria-label')||(button.textContent||'').trim())&&usable(button));
+  }
   function cancelNativeWindow(w,dialogs,{usable,enqueue,say,pause}) {
     if(!w||!w.dialog)return false;
     if(w.manual){say('窗口已由你接手，保留原记录等待处理');return false;}
@@ -203,12 +208,11 @@
     if(dialogs.length!==1||dialogs[0]!==w.dialog){say('窗口归属已变化，保留原记录等待处理');return false;}
     if(w.failed){say('取消窗口失败，等待手动处理');return false;}
     if(w.closeAt&&Date.now()-w.closeAt<5000){say('等待原生窗口取消完成');return false;}
-    const candidates=[...w.dialog.querySelectorAll('button')].filter(b=>/^(取消|关闭|Close)$/.test(b.getAttribute('aria-label')||(b.textContent||'').trim()));
-    const button=candidates.length===1?candidates[0]:null;
-    if((w.closeAttempts||0)>=2||!usable(button)&&Date.now()-(w.cancelAt??=Date.now())>=15000){
-      w.failed=true;pause('原生窗口无法自动关闭，已停止点击并保留记录；请手动关闭后重新开启');return false;
+    const button=nativeCancelButton(w.dialog,usable);
+    if((w.closeAttempts||0)>=2||!button&&Date.now()-(w.cancelAt??=Date.now())>=15000){
+      w.failed=true;pause(`${w.pauseAfter||w.cancelReason||'取消原操作'}；原生窗口无法自动关闭，已停止点击并保留记录；请手动关闭后重新开启`);return false;
     }
-    if(!usable(button)){say('等待原生取消或关闭按钮可用');return false;}
+    if(!button){say('等待原生取消或关闭按钮可用');return false;}
     enqueue(button,()=>{if(w.manual||!w.dialog.isConnected)return;w.closeAttempts=(w.closeAttempts||0)+1;w.closeAt=Date.now();});
     return false;
   }
@@ -1631,7 +1635,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.147';
+  const SCRIPT_VERSION = '1.17.148';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -19502,8 +19506,20 @@ installShelterPlanningWorker(self);
     if (data.crops.length !== s.entries.length || empty.length !== s.empty.length ||
         data.plots.length !== s.total) return { error: '农场种植地块发生变化，请重新检查' };
     if (data.stamina.current < empty.length) return { error: '最新体力不足以种满空地，请恢复后检查' };
-    const candidates = [];
-    const seen = new Set();
+    const sourceControls=[...dialog.querySelectorAll('label')].filter(label=>textOf(label).startsWith('种源与品质'));
+    const source=sourceControls.length?sourceControls[0].querySelector('select')?.value:'inventory';
+    if(sourceControls.length>1||!['safe','normal','fine','rare','shop','auto','inventory'].includes(source))
+      return {error:'当前种源与品质无法核对，暂不种植'};
+    const stock=new Map(),seedsByName=new Map();
+    for(const item of data.inventory)if(source!=='shop'&&(source==='safe'?item.quality==='normal':
+        ['auto','inventory'].includes(source)||item.quality===source))
+      stock.set(item.seedKey,(stock.get(item.seedKey)??0)+item.quantity);
+    for(const seed of data.seeds){
+      const name=seed.name,matches=seedsByName.get(name);
+      if(matches)matches.push(seed);else seedsByName.set(name,[seed]);
+    }
+    const usePouch=['safe','auto','inventory'].includes(source);
+    let best=null;
     for (const button of dialog.querySelectorAll('button')) {
       if (!usable(button)) continue;
       const name = textOf(button.querySelector('span.font-semibold'));
@@ -19512,12 +19528,11 @@ installShelterPlanningWorker(self);
       const text = textOf(button);
       const free = text.match(/免费\s*·\s*存货\s*(\d+)/);
       if (!free || +free[1] < s.empty.length) continue; // 不自动补购种子。
-      const seeds = data.seeds.filter(seed => seed.name === name);
+      const seeds = seedsByName.get(name)||[];
       if (seeds.length !== 1) return { error: `${name}的种子数据无法核对` };
       const seed = seeds[0];
-      const available = (data.seedPouch?.[seed.key] || 0) + data.inventory.filter(i => i.seedKey === seed.key).reduce((sum,i) => sum+i.quantity,0);
-      if (available < empty.length || (seed.minSoilLevel || 0) > (data.soilLevel || 0)) continue;
-      seen.add(name);
+      const available = (usePouch?data.seedPouch?.[seed.key]??0:0) + (stock.get(seed.key)??0);
+      if (!(available >= empty.length) || (seed.minSoilLevel || 0) > (data.soilLevel || 0)) continue;
       const cost = button.querySelector('[title*="种植消耗"]')?.title.match(/种植消耗\s*(\d+)\s*体力/);
       if (!cost || Number(cost[1]) !== 1) return { error: '种植体力规则变化，请手动核对' };
       if (farmCrop !== 'auto' && name === farmCrop) return { button, name, description: `指定种植：${name}；每块留种 1 份` };
@@ -19535,12 +19550,10 @@ installShelterPlanningWorker(self);
       // 统一作物长期循环：全场一轮需 2N 体力，每块减一份留种。
       const cycle = Math.max(growth, 2 * data.plots.length * regen);
       const income = harvest * price * 3600000 / cycle;
-      candidates.push({ button, name, income });
+      if(!best||income>best.income)best={button,name,income};
     }
     if (farmCrop !== 'auto') return { error: `${farmCrop}未解锁或免费存货不足，暂不种植` };
-    if (!candidates.length || !seen.size) return { error: '没有足够免费存货的可选作物，暂不种植' };
-    candidates.sort((a,b) => b.income - a.income);
-    const best = candidates[0];
+    if (!best) return { error: '没有足够免费存货的可选作物，请核对当前种源与品质或补足存货后开启农场' };
     return { ...best, description: `当前选 ${best.name}：留种后约 ${best.income.toFixed(1)} 代币/小时（普通品质）` };
   }
   for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
@@ -19552,6 +19565,7 @@ installShelterPlanningWorker(self);
   }
   function requestSeedClose(reason,pauseAfter='') {
     if(!seedWindow||seedWindow.dialog!==ownSeedDialog){say('种子窗口归属无法核对，等待处理');return;}
+    if(!seedWindow.cancelReason)log.add('farm-seed-blocked','记录选种窗口关闭原因',{reason:pauseAfter||reason,pending:Boolean(farmPlan)});
     seedWindow.cancelReason??=reason;seedWindow.pauseAfter||=pauseAfter;
     const dialogs=[...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].filter(visible);
     closeFeatureWindow(seedWindow,dialogs,'farm',pauseFarm);
@@ -19904,14 +19918,14 @@ installShelterPlanningWorker(self);
     if(!work||work.manual||!work.dialog||dialogs.length!==1||dialogs[0]!==work.dialog)return false;
     if(work.auctionCancelAt&&Date.now()-work.auctionCancelAt<5000)return true;
     if((work.auctionCancelCount||0)>=2){say('拍卖等待原生取消完成，请关闭未响应的弹窗');return true;}
-    const buttons=[...work.dialog.querySelectorAll('button')].filter(button=>/^(取消|关闭|Close)$/.test(button.getAttribute('aria-label')||textOf(button)));
-    if(buttons.length!==1||!usable(buttons[0]))return false;
+    const button=nativeCancelButton(work.dialog,usable);
+    if(!button)return false;
     work.auctionCancelAt=Date.now();work.auctionCancelCount=(work.auctionCancelCount||0)+1;
     if(work===shelterWorkConfirm){work.cancelling=true;work.ownerCancelled=true;}
     if(work===shelterWork||work===shelterSocialWork)work.closing=true;
     if(work===shelterRecallWork||work===shelterBuildWork)work.cancelled=true;
     if(work===shelterRescueWork)work.cancelReason='汽水拍卖优先';
-    buttons[0].click();schedule();return true;
+    button.click();schedule();return true;
   }
   const auctionNotice=createNoticeHandler(log,say,(button,key,label,before)=>{before();button.click();schedule();},usable);
   function auctionClearOtherDialogs(dialogs) {

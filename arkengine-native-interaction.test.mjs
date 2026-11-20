@@ -5,6 +5,17 @@ import vm from 'node:vm';
 
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const extract=name=>source.match(new RegExp(`^  function ${name}\\([^]*?^  }`,'m'))?.[0]||'';
+test('原生关闭：同一窗口多个关闭入口选择可用项，不借用内层窗口控件',()=>{
+  const buttons=[],owner={querySelectorAll:()=>buttons},nested={};
+  const button=(label,dialog=owner,enabled=true)=>({getAttribute:()=>label,textContent:label,
+    closest:()=>dialog,enabled});
+  const find=vm.runInNewContext(extract('nativeCancelButton')+'\nnativeCancelButton');
+  const cancel=button('取消'),close=button('关闭');
+  buttons.push(button('关闭',nested),button('确认'),button('关闭',owner,false),cancel,close);
+  assert.equal(find(owner,element=>element.enabled),cancel);
+  cancel.enabled=false;assert.equal(find(owner,element=>element.enabled),close);
+  close.enabled=false;assert.equal(find(owner,element=>element.enabled),undefined);
+});
 function setup(path='/farm'){
   const handlers=new Map(),counts={scans:0,cancels:0},dialogs=[];
   const context={location:{pathname:path},host:{},seedWindow:null,dispatchWindow:null,dungeonWindow:null,
