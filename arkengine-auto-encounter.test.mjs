@@ -50,7 +50,8 @@ const source = rawSource.replace('const logStore = createLogStore();', 'const lo
   .replace('function spend(entries,action,now) {','$& if(window.panelProbe)panelProbe.spend++;')
   .replace('function stockHint() {','$& if(window.panelProbe)panelProbe.ticks++;')
   .replace('function shelterCampaignPlan(m,cfg={},record={},target=14) {',
-    'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(typeof window!=="undefined"&&window.sm?.planCostMs&&!cfg.maintenanceOnly){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}' +
+    'function shelterCampaignPlan(m,cfg={},record={},target=14) { if(typeof window!=="undefined"&&window.sm?.maintenanceCostMs&&cfg.maintenanceOnly){clock+=sm.maintenanceCostMs;sm.maintenanceCalls=(sm.maintenanceCalls||0)+1;}' +
+    'if(typeof window!=="undefined"&&window.sm?.planCostMs&&!cfg.maintenanceOnly){clock+=sm.planCostMs;sm.planCalls=(sm.planCalls||0)+1;}' +
     'if(typeof window!=="undefined"&&window.sm?.executionPlanCostMs&&!cfg.maintenanceOnly&&(document.querySelector("[data-staff-dialog],[data-construction-dialog]")||sm.slowDeparture&&sm.tab==="废土")){' +
     'clock+=sm.executionPlanCostMs;sm.executionPlanCalls=(sm.executionPlanCalls||0)+1;}');
 const executable = [process.env.CHROME_PATH,

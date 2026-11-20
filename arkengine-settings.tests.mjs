@@ -297,6 +297,8 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
         const visible=()=>evaluate(`(()=>{const root=${panel},box=root.querySelector('.box'),button=root.getElementById('log-export'),rect=button.getBoundingClientRect(),bounds=box.getBoundingClientRect();
           return button.checkVisibility()&&rect.top>=bounds.top&&rect.bottom<=bounds.bottom&&rect.left>=0&&rect.right<=innerWidth&&rect.bottom<=innerHeight&&box.scrollWidth<=box.clientWidth;})()`);
         assert.ok(await visible(),`default ${width}x${height}`);
+        const buttons=await evaluate(`[...${panel}.querySelectorAll('.panel-tools button')].map(button=>{const rect=button.getBoundingClientRect();return {width:rect.width,height:rect.height,top:rect.top};})`);
+        assert.equal(buttons.length,2);assert.deepEqual(buttons[0],buttons[1],`matching toolbar buttons ${width}x${height}`);
         if(height>=667)assert.ok(await evaluate(`${panel}.querySelector('.box').scrollHeight<=${panel}.querySelector('.box').clientHeight`));
         if(process.env.ARKENGINE_TEST_SCREENSHOT_DIR){
           await mkdir(process.env.ARKENGINE_TEST_SCREENSHOT_DIR,{recursive:true});

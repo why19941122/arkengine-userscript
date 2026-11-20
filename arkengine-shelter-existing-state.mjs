@@ -14,8 +14,10 @@ export function createShelterExistingState() {
   const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));
   const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));
   const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
+    (r.upgradeUntil===undefined||r.role==='training'&&time(r.upgradeUntil)&&r.upgradeUntil>r.at&&r.until>r.upgradeUntil)&&
+    (r.existingTraining===undefined||r.existingTraining===true&&r.role==='training'&&r.purpose==='current'&&r.finishCurrent===true)&&
     (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
-      Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
+      Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining?(r.base+1)*60+10:130)*60000)&&
     (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&
       (r.purpose===undefined||['production','parent','current'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
       (r.purpose!=='current'||r.finishCurrent===true)&&
@@ -102,7 +104,7 @@ export function createShelterExistingState() {
       const p=s.residents.find(p=>p.id===r.id),d=state.defense.find(d=>d.id===r.id&&d.from===r.room&&p&&[d.room,null].includes(p.roomId));
       const current=p&&p.deadAt===null&&p.away===null&&p.adultAt<=now&&(p.roomId===r.room||d);
       const row={residentId:r.id,roomId:r.room,destination:r.destination??null,intentId:null,
-        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination','finishCurrent'])};
+        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination','finishCurrent','existingTraining','upgradeUntil'])};
       if(current){
         const due=r.role==='training'&&(p.stats[r.stat]>r.base||time(r.until)&&r.until<=now||time(r.windowEnd)&&r.windowEnd<=now);
         const returnAt=due?now:Math.min(windowEnd,r.until??windowEnd);

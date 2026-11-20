@@ -11,6 +11,30 @@ const view=(overrides={})=>({enabled:true,auction:{startsAt:'2026-11-20T20:00:00
   nextReleaseAt:'2026-11-20T20:20:00+08:00',...overrides}});
 const state={rounds:[],rejected:''};
 
+test('汽水拍卖：每轮只在提前两分钟至开拍一分钟内独占，间隔七分钟恢复其他玩法',()=>{
+  const auction=core.model(view());
+  for(const [time,active,release] of [
+    ['19:57:59',false,'20:00:00'],['19:58:00',true,'20:00:00'],['20:00:59',true,'20:00:00'],
+    ['20:01:00',false,'20:10:00'],['20:07:59',false,'20:10:00'],['20:08:00',true,'20:10:00'],
+    ['20:10:59',true,'20:10:00'],['20:11:00',false,'20:20:00'],['20:18:00',true,'20:20:00'],
+    ['20:58:00',false,'21:00:00'],['21:00:00',false,'21:00:00']]){
+    const visit=core.visit(auction,Date.parse('2026-11-20T'+time+'+08:00'));
+    assert.equal(visit.active,active,time);
+    assert.equal(visit.releaseAt,Date.parse('2026-11-20T'+release+'+08:00'),time);
+  }
+  assert.equal(core.visit(null,Date.parse('2026-11-20T20:05:00+08:00')).active,false);
+  assert.equal(core.visit(auction,Date.parse('2026-11-21T19:58:00+08:00')).active,true);
+  const shifted=core.model(view({startsAt:'2026-11-20T20:02:00+08:00'}));
+  assert.equal(core.visit(shifted,Date.parse('2026-11-20T20:00:00+08:00')).active,true);
+  assert.equal(core.visit(shifted,Date.parse('2026-11-20T20:03:00+08:00')).active,false);
+});
+test('汽水拍卖：开拍前不补买上一批，离场时间后不新开订单',()=>{
+  const auction=core.model(view());
+  for(const time of ['20:01:00','20:07:59','20:08:00','20:09:59','20:11:00'])
+    assert.equal(core.decision(auction,state,2000000,Date.parse('2026-11-20T'+time+'+08:00')).kind,'wait',time);
+  assert.equal(core.decision(auction,state,2000000,now).kind,'buy');
+});
+
 test('汽水拍卖：严格低于40万，一轮一瓶，每十分钟新批仍参与，不硬编码每日瓶数',()=>{
   for(const price of [0,400000,400001])assert.equal(core.decision(core.model(view({price})),state,2000000,now).kind,'wait');
   const first=core.decision(core.model(view()),state,2000000,now);assert.equal(first.kind,'buy');

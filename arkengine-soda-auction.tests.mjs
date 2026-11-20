@@ -6,6 +6,74 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  await t.test('汽水拍卖：20:01离场继续奇遇，20:08回来，连续两轮按窗口抢占',async()=>{
+    await setupAuction(`localStorage.setItem('arkengine:auto-encounter:enabled:v1','true');
+      localStorage.setItem('arkengine:auto-dungeon:enabled:v1','false');
+      localStorage.setItem('arkengine:auto-farm:schedule:v1',JSON.stringify({nextAt:clock+3600000,expeditionAt:clock+3600000,expeditionReviewAt:clock+3600000}));`);
+    await ready();
+    for(const [leave,returnAt,release,orders] of [['20:01:00','20:08:00','20:10:00',2],['20:11:00','20:18:00','20:20:00',3]]){
+      const completed=await evaluate("cm.calls.filter(call=>call==='choose').length");
+      await evaluate(`clock=Date.parse('2026-11-20T${leave}+08:00');renderFeature();`);await pulse(0);
+      try{await drive(`location.pathname==='/cultivate'&&cm.calls.filter(call=>call==='choose').length>${completed}`,'ordinary encounter between auctions');}
+      catch(error){throw Error(error.message+' '+JSON.stringify({leave,completed,...await evaluate(`({clock,cm,path:location.pathname,
+        schedule:localStorage.getItem('arkengine:auto-encounter:schedule:v1'),
+        events:(await window.__arkTestLogs.read('cultivate',undefined,Infinity)).events.slice(-8)})`)}));}
+      const reads=await evaluate('am.reads.length');await pulse(15000);
+      assert.equal(await evaluate('am.reads.length'),reads,'no auction polling between windows');
+      await evaluate(`clock=Date.parse('2026-11-20T${returnAt}+08:00')-1;renderFeature();`);await pulse(0);
+      assert.equal(await evaluate('location.pathname'),'/cultivate');
+      await pulse(1);
+      await until(()=>evaluate("location.pathname==='/shelter'&&sm.tab==='汽水交易'"),'next early auction visit');
+      assert.equal(await evaluate('am.posts.length'),orders-1);
+      await fresh(`clock=Date.parse('2026-11-20T${release}+08:00');am.view.auction.released=${orders*3};am.view.auction.available=3;`);
+      await until(()=>evaluate(`am.posts.length===${orders}`),'next timed auction purchase');
+    }
+  });
+  await t.test('汽水拍卖：超价和售罄都只等到本轮一分钟，刷新不重新占用空档',async()=>{
+    await setupAuction('am.view.auction.price=400000;');
+    await until(()=>evaluate("sm.tab==='汽水交易'"),'unaffordable auction window');
+    await fresh("clock=Date.parse('2026-11-20T20:01:00+08:00');am.view.auction.available=0;");
+    await drive("location.pathname==='/activities/expedition'",'leave unsold auction window');
+    await reloadAuction();await pulse(0);
+    assert.equal(await evaluate('am.posts.length'),0);
+    assert.doesNotMatch(await status(),/汽水拍卖优先|驻留汽水交易/);
+    await evaluate("clock=Date.parse('2026-11-20T20:08:00+08:00');sm.tab='避难所';renderFeature();");await pulse(0);
+    await until(()=>evaluate("sm.tab==='汽水交易'"),'resume next window after reload');
+    assert.equal(await evaluate('am.posts.length'),0);
+  });
+  await t.test('汽水拍卖：一分钟到期取消未提交确认，按钮随后恢复也不会买入',async()=>{
+    await setupAuction('am.confirmDisabled=true;');
+    await until(()=>evaluate('!!document.getElementById("auction-confirm")'),'confirmation waiting at deadline');
+    await evaluate("clock=Date.parse('2026-11-20T20:01:00+08:00');document.getElementById('auction-confirm').disabled=false;");
+    await pulse(0);
+    await drive("location.pathname==='/activities/expedition'",'cancel and leave at deadline');
+    assert.equal(await evaluate('am.posts.length'),0);
+    assert.equal(await evaluate(`${state}.pending`),null);
+    assert.equal(await evaluate('am.clicks.filter(click=>click.type==="cancel").length'),1);
+  });
+  await t.test('汽水拍卖：未决原单在离场后继续保留，迟到成交只记一次',async()=>{
+    await setupAuction("am.mode='hold';");await ready();
+    const original=await evaluate(`${state}.pending`);
+    await evaluate("clock=Date.parse('2026-11-20T20:01:00+08:00');");await pulse(0);
+    await drive("location.pathname==='/activities/expedition'",'leave while original response pending');
+    assert.equal((await evaluate(`${state}.pending`)).id,original.id);
+    await evaluate('finishAuction();');
+    await until(()=>evaluate(`${state}.pending===null`),'late receipt after timed departure');
+    assert.equal(await evaluate('am.posts.length'),1);
+    await until(()=>evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='soda-auction-bought').length===1`),'one late receipt after departure');
+  });
+  await t.test('汽水拍卖：未知原单不占用七分钟空档，下轮仍返回拍卖且不重买',async()=>{
+    await setupAuction("am.mode='retry';");await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'unknown auction response');
+    const original=await evaluate(`${state}.pending.id`);
+    await evaluate("clock=Date.parse('2026-11-20T20:01:00+08:00');");await pulse(0);
+    await drive("location.pathname==='/activities/expedition'",'unknown order yields between rounds');
+    await evaluate("clock=Date.parse('2026-11-20T20:08:00+08:00');");await pulse(0);
+    await until(()=>evaluate("location.pathname==='/shelter'&&sm.tab==='汽水交易'"),'unknown order returns next window');
+    await fresh("clock=Date.parse('2026-11-20T20:10:00+08:00');am.view.auction.released=6;");
+    assert.equal(await evaluate('am.posts.length'),1);
+    assert.equal(await evaluate(`${state}.pending.id`),original);
+  });
   await t.test('汽水拍卖：默认开启，提前两分钟驻留，其他玩法和到期远征均让路',async()=>{
     await setupAuction(`clock=Date.parse('2026-11-20T19:57:59+08:00');am.view.auction.live=false;
       localStorage.setItem('arkengine:auto-farm:enabled:v1','true');localStorage.setItem('arkengine:auto-encounter:enabled:v1','true');

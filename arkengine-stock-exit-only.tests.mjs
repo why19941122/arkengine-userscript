@@ -4,6 +4,39 @@ export async function stockExitOnlyTests({t,setupStock,reloadStock,evaluate,puls
   const ledger=`JSON.parse(localStorage.getItem('arkengine:auto-stock:ledger:v1'))`,done=`location.pathname==='/activities/expedition'`;
   const settings=`localStorage.setItem('arkengine:auto-stock:config:v1',JSON.stringify({trade:true,predict:true,
     tradeLimit:3000,predictionLimit:500,stake:100,reserve:100}));`;
+  await t.test('股市空转浏览器：停滞旧仓逐步降频，刷新不提前回访，手动检查恢复后照常兑现盈利',async()=>{
+    await setupStock(settings+`km.saleReceipt=true;km.view.stocks[0].stale=true;km.view.stocks[0].priceCents=1000;
+      km.view.positions=[{stockId:1,shares:100,costBasisTokens:1000,holdUntil:null}];
+      localStorage.setItem('arkengine:auto-stock:ledger:v1',JSON.stringify({version:1,userId:77,nextAt:0,note:'旧仓',hold:false,
+        entries:[],pending:null,owned:{'1':{shares:100,cost:1000,modelName:'模型甲',manual:false}}}));`);
+    await drive(done,'initial stagnant position');
+    for(const delay of [300000,900000,1800000]){
+      assert.equal(await evaluate(`${ledger}.idleCheck.delay`),delay);
+      const due=await evaluate(`${ledger}.nextAt`);
+      await reloadStock();await drive(done,'reload preserves idle appointment');
+      assert.equal(await evaluate(`${ledger}.nextAt`),due);
+      const reads=await evaluate('km.reads');await pulse(60000);
+      assert.equal(await evaluate('km.reads'),reads,'no early stock requests');
+      assert.equal(await evaluate('km.calls.length'),0);
+      if(delay===1800000)break;
+      await pulse(await evaluate(`${ledger}.nextAt-clock+1`));
+      await drive(`${ledger}.nextAt>${due}&&${done}`,'next idle appointment');
+    }
+    await evaluate(`km.view.stocks[0].priceCents=1050;document.getElementById('ark-auto-expedition').shadowRoot.getElementById('stock-check').click();`);
+    await drive(`km.calls.length===1&&!${ledger}.pending`,'manual recheck sells profitable old lot');
+    assert.equal(await evaluate('km.calls[0].action'),'sell');
+    assert.equal(await evaluate(`${ledger}.entries[0].proceeds`),1023);
+    assert.equal(await evaluate(`${ledger}.entries[0].releasedCost`),1000);
+  });
+  await t.test('股市空转浏览器：空仓每小时核对，原单未知仍按原节奏保留核对',async()=>{
+    await setupStock(settings);await drive(done,'empty stock account');
+    assert.equal(await evaluate(`${ledger}.idleCheck.delay`),3600000);
+    const reads=await evaluate('km.reads');await pulse(300000);
+    assert.equal(await evaluate('km.reads'),reads);assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+    await setupStock(settings+stockHistoricalRequest({result:null}));await drive(done,'unknown original stock request');
+    assert.equal(await evaluate(`${ledger}.idleCheck`),null);
+    assert.equal(await evaluate(`${ledger}.pending.key`),'old-buy-request');
+  });
   await t.test('整合股市浏览器：保存旧买卖及预测开关也只观察，新买与下注均不发送',async()=>{
     await setupStock(settings+`km.view.rounds=[{id:42,stockId:1,ruleVersion:2,oddsBp:180,
       lockAt:new Date(clock+240000).toISOString(),closeAt:new Date(clock+900000).toISOString()}];`);

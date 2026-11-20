@@ -221,6 +221,63 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     for(const p of s.residents){p.stats.agi=10;p.training=0;}
     s.residents[5].roomId=4;Object.assign(s.residents[4],{roomId:30,xp:0,hp:100,training:0});
     localStorage.setItem('arkengine:auto-shelter:staff:v1','production');${extra}`);
+  await t.test('训练室升级浏览器：40%及90%跨刷新不调岗、不弹确认，完成一格才返岗',async()=>{
+    await setupShelter(scene({training:true},`sm.ui20261109=true;
+      s.rooms.push({...s.rooms[0],id:79,type:'training',trainStat:'per',floor:3,col:2,level:2,upgradeAt:clock+3*3600000});
+      for(const [index,progress] of [[4,.4],[5,.9]])Object.assign(s.residents[index],
+        {roomId:79,xp:0,hp:100,training:progress,stats:{...s.residents[index].stats,per:4}});
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'升级前当前格训练',campaign:{
+        roles:[{id:5,room:79,role:'training',at:clock-600000,stat:'per',base:4,purpose:'production',finishCurrent:true,
+          until:clock+2*3600000,windowEnd:clock+168*3600000,destination:3}],trips:[],attempts:[],heals:[],trainingRest:[]}}));
+      sm.trainingPrompts=0;const confirm=fixtureConfirm;window.fixtureConfirm=(...args)=>{sm.trainingPrompts++;return confirm(...args);};`));
+    await settle('upgrading training room preserves both residents');
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&[5,6].includes(call.residentId))'),false);
+    const roles=await evaluate(`${state}.campaign.roles.filter(role=>[5,6].includes(role.id))`);
+    assert.equal(roles.length,2);assert.ok(roles.every(role=>role.upgradeUntil&&role.until>role.upgradeUntil));
+    assert.equal(await evaluate('sm.trainingPrompts'),0);
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&[5,6].includes(call.residentId))'),false);
+    await reloadCampaign();await settle('upgrading training survives refresh');
+    assert.deepEqual(await evaluate(`${state}.campaign.roles.filter(role=>[5,6].includes(role.id))`),roles);
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&[5,6].includes(call.residentId))'),false);
+    await evaluate(`const room=sm.view.state.rooms.find(room=>room.id===79);clock=room.upgradeAt+1;room.upgradeAt=null;room.level=3;
+      sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;
+      for(const person of sm.view.state.residents.filter(person=>[5,6].includes(person.id))){person.stats.per=5;person.training=0;}
+      ${panel}.getElementById('shelter-check').click();`);
+    await drive(`sm.view.state.residents.filter(person=>[5,6].includes(person.id)).every(person=>person.roomId!==79)&&!${pending}`,
+      'completed upgraded training returns',160);
+    assert.deepEqual(await evaluate('sm.assignmentOrigins.filter(call=>call.from===79).map(call=>call.residentId).sort()'),[5,6]);
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5&&call.roomId===3).length'),1);
+  });
+  await t.test('训练确认计算复用：维护核对七百毫秒，完成训练后有限读取即返岗',async()=>{
+    await setupShelter(trainingConfirmScene(`sm.maintenanceCostMs=700;sm.trainingReads=0;
+      const read=window.fetch;window.fetch=(url,options)=>{
+        if(url==='/api/shelter'&&document.querySelector('[role="alertdialog"]'))sm.trainingReads++;
+        return read(url,options);};`));
+    await drive(`Boolean(document.querySelector('[role="alertdialog"]'))`,'training confirmation opens');
+    const openedAt=await evaluate('clock');
+    await drive(`sm.calls.some(call=>call.type==='assign'&&call.residentId===5)&&!${pending}`,'bounded training confirmation',30);
+    assert.ok(await evaluate(`clock-${openedAt}<20000`));
+    assert.ok(await evaluate('sm.trainingReads<=2'));
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),1);
+    assert.equal(await evaluate(`document.querySelector('[role="alertdialog"]')`),null);
+  });
+  await t.test('孙小满训练浏览器：手动智力25%及零进度不因没有零件岗位退出，刷新仍完成同一格',async()=>{
+    await setupShelter(scene({training:true},`sm.ui20261109=true;
+      s.rooms.push({...s.rooms[0],id:466,type:'training',trainStat:'int',floor:3,col:2,level:3});
+      for(const [index,progress] of [[4,.25],[5,0]])Object.assign(s.residents[index],
+        {roomId:466,xp:0,hp:100,training:progress,stats:{...s.residents[index].stats,int:7}});
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      sm.trainingPrompts=0;const confirm=fixtureConfirm;window.fixtureConfirm=(...args)=>{sm.trainingPrompts++;return confirm(...args);};`));
+    await settle('manual training without immediate production purpose remains');
+    assert.equal(await evaluate('sm.trainingPrompts'),0);
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&[5,6].includes(call.residentId))'),false);
+    const roles=await evaluate(`${state}.campaign.roles.filter(role=>[5,6].includes(role.id))`);
+    assert.equal(roles.length,2);assert.ok(roles.every(role=>role.existingTraining&&role.base===7));
+    await reloadCampaign();await settle('manual training fixed deadlines survive refresh');
+    assert.deepEqual(await evaluate(`${state}.campaign.roles.filter(role=>[5,6].includes(role.id))`),roles);
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&[5,6].includes(call.residentId))'),false);
+  });
   await t.test('141魅力训练浏览器：64.3%及25%都保留当前格，刷新不弹离岗确认也不延长期限',async()=>{
     await setupShelter(scene({training:true},`sm.ui20261109=true;sm.simulateResources=true;
       s.rooms.push({...s.rooms[0],id:79,type:'training',trainStat:'cha',floor:3,col:2,level:3});
@@ -4847,6 +4904,19 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
           window.addEventListener('focus',check);});};`));
     await drive(`sm.calls.some(c=>c.type==='explore_recall')&&!${pending}`,'slow recall read completes without cancelling',80);
     assert.equal(await evaluate('sm.delayedRecallReads'),1);
+    assert.equal(await evaluate('sm.recallOpens'),1);
+    assert.deepEqual(await evaluate('sm.calls.map(c=>[c.type,c.explorerId])'),[['explore_recall',11]]);
+  });
+  await t.test('召回计算复用：维护核对每次耗时七百毫秒，确认不陷入重读循环',async()=>{
+    await setupShelter(scene({explore:true},recallScreenshotScene+`sm.maintenanceCostMs=700;
+      sm.recallReads=0;const read=window.fetch;window.fetch=(url,options)=>{
+        if(url==='/api/shelter'&&document.querySelector('[role="dialog"]'))sm.recallReads++;
+        return read(url,options);};`));
+    await drive(`sm.recallOpens===1`,'recall opened before expensive verification');
+    const openedAt=await evaluate('clock');
+    await drive(`sm.calls.some(c=>c.type==='explore_recall')&&!${pending}`,'bounded recall verification',30);
+    assert.ok(await evaluate(`clock-${openedAt}<20000`),'recall finishes within twenty simulated seconds');
+    assert.ok(await evaluate('sm.recallReads<=2'),'one fresh confirmation read and at most one reconciliation read');
     assert.equal(await evaluate('sm.recallOpens'),1);
     assert.deepEqual(await evaluate('sm.calls.map(c=>[c.type,c.explorerId])'),[['explore_recall',11]]);
   });

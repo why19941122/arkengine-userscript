@@ -101,6 +101,35 @@ test('existing state: current-cell protection imports only its actual training s
   assert.throws(()=>load(v,broken),/Invalid inherited role/);
 });
 
+test('existing state: training upgrade wait survives import without extending the remaining cell budget',()=>{
+  const view=scene(),saved=schedule();training(saved,view);
+  const role=saved.campaign.roles[0];
+  Object.assign(role,{finishCurrent:true,upgradeUntil:start+3*hour,until:start+4*hour});
+  view.state.rooms.find(room=>room.id===7).upgradeAt=role.upgradeUntil;
+  const {node,blocked}=load(view,saved);assert.deepEqual(blocked,[]);
+  assert.equal(node.existing.roles[0].record.upgradeUntil,role.upgradeUntil);
+  assert.equal(node.existing.roles[0].record.until,role.until);
+  for(const change of [{upgradeUntil:role.at},{upgradeUntil:role.until},{upgradeUntil:'later'},
+    {until:role.upgradeUntil+131*60000}]){
+    const broken=structuredClone(saved);Object.assign(broken.campaign.roles[0],change);
+    assert.throws(()=>load(view,broken),/Invalid inherited role/);
+  }
+});
+
+test('existing state: manually started full cell keeps its finite deadline and rejects unrelated or unbounded markers',()=>{
+  const view=scene(),saved=schedule();training(saved,view);
+  const role=saved.campaign.roles[0];
+  Object.assign(role,{purpose:'current',finishCurrent:true,existingTraining:true,until:start+6*hour});
+  delete role.destination;delete role.windowEnd;
+  const {node,blocked}=load(view,saved);assert.deepEqual(blocked,[]);
+  assert.equal(node.existing.roles[0].record.existingTraining,true);assert.equal(node.existing.roles[0].record.until,role.until);
+  for(const change of [{existingTraining:'true'},{existingTraining:false},{purpose:'parent'},
+    {until:role.at+11*hour},{finishCurrent:undefined}]){
+    const broken=structuredClone(saved);Object.assign(broken.campaign.roles[0],change);
+    assert.throws(()=>load(view,broken),/Invalid inherited role/);
+  }
+});
+
 test('existing state: conflicts already present in native roles remain visible instead of dropping a commitment',()=>{
   const v=scene(),s=schedule();training(s,v);
   const p=v.state.residents.find(p=>p.id===6);p.roomId=7;p.training=.2;

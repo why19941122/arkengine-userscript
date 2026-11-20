@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.143
+// @version      1.17.145
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -964,6 +964,24 @@
             '尚未触发净收益8%、净亏损6%或行情转弱的退出条件');
       });
     }
+    function idleRecheck(m,config,ledger,now) {
+      if(!m.view.enabled||config.newBuy!==false||config.predict||!config.trade||config.observeOnly||ledger.userId!==m.view.userId||
+          ledger.pending||ledger.hold||ledger.periodRequest||ledger.accountingWait||ledger.rejectionCooldownUntil>now||
+          ledger.entries.some(entry=>entry.result==='reserved'||entry.action==='predict'&&entry.result==='success'&&!entry.settlement))return null;
+      const positions=positionReport(m,ledger,now);
+      if(!positions.length){
+        if(Object.keys(ledger.owned).length||m.view.positions.some(position=>position.shares>0))return null;
+        return {signature:'empty',repeats:0,at:now,delay:3600000};
+      }
+      if(positions.some(position=>position.status!=='holding'||
+          m.view.stocks.find(stock=>String(stock.id)===position.stockId)?.stale!==true))return null;
+      const signature=JSON.stringify([m.rules.sellFeePct,
+        positions.map(position=>[position.stockId,position.modelName,position.shares,position.cost,position.estimatedNet,position.holdUntil,
+          m.view.stocks.find(stock=>String(stock.id)===position.stockId).priceCents])]);
+      const previous=ledger.idleCheck;
+      const repeats=previous?.signature===signature&&whole(previous.repeats)&&previous.at<=now?Math.min(2,previous.repeats+1):0;
+      return {signature,repeats,at:now,delay:[300000,900000,1800000][repeats]};
+    }
     function marketShape(view) {
       // Only names/types from the already accepted response. Unknown numeric values
       // are not collected or interpreted as model usage, error rates or price drivers.
@@ -1484,7 +1502,7 @@
       if(!bet||bet.roundId!==a.roundId||bet.direction!==a.direction||bet.betTokens!==a.betTokens)return null;
       return {betId:bet.id,...(bet.settled===true&&whole(bet.payoutTokens)?{payout:bet.payoutTokens}:{})};
     }
-    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleAmount,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,accountBudget,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,unlockRecheck,positionReport,observationParts,marketShape,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
+    return {whole,positive,id,sameStockId,time,quote,sharesFor,saleAmount,saleSharesFor,model,uniqueBet,trend,marketSummary,entryTime,spend,websiteLimits,funding,accountBudget,account,accountRuntime,beginPeriod,historyTotals,performance,riskExposure,riskReason,sellPlan,exitPlans,unlockRecheck,positionReport,idleRecheck,observationParts,marketShape,choose,decisionDiagnostics,diagnosticParts,recoveryWait,waitReason,input,same,receipt,saleProceeds,saleReward,saleReceiptShape,incomeInput,incomeBefore,incomeProof};
   })();
   // STOCK_CORE_END
 
@@ -1508,10 +1526,19 @@
     function round(auction,now) {
       return `${auction.startsAt}:${auction.released??Math.max(0,Math.floor((now-auction.startsAt)/600000))}`;
     }
+    function visit(auction,now) {
+      const current=auction?.day===day(now)?auction:null;
+      const startsAt=current?.startsAt??start(now),endsAt=current?.endsAt??Date.parse(day(now)+'T23:59:59.999+08:00');
+      let releaseAt=startsAt+Math.max(0,Math.floor((now-startsAt)/600000))*600000;
+      if(now>=releaseAt+60000)releaseAt+=600000;
+      const opensAt=releaseAt-120000,closesAt=Math.min(releaseAt+60000,endsAt);
+      return {releaseAt,opensAt,closesAt,active:releaseAt<endsAt&&now>=opensAt&&now<closesAt};
+    }
     function decision(auction,state,balance,now) {
       if(!auction||auction.day!==day(now))return {kind:'read'};
       if(now>=auction.endsAt||auction.remaining===0||auction.boughtToday>=auction.perUserDaily)return {kind:'done'};
-      if(now<auction.startsAt||!auction.live)return {kind:'wait',reason:'等待开拍'};
+      const window=visit(auction,now);
+      if(!window.active||now<window.releaseAt||!auction.live)return {kind:'wait',reason:'等待本轮开拍'};
       const batch=round(auction,now);
       if(state.rounds.includes(batch))return {kind:'wait',reason:'本轮已买 1 瓶，守候下一轮'};
       if(!auction.available)return {kind:'wait',reason:'本轮已售罄，守候下一批'};
@@ -1528,7 +1555,7 @@
           /售罄|卖完|库存不足|余额不足|代币不足|拍满|限额|上限|已结束|未开始|未开放|价格.*(?:变化|变动|超过)/.test(body.error))return 'rejected';
       return 'unknown';
     }
-    return {whole,day,start,model,round,decision,outcome};
+    return {whole,day,start,model,round,visit,decision,outcome};
   }
 
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
@@ -1591,7 +1618,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.143';
+  const SCRIPT_VERSION = '1.17.145';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -1605,9 +1632,8 @@
     style.textContent=`.panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
       .panel-heading{min-width:0}.panel-heading strong{display:block;font-size:13px}
       .panel-header{position:sticky;top:-12px;z-index:1;background:#1b2033;padding:8px 0}
-      .panel-tools{display:flex;align-items:center;gap:6px}.panel-tools button{min-height:36px;padding:4px 8px}
+      .panel-tools{display:flex;align-items:center;gap:6px;flex-shrink:0}.panel-tools button{box-sizing:border-box;width:64px;min-height:36px;padding:4px 6px;white-space:nowrap}
       .panel-version{display:block;color:#acbde1;font-size:11px}
-      #panel-fold{flex-shrink:0;min-height:28px;padding:2px 8px}
       #panel-content[hidden]{display:none}
       .panel-section{margin-top:8px;border:1px solid #616e9c;border-radius:4px;overflow-wrap:anywhere}
       .panel-section>summary{padding:0 10px;font-weight:600;background:#252d45}
@@ -1679,12 +1705,12 @@
       !(event.data?.blockedMs>=90000)&&!(event.data?.attempt>0));
   const normalLog = event => routineLog(event)||['state', 'heartbeat'].includes(event.type) ||
     event.type === 'request-result' && event.data?.status >= 200 && event.data.status < 400;
-  const LOG_PRIORITY_VERSION = 8;
+  const LOG_PRIORITY_VERSION = 9;
   const criticalLog = event => Boolean(event.receiptId) || !routineLog(event)&&([
     'stock-submit','stock-response','stock-confirmed','stock-income','stock-prediction-settled',
     'shelter-submitted','shelter-prepared','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed','shelter-work-cancelled','shelter-assignment-reconciled',
     'shelter-population','shelter-training-adopted','shelter-defense-settled','shelter-trips-recovered','shelter-rescue-rejected',
-    'shelter-execution-evidence','shelter-recall-cancelled','shelter-user-interaction','shelter-paused',
+    'shelter-execution-evidence','shelter-recall-cancelled','shelter-recall-opened','shelter-recall-control-wait','encounter-quota','shelter-user-interaction','shelter-paused',
     'page-lifecycle','reward','pause',
   ].includes(event.type) || /-(error|held|blocked|recovered|resumed)$/.test(event.type) ||
     event.type==='request-result' && Number.isFinite(event.data?.status) && event.data.status>=400);
@@ -2684,11 +2710,12 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let encounterSchedule = loadState(localStorage, ENCOUNTER_SCHEDULE, { nextAt: 0, note: '' }, 'cultivate',
     value => objectState(value) && Number.isFinite(value.nextAt) && typeof value.note === 'string');
   function planEncounter(nextAt, note) {
+    if(encounterSchedule.nextAt===nextAt&&encounterSchedule.note===note)return;
     encounterSchedule = { nextAt, note };
     localStorage.setItem(ENCOUNTER_SCHEDULE, JSON.stringify(encounterSchedule));
     setPanelText(last, note);
   }
-  const nextDailyReset=()=>Math.floor((Date.now()+4*3600000)/86400000)*86400000+86400000-4*3600000;
+  const nextDailyReset=(hour=4)=>Math.floor((Date.now()+(8-hour)*3600000)/86400000)*86400000+86400000-(8-hour)*3600000;
   if (encounterSchedule.note === '今日奇遇次数已用完，一小时后核对网页额度') {
     const resetAt = nextDailyReset(), observedAt = encounterSchedule.nextAt - 3600000;
     encounterSchedule = observedAt >= resetAt - 86400000 && observedAt <= Date.now() ?
@@ -3023,13 +3050,19 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
 
     if (pendingOperation()) { say('等待原奇遇请求结束，保留原记录'); return; }
 
-    if (!encounterAction && encounterSchedule.nextAt > Date.now()) {
+    const buttons = [...document.querySelectorAll('button')].filter(visible);
+    const quotaTexts = [...document.querySelectorAll('p, span, [aria-live]')].filter(visible).map(textOf);
+    const exhausted = buttons.some(button =>
+      /(?:今日|每日).*(?:次数.*(?:用完|用尽|耗尽)|(?:已达|达到).*上限)/.test(textOf(button))) ||
+      quotaTexts.some(text =>
+        /^(?:今日|每日)\s*(?:奇遇\s*)?(?:剩余|剩余次数)\s*[:：]?\s*0\s*\/\s*24\s*次?$/.test(text) ||
+        /^(?:今日|每日)\s*奇遇\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次?$/.test(text) ||
+        /^(?:今日|每日)\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次\s*奇遇(?:\s*[,。;]|$)/.test(text));
+    if (!encounterAction && encounterSchedule.nextAt > Date.now() && !exhausted) {
       if (!visitDungeon()) returnToExpedition();
       return;
     }
-
-    const cooldown = [...document.querySelectorAll('button')].find(el =>
-      visible(el) && /^奇遇冷却\s/.test(textOf(el)));
+    const cooldown = buttons.find(el => /^奇遇冷却\s/.test(textOf(el)));
     if (cooldown) {
       // 先确认上一轮已结束，避免同样的下一轮选项被旧重试记录挡住。
       lastAction = null;
@@ -3037,17 +3070,17 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       recoveryBudget.clear('encounter');
       recoveryBudget.clear('encounter-original');
     }
-    const exhausted = [...document.querySelectorAll('button')].filter(visible).some(button =>
-      /(?:今日|每日).*(?:次数.*(?:用完|用尽|耗尽)|(?:已达|达到).*上限)/.test(textOf(button))) ||
-      [...document.querySelectorAll('p, span, [aria-live]')].filter(visible).some(element =>
-        /^(?:今日|每日)\s*(?:奇遇\s*)?(?:剩余|剩余次数)\s*[:：]?\s*0\s*\/\s*24\s*次?$/.test(textOf(element)) ||
-        /^(?:今日|每日)\s*奇遇\s*(?:已用|已完成|已寻访)\s*[:：]?\s*24\s*\/\s*24\s*次?$/.test(textOf(element)));
     if (exhausted && encounterAction?.kind === 'choose') {
       saveEncounterAction(null);
       recoveryBudget.clear('encounter');
       recoveryBudget.clear('encounter-original');
     }
-    if (exhausted) planEncounter(nextDailyReset(), '今日奇遇次数已用完，北京时间4点刷新后核对网页额度');
+    if (exhausted) {
+      const midnight = quotaTexts.some(text => /^(?:今日|每日).*奇遇.*北京时间\s*(?:零点|0\s*点|00:00)\s*(?:重置|刷新)/.test(text));
+      const resetHour = midnight ? 0 : 4, nextAt = nextDailyReset(resetHour);
+      if(encounterSchedule.nextAt!==nextAt)log.add('encounter-quota','奇遇额度耗尽，已预约网页刷新时间',{used:24,limit:24,resetHour,nextAt});
+      planEncounter(nextAt, `今日奇遇次数已用完，北京时间${resetHour}点刷新后核对网页额度`);
+    }
     if (cooldown) {
       const match = textOf(cooldown).match(/^奇遇冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
       const seconds = match && +match[2] < 60 && (match[3] === undefined || +match[3] < 60) ?
@@ -4037,7 +4070,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         <label class="staff-option">预测24小时下注上限 <input id="stock-prediction-limit" type="number" min="0" step="1" style="width:90px"></label>
         <label class="staff-option">预测每注固定代币 <input id="stock-stake" type="number" min="0" step="1" style="width:90px"></label>
         <label class="staff-option">账号保留代币 <input id="stock-reserve" type="number" min="0" step="1" style="width:90px"></label>
-        <p class="hint">每5分钟核对旧仓与行情。旧仓净盈利8%、净亏损6%或趋势转弱时按退出条件尝试卖出，须满足持有期、网站限额及真实报价；新买入与预测保持暂停。</p>
+        <p class="hint">旧仓通常5分钟复查；停滞且无变化时逐步延长至15、30分钟，空仓每小时核对。持仓解锁和原单核对优先；新买入与预测保持暂停。</p>
         <p class="hint">交易按市价成交，无最高成交价保证；预留10%报价余量仍可能超出预估。上限只统计脚本支出，卖出及预测返还不补回24小时额度。手动持仓和历史仓由你处理。</p>
         <div class="panel-actions"><button type="button" id="stock-save">保存股市设置</button>
         </div></details></div></details>
@@ -4135,6 +4168,9 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         v.periodArchive.openingQuotes.reduce((n,q)=>n+BigInt(q.quoted),0n))&&
     (v.accountingWait===undefined||typeof v.accountingWait==='string')&&
     (v.rejectionCooldownUntil===undefined||stockCore.whole(v.rejectionCooldownUntil))&&
+    (v.idleCheck==null||objectState(v.idleCheck)&&typeof v.idleCheck.signature==='string'&&
+      stockCore.whole(v.idleCheck.repeats)&&v.idleCheck.repeats<=2&&stockCore.whole(v.idleCheck.at)&&
+      [300000,900000,1800000,3600000].includes(v.idleCheck.delay))&&
     (v.archive===undefined||objectState(v.archive)&&['buyCost','knownProceeds','releasedCost','unknownSales','predictionStake','predictionPaid'].every(k=>stockCore.whole(v.archive[k]))&&
       ['realized','predictionNet'].every(k=>Number.isSafeInteger(v.archive[k])))&&
     stockCore.whole(v.nextAt) && typeof v.note==='string' && typeof v.hold==='boolean' && objectState(v.owned) &&
@@ -4668,15 +4704,19 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     }
     const unlockRecheck=!blocked&&!exitContinuation&&stockRead&&now-stockRead.at<=10000?
       stockCore.unlockRecheck(stockRead.model,stockLedger,now):null;
-    const retryAfterMs=exitContinuation?5000:unlockRecheck?unlockRecheck.at-now:300000;
+    const idleCheck=!blocked&&!exitContinuation&&!unlockRecheck&&stockRead&&now-stockRead.at<=10000&&!stockUiWait&&!stockNative().length?
+      stockCore.idleRecheck(stockRead.model,stockLivePolicy(stockConfig),stockLedger,now):null;
+    const retryAfterMs=exitContinuation?5000:unlockRecheck?unlockRecheck.at-now:idleCheck?.delay??300000;
     if(unlockRecheck)note=note.replace(/五分钟后(?:继续|再检查|重新检查)/g,'稍后复查')+
       `；${unlockRecheck.modelName}持有期即将结束，已预约解锁后重新核对`;
-    stockPersist({...stockLedger,nextAt:now+retryAfterMs,note,hold:hold || stockLedger.hold,
+    if(idleCheck&&retryAfterMs>300000)note+=`；${idleCheck.signature==='empty'?'无待管理持仓':'停滞旧仓无变化'}，${retryAfterMs/60000}分钟后复查`;
+    stockPersist({...stockLedger,nextAt:now+retryAfterMs,note,idleCheck,hold:hold || stockLedger.hold,
       ...(stockRead?{valuation:{...stockCore.performance(stockRead.model,stockLedger,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),at:stockRead.at}}:{}),
       holdReason:hold?note:stockHoldReason()});
     stockDecisionLog();
     log.add(hold?'stock-held':'stock-check',note,{diagnosticId:stockRead?.diagnosticId??null,observationId:stockRead?.observationId??null,
       pending:Boolean(stockLedger.pending),held:stockLedger.hold,holdReason:stockHoldReason(),retryAfterMs,exitContinuation,unlockRecheck,
+      idleRecheck:idleCheck?{repeats:idleCheck.repeats,delay:idleCheck.delay}:null,
       buys24h:stockCore.spend(stockLedger.entries,'buy',Date.now()),predictions24h:stockCore.spend(stockLedger.entries,'predict',Date.now()),
       ...(stockRead?{market:stockCore.marketSummary(stockRead.model,Date.now()),positions:stockCore.positionReport(stockRead.model,stockLedger,Date.now()),
         performance:stockCore.performance(stockRead.model,stockLedger,Date.now())}:{}),
@@ -6203,8 +6243,10 @@ function createShelterExistingState() {
   const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));
   const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));
   const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
+    (r.upgradeUntil===undefined||r.role==='training'&&time(r.upgradeUntil)&&r.upgradeUntil>r.at&&r.until>r.upgradeUntil)&&
+    (r.existingTraining===undefined||r.existingTraining===true&&r.role==='training'&&r.purpose==='current'&&r.finishCurrent===true)&&
     (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
-      Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
+      Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining?(r.base+1)*60+10:130)*60000)&&
     (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&
       (r.purpose===undefined||['production','parent','current'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
       (r.purpose!=='current'||r.finishCurrent===true)&&
@@ -6291,7 +6333,7 @@ function createShelterExistingState() {
       const p=s.residents.find(p=>p.id===r.id),d=state.defense.find(d=>d.id===r.id&&d.from===r.room&&p&&[d.room,null].includes(p.roomId));
       const current=p&&p.deadAt===null&&p.away===null&&p.adultAt<=now&&(p.roomId===r.room||d);
       const row={residentId:r.id,roomId:r.room,destination:r.destination??null,intentId:null,
-        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination','finishCurrent'])};
+        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination','finishCurrent','existingTraining','upgradeUntil'])};
       if(current){
         const due=r.role==='training'&&(p.stats[r.stat]>r.base||time(r.until)&&r.until<=now||time(r.windowEnd)&&r.windowEnd<=now);
         const returnAt=due?now:Math.min(windowEnd,r.until??windowEnd);
@@ -8417,7 +8459,7 @@ installShelterPlanningWorker(self);
   return {request,invalidate};
 };
   const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;
-    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuXG4gIGNvbnN0IHN0YWZmUm9vbVR5cGVzID0gWydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddO1xuICBjb25zdCBzdGFmZlJvb21OYW1lcyA9IHsgcG93ZXI6J+WPkeeUteermScsZGluZXI6J+mkkOWOhScsd2F0ZXI6J+WHgOawtOermScsc2NyYXA6J+W6n+aWmeWbnuaUtuermScscXVhcnRlcnM6J+Wuv+iIjScgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDmqKHmi5/mr4/kuIDmraXnmoTmiL/pl7Tlrrnph4/kuI7kvpvlupTvvJvkuI3og73lronlhajohb7kvY3nmoTmu6HlkZjmiL/pl7Tkv53nlZnljp/lronmjpLjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gIGNvbnN0IGZhbWlseUtleSA9IChhLGIpID0+IFthLGJdLnNvcnQoKHgseSk9PngteSkuam9pbignOicpO1xuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcblxuICAiLCJcbmxldCBzaGVsdGVyU3RhZmZNb2RlLHNoZWx0ZXJTdGFmZkhvbGQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsc2hlbHRlck9wdGltaXplLHNoZWx0ZXJTdGF0ZTtcbmNvbnN0IHNhdmVTaGVsdGVyPSgpPT57dGhyb3cgRXJyb3IoXCJSZWFkLW9ubHkgZmFtaWx5IHByZXZpZXcgY2Fubm90IHNhdmUgc3RhdGVcIik7fTtcbmZ1bmN0aW9uIGluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoZW5kcG9pbnQsbW9kZWwscm91dGVzLGZhbWlseVN1cHBseT1udWxsKSB7XG4gIGVuZHBvaW50Lm9ubWVzc2FnZT0oe2RhdGF9KT0+e1xuICAgIHRyeXtcbiAgICAgIGlmKGRhdGEua2luZD09PSduYXRpdmUtZmFtaWx5LXN1cHBseScpe1xuICAgICAgICBpZighZmFtaWx5U3VwcGx5KXRocm93IEVycm9yKCdGYW1pbHktc3VwcGx5IGtlcm5lbCB1bmF2YWlsYWJsZScpO1xuICAgICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOmRhdGEua2luZCxzdXBwbHk6ZmFtaWx5U3VwcGx5KGRhdGEpfSk7cmV0dXJuO1xuICAgICAgfVxuICAgICAgY29uc3QgcmVzdWx0PXJvdXRlcyhtb2RlbChkYXRhLnZpZXcpLGRhdGEub3B0aW9ucyxkYXRhLnRhcmdldFNjb3JlLGRhdGEuZmlyc3QsZGF0YS5wbGFubmluZyk7XG4gICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOiduYXRpdmUtbGV2ZWwtcm91dGVzJyxyb3V0ZXM6cmVzdWx0fSk7XG4gICAgfWNhdGNoKGUpe2VuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGVycm9yOlN0cmluZyhlPy5tZXNzYWdlPz9lKX0pO31cbiAgfTtcbn1cbmluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoc2VsZixzaGVsdGVyTW9kZWwsc2hlbHRlckxldmVsUm91dGVzLGRhdGE9Pntcbih7c2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGV9PWRhdGEucG9saWN5KTtcbnJldHVybiBzaGVsdGVyUG9wdWxhdGlvbkZhbWlseVN1cHBseShzaGVsdGVyTW9kZWwoZGF0YS52aWV3KSxkYXRhLmNhbXBhaWduKTtcbn0pO1xuIl0="),char=>char.charCodeAt(0))));
+    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcblxuICBjb25zdCBzdGFmZlJvb21UeXBlcyA9IFsncG93ZXInLCdkaW5lcicsJ3dhdGVyJywnc2NyYXAnXTtcbiAgY29uc3Qgc3RhZmZSb29tTmFtZXMgPSB7IHBvd2VyOiflj5HnlLXnq5knLGRpbmVyOifppJDljoUnLHdhdGVyOiflh4DmsLTnq5knLHNjcmFwOiflup/mlpnlm57mlLbnq5knLHF1YXJ0ZXJzOiflrr/oiI0nIH07XG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5qih5ouf5q+P5LiA5q2l55qE5oi/6Ze05a656YeP5LiO5L6b5bqU77yb5LiN6IO95a6J5YWo6IW+5L2N55qE5ruh5ZGY5oi/6Ze05L+d55WZ5Y6f5a6J5o6S44CCXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICBjb25zdCBmYW1pbHlLZXkgPSAoYSxiKSA9PiBbYSxiXS5zb3J0KCh4LHkpPT54LXkpLmpvaW4oJzonKTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG5cbiAgIiwiXG5sZXQgc2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGU7XG5jb25zdCBzYXZlU2hlbHRlcj0oKT0+e3Rocm93IEVycm9yKFwiUmVhZC1vbmx5IGZhbWlseSBwcmV2aWV3IGNhbm5vdCBzYXZlIHN0YXRlXCIpO307XG5mdW5jdGlvbiBpbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKGVuZHBvaW50LG1vZGVsLHJvdXRlcyxmYW1pbHlTdXBwbHk9bnVsbCkge1xuICBlbmRwb2ludC5vbm1lc3NhZ2U9KHtkYXRhfSk9PntcbiAgICB0cnl7XG4gICAgICBpZihkYXRhLmtpbmQ9PT0nbmF0aXZlLWZhbWlseS1zdXBwbHknKXtcbiAgICAgICAgaWYoIWZhbWlseVN1cHBseSl0aHJvdyBFcnJvcignRmFtaWx5LXN1cHBseSBrZXJuZWwgdW5hdmFpbGFibGUnKTtcbiAgICAgICAgZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsa2luZDpkYXRhLmtpbmQsc3VwcGx5OmZhbWlseVN1cHBseShkYXRhKX0pO3JldHVybjtcbiAgICAgIH1cbiAgICAgIGNvbnN0IHJlc3VsdD1yb3V0ZXMobW9kZWwoZGF0YS52aWV3KSxkYXRhLm9wdGlvbnMsZGF0YS50YXJnZXRTY29yZSxkYXRhLmZpcnN0LGRhdGEucGxhbm5pbmcpO1xuICAgICAgZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsa2luZDonbmF0aXZlLWxldmVsLXJvdXRlcycscm91dGVzOnJlc3VsdH0pO1xuICAgIH1jYXRjaChlKXtlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxlcnJvcjpTdHJpbmcoZT8ubWVzc2FnZT8/ZSl9KTt9XG4gIH07XG59XG5pbnN0YWxsU2hlbHRlckxldmVsV29ya2VyKHNlbGYsc2hlbHRlck1vZGVsLHNoZWx0ZXJMZXZlbFJvdXRlcyxkYXRhPT57XG4oe3NoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxzaGVsdGVyT3B0aW1pemUsc2hlbHRlclN0YXRlfT1kYXRhLnBvbGljeSk7XG5yZXR1cm4gc2hlbHRlclBvcHVsYXRpb25GYW1pbHlTdXBwbHkoc2hlbHRlck1vZGVsKGRhdGEudmlldyksZGF0YS5jYW1wYWlnbik7XG59KTtcbiJd"),char=>char.charCodeAt(0))));
     const functions=[
       shelterWorkerRate,
       shelterStoredItems,
@@ -8478,6 +8520,7 @@ installShelterPlanningWorker(self);
       shelterParentTrainingEstimate,
       shelterStaffCapacity,
       shelterTrainingDestinations,
+      shelterTrainingUpgrade,
       shelterTrainingFinish,
       shelterTrainingPurpose,
       shelterTrainingProgress,
@@ -10546,17 +10589,40 @@ installShelterPlanningWorker(self);
           Number.isInteger(p.stats[r.stat])&&p.stats[r.stat]>=r.base)))
       .map(r=>({id:r.id,room:r.destination}));
   }
+  function shelterTrainingUpgrade(m,p,room,cfg,record={},role=null) {
+    const stat=room?.trainStat,base=p?.stats?.[stat],health=p&&shelterHealth(p),perk=m.state.legacy?.perks?.training??0;
+    const existing=!role||role.existingTraining===true;
+    if(!cfg.training||!cfg.development||record.pending||!p||p.deadAt!==null||p.away!==null||p.adultAt>m.now||
+        !health||health.hp<.9*health.max||room?.type!=='training'||p.roomId!==room.id||room.builtAt>m.now||
+        !Number.isFinite(room.upgradeAt)||room.upgradeAt<=m.now||room.incident||room.unpowered||
+        !Number.isInteger(room.level)||room.level<1||room.level>=3||!Number.isInteger(perk)||perk<0||perk>10||
+        !Number.isInteger(base)||base<0||base>=10||!Number.isFinite(p.training)||p.training<0||p.training===0&&!existing||p.training>=1||
+        role&&(role.stat!==stat||role.base!==base)||role?.preparation&&(!cfg.parentTraining||!cfg.parentPreparation))return null;
+    const remaining=Math.ceil((1-p.training)*(base+1)/(room.level*(1+.05*perk))*6-1e-9)*600000;
+    if(!existing&&role.finishCurrent&&remaining>2*3600000||
+        !shelterConstructionSupply(m,[p.id],shelterGrowthNeeds(m).demand,shelterProductionWithout(m,[p.id]),1).safe)return null;
+    if(role?.upgradeUntil===room.upgradeAt)return role;
+    const until=room.upgradeAt+remaining+600000;
+    return {...(role?.purpose?role:{id:p.id,room:room.id,role:'training',at:m.now,stat,base,purpose:'current',finishCurrent:true,existingTraining:true}),
+      upgradeUntil:room.upgradeAt,until:Math.max(role?.until||0,until)};
+  }
   function shelterTrainingFinish(m,p,room,cfg,record={},role=null,assessment=null) {
+    const upgrading=shelterTrainingUpgrade(m,p,room,cfg,record,role);
+    if(upgrading)return upgrading;
     const health=p&&shelterHealth(p),fixed=role?.finishCurrent||role?.preparation||role?.purpose==='production';
     const current=fixed&&role.stat===room?.trainStat&&p?.stats?.[role.stat]===role.base&&m.now<role.until;
+    const existing=!role||role.existingTraining===true;
     if(!health||health.hp<.9*health.max||!cfg.training||!cfg.development||record.pending||
       role?.preparation&&(!cfg.parentTraining||!cfg.parentPreparation)||
       fixed&&!current&&!(role.stat===room?.trainStat&&p.stats?.[role.stat]>role.base)||room?.type!=='training'||
-      p.roomId!==room.id||!Number.isFinite(p.training)||p.training<=0||p.training>=1)return null;
+      p.roomId!==room.id||!Number.isFinite(p.training)||p.training<0||p.training===0&&!existing||p.training>=1||
+      role?.existingTraining&&p.stats?.[role.stat]!==role.base)return null;
     const progress=assessment||shelterTrainingProgress(m,p,room);
-    if(!Number.isFinite(progress.finishAt)||progress.finishAt<=m.now||progress.finishAt-m.now>2*3600000||
+    if(!Number.isFinite(progress.finishAt)||progress.finishAt<=m.now||!existing&&progress.finishAt-m.now>2*3600000||
       !Number.isInteger(progress.base)||progress.base>=10||!shelterConstructionSupply(m,[p.id],shelterGrowthNeeds(m).demand,
         shelterProductionWithout(m,[p.id]),1).safe)return null;
+    if(existing&&(role?.existingTraining||!assessment?.eligible||progress.finishAt-m.now>2*3600000))return current?role:{id:p.id,room:room.id,role:'training',at:m.now,stat:progress.stat,base:progress.base,
+      purpose:'current',finishCurrent:true,existingTraining:true,until:progress.finishAt+600000};
     const base=current?{...role}:{id:p.id,room:room.id,role:'training',at:m.now,stat:progress.stat,base:progress.base,
       until:progress.finishAt+600000,...(role?.preparation?{preparation:true}:{finishCurrent:true})};
     if(cfg.parentTraining&&(!current||role.purpose==='parent')){
@@ -10801,7 +10867,7 @@ installShelterPlanningWorker(self);
     const historicalTraining=[];
     if(cfg.development&&!record.pending)for(const p of s.residents){
       const room=s.rooms.find(r=>r.id===p.roomId);
-      if(!home(p)||purposeProtectedIds.has(p.id)||!active(room))continue;
+      if(!home(p)||purposeProtectedIds.has(p.id)||!active(room)&&!(room?.type==='training'&&Number.isFinite(room.upgradeAt)&&room.upgradeAt>now))continue;
       const previous=roles.find(r=>r.id===p.id&&r.room===p.roomId);
       if(previous){
         if(previous.role==='training'&&previous.purpose===undefined)roles.splice(roles.indexOf(previous),1);
@@ -10970,7 +11036,9 @@ installShelterPlanningWorker(self);
     const adoptedDestinations=roles.filter(r=>r.purpose==='production'&&r.until>now&&
       s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>({id:r.id,room:r.destination}));
     for(const p of historicalTraining){
-      const room=s.rooms.find(r=>r.id===p.roomId),assessment=shelterTrainingReturn(m,p,room,168,
+      const room=s.rooms.find(r=>r.id===p.roomId),upgrading=shelterTrainingUpgrade(m,p,room,cfg,record);
+      if(upgrading){roles.push(upgrading);result.adoptions.push(upgrading);reserve(p);result.events.push(room.upgradeAt-now);continue;}
+      const assessment=shelterTrainingReturn(m,p,room,168,
         trainingCommitments({destinations:adoptedDestinations}));
       if(['unknown-training','awaiting-training-settlement'].includes(assessment.reason)){
         reserve(p);notes.push(`${normalized(p.name)}历史训练属性、进度或结算尚待核对，保留当前格，不假设进度为零。`);continue;
@@ -11006,6 +11074,12 @@ installShelterPlanningWorker(self);
       const p=s.residents.find(p=>p.id===role.id),r=p&&s.rooms.find(r=>r.id===p.roomId);
       if(!p||!home(p)||purposeProtectedIds.has(p.id)||role.room!==p.roomId)continue;
       if(role.role==='training'&&(cfg.training||['parent','production','current'].includes(role.purpose))){
+        const upgrading=shelterTrainingUpgrade(m,p,r,cfg,record,role);
+        if(upgrading){
+          if(upgrading!==role)result.adoptions.push(upgrading);
+          reserve(p);if(upgrading.destination)reserveTraining(p.id,upgrading.destination);
+          result.events.push(r.upgradeAt-now);continue;
+        }
         if(role.purpose==='production'){
           const assessment=shelterTrainingReturn(m,p,r,Math.min(168,Math.max(1/6,(role.windowEnd-now)/3600000)),
             trainingCommitments({destination:role.destination}));
@@ -11470,9 +11544,11 @@ installShelterPlanningWorker(self);
         (r.from===null||positive(r.from))&&at(r.at))&&new Set(v.defense.map(r=>r.id)).size===v.defense.length)&&
       (v.defenseManual===undefined||Array.isArray(v.defenseManual)&&v.defenseManual.length<=200&&v.defenseManual.every(positive))&&
       v.roles.every(r=>positive(r.id)&&positive(r.room)&&at(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
+        (r.upgradeUntil===undefined||r.role==='training'&&at(r.upgradeUntil)&&r.upgradeUntil>r.at&&r.until>r.upgradeUntil)&&
         (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&!r.finishCurrent&&r.base<10)&&
+        (r.existingTraining===undefined||r.existingTraining===true&&r.role==='training'&&r.purpose==='current'&&r.finishCurrent===true)&&
         (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
-          Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
+          Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining?(r.base+1)*60+10:130)*60000)&&
         (r.role!=='training'||(r.purpose==='production'?['str','per','end','agi','int'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
           at(r.windowEnd)&&r.windowEnd>r.at&&positive(r.destination):r.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
             (r.destination===undefined||positive(r.destination)):
@@ -16668,12 +16744,17 @@ installShelterPlanningWorker(self);
     });return true;
   }
   function shelterMaintenanceSchedule(m) {
-    return shelterCampaignPlan(m,{...shelterCampaign,maintenanceOnly:true,
+    const cache=shelterCampaignSchedule.cache,inputs=[m,shelterCampaign,shelterState,shelterPending,
+      shelterStaffMode,shelterStaffHold,shelterPopulationTarget,shelterRead?.startedAt];
+    if(cache?.maintenance?.inputs.every((value,index)=>value===inputs[index]))return cache.maintenance.plan;
+    const plan=shelterCampaignPlan(m,{...shelterCampaign,maintenanceOnly:true,
       development:shelterStaffMode!=='off'&&!shelterStaffHold,
       parentTraining:Boolean(shelterCampaign.training&&['family','population'].includes(shelterStaffMode)&&!shelterStaffHold)},
       {...shelterState.campaign,parentPreparation:shelterState.parentPreparation,families:shelterState.families||[],pending:shelterPending,
         familyReserved:[...(shelterState.pair?[shelterState.pair.a,shelterState.pair.b]:[]),...(shelterState.swap?.people||[]).map(p=>p.id)],
         readStartedAt:shelterRead?.startedAt},shelterPopulationTarget);
+    if(cache)cache.maintenance={inputs,plan};
+    return plan;
   }
   function shelterEmploymentSchedule(m,maintenance=shelterMaintenanceSchedule(m)) {
     // Adding an idle adult to an existing production seat needs current safety
@@ -16976,6 +17057,7 @@ installShelterPlanningWorker(self);
     const button=buttonIn(row,'召回');if(!usable(button))return holdShelterCampaign('原普通探险的召回按钮暂不可核对');
     offer('shelter:recall-open','打开普通探险召回确认',()=>{
       shelterRecallWork={id:c.targets[0],at:Date.now(),title:`召回 ${textOf(row.querySelector('p')).startsWith('#')?`#${e.residentId} `:''}${c.name}?`};
+      log.add('shelter-recall-opened','打开本轮召回窗口',{explorer:e.id,resident:e.residentId,readAgeMs:Date.now()-shelterRead.at});
       shelterOpenDialog(shelterRecallWork,()=>button.click());
     });return true;
   }
@@ -17594,7 +17676,7 @@ installShelterPlanningWorker(self);
         missingWithReserve:Math.max(0,(c.cost?.[k]||0)+shelterConstruction[k+'Reserve']+held[k]-s.resources[k])}]))});
     for(const row of plan?.rejectedLevel||[])rows.push({kind:'construction-rejected',project:project(row.project),reasons:row.reasons});
     for(const text of plan?.notes||[])rows.push({kind:'planning-note',text});
-    for(const role of shelterState.campaign?.roles||[])rows.push({kind:'assigned-role',...pick(role,['id','room','from','role','at','stat','base','purpose','preparation','finishCurrent','until','windowEnd','destination'])});
+    for(const role of shelterState.campaign?.roles||[])rows.push({kind:'assigned-role',...pick(role,['id','room','from','role','at','stat','base','purpose','preparation','finishCurrent','existingTraining','until','windowEnd','destination','upgradeUntil'])});
     for(const seat of campaign?.trainingDestinations||[])rows.push({kind:'training-destination',...pick(seat,['id','room'])});
     const equipment=new Set(s.residents.flatMap(p=>[p.weaponId,p.outfitId]).filter(id=>id!==null));
     for(const id of equipment){
@@ -19762,7 +19844,8 @@ installShelterPlanningWorker(self);
     if(work?.confirming&&!work.sent&&method!=='GET'){
       auctionReload();const pending=auctionState.pending;
       let body;try{body=JSON.parse(args[1]?.body);}catch{}
-      const valid=auctionAllowed()&&auctionExclusive&&inShelter()&&!work.manual&&pending?.id===work.id&&
+      const visit=auctionCore.visit(auctionView?.model,Date.now());
+      const valid=auctionAllowed()&&auctionExclusive&&visit.active&&Date.now()>=visit.releaseAt&&inShelter()&&!work.manual&&pending?.id===work.id&&
         pending.phase==='opening'&&auctionIdentity?.vault===pending.vault&&Date.now()-auctionIdentity.at<=30000&&
         url.pathname==='/api/shelter/auction'&&method==='POST'&&body?.quantity===1&&body.maxUnitPrice===pending.price&&
         /^[a-zA-Z0-9-]{8,64}$/.test(body.idempotencyKey||'')&&
@@ -19858,15 +19941,14 @@ installShelterPlanningWorker(self);
     if(!auctionExclusive)return;
     auctionExclusive=false;
     auctionContextRead?.close();auctionContextRead=null;
-    shelterEntryAt=0;stockEntryAt=0;nextStepAt=0;
-    log.add('soda-auction-release','拍卖守候结束，恢复其他玩法');
+    shelterEntryAt=inShelter()?Date.now():0;shelterLeave=inShelter();stockEntryAt=0;nextStepAt=0;
+    log.add('soda-auction-release','本轮拍卖守候结束，恢复其他玩法');
   }
   function auctionStep() {
     auctionReload();auctionRecord();auctionToggle.checked=localStorage.getItem(AUCTION_PREF)!=='false';
     const now=Date.now(),today=auctionCore.day(now),current=auctionView?.model;
-    const startsAt=current?.day===today?current.startsAt:auctionCore.start(now);
-    const endsAt=current?.day===today?current.endsAt:Date.parse(today+'T23:59:59.999+08:00');
-    const requested=auctionToggle.checked&&now>=startsAt-120000&&now<endsAt&&auctionState.doneDay!==today;
+    const visit=auctionCore.visit(current,now);
+    const requested=auctionToggle.checked&&visit.active&&auctionState.doneDay!==today;
     if(!requested&&!auctionWindow){auctionRelease();return false;}
     const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
     if(!requested){
@@ -19882,7 +19964,7 @@ installShelterPlanningWorker(self);
       if(captureShelterHelp&&!captureShelterHelp.sent)captureShelterHelp.cancelled=true;
       if(navigation?.to!=='/shelter')clearNavigation();
       auctionReadAt=0;
-      log.add('soda-auction-priority','进入汽水拍卖独占时段，暂停其他玩法',{startsAt,endsAt});
+      log.add('soda-auction-priority','进入本轮汽水拍卖守候时段，暂停其他玩法',visit);
     }
     pollReadSessions();
     const errors=[...document.querySelectorAll('[role="status"].text-destructive,[role="status"].bg-destructive,[role="alert"].text-destructive,[role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
@@ -19892,7 +19974,7 @@ installShelterPlanningWorker(self);
     if(stateFault('auction')||auctionIssue){say(stateFault('auction')||auctionIssue);return true;}
     auctionContext();
     if(cultivation.yieldForAuction(dialogs,auctionCancelWindow))return true;
-    if(auctionConfirm(dialogs))return true;
+    if((auctionState.pending?.phase!=='submitted'||dialogs.length)&&auctionConfirm(dialogs))return true;
     if(dialogs.length)return auctionClearOtherDialogs(dialogs);
     if(dispatchWindow?.auctionCancelAt&&plan?.phase==='opening'&&!nativePending().length){savePlan(null);dispatchWindow=null;}
     if(seedWindow?.auctionCancelAt){seedWindow=null;ownSeedDialog=null;openingSeedsAt=0;}
@@ -19906,6 +19988,7 @@ installShelterPlanningWorker(self);
     if(tab&&tab.getAttribute('aria-selected')!=='true'){
       if(usable(tab))tab.click();else say('等待汽水交易入口');return true;
     }
+    if(auctionState.pending?.phase==='submitted'&&auctionConfirm(dialogs))return true;
     if(!auctionIdentity||!auctionBalance||now-auctionIdentity.at>30000||now-auctionBalance.at>30000){say('拍卖守候中，核对账号和可用代币');return true;}
     if(auctionState.vault!==auctionIdentity.vault){
       auctionSave({...emptyAuction(),vault:auctionIdentity.vault,receipts:auctionState.receipts});

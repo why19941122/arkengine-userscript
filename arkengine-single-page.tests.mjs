@@ -145,6 +145,36 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
     await drive(`${home}&&cm.calls.length===2&&dm.calls.some(call=>call[0]==='sweep')`,'both quotas refresh at four',150);
     assert.equal(await evaluate('cm.remaining'),23);assert.equal(await evaluate('dm.remaining'),0);
   });
+  await t.test('单页真实额度：今日已完成24/24次奇遇按网页零点预约，秘境仍四点刷新',async()=>{
+    await setupUnified(`cm.remaining=0;cm.completedLabel=true;dm.remaining=0;
+      localStorage.setItem('arkengine:auto-expedition:burst-day:v1',new Date(clock+8*3600000).toISOString().slice(0,10));`);
+    await drive(`${home}&&${schedule}?.nextAt>clock&&JSON.parse(localStorage.getItem('arkengine:auto-dungeon:state:v1'))?.exhaustedDay`,'actual completed quota scheduled',150);
+    const reset=Date.parse('2026-10-11T00:00:00+08:00');
+    assert.equal(await evaluate(`${schedule}.nextAt`),reset);
+    await reloadUnified();
+    const visits=await evaluate('fm.calls.filter(call=>call.type==="navigate").length');
+    const dungeonVisits=await evaluate('fm.calls.filter(call=>call.path==="/cultivate/dungeon").length');
+    for(let pass=0;pass<3;pass++)await pulse(3600000);
+    assert.equal(await evaluate('fm.calls.filter(call=>call.type==="navigate").length'),visits);
+    await evaluate(`clock=${reset};cm.remaining=24;renderFeature();
+      localStorage.setItem('arkengine:auto-expedition:burst-day:v1',new Date(clock+8*3600000).toISOString().slice(0,10));`);
+    await drive(`${home}&&cm.calls.length===2`,'encounter resumes at advertised midnight',100);
+    assert.equal(await evaluate('dm.remaining'),0);
+    assert.equal(await evaluate('fm.calls.filter(call=>call.path==="/cultivate/dungeon").length'),dungeonVisits);
+  });
+  await t.test('单页真实额度：剩余一次不会误停，最后奖励优先领取',async()=>{
+    await setupUnified(`${disableDungeon}cm.remaining=1;cm.completedLabel=true;`);
+    await drive(`${home}&&cm.calls.length===2&&${schedule}?.nextAt>clock`,'last real encounter received',100);
+    assert.equal(await evaluate(`${schedule}.nextAt`),Date.parse('2026-10-11T00:00:00+08:00'));
+    assert.deepEqual(await evaluate('cm.calls'),['seek','choose']);
+  });
+  await t.test('单页真实额度：当前页旧五分钟预约被明确耗尽提示纠正',async()=>{
+    await setupUnified(`${disableDungeon}cm.remaining=0;cm.completedLabel=true;
+      localStorage.setItem('arkengine:auto-encounter:schedule:v1',JSON.stringify({nextAt:clock+300000,note:'奇遇按钮暂不可用'}));`,'/cultivate');
+    await drive(`${home}&&${schedule}?.nextAt>clock+300000`,'old short recheck corrected');
+    assert.equal(await evaluate(`${schedule}.nextAt`),Date.parse('2026-10-11T00:00:00+08:00'));
+    assert.deepEqual(await evaluate('cm.calls'),[]);
+  });
   await t.test('单页挂机：人工弹窗和未知原奇遇均阻止切页',async()=>{
     for(const kind of ['dialog','pending']){
       await setupUnified(`${disableDungeon}cm.remaining=0;

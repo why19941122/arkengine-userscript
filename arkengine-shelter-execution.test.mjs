@@ -62,6 +62,28 @@ test('跨格训练保护：返岗最终确认发现当前格已到90%则撤销�
   assert.equal(work.executionFailure.reason,'training-in-progress');
 });
 
+test('训练室升级保护：旧返岗意图在最终确认遇到90%升级训练必须撤销',()=>{
+  const context=completedReturn();context.c.shelterCampaign.training=true;
+  const person=context.f.view.state.residents.find(person=>person.id===5),room=context.f.view.state.rooms.find(room=>room.id===90);
+  const role=context.c.shelterState.campaign.roles[0];
+  Object.assign(role,{base:person.stats.end,finishCurrent:true,until:context.f.view.serverTime+3600000});
+  person.training=.9;room.upgradeAt=context.f.view.serverTime+3*3600000;
+  const work=context.capture(context.returnChoice);
+  assert.equal(context.api.current(context.model(),work),null);
+  assert.equal(work.executionFailure.reason,'training-in-progress');
+});
+
+test('手动训练最终确认：没有自动用途记录的零进度或25%训练不能被旧离岗意图发送',()=>{
+  for(const progress of [0,.25]){
+    const context=completedReturn();context.c.shelterCampaign.training=true;context.c.shelterState.campaign.roles=[];
+    const person=context.f.view.state.residents.find(person=>person.id===5),room=context.f.view.state.rooms.find(room=>room.id===90);
+    room.trainStat='int';room.level=3;person.stats.int=7;person.training=progress;
+    const work=context.capture(context.returnChoice);
+    assert.equal(context.api.current(context.model(),work),null);
+    assert.equal(work.executionFailure.reason,'training-in-progress');
+  }
+});
+
 test('训练连续生命周期：旧返岗确认遇到已保存的当前90%训练也必须撤销',()=>{
   const context=completedReturn();context.c.shelterCampaign.training=true;
   const person=context.f.view.state.residents.find(entry=>entry.id===5),role=context.c.shelterState.campaign.roles[0];
@@ -407,8 +429,8 @@ test('公共进度契约：自然恢复到九成不再打针，返岗接受供�
   x.f.view.state.residents[4].hp=89;assert.equal(x.api.current(x.model(),w),w.execution);
   x.f.view.state.residents[4].hp=90;assert.equal(x.api.current(x.model(),w),null);
   assert.equal(w.executionFailure.reason,'healing-no-longer-needed');
-  const y=setup();y.f.view.state.residents[4].roomId=90;
-  const returned=y.capture({kind:'assign',id:5,room:4,from:90,role:'training-release'});
+  const y=completedReturn();
+  const returned=y.capture(y.returnChoice);
   y.f.view.state.resources.water++;assert.equal(y.api.current(y.model(),returned),returned.execution);
 });
 test('取消让路：只延后已撤销且未发送的同一动作，其他动作和未知原单不受影响',()=>{

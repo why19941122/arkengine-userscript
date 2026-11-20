@@ -12,6 +12,7 @@ window.renderDun=()=>{
     const seconds=Math.max(0,Math.ceil((cm.cooldownAt-clock)/1000));
     seek.textContent=cm.remaining===0?'今日奇遇次数已用完':seconds?'奇遇冷却 '+Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0'):'寻找奇遇';
     if(cm.quotaLabel){const quota=document.createElement('p');quota.textContent='今日奇遇剩余 '+cm.remaining+'/24 次';game.append(quota);seek.textContent='寻找奇遇';}
+    if(cm.completedLabel){const quota=document.createElement('p');quota.textContent='今日已完成 '+(24-cm.remaining)+'/24 次奇遇，北京时间零点重置。';game.append(quota);seek.textContent='寻找奇遇';}
     if(cm.unavailable){seek.disabled=true;seek.textContent='寻找奇遇';}
     seek.onclick=()=>{if(seek.disabled)throw Error('Unavailable encounter');cm.calls.push('seek');cm.remaining--;dm.encounter=true;renderDun();};
     const panel=document.getElementById('cultivation-encounter');

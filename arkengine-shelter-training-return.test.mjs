@@ -67,6 +67,36 @@ test('当前格训练：旧生产保护转入收尾时补全有限期限标记�
   assert.equal(api.valid({...record,roles:[retained]}),true);
 });
 
+test('孙小满训练保护：智力7的12.5%、25%及刚入室0%无零件用途仍练完当前格，刷新不续期',()=>{
+  for(const progress of [.125,.25,0]){
+    const context=scene('int',7),{p,room,v,record}=context;
+    p.roomId=room.id;p.training=progress;room.level=3;
+    const plan=context.run(),role=plan.adoptions.find(role=>role.id===p.id);
+    assert.ok(!plan.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+    assert.equal(role?.existingTraining,true);assert.equal(role.base,7);assert.equal(role.purpose,'current');
+    assert.equal(role.destination,undefined);record.roles=[role];assert.equal(api.valid(record),true);
+    const deadline=role.until;v.serverTime+=60000;
+    assert.ok(!context.run().adoptions.some(role=>role.id===p.id&&role.until!==deadline));
+    assert.ok(!context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+    p.stats.int=8;p.training=0;
+    assert.ok(context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  }
+});
+
+test('手动训练边界：同格到期、关闭、断供与换房不续期，已完成属性不保护下一格',()=>{
+  for(const reason of ['deadline','disabled','supply','room','completed']){
+    const context=scene('int',7),{p,room,v,record,cfg,s}=context;
+    p.roomId=room.id;p.training=0;room.level=3;
+    const role=context.run().adoptions.find(role=>role.id===p.id);assert.ok(role?.existingTraining);record.roles=[role];
+    if(reason==='deadline')v.serverTime=role.until;
+    if(reason==='disabled')cfg.training=false;
+    if(reason==='supply')s.resources.power=0;
+    if(reason==='room')p.roomId=4;
+    if(reason==='completed'){p.stats.int++;p.training=.1;}
+    assert.equal(api.finish(api.model(v),p,room,cfg,record,role),null,reason);
+  }
+});
+
 function scene(stat='end',base=5){
   const v=campaignView(),s=v.state;
   const room={...s.rooms[0],id:90,type:'training',trainStat:stat,level:1,floor:3,col:2};s.rooms.push(room);
@@ -77,6 +107,54 @@ function scene(stat='end',base=5){
   return {v,s,p,room,cfg,record,estimate:(h=168,options={})=>api.estimate(api.model(v),p,room,h,options),
     run:()=>api.plan(api.model(v),cfg,record,14)};
 }
+
+test('训练室升级保护：143日志同型40%进度跨升级保留，固定延时后完成才返岗',()=>{
+  const context=scene('per',4),{p,room,v,record}=context;
+  p.roomId=room.id;p.training=.4;room.level=2;
+  const original=context.run().adoptions.find(role=>role.id===p.id);assert.ok(original);
+  record.roles=[original];room.upgradeAt=v.serverTime+3*hour;
+  const paused=context.run(),updated=paused.adoptions.find(role=>role.id===p.id);
+  assert.ok(!paused.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  assert.ok(updated&&updated.until>room.upgradeAt);assert.equal(updated.base,4);
+  record.roles=[updated];assert.equal(api.valid(record),true);
+  v.serverTime+=hour;
+  assert.ok(!context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  assert.ok(!context.run().adoptions.some(role=>role.id===p.id&&role.until!==updated.until));
+  v.serverTime=room.upgradeAt;v.state.lastSettledAt=v.serverTime;room.upgradeAt=null;room.level=3;
+  assert.ok(!context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  p.stats.per++;p.training=0;
+  assert.ok(context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+});
+
+test('训练室升级保护：无旧记录的90%进度也保留，关闭训练或真实断供仍解除',()=>{
+  for(const reason of ['ordinary','disabled','supply']){
+    const context=scene('cha',5),{p,room,v,cfg,s}=context;
+    p.roomId=room.id;p.training=.9;room.upgradeAt=v.serverTime+hour;
+    if(reason==='disabled')cfg.training=false;
+    if(reason==='supply')s.resources.power=0;
+    const plan=context.run();
+    assert.equal(plan.adoptions.some(role=>role.id===p.id),reason==='ordinary',reason);
+    if(reason==='ordinary')assert.ok(plan.reserved.includes(p.id));
+  }
+});
+
+test('训练室升级保护：完成、未知进度、失效身份与真实断供不被旧升级记录保护',()=>{
+  for(const reason of ['completed','unknown','disabled','supply','away','dead','manual-room','pending','fault']){
+    const context=scene('cha',5),{p,room,v,cfg,s,record}=context;
+    p.roomId=room.id;p.training=.9;room.upgradeAt=v.serverTime+3*hour;
+    const role=context.run().adoptions.find(role=>role.id===p.id);assert.ok(role);record.roles=[role];
+    if(reason==='completed')p.stats.cha++;
+    if(reason==='unknown')delete p.training;
+    if(reason==='disabled')cfg.training=false;
+    if(reason==='supply')s.resources.power=0;
+    if(reason==='away')p.away={kind:'explore'};
+    if(reason==='dead')p.deadAt=v.serverTime;
+    if(reason==='manual-room')p.roomId=4;
+    if(reason==='pending')record.pending={kind:'assign'};
+    if(reason==='fault')room.unpowered=true;
+    assert.equal(api.finish(api.model(v),p,room,cfg,record,role),null,reason);
+  }
+});
 
 test('人口训练协调修复：普通生产训练不能吃掉下一人口口粮，补足后恢复入训',()=>{
   const x=scene('agi'),diner=x.s.rooms.find(r=>r.id===2),worker=x.s.residents.find(p=>p.id===2);
@@ -307,7 +385,7 @@ test('生产训练返岗房升级：完成、关闭、到期、断供或岗位�
     if(reason==='wrong-resource')destination.type='diner';
     if(reason==='full')s.residents[5].roomId=destination.id;
     if(reason==='unpowered')destination.unpowered=true;
-    if(reason==='training-inactive')room.upgradeAt=v.serverTime+hour;
+    if(reason==='training-inactive')room.unpowered=true;
     if(reason==='stat-changed')room.trainStat='agi';
     if(reason==='upgrade-too-late')destination.upgradeAt=record.roles[0].windowEnd;
     const released=context.run().actions.find(action=>action.id===p.id&&action.role==='training-release');
