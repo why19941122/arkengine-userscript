@@ -5,6 +5,12 @@ import vm from 'node:vm';
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const text=vm.runInNewContext(source.match(/^  function logIncomeText\([^]*?^  }/m)[0]+'\nlogIncomeText');
 const day='2026-11-20';
+test('统一收益：汽水拍卖记录代币支出，不混入股市盈亏或远征收益',()=>{
+  const summary=text({expedition:{day,totals:{避难所汽水:2,汽水拍卖支出:399999}}},day);
+  assert.match(summary,/避难所：汽水 2 · 拍卖支出 399999 代币/);
+  assert.match(summary,/股市：已实现盈亏 0 代币/);
+  assert.match(summary,/远征\/农场：钻石 0 · 代币 0/);
+});
 test('统一收益：两组同日汇总，汽水、修仙货币和已实现盈亏只记一次',()=>{
   const groups={cultivate:{day,totals:{钻石:260,代币:6.25,修为:192180,秘境扫荡钻石:260}},
     expedition:{day,totals:{代币:1250,股市返还:1000,避难所商队代币:50,钻石:12,避难所汽水:2,避难所零件:100,

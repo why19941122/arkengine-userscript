@@ -33,6 +33,8 @@ import { crossFeatureMarkup } from './arkengine-cross-feature.fixture.mjs';
 import { crossFeatureTests } from './arkengine-cross-feature.tests.mjs';
 import { singlePageMarkup } from './arkengine-single-page.fixture.mjs';
 import { singlePageTests } from './arkengine-single-page.tests.mjs';
+import { auctionMarkup } from './arkengine-soda-auction.fixture.mjs';
+import { sodaAuctionTests } from './arkengine-soda-auction.tests.mjs';
 import { readLifecycleTests } from './arkengine-read-lifecycle.tests.mjs';
 import { dialogRecoveryTests } from './arkengine-dialog-recovery.tests.mjs';
 import { currentGrowthTests } from './arkengine-shelter-current-growth.tests.mjs';
@@ -199,7 +201,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     const expedition = req.url.startsWith('/activities/expedition');
     if (expedition) expeditionRequests++;
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(req.url.includes('single-page-fixture') ? singlePageMarkup : req.url.includes('cross-feature-fixture') ? crossFeatureMarkup : req.url.includes('stock-fixture') || url.pathname === '/stock' ? stockMarkup : req.url.includes('shelter-fixture') ? shelterMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
+    res.end(req.url.includes('auction-fixture') ? auctionMarkup : req.url.includes('single-page-fixture') ? singlePageMarkup : req.url.includes('cross-feature-fixture') ? crossFeatureMarkup : req.url.includes('stock-fixture') || url.pathname === '/stock' ? stockMarkup : req.url.includes('shelter-fixture') ? shelterMarkup : req.url.includes('farm-fixture') || url.pathname === '/farm' && !url.searchParams.has('test') ? farmMarkup : expedition ? expeditionMarkup : req.url.includes('dungeon-fixture') ? dungeonMarkup : markup);
   });
   let cdp, runtime;
   try {
@@ -255,7 +257,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     })`);
     // Existing business scenarios start after initial setup, with their explicit switches intact.
     // Startup-default tests remove these markers to exercise the real installation/upgrade path.
-    const configuredDefaults=`localStorage.setItem('arkengine:auto-encounter:enabled:v1','false');for(const scope of ['stock','shelter'])localStorage.setItem('arkengine:auto-defaults:'+scope+':v1','applied');`;
+    const configuredDefaults=`localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','false');localStorage.setItem('arkengine:auto-encounter:enabled:v1','false');for(const scope of ['stock','shelter'])localStorage.setItem('arkengine:auto-defaults:'+scope+':v1','applied');`;
     let pageSerial = 0;
     const setup = async (code = '', path = '/cultivate') => {
       await cdp.send('Page.navigate', { url: `${origin}${path}?test=${++pageSerial}` }, tab.sessionId);
@@ -565,6 +567,25 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       }finally{await cdp.send('Target.closeTarget',{targetId:other.targetId});}
     };
     await singlePageTests({t,setupUnified,reloadUnified,evaluate,pulse,drive,secondUnified});
+    const setupAuction=async(code='')=>{
+      await cdp.send('Page.navigate',{url:`${origin}/activities/expedition?auction-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`typeof am==='object'&&!document.getElementById('ark-auto-expedition')`),'auction fixture');
+      await resetLogs();
+      await evaluate(`localStorage.clear();sessionStorage.clear();${configuredDefaults}
+        localStorage.removeItem('arkengine:auto-soda-auction:enabled:v1');
+        localStorage.setItem('arkengine:auto-farm:enabled:v1','false');localStorage.setItem('arkengine:auto-shelter:enabled:v1','false');
+        clock=Date.parse('2026-11-20T20:00:00+08:00');Math.random=()=>0.99999;model.burst=0;model.runs=[];addRuns(6);${code};renderFeature();`);
+      await evaluate(source);
+    };
+    const reloadAuction=async()=>{
+      const snapshot=await evaluate('({clock,model,fm,dm,cm,sm,am})');
+      await cdp.send('Page.navigate',{url:`${origin}/shelter?auction-fixture=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?auction-fixture=${pageSerial}'&&typeof am==='object'&&!document.getElementById('ark-auto-expedition')`),'reloaded auction fixture');
+      await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});renderFeature();`);
+      await evaluate(source);
+    };
+    await sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pulse,until,drive,
+      trustedAuctionKey:()=>cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key:'Shift',code:'ShiftLeft'},tab.sessionId)});
     const confirmed = `model.calls.filter(c => c.type === 'dispatch')`;
 
     await t.test('页面性能：空闲远征连续更新不重绘不变面板，不解析未变大记录，仍能识别同页存储变化',async()=>{

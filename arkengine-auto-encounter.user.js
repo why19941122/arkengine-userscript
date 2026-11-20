@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.142
+// @version      1.17.143
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1488,6 +1488,49 @@
   })();
   // STOCK_CORE_END
 
+  function createSodaAuctionCore() {
+    const whole=value=>Number.isSafeInteger(value)&&value>=0;
+    const day=now=>new Date(now+8*3600000).toISOString().slice(0,10);
+    const start=now=>Date.parse(day(now)+'T20:00:00+08:00');
+    function model(body) {
+      const auction=body?.auction;
+      if(body?.enabled!==true||!auction)return null;
+      const startsAt=Date.parse(auction.startsAt),endsAt=Date.parse(auction.endsAt);
+      if(!Number.isFinite(startsAt)||!Number.isFinite(endsAt)||endsAt<=startsAt||endsAt-startsAt>86400000||
+          !['supply','sold','remaining','perUserDaily','boughtToday'].every(key=>whole(auction[key]))||
+          typeof auction.live!=='boolean'||auction.available!==undefined&&!whole(auction.available)||
+          auction.released!==undefined&&!whole(auction.released)||
+          auction.nextReleaseAt!=null&&!Number.isFinite(Date.parse(auction.nextReleaseAt))||
+          auction.price!=null&&!whole(auction.price))return null;
+      return {...auction,startsAt,endsAt,day:day(startsAt),available:auction.available??auction.remaining,
+        nextReleaseAt:auction.nextReleaseAt==null?null:Date.parse(auction.nextReleaseAt)};
+    }
+    function round(auction,now) {
+      return `${auction.startsAt}:${auction.released??Math.max(0,Math.floor((now-auction.startsAt)/600000))}`;
+    }
+    function decision(auction,state,balance,now) {
+      if(!auction||auction.day!==day(now))return {kind:'read'};
+      if(now>=auction.endsAt||auction.remaining===0||auction.boughtToday>=auction.perUserDaily)return {kind:'done'};
+      if(now<auction.startsAt||!auction.live)return {kind:'wait',reason:'等待开拍'};
+      const batch=round(auction,now);
+      if(state.rounds.includes(batch))return {kind:'wait',reason:'本轮已买 1 瓶，守候下一轮'};
+      if(!auction.available)return {kind:'wait',reason:'本轮已售罄，守候下一批'};
+      if(!whole(auction.price)||auction.price<=0||auction.price>=400000)return {kind:'wait',reason:'等待单价低于 400000 代币'};
+      if(!Number.isFinite(balance)||balance<auction.price)return {kind:'wait',reason:'代币不足，等待降价或余额恢复'};
+      const signature=JSON.stringify([batch,auction.price,auction.available,auction.boughtToday,balance]);
+      if(state.rejected===signature)return {kind:'wait',reason:'本次未成交，等待新价格或新一批'};
+      return {kind:'buy',round:batch,price:auction.price,signature};
+    }
+    function outcome(pending,status,body) {
+      if(status>=200&&status<300&&body?.code!=='retry'&&body?.quantity===1&&whole(body.unitPrice)&&body.unitPrice>0&&
+          body.unitPrice<=pending.price&&body.unitPrice<400000)return 'success';
+      if([400,409,422].includes(status)&&body?.code!=='retry'&&typeof body?.error==='string'&&
+          /售罄|卖完|库存不足|余额不足|代币不足|拍满|限额|上限|已结束|未开始|未开放|价格.*(?:变化|变动|超过)/.test(body.error))return 'rejected';
+      return 'unknown';
+    }
+    return {whole,day,start,model,round,decision,outcome};
+  }
+
   const LOG_PREFIX = 'arkengine:auto-log:v1:';
   const diagnosticLogs = {};
   // 仅在本脚本点击领取的同步调用期间绑定原网页请求，不读取请求正文。
@@ -1503,6 +1546,7 @@
   let observeShelterIncome = null;
   let captureShelterHelp = null;
   let captureShelterCaravan = null;
+  let observeAuctionRequest = null;
   let observeSessionPage = () => {};
   const pageGroup = path => /^\/cultivate(?:\/dungeon)?\/?$/.test(path) ? 'cultivate' :
     /^(?:\/activities\/expedition|\/farm|\/shelter|\/stock)\/?$/.test(path) ? 'expedition' : '';
@@ -1547,7 +1591,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.142';
+  const SCRIPT_VERSION = '1.17.143';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -2107,7 +2151,7 @@
     const pendingStock=['股市卖出待核对','股市卖出成本待核对','股市买入待核对'].some(key=>amount(expedition,key)>0);
     const otherTokens=amount(expedition,'代币')-amount(expedition,'股市返还')-amount(expedition,'避难所商队代币');
     return ['今日收益',
-      `避难所：汽水 ${format(amount(expedition,'避难所汽水'))}`,
+      `避难所：汽水 ${format(amount(expedition,'避难所汽水'))}${amount(expedition,'汽水拍卖支出')?` · 拍卖支出 ${format(amount(expedition,'汽水拍卖支出'))} 代币`:''}`,
       `修仙：钻石 ${format(amount(cultivate,'钻石'))} · 代币 ${format(amount(cultivate,'代币'))}${amount(cultivate,'秘境金额待核对')?'（部分待核对）':''}`,
       `股市：已实现盈亏 ${stockNet>0?'+':''}${format(stockNet)} 代币${pendingStock?'（部分待核对）':''}`,
       `远征/农场：钻石 ${format(amount(expedition,'钻石'))} · 代币 ${format(otherTokens)}`,
@@ -2368,7 +2412,7 @@
     const paths = new Set(['/api/cultivation', '/api/cultivation/dungeons',
       '/api/activities', '/api/activities/expedition-claim-all', '/api/activities/expedition-event',
       '/api/farm', '/api/farm/plant', '/api/farm/plant-all', '/api/farm/harvest', '/api/farm/harvest-all',
-      '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action', '/api/stock']);
+      '/api/farm/sell', '/api/me/balance', '/api/stamina', '/api/shelter', '/api/shelter/action', '/api/shelter/auction', '/api/stock']);
     const background = new Set(['/api/me/balance', '/api/stamina']);
     const samples = new Map();
     function record(info, result) {
@@ -2392,6 +2436,9 @@
     const originalFetch = window.fetch;
     window.fetch = function (...args) {
       const at = Date.now();
+      let auctionObservation;
+      try { auctionObservation=observeAuctionRequest?.(args,at); }
+      catch(error) { return Promise.reject(error); }
       const claimCapture = captureExpeditionClaim;
       let shelterCapture = captureShelterAction;
       // A native confirmation resumes an awaited callback, including when the
@@ -2517,6 +2564,8 @@
         }
       } catch { /* 只观察能与已保存原请求完全匹配的 JSON，不改变网页请求。 */ }
       const promise = Reflect.apply(originalFetch, this, args);
+      if(auctionObservation)promise.then(response=>response.clone().json().then(body=>auctionObservation(response.status,body)),
+        ()=>auctionObservation(null,null)).catch(()=>auctionObservation(null,null));
       if(dungeonReceipt)promise.then(r=>r.clone().json().then(body=>dungeonReceipt(r.status,body))).catch(()=>{});
       if(stockIncomeRead)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.view(stockIncomeRead,r.status,body))).catch(()=>{});
       if(stockIncomeRequest&&!stockBound)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.result(stockIncomeContext,stockIncomeRequest,r.status,body))).catch(()=>{});
@@ -3583,6 +3632,16 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   });
   return {
     tick, onPage, cancel: cancelPendingClick,
+    yieldForAuction(dialogs,cancel) {
+      cancelPendingClick();
+      if(!dungeonWindow||dungeonPlan?.phase!=='opening'||nativeDungeonRequests().length)return false;
+      if(dungeonWindow.dialog?.isConnected)return cancel(dungeonWindow,dialogs);
+      if(dungeonWindow.auctionCancelAt){
+        if(dungeonPlan.action!=='sweep')saveDungeon({...dungeon,run:null});
+        saveDungeonPlan(null);openedDungeonDialog=false;dungeonWindow=null;
+      }
+      return false;
+    },
     observe() { try { observeDungeonEntryReview(); } catch { dungeonEntryReview = null; } },
     pending() { return Boolean(encounterAction || dungeonPlan || pendingOperation() || nativeDungeonRequests().length); },
     update() {
@@ -3705,6 +3764,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let offered = false;
   let scheduled = false;
   let nextStepAt = 0;
+  let auctionExclusive = false;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
   let pageFrozen = false;
   const claimPageId = crypto.randomUUID();
@@ -3838,6 +3898,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <strong>方舟挂机助手</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <button type="button" id="toggle"></button>
+      <label class="staff-option"><input type="checkbox" id="auction-enabled" checked>汽水拍卖优先 · 单价 &lt;40万 · 每轮1瓶</label>
       <details class="panel-subsection" data-panel-section="settings"><summary>设置与运行详情</summary>
       <details class="panel-section" data-panel-section="cultivate">
       <summary>奇遇与秘境</summary><div class="panel-section-body">
@@ -3988,8 +4049,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   const toggle = shadow.getElementById('toggle');
   const say = message => { if (status.textContent !== message) status.textContent = message; };
   const cultivation = createCultivationAutomation({ host, shadow,
-    automationEnabled: () => enabled && !sharedGroupPaused(PREF),
-    ownsLock: () => active && enabled && !pageFrozen && !sharedGroupPaused(PREF), schedule,
+    automationEnabled: () => enabled && !auctionExclusive && !sharedGroupPaused(PREF),
+    ownsLock: () => active && enabled && !auctionExclusive && !pageFrozen && !sharedGroupPaused(PREF), schedule,
     finishVisit: () => finishScheduledVisit('cultivate'),
     navigate: path => offer(`cultivate:travel:${path}`, path === '/cultivate/dungeon' ? '切换到秘境' :
       path === '/cultivate' ? '返回主殿核对奇遇' : '返回远征，等待下次预约', () => startNavigation(path, travelLink(path))), report: say });
@@ -18836,6 +18897,7 @@ installShelterPlanningWorker(self);
       /^shelter:(?:staff-open:[1-9]\d*|staff-page:[1-9]\d*:[1-9]\d*|quest-page:(?:clear|select):[1-9]\d*|tab:[0-2])$/.test(key);
   }
   function offerReady(key, label) {
+    if(auctionExclusive){cancelQueued();return false;}
     if (accountStopReason()) { setEnabled(false, accountStopReason()); return false; }
     offered = true;
     const preparation=inShelter()&&shelterPreparationAction(key);
@@ -19027,6 +19089,7 @@ installShelterPlanningWorker(self);
     sessionStorage.removeItem(NAV_JOURNAL);
   }
   function startNavigation(path, link) {
+    if(auctionExclusive&&path!=='/shelter')return;
     navigation = { from: location.pathname.replace(/\/$/, ''), to: path, at: Date.now(), reloaded: false };
     if(path==='/shelter'&&navigation.from!=='/shelter'){
       try{sessionStorage.removeItem('arkengine:auto-shelter:handoff:v1');}catch{}
@@ -19592,8 +19655,306 @@ installShelterPlanningWorker(self);
     planFarmVisit(next + 2000, '作物生长中');
   }
 
+  const AUCTION_PREF='arkengine:auto-soda-auction:enabled:v1';
+  const AUCTION_STATE='arkengine:auto-soda-auction:state:v1';
+  const auctionCore=createSodaAuctionCore();
+  const emptyAuction=()=>({version:1,vault:null,day:'',rounds:[],doneDay:'',pending:null,receipts:[],rejected:''});
+  const auctionPendingValid=p=>objectState(p)&&typeof p.id==='string'&&auctionCore.whole(p.at)&&
+    ['opening','submitted'].includes(p.phase)&&auctionCore.whole(p.vault)&&p.price>0&&p.price<400000&&auctionCore.whole(p.price)&&
+    typeof p.round==='string'&&typeof p.day==='string'&&typeof p.signature==='string'&&
+    (p.phase==='opening'||typeof p.key==='string'&&/^[a-zA-Z0-9-]{8,64}$/.test(p.key));
+  const auctionValid=value=>objectState(value)&&value.version===1&&(value.vault===null||auctionCore.whole(value.vault))&&
+    typeof value.day==='string'&&typeof value.doneDay==='string'&&typeof value.rejected==='string'&&
+    Array.isArray(value.rounds)&&value.rounds.every(round=>typeof round==='string')&&
+    (value.pending===null||auctionPendingValid(value.pending))&&Array.isArray(value.receipts)&&value.receipts.every(receipt=>
+      objectState(receipt)&&typeof receipt.id==='string'&&auctionCore.whole(receipt.at)&&receipt.quantity===1&&
+      auctionCore.whole(receipt.vault)&&auctionCore.whole(receipt.unitPrice)&&receipt.unitPrice>0&&receipt.unitPrice<400000);
+  let auctionState=loadState(localStorage,AUCTION_STATE,emptyAuction(),'auction',auctionValid);
+  let auctionRaw=localStorage.getItem(AUCTION_STATE),auctionView=null,auctionIdentity=null,auctionBalance=null;
+  let auctionSequence=0,auctionAccountFloor=0,auctionWindow=null,auctionIssue='',auctionContextRead=null,auctionReadAt=0,auctionLogging=false;
+  const auctionToggle=shadow.getElementById('auction-enabled');
+  auctionToggle.checked=localStorage.getItem(AUCTION_PREF)!=='false';
+  function auctionSave(value) {
+    if(!auctionValid(value))throw Error('拍卖记录无效');
+    const raw=JSON.stringify(value);localStorage.setItem(AUCTION_STATE,raw);
+    if(localStorage.getItem(AUCTION_STATE)!==raw)throw Error('拍卖记录未保存');
+    auctionRaw=raw;auctionState=value;
+  }
+  function auctionReload() {
+    const raw=localStorage.getItem(AUCTION_STATE);
+    if(raw!==auctionRaw){auctionState=loadState(localStorage,AUCTION_STATE,emptyAuction(),'auction',auctionValid);auctionRaw=raw;}
+  }
+  const auctionAllowed=()=>enabled&&active&&!pageFrozen&&!sharedGroupPaused(PREF)&&
+    localStorage.getItem(AUCTION_PREF)!=='false'&&!accountStopReason()&&!stateFault('auction')&&!auctionIssue;
+  function auctionRecord() {
+    if(auctionLogging||!auctionState.receipts.length)return;
+    const receipt=auctionState.receipts[0];auctionLogging=true;
+    void log.add('soda-auction-bought','汽水拍卖原回执确认买入 1 瓶',{
+      quantity:1,unitPrice:receipt.unitPrice,vault:receipt.vault,reward:{避难所汽水:1,汽水拍卖支出:receipt.unitPrice}},
+      true,'soda-auction:'+receipt.id,receipt.at).then(saved=>{
+      if(saved){auctionReload();auctionSave({...auctionState,receipts:auctionState.receipts.filter(entry=>entry.id!==receipt.id)});}
+    }).catch(()=>{auctionIssue='拍卖收益记录保存失败，保留原回执';}).finally(()=>{auctionLogging=false;});
+  }
+  function auctionObserveRead(path,sequence,at,status,body) {
+    if(status<200||status>=300||status===null)return;
+    if(path!=='/api/shelter'&&sequence<auctionAccountFloor)return;
+    if(path==='/api/shelter/auction'&&sequence>(auctionView?.sequence||0)){
+      const model=auctionCore.model(body);
+      if(model||body?.enabled===false)auctionView={model,disabled:body?.enabled===false,sequence,at};
+    }else if(path==='/api/shelter'&&sequence>(auctionIdentity?.sequence||0)&&auctionCore.whole(body?.vaultNo)){
+      if(auctionIdentity&&auctionIdentity.vault!==body.vaultNo){auctionAccountFloor=sequence;auctionView=null;auctionBalance=null;}
+      auctionIdentity={vault:body.vaultNo,sequence,at};
+    }else if(path==='/api/me/balance'&&sequence>(auctionBalance?.sequence||0)&&Number.isFinite(body?.tokens)&&body.tokens>=0){
+      auctionBalance={tokens:body.tokens,sequence,at};
+    }
+    if(auctionExclusive)schedule();
+  }
+  function auctionContext() {
+    if(auctionContextRead||Date.now()<auctionReadAt||!auctionAllowed())return;
+    auctionReadAt=Date.now()+15000;
+    const controller=createReadSession(10000,()=>auctionAllowed()&&auctionExclusive);auctionContextRead=controller;
+    const paths=['/api/shelter','/api/me/balance'];
+    if(!auctionView||Date.now()-auctionView.at>30000)paths.push('/api/shelter/auction');
+    void Promise.allSettled(paths.map(async path=>{
+      const response=await controller.fetch(path,{cache:'no-store'});await controller.json(response);
+    })).finally(()=>{controller.close();if(auctionContextRead===controller)auctionContextRead=null;schedule();});
+  }
+  function auctionRequestResult(id,status,body) {
+    auctionReload();const pending=auctionState.pending;
+    if(pending?.id!==id||pending.phase!=='submitted')return;
+    const outcome=auctionCore.outcome(pending,status,body);
+    if(outcome==='unknown'){
+      auctionSave({...auctionState,pending:{...pending,unknown:true}});
+      log.add('soda-auction-unconfirmed','拍卖原单结果待核对，保留原单，不自动重买',{status});
+    }else{
+      const receipts=[...auctionState.receipts],rounds=[...auctionState.rounds];
+      if(outcome==='success'){
+        if(!rounds.includes(pending.round))rounds.push(pending.round);
+        receipts.push({id:pending.id,at:Date.now(),quantity:1,unitPrice:body.unitPrice,vault:pending.vault});
+      }else log.add('soda-auction-rejected','本次未成交，继续驻留等待新的购买条件',{status});
+      auctionSave({...auctionState,pending:null,rounds,receipts,rejected:outcome==='rejected'?pending.signature:''});
+      auctionWindow=null;auctionRecord();
+    }
+    schedule();
+  }
+  observeAuctionRequest=(args,at)=>{
+    const input=args[0],url=new URL(typeof input==='string'?input:input instanceof URL?input.href:input?.url,document.baseURI);
+    if(url.origin!==location.origin)return null;
+    const method=String(args[1]?.method??input?.method??'GET').toUpperCase();
+    if(method==='GET'&&['/api/shelter/auction','/api/shelter','/api/me/balance'].includes(url.pathname)){
+      const sequence=++auctionSequence;
+      return (status,body)=>auctionObserveRead(url.pathname,sequence,at,status,body);
+    }
+    if(url.pathname==='/api/shelter/auction'&&method==='POST'&&auctionState.pending?.phase==='submitted'){
+      try{
+        const request=JSON.parse(args[1]?.body),pending=auctionState.pending;
+        if(request.quantity===1&&request.maxUnitPrice===pending.price&&request.idempotencyKey===pending.key)
+          return (status,response)=>{
+            try{auctionRequestResult(pending.id,status,response);}
+            catch{auctionIssue='拍卖原单回执无法保存，保留原记录';schedule();}
+          };
+      }catch{}
+    }
+    if(auctionExclusive&&method!=='GET'&&url.pathname!=='/api/shelter/auction'&&
+        (captureShelterAction||continueShelterAction||captureStockAction||captureShelterCaravan&&!captureShelterCaravan.sent||captureShelterHelp&&!captureShelterHelp.sent))
+      throw Error('汽水拍卖优先，取消尚未提交的其他自动操作');
+    const work=auctionWindow;
+    if(work?.confirming&&!work.sent&&method!=='GET'){
+      auctionReload();const pending=auctionState.pending;
+      let body;try{body=JSON.parse(args[1]?.body);}catch{}
+      const valid=auctionAllowed()&&auctionExclusive&&inShelter()&&!work.manual&&pending?.id===work.id&&
+        pending.phase==='opening'&&auctionIdentity?.vault===pending.vault&&Date.now()-auctionIdentity.at<=30000&&
+        url.pathname==='/api/shelter/auction'&&method==='POST'&&body?.quantity===1&&body.maxUnitPrice===pending.price&&
+        /^[a-zA-Z0-9-]{8,64}$/.test(body.idempotencyKey||'')&&
+        Object.keys(body).every(key=>['quantity','maxUnitPrice','idempotencyKey'].includes(key));
+      if(!valid){
+        auctionIssue='拍卖请求与确认内容不一致，已阻止提交';work.confirming=false;
+        schedule();throw Error(auctionIssue);
+      }
+      try{auctionSave({...auctionState,pending:{...pending,phase:'submitted',key:body.idempotencyKey}});}
+      catch(error){auctionIssue='拍卖原请求无法持久保存，已阻止提交';work.confirming=false;schedule();throw error;}
+      work.sent=true;
+      return (status,response)=>{
+        try{auctionRequestResult(work.id,status,response);}
+        catch{auctionIssue='拍卖回执无法保存，保留原单等待核对';schedule();}
+      };
+    }
+    if(work?.manual&&url.pathname==='/api/shelter/auction'&&method==='POST'&&auctionState.pending?.phase==='opening'){
+      try{
+        const body=JSON.parse(args[1]?.body),pending=auctionState.pending;
+        const matches=body.quantity===1&&body.maxUnitPrice===pending.price&&/^[a-zA-Z0-9-]{8,64}$/.test(body.idempotencyKey||'');
+        auctionSave({...auctionState,pending:{...pending,phase:'submitted',key:matches?body.idempotencyKey:'manual-unknown-'+pending.id,unknown:true}});
+        work.sent=true;
+        if(matches)return (status,response)=>{
+          try{auctionRequestResult(work.id,status,response);}catch{auctionIssue='手动接管的拍卖回执无法保存';schedule();}
+        };
+      }catch{auctionIssue='手动接管的拍卖原单无法核对，保留原记录';}
+    }
+    return null;
+  };
+  function auctionPanel() {
+    const candidates=[...document.querySelectorAll('section')].filter(panel=>
+      textOf(panel.querySelector('h2,h3,[data-slot="card-title"]'))==='每日拍卖');
+    return currentElement(candidates);
+  }
+  function auctionCancelWindow(work,dialogs) {
+    if(!work||work.manual||!work.dialog||dialogs.length!==1||dialogs[0]!==work.dialog)return false;
+    if(work.auctionCancelAt&&Date.now()-work.auctionCancelAt<5000)return true;
+    if((work.auctionCancelCount||0)>=2){say('拍卖等待原生取消完成，请关闭未响应的弹窗');return true;}
+    const buttons=[...work.dialog.querySelectorAll('button')].filter(button=>/^(取消|关闭|Close)$/.test(button.getAttribute('aria-label')||textOf(button)));
+    if(buttons.length!==1||!usable(buttons[0]))return false;
+    work.auctionCancelAt=Date.now();work.auctionCancelCount=(work.auctionCancelCount||0)+1;
+    if(work===shelterWorkConfirm){work.cancelling=true;work.ownerCancelled=true;}
+    if(work===shelterWork||work===shelterSocialWork)work.closing=true;
+    if(work===shelterRecallWork||work===shelterBuildWork)work.cancelled=true;
+    if(work===shelterRescueWork)work.cancelReason='汽水拍卖优先';
+    buttons[0].click();schedule();return true;
+  }
+  const auctionNotice=createNoticeHandler(log,say,(button,key,label,before)=>{before();button.click();schedule();},usable);
+  function auctionClearOtherDialogs(dialogs) {
+    const confirmation=shelterWorkConfirm;
+    if(dialogs.length===2&&confirmation?.work===shelterWork&&confirmation.dialog&&shelterWork?.dialog&&confirmation.dialog!==shelterWork.dialog&&
+        !confirmation.manual&&!shelterWork.manual&&!confirmation.clicked&&!confirmation.sent()&&
+        confirmation.pending()?.id===confirmation.id&&dialogs.includes(confirmation.dialog)&&dialogs.includes(shelterWork.dialog))
+      return auctionCancelWindow(confirmation,[confirmation.dialog]);
+    for(const work of [dispatchWindow,seedWindow,shelterWorkConfirm,shelterWork,shelterRecallWork,shelterBuildWork,shelterRescueWork,shelterSocialWork]){
+      if(auctionCancelWindow(work,dialogs))return true;
+    }
+    auctionNotice(dialogs,'拍卖等待你处理人工窗口');return true;
+  }
+  function auctionConfirm(dialogs) {
+    const pending=auctionState.pending,work=auctionWindow;
+    if(!pending)return false;
+    if(pending.phase==='submitted'){
+      say(pending.unknown?'汽水拍卖原单结果未知，保留订单等待核对':'正在确认汽水成交，其他功能暂停');return true;
+    }
+    if(!work){auctionSave({...auctionState,pending:null});return true;}
+    bindNativeWindow(work,dialogs);
+    if(work.confirming){say('正在提交汽水原单');return true;}
+    if(!dialogs.length){
+      if(work.dialog||Date.now()-work.at>5000){auctionSave({...auctionState,pending:null,rejected:pending.signature});auctionWindow=null;}
+      else say('等待汽水原生确认框');
+      return true;
+    }
+    const dialog=work.dialog,title=textOf(dialog?.querySelector('h2,[data-slot="alert-dialog-title"],[data-slot="dialog-title"]'));
+    const match=title.match(/^以 ([\d,]+) 代币\/瓶买入 (\d+) 瓶$/);
+    const amount=dialog&&nativeWindowDescription(dialog).match(/^合计 ([\d,]+) 代币[。\.]/);
+    const current=auctionView?.model,choice=auctionCore.decision(current,auctionState,auctionBalance?.tokens,Date.now());
+    const valid=dialogs.length===1&&dialogs[0]===dialog&&!work.manual&&!work.ambiguous&&auctionAllowed()&&
+      match&&Number(match[1].replaceAll(',',''))===pending.price&&Number(match[2])===1&&
+      amount&&Number(amount[1].replaceAll(',',''))===pending.price&&choice.kind==='buy'&&choice.round===pending.round&&
+      choice.price===pending.price&&auctionIdentity?.vault===pending.vault&&Date.now()-auctionIdentity.at<=30000&&
+      Date.now()-(auctionBalance?.at||0)<=30000&&Date.now()-(auctionView?.at||0)<=20000;
+    if(!valid){
+      say('汽水确认条件已变化，撤销本次等待新行情');
+      if(!work.manual)auctionCancelWindow(work,dialogs);
+      return true;
+    }
+    const buttons=[...dialog.querySelectorAll('button')].filter(button=>textOf(button)==='确认');
+    if(buttons.length!==1||!usable(buttons[0])){say('等待汽水确认按钮可用');return true;}
+    work.confirming=true;buttons[0].click();return true;
+  }
+  function auctionRelease() {
+    if(!auctionExclusive)return;
+    auctionExclusive=false;
+    auctionContextRead?.close();auctionContextRead=null;
+    shelterEntryAt=0;stockEntryAt=0;nextStepAt=0;
+    log.add('soda-auction-release','拍卖守候结束，恢复其他玩法');
+  }
+  function auctionStep() {
+    auctionReload();auctionRecord();auctionToggle.checked=localStorage.getItem(AUCTION_PREF)!=='false';
+    const now=Date.now(),today=auctionCore.day(now),current=auctionView?.model;
+    const startsAt=current?.day===today?current.startsAt:auctionCore.start(now);
+    const endsAt=current?.day===today?current.endsAt:Date.parse(today+'T23:59:59.999+08:00');
+    const requested=auctionToggle.checked&&now>=startsAt-120000&&now<endsAt&&auctionState.doneDay!==today;
+    if(!requested&&!auctionWindow){auctionRelease();return false;}
+    const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
+    if(!requested){
+      if(auctionWindow&&!auctionWindow.sent&&auctionState.pending?.phase==='opening'){
+        if(dialogs.length){auctionCancelWindow(auctionWindow,dialogs);return true;}
+        auctionSave({...auctionState,pending:null});auctionWindow=null;
+      }
+      auctionRelease();return false;
+    }
+    if(!auctionExclusive){
+      auctionExclusive=true;cancelQueued();cultivation.cancel();cancelFarmRead();cancelShelterRead();cancelShelterAuxReads();cancelShelterWatch();cancelStockRead();
+      if(captureShelterCaravan&&!captureShelterCaravan.sent)captureShelterCaravan.cancelled=true;
+      if(captureShelterHelp&&!captureShelterHelp.sent)captureShelterHelp.cancelled=true;
+      if(navigation?.to!=='/shelter')clearNavigation();
+      auctionReadAt=0;
+      log.add('soda-auction-priority','进入汽水拍卖独占时段，暂停其他玩法',{startsAt,endsAt});
+    }
+    pollReadSessions();
+    const errors=[...document.querySelectorAll('[role="status"].text-destructive,[role="status"].bg-destructive,[role="alert"].text-destructive,[role="alert"].bg-destructive')].filter(visible).map(textOf).join(' ');
+    if(/\b(?:401|403|429)\b|cyber_abuse|abuse_detected|user_disabled|未登录|登录.*(?:失效|过期)|账号已切换|封禁|禁用|访问被拒绝|权限不足|频率|频繁|限流|rate.?limit|unauthori[sz]ed|forbidden/i.test(errors)){
+      pauseAccount('游戏提示登录、权限或限流异常');return true;
+    }
+    if(stateFault('auction')||auctionIssue){say(stateFault('auction')||auctionIssue);return true;}
+    auctionContext();
+    if(cultivation.yieldForAuction(dialogs,auctionCancelWindow))return true;
+    if(auctionConfirm(dialogs))return true;
+    if(dialogs.length)return auctionClearOtherDialogs(dialogs);
+    if(dispatchWindow?.auctionCancelAt&&plan?.phase==='opening'&&!nativePending().length){savePlan(null);dispatchWindow=null;}
+    if(seedWindow?.auctionCancelAt){seedWindow=null;ownSeedDialog=null;openingSeedsAt=0;}
+    if(!inShelter()){
+      if(navigation?.to==='/shelter'&&Date.now()-navigation.at<30000){say('正在前往汽水交易');return true;}
+      say('拍卖优先，提前进入汽水交易');startNavigation('/shelter',travelLink('/shelter'));return true;
+    }
+    if(navigation)clearNavigation();
+    const tabs=[...document.querySelectorAll('[role="tab"]')].filter(tab=>textOf(tab)==='汽水交易'&&visible(tab));
+    const tab=tabs.length===1?tabs[0]:null;
+    if(tab&&tab.getAttribute('aria-selected')!=='true'){
+      if(usable(tab))tab.click();else say('等待汽水交易入口');return true;
+    }
+    if(!auctionIdentity||!auctionBalance||now-auctionIdentity.at>30000||now-auctionBalance.at>30000){say('拍卖守候中，核对账号和可用代币');return true;}
+    if(auctionState.vault!==auctionIdentity.vault){
+      auctionSave({...emptyAuction(),vault:auctionIdentity.vault,receipts:auctionState.receipts});
+    }
+    if(auctionState.day!==today)auctionSave({...auctionState,day:today,rounds:[],rejected:''});
+    if(auctionView?.disabled&&auctionCore.day(auctionView.at)===today){
+      auctionSave({...auctionState,doneDay:today});auctionRelease();return false;
+    }
+    if(!current||now-auctionView.at>20000){say('驻留汽水交易，等待原生拍卖行情');return true;}
+    const choice=auctionCore.decision(current,auctionState,auctionBalance.tokens,now);
+    if(choice.kind==='done'){
+      auctionSave({...auctionState,doneDay:today});auctionRelease();return false;
+    }
+    if(choice.kind!=='buy'){say('汽水拍卖优先：'+(choice.reason||'等待今日行情'));return true;}
+    const panel=auctionPanel(),price=textOf(panel).match(/当前 ([\d,]+) 代币\/瓶/);
+    const quantity=panel?.querySelector('input[aria-label="购买数量"]');
+    const buttons=[...(panel?.querySelectorAll('button')||[])].filter(button=>textOf(button)==='买入');
+    const button=buttons.length===1?buttons[0]:null;
+    if(!price||Number(price[1].replaceAll(',',''))!==choice.price||!usable(quantity)||!usable(button)){
+      say('驻留汽水交易，等待购买按钮与最新价格一致');return true;
+    }
+    if(Number(quantity.value)!==1){
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(quantity,'1');
+      quantity.dispatchEvent(new Event('input',{bubbles:true}));quantity.dispatchEvent(new Event('change',{bubbles:true}));schedule();return true;
+    }
+    const pending={id:crypto.randomUUID(),at:now,phase:'opening',vault:auctionIdentity.vault,day:today,
+      round:choice.round,price:choice.price,signature:choice.signature};
+    auctionSave({...auctionState,pending});auctionWindow={...beginNativeWindow(),id:pending.id};
+    say('立即买入 1 瓶汽水');button.click();
+    bindNativeWindow(auctionWindow,[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible));
+    schedule();return true;
+  }
+  auctionToggle.addEventListener('change',()=>{
+    localStorage.setItem(AUCTION_PREF,String(auctionToggle.checked));cancelQueued();schedule();
+  });
+  for(const eventName of ['pointerdown','keydown','input'])document.addEventListener(eventName,event=>{
+    if(event.isTrusted&&auctionWindow&&!auctionWindow.sent&&auctionWindow.dialog?.contains(event.target)){
+      auctionWindow.manual=true;auctionIssue='拍卖窗口已手动接管，暂停自动竞拍，保留原记录';schedule();
+    }
+  },true);
+
   function step() {
     if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
+    if(enabled&&active&&onPage()&&!pageFrozen&&!accountStopReason()&&!stateFault('expedition')){
+      try{if(auctionStep()){
+        if(auctionExclusive)log.pulse(status.textContent,{auction:true,pendingAuction:Boolean(auctionState.pending),rounds:auctionState.rounds.length});
+        return;
+      }}catch{auctionIssue='拍卖状态无法安全核对，保留原单；可关闭拍卖开关恢复其他功能';say(auctionIssue);return;}
+    }
     pollReadSessions();
     syncDialogAnimations();
     farmHint();
@@ -19890,19 +20251,20 @@ installShelterPlanningWorker(self);
       finally {
         if (!offered) cancelQueued();
         if (idleChecked && !idleBlocked) clearIdleWait(true);
-        if (enabled && active && farmEnabled && inFarm()) farmWait.finish();
-        if (enabled && active && onPage()) expeditionLoadWait.finish();
+        if (enabled && active && !auctionExclusive && farmEnabled && inFarm()) farmWait.finish();
+        if (enabled && active && !auctionExclusive && onPage()) expeditionLoadWait.finish();
       }
     });
   }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
+    auctionEnabled:auctionToggle.checked,auctionExclusive,pendingAuction:Boolean(auctionState.pending),
     pageRecovery: (inFarm() ? farmWait : expeditionLoadWait).snapshot(),
     pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait), pendingFarm: Boolean(farmPlan),
     shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending),
     stockEnabled:stockEnabled(),stockDueAt:stockLedger.nextAt,pendingStock:Boolean(stockLedger.pending),stockHeld:stockLedger.hold,
     shelterStaffMode,shelterGear,shelterOptimize,populationTarget:shelterPopulationTarget,
     pendingStaff:Boolean(shelterWork),pendingSwap:Boolean(shelterState.swap),pendingPair:Boolean(shelterState.pair),diagnostic } : null);
-  subscribeWakeup(schedule, onPage, () => enabled, () => cultivation.observe());
+  subscribeWakeup(schedule, onPage, () => enabled, () => {if(!auctionExclusive)cultivation.observe();});
   document.addEventListener('freeze', () => {
     pageFrozen = true;
     cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); releaseLock?.();
@@ -19915,6 +20277,7 @@ installShelterPlanningWorker(self);
   window.addEventListener('pageshow', resumePage);
   window.addEventListener('pagehide', () => { cancelFarmRead(); cancelShelterRead(); cancelShelterAuxReads(); cancelShelterWatch(); cancelStockRead(); cancelQueued(); releaseLock?.(); });
   window.addEventListener('storage', event => {
+    if ([AUCTION_PREF,AUCTION_STATE].includes(event.key)) {schedule();return;}
     if (event.key === PREF) {
       enabled = event.newValue !== 'false';
       toggle.textContent = enabled ? '暂停全部自动操作' : '开始全部自动操作';
