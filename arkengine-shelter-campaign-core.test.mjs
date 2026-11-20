@@ -1,4 +1,4 @@
-import {campaignView} from './arkengine-shelter-campaign.fixture.mjs';
+import {campaignView,fourExplorerView} from './arkengine-shelter-campaign.fixture.mjs';
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
@@ -17,6 +17,47 @@ const api=vm.runInNewContext(`${declarations}\n${code}\n${actions}\n({model:shel
 const now=2_000_000_000;
 
 const cfg=extra=>({...api.defaults,...extra});
+test('普通废土名额：27层四人、32层五人，战力优先于幸运并保留守军供给',()=>{
+  for(const [depth,count] of [[27,4],[32,5]]){
+    const view=fourExplorerView();view.state.depth=depth;
+    const plan=api.plan(api.model(view),cfg({explore:true}),{},14);
+    const starts=plan.actions.filter(action=>action.kind==='explore-start');
+    assert.equal(starts.length,count,plan.notes.join('\n'));
+    assert.ok(starts.every(action=>action.id>=5&&action.id<12));
+    assert.ok(starts.every(action=>['str','end','agi'].every(stat=>view.state.residents.find(person=>person.id===action.id).stats[stat]===10)));
+    assert.ok(!starts.some(action=>action.id===12));
+    assert.ok(view.state.residents.length-starts.length>=2);
+  }
+});
+
+test('普通废土名额：同层原生名额优先，升层后重新核对，拒绝目标不拖住其他出发',()=>{
+  const view=fourExplorerView(),flags=cfg({explore:true});
+  const record={roles:[],trips:[],attempts:[],heals:[],trainingRest:[],exploreSlots:{depth:27,limit:3},
+    rejections:[{kind:'explore-start',id:5,at:view.serverTime-1000,until:view.serverTime+59000,count:1}]};
+  assert.equal(api.record(record),true);
+  let plan=api.plan(api.model(view),flags,record,14);
+  assert.equal(plan.actions.filter(action=>action.kind==='explore-start').length,3);
+  assert.ok(!plan.actions.some(action=>action.kind==='explore-start'&&action.id===5));
+  assert.ok(plan.events.includes(59000));
+  view.state.depth=32;plan=api.plan(api.model(view),flags,record,14);
+  assert.equal(plan.actions.filter(action=>action.kind==='explore-start').length,5);
+  record.rejections[0].until=view.serverTime;
+  assert.ok(api.plan(api.model(view),flags,record,14).actions.some(action=>action.kind==='explore-start'&&action.id===5));
+});
+
+test('普通废土召回退避：只跳过被拒绝的行程，其余到期人员照常召回',()=>{
+  const view=fourExplorerView(),record={trips:[],rejections:[{kind:'explore-recall',id:11,at:view.serverTime-1000,until:view.serverTime+59000,count:1}]};
+  for(const id of [5,6]){
+    view.state.residents.find(person=>person.id===id).away={kind:'explore'};
+    const explorer={id:id+6,residentId:id,tier:2,abyss:false,startedAt:view.serverTime-6*3600000,recalledAt:null,returnAt:null,stimpaks:2,
+      loot:{scrap:0,parts:0,stimpak:0,items:[]}};
+    view.state.explorers.push(explorer);record.trips.push({id:explorer.id,resident:id,at:explorer.startedAt,hours:6});
+  }
+  const plan=api.plan(api.model(view),cfg({explore:true}),record,14);
+  assert.equal(plan.choice.kind,'explore-recall');assert.equal(plan.choice.targets[0],12);
+  assert.ok(!plan.actions.some(action=>action.kind==='explore-recall'&&action.targets[0]===11));
+});
+
 test('日常装备：没有出征也为健康留守成人穿闲置武器，原强武器、外出和幼儿不动',()=>{
   const v=campaignView(),s=v.state;
   s.items=[{id:173,slot:'weapon',damage:[11,18]},{id:169,slot:'weapon',damage:[1,3]},

@@ -89,7 +89,7 @@ window.fetch=async (url,options)=>{
      s.items.push(...e.loot.items);p.away=null;p.roomId=null;s.explorers=s.explorers.filter(r=>r.id!==e.id);
    } else if(a.type==='explore_start'){
      const p=s.residents.find(p=>p.id===a.residentId);
-     if(!p||p.away||a.abyss!==false||s.resources.stimpak<a.stimpaks||s.explorers.length>=Math.min(6,1+Math.floor(s.depth/8)))throw Error('错误普通出发');
+     if(!p||p.away||a.abyss!==false||s.resources.stimpak<a.stimpaks||s.explorers.length>=(sm.exploreSlots??Math.min(6,1+Math.floor(s.depth/8))))throw Error('错误普通出发');
      s.resources.stimpak-=a.stimpaks;p.away={kind:'explore'};p.roomId=null;
      s.explorers.push({id:Math.max(10,...s.explorers.map(e=>e.id))+1,residentId:p.id,tier:a.tier,abyss:false,startedAt:clock,
        recalledAt:null,returnAt:null,stimpaks:a.stimpaks,loot:{scrap:0,parts:0,stimpak:0,items:[]}});
@@ -343,7 +343,7 @@ window.renderShelter=()=>{
    const dig=button(content,Number.isInteger(s.depth)?'往下挖 · '+Math.ceil(120*(s.depth+1)**1.4)+' 废料':'往下挖',{type:'往下挖'});dig.onclick=()=>openConstruction('dig');
    for(const label of ['升级','安排工作','培养感情','星核汽水加速'])button(content,label,{type:label});
  } else if(sm.tab==='废土'){
-   const root=document.createElement('section');root.innerHTML='<h2>单人探险（'+(s.explorers||[]).length+'/6）</h2><ul></ul>';
+   const root=document.createElement('section');root.innerHTML='<h2>单人探险（'+(s.explorers||[]).length+'/'+(sm.exploreSlots??Math.min(6,1+Math.floor((s.depth||1)/8)))+'）</h2><ul></ul>';
    const select=(label,options,value)=>{const l=document.createElement('label');l.append(label);const input=document.createElement('select');
      for(const [v,text] of options){const o=document.createElement('option');o.value=v;o.textContent=text;input.append(o);}l.append(input);root.append(l);input.value=String(value);return input;};
    const people=s.residents.filter(p=>p.away===null&&p.deadAt===null&&p.adultAt<=clock);

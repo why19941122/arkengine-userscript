@@ -262,11 +262,11 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
   await t.test('推荐预设面板：375宽度默认不展示参数，按键可展开高级设置且刷新记忆',async()=>{
     await setupStock(paused);await viewport({width:375,height:812,deviceScaleFactor:1,mobile:false});
     try {
-      await evaluate(`for(const name of ['shelter','stock'])${panel}.querySelector('[data-panel-section="'+name+'"]>summary').click();`);
+      await evaluate(`for(const name of ['settings','shelter','stock'])${panel}.querySelector('[data-panel-section="'+name+'"]>summary').click();`);
       assert.equal(await evaluate(`${panel}.getElementById('stock-trade-limit').checkVisibility()`),false);
       assert.equal(await evaluate(`${panel}.getElementById('shelter-staff').checkVisibility()`),false);
       assert.equal(await evaluate(`${panel}.querySelector('.box').scrollWidth<=${panel}.querySelector('.box').clientWidth`),true);
-      assert.ok(await evaluate(`${panel}.getElementById('stock-preset').getBoundingClientRect().height>=44`));
+      assert.equal(await evaluate(`${panel}.getElementById('stock-preset').checkVisibility()`),false);
       if(process.env.ARKENGINE_TEST_SCREENSHOT_DIR){
         await mkdir(process.env.ARKENGINE_TEST_SCREENSHOT_DIR,{recursive:true});
         for(const name of ['shelter','stock']){
@@ -278,7 +278,46 @@ export async function settingsTests({t,setupShelter,reloadShelter,setupStock,rel
       assert.equal(await evaluate(`${panel}.activeElement.textContent`),'高级设置（可选）');
       await pressEnter();
       await until(()=>evaluate(`localStorage.getItem('arkengine:auto-panel:expedition:section:stock-advanced:collapsed:v1')==='false'`),'advanced preference saved');
+      assert.ok(await evaluate(`${panel}.getElementById('stock-preset').getBoundingClientRect().height>=44`));
       await reloadStock();assert.equal(await evaluate(`${panel}.getElementById('stock-trade-limit').checkVisibility()`),true);
+    } finally {await viewport({width:1280,height:900,deviceScaleFactor:1,mobile:false});}
+  });
+  await t.test('精简面板：单一收益区、默认隐藏设置，滚动及折叠仍能导出全部日志',async()=>{
+    await setupStock(paused+`for(const [group,totals] of [['cultivate',{钻石:9,代币:20,修为:300}],['expedition',{避难所汽水:2,代币:100,股市返还:80,股市已实现盈亏:-5}]]){
+      localStorage.setItem('arkengine:auto-log:v1:'+group+':2026-10-10',JSON.stringify({day:'2026-10-10',totals,events:[{type:'fixture-reward',detail:group+' income'}]}));}`);
+    try {
+      await until(()=>evaluate(`${panel}.getElementById('log-summary').textContent.includes('修仙：钻石 9 · 代币 20')`),'merged persisted income loaded');
+      assert.match(await evaluate(`${panel}.getElementById('log-summary').textContent`),/避难所：汽水 2\n修仙：钻石 9 · 代币 20\n股市：已实现盈亏 -5 代币\n远征\/农场：钻石 0 · 代币 20/);
+      assert.equal(await evaluate(`${panel}.querySelector('[data-panel-section="settings"]').open`),false);
+      assert.equal(await evaluate(`${panel}.querySelectorAll('#log-summary').length`),1);
+      assert.equal(await evaluate(`${panel}.getElementById('cultivate-log-summary')`),null);
+      assert.equal(await evaluate(`${panel}.getElementById('stock-trade-limit').checkVisibility()`),false);
+      for(const [width,height] of [[375,667],[1280,900],[667,375]]){
+        await viewport({width,height,deviceScaleFactor:1,mobile:false});
+        const visible=()=>evaluate(`(()=>{const root=${panel},box=root.querySelector('.box'),button=root.getElementById('log-export'),rect=button.getBoundingClientRect(),bounds=box.getBoundingClientRect();
+          return button.checkVisibility()&&rect.top>=bounds.top&&rect.bottom<=bounds.bottom&&rect.left>=0&&rect.right<=innerWidth&&rect.bottom<=innerHeight&&box.scrollWidth<=box.clientWidth;})()`);
+        assert.ok(await visible(),`default ${width}x${height}`);
+        if(height>=667)assert.ok(await evaluate(`${panel}.querySelector('.box').scrollHeight<=${panel}.querySelector('.box').clientHeight`));
+        if(process.env.ARKENGINE_TEST_SCREENSHOT_DIR){
+          await mkdir(process.env.ARKENGINE_TEST_SCREENSHOT_DIR,{recursive:true});
+          const {data}=await screenshot();await writeFile(join(process.env.ARKENGINE_TEST_SCREENSHOT_DIR,`compact-${width}.png`),Buffer.from(data,'base64'));
+        }
+        await evaluate(`for(const section of ${panel}.querySelectorAll('[data-panel-section]'))section.open=true;${panel}.querySelector('.box').scrollTop=100000;`);
+        assert.ok(await visible(),`scrolled ${width}x${height}`);
+        await click('panel-fold');assert.ok(await visible(),`folded ${width}x${height}`);
+        await click('panel-fold');await evaluate(`for(const section of ${panel}.querySelectorAll('[data-panel-section]'))section.open=false;`);
+      }
+      await click('panel-fold');
+      await evaluate(`window.exportedBlob=null;URL.createObjectURL=blob=>{exportedBlob=blob;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};`);
+      await click('log-export');await until(()=>evaluate('!!exportedBlob'),'folded export');
+      const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
+      assert.equal(exported.days.find(day=>day.group==='cultivate').totals['修为'],300);
+      assert.equal(exported.days.find(day=>day.group==='expedition').totals['股市返还'],80);
+      assert.equal(exported.days.flatMap(day=>day.events).filter(event=>event.type==='fixture-reward').length,2);
+      assert.equal(await evaluate(`${panel}.getElementById('log-export').disabled`),false);
+      await reloadStock();await until(()=>evaluate(`${panel}.getElementById('log-summary').textContent.includes('修仙：钻石 9 · 代币 20')`),'merged income survives reload');
+      await evaluate(`clock=Date.parse('2026-10-11T00:01:00+08:00');window.dispatchEvent(new Event('focus'));`);
+      await until(()=>evaluate(`${panel}.getElementById('log-summary').textContent.includes('修仙：钻石 0 · 代币 0')`),'merged income resets on new day');
     } finally {await viewport({width:1280,height:900,deviceScaleFactor:1,mobile:false});}
   });
 }

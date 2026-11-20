@@ -72,6 +72,7 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
     await setupUnified(`${disableDungeon}cm.remaining=0;`);
     await drive(`${home}&&${schedule}?.nextAt>clock`,'exhausted quota returns');
     const nextAt=await evaluate(`${schedule}.nextAt`);
+    assert.equal(new Date(nextAt+8*3600000).toISOString().slice(11,19),'04:00:00');
     await reloadUnified();
     assert.equal(await evaluate(`${schedule}.nextAt`),nextAt);
     await pulse(1800000);
@@ -80,6 +81,21 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
     await evaluate(`cm.remaining=24;clock=${nextAt};`);
     await drive(`${home}&&cm.calls.length===2`,'native quota restored');
     assert.equal(await evaluate('cm.remaining'),23);
+  });
+  await t.test('单页额度迁移：旧版小时复查改为四点，已过刷新点则立即核对',async()=>{
+    for(const refreshed of [false,true]){
+      await setupUnified(`${disableDungeon}
+        clock=Date.parse('${refreshed?'2026-10-11T04:10:00+08:00':'2026-10-10T12:00:00+08:00'}');
+        localStorage.setItem('arkengine:auto-encounter:schedule:v1',JSON.stringify({
+          nextAt:clock+1800000,note:'今日奇遇次数已用完，一小时后核对网页额度'}));`);
+      if(refreshed){await drive('cm.calls.length===2','old exhaustion expired across four');assert.equal(await evaluate('cm.remaining'),23);}
+      else{
+        const nextAt=await evaluate(`${schedule}.nextAt`);
+        assert.equal(nextAt,Date.parse('2026-10-11T04:00:00+08:00'));
+        await pulse(10000);assert.deepEqual(await evaluate('cm.calls'),[]);
+        assert.equal(await evaluate('fm.calls.filter(call=>call.type==="navigate").length'),0);
+      }
+    }
   });
   await t.test('单页挂机：奇遇冷却返回远征，到期才再切页',async()=>{
     await setupUnified(`${disableDungeon}cm.cooldownAt=clock+600000;`);
@@ -96,7 +112,10 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
       await setupUnified(`${disableDungeon}${exhausted?'cm.remaining=0;cm.quotaLabel=true;':'cm.unavailable=true;'}`);
       await drive(`${home}&&${schedule}?.nextAt>clock`,'disabled native seek returns');
       const remaining=await evaluate(`${schedule}.nextAt-clock`);
-      assert.ok(remaining>(exhausted?3500000:290000)&&remaining<=(exhausted?3600000:300000));
+      if(exhausted){
+        assert.ok(remaining>3600000&&remaining<=86400000);
+        assert.equal(new Date(await evaluate(`${schedule}.nextAt`)+8*3600000).toISOString().slice(11,19),'04:00:00');
+      }else assert.ok(remaining>290000&&remaining<=300000);
       assert.deepEqual(await evaluate('cm.calls'),[]);
     }
   });
@@ -105,6 +124,26 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
     await drive(`${home}&&cm.calls.includes('choose')`,'last reward claimed');
     assert.deepEqual(await evaluate('cm.calls'),['choose']);
     assert.deepEqual(await evaluate(`dm.calls.filter(call=>call[0]==='encounter').map(call=>call[1])`),[1]);
+  });
+  await t.test('单页额度日预约：奇遇秘境均满后跨零点不切入，凌晨四点一起恢复',async()=>{
+    await setupUnified(`cm.remaining=0;dm.remaining=0;
+      localStorage.setItem('arkengine:auto-expedition:burst-day:v1',new Date(clock+8*3600000).toISOString().slice(0,10));`);
+    await drive(`${home}&&${schedule}?.nextAt>clock&&JSON.parse(localStorage.getItem('arkengine:auto-dungeon:state:v1'))?.exhaustedDay`,'both quotas exhausted',150);
+    const firstReset=await evaluate(`${schedule}.nextAt`);
+    assert.equal(new Date(firstReset+8*3600000).toISOString().slice(11,19),'04:00:00');
+    await reloadUnified();
+    const visits=await evaluate('fm.calls.filter(call=>call.type==="navigate").length');
+    for(let pass=0;pass<4;pass++)await pulse(3600000);
+    await evaluate(`clock=${firstReset}-4*3600000;
+      localStorage.setItem('arkengine:auto-expedition:burst-day:v1',new Date(clock+8*3600000).toISOString().slice(0,10));`);
+    await pulse(1000);
+    await evaluate(`clock=${firstReset}-60000;`);await pulse(1000);
+    assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+    assert.equal(await evaluate('fm.calls.filter(call=>call.type==="navigate").length'),visits);
+    assert.equal(await evaluate(`!!document.getElementById('ark-auto-expedition')&&localStorage.getItem('arkengine:auto-expedition:enabled:v1')!=='false'`),true);
+    await evaluate(`clock=${firstReset};cm.remaining=24;dm.remaining=1;dm.sweep=true;`);
+    await drive(`${home}&&cm.calls.length===2&&dm.calls.some(call=>call[0]==='sweep')`,'both quotas refresh at four',150);
+    assert.equal(await evaluate('cm.remaining'),23);assert.equal(await evaluate('dm.remaining'),0);
   });
   await t.test('单页挂机：人工弹窗和未知原奇遇均阻止切页',async()=>{
     for(const kind of ['dialog','pending']){

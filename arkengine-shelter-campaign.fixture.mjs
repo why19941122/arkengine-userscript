@@ -11,6 +11,16 @@ export function campaignView(time=2_000_000_000){
       rooms:[room(1,'power',2),room(2,'diner',3),room(3,'water',4),room(4,'scrap',5),{...room(5,'quarters',2,2),width:2},room(6,'storage',6),
         ...Array.from({length:7},(_,i)=>room(10+i,'elevator',1,i+1,1))]}};
 }
+export function fourExplorerView(time=2_000_000_000){
+  const view=campaignView(time),state=view.state,base=state.residents[4];
+  state.depth=27;state.resources.stimpak=40;view.drops.tierPermille=[50,70,90,110];
+  state.rooms.push({...state.rooms[0],id:90,type:'medbay',floor:3,col:2,width:3,stored:0});
+  state.residents=state.residents.slice(0,4);
+  for(let id=5;id<=12;id++)state.residents.push({...structuredClone(base),id,name:'探险居民'+id,hp:149,
+    stats:{...base.stats,str:10,end:10,agi:10,lck:id===12?10:3},roomId:null});
+  Object.assign(state.residents.at(-1).stats,{str:1,end:1,agi:1});state.residents.at(-1).hp=118;
+  return view;
+}
 export function fullRosterAllocationView(count=24,time=2_000_000_000){
   const v=campaignView(time),base=v.state.residents[0],room=v.state.rooms[0],types=['power','diner','water','scrap'];
   if(![24,200].includes(count))throw Error('Explicit full-roster fixture size required');

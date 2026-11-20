@@ -11,11 +11,62 @@ const code=source.slice(source.indexOf('  function shelterWorkerRate('),source.i
 const staff=source.slice(source.indexOf('  const staffRoomTypes ='),source.indexOf('  function shelterExploreStep('));
 const api=vm.runInNewContext(`${declarations}\n${code}\n${staff}\n({model:shelterModel,estimate:shelterTrainingReturn,plan:shelterCampaignPlan,
   capacity:shelterStaffCapacity,allocation:shelterFindAllocation,projection:shelterSwapProjection,
-  defaults:campaignDefaults,valid:validCampaignRecord,pending:validCampaignPending})`,{
+  defaults:campaignDefaults,valid:validCampaignRecord,pending:validCampaignPending,finish:shelterTrainingFinish})`,{
   objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
   shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const hour=3600000;
+test('141日志训练：魅力64.3%及25%先完成当前格，不因缺少生产用途调走，刷新期限固定',()=>{
+  for(const [base,progress] of [[6,.643],[5,.25]]){
+    const context=scene('cha',base),{p,room,record,v}=context;
+    room.level=3;p.roomId=room.id;p.training=progress;
+    const plan=context.run(),retained=plan.adoptions.find(role=>role.id===p.id);
+    assert.ok(retained,JSON.stringify(plan.actions));
+    assert.equal(retained.purpose,'current');assert.equal(retained.base,base);
+    assert.ok(!plan.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+    record.roles.push(retained);assert.equal(api.valid(record),true);
+    v.serverTime+=60000;
+    const restored=context.run();assert.ok(!restored.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+    assert.ok(!restored.adoptions.some(role=>role.id===p.id&&role.until!==retained.until));
+    v.serverTime=retained.until+1;
+    assert.ok(context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  }
+});
+
+test('当前格训练：幸运和无空位智力也保护已有进度，不虚构生产收益或返岗席位',()=>{
+  for(const stat of ['lck','int']){
+    const context=scene(stat,5);context.p.roomId=context.room.id;context.p.training=.9;
+    const plan=context.run(),retained=plan.adoptions.find(role=>role.id===context.p.id);
+    assert.equal(retained?.purpose,'current',stat);assert.equal(retained.destination,undefined);
+    assert.ok(!plan.actions.some(action=>action.id===context.p.id&&action.role==='training-release'));
+    context.record.roles.push(retained);context.p.stats[stat]++;context.p.training=0;
+    assert.ok(context.run().actions.some(action=>action.id===context.p.id&&action.role==='training-release'));
+  }
+});
+
 const close=(actual,expected)=>assert.ok(Math.abs(actual-expected)<1e-6,`${actual} != ${expected}`);
+test('当前格训练：关闭、断供与固定截止释放，不以当前格保护永久占位',()=>{
+  for(const condition of ['disabled','supply','deadline']){
+    const context=scene('cha',5);context.p.roomId=context.room.id;context.p.training=.9;
+    const retained=context.run().adoptions.find(role=>role.id===context.p.id);assert.equal(retained?.purpose,'current');
+    context.record.roles.push(retained);
+    if(condition==='disabled')context.cfg.training=false;
+    if(condition==='supply')context.s.resources.power=0;
+    if(condition==='deadline')context.v.serverTime=retained.until;
+    const plan=context.run();assert.ok(plan.actions.some(action=>action.id===context.p.id&&action.role==='training-release'),condition);
+    assert.ok(!plan.adoptions.some(role=>role.id===context.p.id),condition);
+  }
+});
+
+test('当前格训练：旧生产保护转入收尾时补全有限期限标记，不继承虚假返岗位',()=>{
+  const context=scene('end',5),{p,room,v,cfg,record}=context;p.roomId=room.id;p.training=.9;
+  const role={id:p.id,room:room.id,role:'training',at:v.serverTime-4*hour,stat:'end',base:5,
+    purpose:'production',until:v.serverTime+hour,windowEnd:v.serverTime+1000,destination:4};
+  const retained=api.finish(api.model(v),p,room,cfg,record,role);
+  assert.equal(retained?.purpose,'current');assert.equal(retained.finishCurrent,true);
+  assert.ok(retained.until<=role.until);assert.equal(retained.destination,undefined);assert.equal(retained.windowEnd,undefined);
+  assert.equal(api.valid({...record,roles:[retained]}),true);
+});
+
 function scene(stat='end',base=5){
   const v=campaignView(),s=v.state;
   const room={...s.rooms[0],id:90,type:'training',trainStat:stat,level:1,floor:3,col:2};s.rooms.push(room);

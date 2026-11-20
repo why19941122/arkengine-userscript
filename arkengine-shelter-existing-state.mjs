@@ -14,10 +14,11 @@ export function createShelterExistingState() {
   const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));
   const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));
   const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
-    (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production'].includes(r.purpose)&&
+    (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
       Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
     (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&
-      (r.purpose===undefined||['production','parent'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
+      (r.purpose===undefined||['production','parent','current'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
+      (r.purpose!=='current'||r.finishCurrent===true)&&
       (r.purpose!=='production'||['str','per','end','agi','int'].includes(r.stat)&&time(r.windowEnd)&&r.windowEnd>r.at&&id(r.destination)));
   const validMaterial=m=>m&&id(m.vaultNo)&&id(m.id)&&['power','diner','water','scrap','medbay','workshop','storage','quarters'].includes(m.type)&&
     m.level===3&&id(m.targetLevel)&&id(m.finalTarget)&&m.targetLevel<=m.finalTarget;

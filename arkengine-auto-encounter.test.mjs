@@ -736,6 +736,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       const panel=`document.getElementById('ark-auto-expedition').shadowRoot`;
       const farm=`${panel}.querySelector('[data-panel-section="farm"]')`;
       await cdp.send('Page.bringToFront',{},tab.sessionId);
+      await evaluate(`${panel}.querySelector('[data-panel-section="settings"]>summary').click();`);
       await evaluate(`${farm}.querySelector('summary').focus();`);
       assert.equal(await evaluate(`${panel}.activeElement===${farm}.querySelector('summary')`),true);
       for(const [key,code,keyCode] of [['Enter','Enter',13],[' ','Space',32]]) {
@@ -2078,7 +2079,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       }
       assert.deepEqual(await evaluate(`${logBucket()}.totals`),{'代币':1001234.5,'修为':12000,'钻石':2});
       assert.deepEqual(await clickLog(),[1,1,1,1],'统计代币不改变钻石优先的选项规则');
-      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('cultivate-log-summary').textContent`),/代币 1001234\.5/);
+      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-summary').textContent`),/代币 1001234\.5/);
     });
     await t.test('代币统计：远征单领批领加上明确额外里程碑，相同回执两次分别入账', async () => {
       await setupExp(`addRuns(1,false,true);addRuns(5);model.claimReceipts=[
@@ -2119,7 +2120,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
       assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
       await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};HTMLAnchorElement.prototype.click=function(){};
-        [...document.getElementById('ark-auto-expedition').shadowRoot.querySelectorAll('details button')].find(b=>b.textContent==='导出全部日志（7 天）').click();`);
+        document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-export').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported=await evaluate('exportedBlob.text().then(JSON.parse)');
       assert.equal(exported.days[0].totals['代币'],247);
@@ -2177,7 +2178,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       assert.notEqual(await evaluate(logBucket('expedition','2026-10-09')),null,'旧日志迁移后仍可读取');
       await evaluate(`window.exportedBlob=null;URL.createObjectURL=b=>{exportedBlob=b;return 'blob:local';};
         HTMLAnchorElement.prototype.click=function(){};
-        document.getElementById('ark-auto-expedition').shadowRoot.querySelector('#local-log button').click();`);
+        document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-export').click();`);
       await until(()=>evaluate('!!exportedBlob'),'async log export');
       const exported = await evaluate(`exportedBlob.text().then(JSON.parse)`);
       assert.equal(exported.version,scriptVersion);
@@ -2233,8 +2234,8 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         choices(['修为 +1','钻石 +2']);`);
       await drive(`clicks.length===1`,'storage-full automation continues');
       assert.deepEqual(await clickLog(),[1]);
-      await until(()=>evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('cultivate-log-summary').textContent.includes('日志存储失败')`),'async storage failure is displayed');
-      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('cultivate-log-summary').textContent`),/日志存储失败/);
+      await until(()=>evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-summary').textContent.includes('日志存储失败')`),'async storage failure is displayed');
+      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-summary').textContent`),/日志存储失败/);
     });
 
     await t.test('秘境接续优化：逐节通关后网页允许扫荡时立即完成今日剩余次数', async () => {
@@ -2293,7 +2294,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       const totals=await evaluate(sweepIncomeTotals);
       assert.equal(totals['修为'],192180);assert.equal(totals['代币'],6.25);assert.equal(totals['灵力'],480);
       assert.equal(totals['秘境扫荡通关'],5);assert.equal(totals['秘境扫荡修为'],192180);
-      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('cultivate-log-summary').textContent`),/秘境扫荡.*192180.*260/);
+      assert.match(await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('log-summary').textContent`),/修仙：钻石 260 · 代币 6\.25/);
       await evaluate(`fetch('/api/cultivation/dungeons',{method:'POST',body:JSON.stringify({...dm.calls.find(c=>c[0]==='sweep')[1],idempotencyKey:dm.calls.find(c=>c[0]==='sweep')[2]})});persistDun();`);
       await cdp.send('Page.navigate',{url:origin+'/cultivate?dungeon-fixture=income-reload'},tab.sessionId);
       await until(()=>evaluate(`location.search==='?dungeon-fixture=income-reload'&&typeof renderDun==='function'&&!window.__arkTestLogs`),'income reload');

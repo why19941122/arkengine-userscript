@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.141
+// @version      1.17.142
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1547,7 +1547,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.141';
+  const SCRIPT_VERSION = '1.17.142';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -1560,6 +1560,8 @@
     const style=document.createElement('style');
     style.textContent=`.panel-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
       .panel-heading{min-width:0}.panel-heading strong{display:block;font-size:13px}
+      .panel-header{position:sticky;top:-12px;z-index:1;background:#1b2033;padding:8px 0}
+      .panel-tools{display:flex;align-items:center;gap:6px}.panel-tools button{min-height:36px;padding:4px 8px}
       .panel-version{display:block;color:#acbde1;font-size:11px}
       #panel-fold{flex-shrink:0;min-height:28px;padding:2px 8px}
       #panel-content[hidden]{display:none}
@@ -1585,7 +1587,9 @@
     const version=document.createElement('span');version.id='script-version';version.className='panel-version';
     version.textContent=`v${SCRIPT_VERSION}`;heading.append(title,version);
     const fold=document.createElement('button');fold.id='panel-fold';fold.type='button';
-    fold.setAttribute('aria-controls','panel-content');header.append(heading,fold);
+    const toolbar=document.createElement('div');toolbar.className='panel-tools';
+    toolbar.append(shadow.getElementById('log-export'),fold);
+    fold.setAttribute('aria-controls','panel-content');header.append(heading,toolbar);
     const content=document.createElement('div');content.id='panel-content';
     while(box.firstChild)content.append(box.firstChild);
     box.append(header,content);
@@ -2093,6 +2097,28 @@
   }
   const logStore = createLogStore();
 
+  let logSummaryHint=null,logSummaryDay=null;
+  function logIncomeText(groups,day) {
+    const totals=name=>groups[name]?.day===day?groups[name].totals:{};
+    const expedition=totals('expedition'),cultivate=totals('cultivate');
+    const amount=(values,key)=>Number.isFinite(values?.[key])?values[key]:0;
+    const format=value=>String(Number(value.toFixed(6)));
+    const stockNet=amount(expedition,'股市已实现盈亏')+amount(expedition,'股市预测净盈亏');
+    const pendingStock=['股市卖出待核对','股市卖出成本待核对','股市买入待核对'].some(key=>amount(expedition,key)>0);
+    const otherTokens=amount(expedition,'代币')-amount(expedition,'股市返还')-amount(expedition,'避难所商队代币');
+    return ['今日收益',
+      `避难所：汽水 ${format(amount(expedition,'避难所汽水'))}`,
+      `修仙：钻石 ${format(amount(cultivate,'钻石'))} · 代币 ${format(amount(cultivate,'代币'))}${amount(cultivate,'秘境金额待核对')?'（部分待核对）':''}`,
+      `股市：已实现盈亏 ${stockNet>0?'+':''}${format(stockNet)} 代币${pendingStock?'（部分待核对）':''}`,
+      `远征/农场：钻石 ${format(amount(expedition,'钻石'))} · 代币 ${format(otherTokens)}`,
+      ...Object.values(groups).some(value=>value.failed)?['日志存储失败，统计可能不全；原记录保留。']:[]].join('\n');
+  }
+  function renderLogIncome() {
+    if(!logSummaryHint)return;
+    logSummaryDay=Math.floor((Date.now()+8*3600000)/86400000);
+    setPanelText(logSummaryHint,logIncomeText(Object.fromEntries(
+      Object.entries(diagnosticLogs).map(([name,logger])=>[name,logger.summary()])),logDay()));
+  }
   function createLog(group) {
     const pageId = crypto.randomUUID();
     const heartbeatKey = `${LOG_PREFIX}${group}:heartbeat`;
@@ -2105,7 +2131,6 @@
     let lastWrite = 0;
     let lastState = '';
     let lastSample = 0;
-    let hint;
     let storageFailed = false;
     try {
       checkpoint = JSON.parse(localStorage.getItem(heartbeatKey) || 'null');
@@ -2142,15 +2167,7 @@
       .then(value => committed(event, value)).catch(failed);
     function failed() { storageFailed = true; failedWrites++; render(); }
     function render() {
-      if (!hint) return;
-      const totals = cached.day === logDay() ? cached.totals : {};
-      const message = storageFailed ? '日志存储失败；部分事件未保存，自动操作仍继续。请检查站点空间后重新导出。' :
-        `本组今日确认${group==='expedition'?'到账':'收入'}：代币 ${totals['代币'] || 0} · 修为 ${totals['修为'] || 0} · 钻石 ${totals['钻石'] || 0}（${group==='expedition'?'含股市本金返还，非净利润':'毛收入，不含未完成秘境'}）`+
-        (group==='expedition'?`\n股市：返还 ${totals['股市返还']||0} 代币（含本金）；其中股票卖出到账 ${totals['股市卖出到账']||0}；买入支出 ${totals['股市买入支出']||0}，下注支出 ${totals['股市下注支出']||0}；股票已核对实现盈亏 ${totals['股市已实现盈亏']||0}，已结算预测净盈亏 ${totals['股市预测净盈亏']||0}；卖出到账待核对 ${totals['股市卖出待核对']||0} 笔，卖出成本待核对 ${totals['股市卖出成本待核对']||0} 笔，买入金额未核实 ${totals['股市买入待核对']||0} 笔。存在待核对时，已知盈亏不代表完整盈亏。`+
-          `\n避难所领取入库：${['废料','零件','电力','食物','净水','治疗针','汽水'].map(k=>`${k} ${totals['避难所'+k]||0}`).join(' · ')}；商队代币 ${totals['避难所商队代币']||0}、装备 ${totals['避难所商队装备']||0} 件；金额待核对 ${totals['避难所金额待核对']||0} 笔。`+
-          '\n含可核对的自动与手动操作。按本地确认日入账，资源可含返还，估值和缺失的旧历史不入账。':
-          `\n其中秘境扫荡：修为 ${totals['秘境扫荡修为']||0} · 钻石 ${totals['秘境扫荡钻石']||0} · 代币 ${totals['秘境扫荡代币']||0}；完成 ${totals['秘境扫荡通关']||0} 趟，金额待核对 ${totals['秘境金额待核对']||0} 趟。已含在总收入中，未扣门票；中断趟留待最终累计，不重复计入。`);
-      if (hint.textContent !== message) hint.textContent = message;
+      renderLogIncome();
     }
     function refreshLog(includeEvents = false) {
       return (includeEvents ? logStore.read(group) : logStore.summary(group)).then(value => {
@@ -2273,9 +2290,12 @@
     }
     function mount(shadow) {
       const box = shadow.querySelector('.box');
-      hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'log-summary';hint.style.whiteSpace='pre-line'; box.append(hint);
+      logSummaryHint=document.createElement('p');logSummaryHint.className='hint';logSummaryHint.id='log-summary';logSummaryHint.style.whiteSpace='pre-line';
+      box.querySelector('#toggle').after(logSummaryHint);
       const details = document.createElement('details'); details.id = 'local-log';
-      details.innerHTML = '<summary style="cursor:pointer">本地日志（最近 7 天）</summary><p class="hint">保留前 7 个完整自然日及今天，全部玩法共用约 20 MiB 事件预算。行情压缩保存，关键故障、结果与收益汇总优先于重复详情。容量不足仍可能提前清理；导出注明实际覆盖和缺口。</p><button type="button">导出全部日志（7 天）</button><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
+      details.innerHTML = '<summary style="cursor:pointer">查看最近日志</summary><p class="hint">导出含全部玩法、七日记录及覆盖缺口。</p><pre style="white-space:pre-wrap;max-height:180px;overflow:auto;font:11px/1.5 system-ui"></pre>';
+      const exportButton=document.createElement('button');exportButton.type='button';exportButton.id='log-export';exportButton.textContent='导出日志';
+      exportButton.title='导出全部玩法最近七天日志';box.append(exportButton);
       details.addEventListener('toggle', async () => {
         if (!details.open) return;
         try {
@@ -2285,7 +2305,7 @@
             `${event.beijing?.slice(11,19) || ''} ${event.type || ''} ${event.detail || ''}`).join('\n') || '今天暂无记录';
         } catch { failed(); details.querySelector('pre').textContent = '日志不可读'; }
       });
-      details.querySelector('button').onclick = async event => {
+      exportButton.onclick = async event => {
         const button = event.currentTarget;
         button.disabled = true;
         try {
@@ -2300,20 +2320,16 @@
         } catch { failed(); }
         finally { button.disabled = false; }
       };
-      box.append(details); render(); refreshLog();
+      box.append(details); render();
       const scopes = ['cultivate', 'dungeon', 'expedition', 'farm', 'shelter', 'stock'];
       for (const [key, scope] of stateFaults) if (scopes.includes(scope)) {
         add('invalid-state', '保存记录不可读，原文保留；受影响功能暂停', { key, scope });
       }
     }
-    const log = { add, observation, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites };
-    log.mountSummary = shadow => {
-      hint = document.createElement('p'); hint.className = 'hint'; hint.id = 'cultivate-log-summary'; hint.style.whiteSpace = 'pre-line';
-      shadow.querySelector('[data-panel-section="cultivate"] .panel-section-body').append(hint);
-      render(); refreshLog();
-    };
-
+    const log = { add, observation, pulse, stop, expect, receipts, mount, observeLifecycle, failedWrites: () => failedWrites,
+      summary:()=>({day:cached.day,totals:cached.totals,failed:storageFailed}) };
     diagnosticLogs[group] = log;
+    refreshLog();
     return log;
   }
 
@@ -2547,7 +2563,7 @@
               let request=null;try{request=JSON.parse(args[1]?.body);}catch{ /* 无可核对的原生正文 */ }
               shelterCapture(result,request);
               if(response)response.clone().json().then(body=>{
-                if(result.outcome==='ok'||shelterCapture.kind==='rescue'&&result.outcome==='http-error')shelterCapture(result,request,body);})
+                if(result.outcome==='ok'||['rescue','explore-start','explore-recall'].includes(shelterCapture.kind)&&result.outcome==='http-error')shelterCapture(result,request,body);})
                 .catch(()=>{ shelterCapture.end?.(); /* 缺少正文保留未知结果，后续按目标状态核对 */ })
                 .finally(()=>shelterCapture.settled?.(result,request));
               else shelterCapture.settled?.(result,request);
@@ -2623,6 +2639,14 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     localStorage.setItem(ENCOUNTER_SCHEDULE, JSON.stringify(encounterSchedule));
     setPanelText(last, note);
   }
+  const nextDailyReset=()=>Math.floor((Date.now()+4*3600000)/86400000)*86400000+86400000-4*3600000;
+  if (encounterSchedule.note === '今日奇遇次数已用完，一小时后核对网页额度') {
+    const resetAt = nextDailyReset(), observedAt = encounterSchedule.nextAt - 3600000;
+    encounterSchedule = observedAt >= resetAt - 86400000 && observedAt <= Date.now() ?
+      { nextAt: resetAt, note: '今日奇遇次数已用完，北京时间4点刷新后核对网页额度' } :
+      { nextAt: 0, note: '已过每日刷新时间，核对奇遇额度' };
+    localStorage.setItem(ENCOUNTER_SCHEDULE, JSON.stringify(encounterSchedule));
+  }
   let encounterAction = loadState(sessionStorage, ENCOUNTER_ACTION, null, 'cultivate', value =>
     timedState(value) && ['seek', 'choose'].includes(value.kind) && typeof value.signature === 'string');
   function saveEncounterAction(value) {
@@ -2686,7 +2710,6 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   const toggle = shadow.getElementById('cultivate-toggle');
   const dungeonStatus = shadow.getElementById('dungeon-status');
   const dungeonToggle = shadow.getElementById('dungeon-toggle');
-  log.mountSummary(shadow);
   function updateDungeonHint() {
     const hint = stateFault('dungeon') || (!dungeonEnabled ? '秘境已暂停' : dungeon.run ? '秘境：本轮探索尚未结束' :
       dungeon.exhaustedDay === dungeonDay() ? '秘境：次数已用完，北京时间 4 点后再检查' :
@@ -2975,7 +2998,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       recoveryBudget.clear('encounter');
       recoveryBudget.clear('encounter-original');
     }
-    if (exhausted) planEncounter(Date.now() + 3600000, '今日奇遇次数已用完，一小时后核对网页额度');
+    if (exhausted) planEncounter(nextDailyReset(), '今日奇遇次数已用完，北京时间4点刷新后核对网页额度');
     if (cooldown) {
       const match = textOf(cooldown).match(/^奇遇冷却\s+(\d+):(\d{2})(?::(\d{2}))?$/);
       const seconds = match && +match[2] < 60 && (match[3] === undefined || +match[3] < 60) ?
@@ -3568,8 +3591,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     },
     dueAt() {
       if (!enabled || sharedGroupPaused(PREF) || stateFault('cultivate')) return Infinity;
-      const dungeonAt = dungeonEnabled && !stateFault('dungeon') &&
-        (dungeon.run || dungeon.exhaustedDay !== dungeonDay()) ? dungeon.nextAt : Infinity;
+      const dungeonAt = dungeonEnabled && !stateFault('dungeon') ?
+        !dungeon.run && dungeon.exhaustedDay === dungeonDay() ? nextDailyReset() : dungeon.nextAt : Infinity;
       return Math.min(encounterSchedule.nextAt, dungeonAt);
     }
   };
@@ -3815,11 +3838,10 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <strong>方舟挂机助手</strong>
       <p id="status" role="status" aria-live="polite"></p>
       <button type="button" id="toggle"></button>
-      <p class="hint">一个页面统一挂机，到期检查奇遇与秘境后返回远征。</p>
+      <details class="panel-subsection" data-panel-section="settings"><summary>设置与运行详情</summary>
       <details class="panel-section" data-panel-section="cultivate">
       <summary>奇遇与秘境</summary><div class="panel-section-body">
       <p class="hint" id="cultivate-status">等待检查奇遇</p>
-      <p class="hint">奇遇每日最多 24 次，以网页剩余次数为准；钻石优先，其次修为。</p>
       <p class="hint" id="last">等待下一次奇遇</p>
       <button type="button" id="cultivate-toggle"></button>
       <p class="hint" id="dungeon-status"></p>
@@ -3844,24 +3866,21 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <details class="panel-section" data-panel-section="shelter">
       <summary>方舟避难所</summary><div class="panel-section-body">
       <p class="hint" id="shelter-status"></p>
-      <p><strong>推荐：综合发展</strong></p>
-      <p class="hint">首次安装或升级自动启用分工、穿装、生育、探险、周任务、训练、医疗、事件增援、电台及按规划建设。之后手动暂停会保留；不消费汽水，不交付商队换代币。</p>
-      <p class="hint preset-summary" id="shelter-preset-summary"></p>
-      <button type="button" class="preset-button" id="shelter-preset">应用推荐并开启避难所</button>
       <div class="panel-actions"><button type="button" id="shelter-toggle"></button>
       <button type="button" id="shelter-check">检查避难所</button>
       </div>
       <button type="button" id="shelter-cancel-old-assignment" hidden>解除已取消的旧调岗等待</button>
-      <p class="hint" id="shelter-config-summary"></p>
-      <p class="hint" id="shelter-construction-status"></p>
       <details class="panel-subsection" data-panel-section="shelter-plan"><summary>当前计划与运行提醒</summary>
+      <p class="hint" id="shelter-construction-status"></p>
       <p class="hint" id="shelter-advice">首次检查后显示生产和生育建议。</p>
       <p class="hint" id="shelter-campaign-status" style="white-space:pre-line"></p>
       <p class="hint" id="shelter-development" style="white-space:pre-line">检查避难所后比较建造、升级和扩容。</p>
       <p class="hint" id="shelter-development-trace" style="white-space:pre-line"></p>
       <p class="hint" id="shelter-operations" style="white-space:pre-line">检查后显示停产、供应、施工和废土返程情况。</p></details>
       <details class="panel-subsection" data-panel-section="shelter-advanced"><summary>高级设置（可选）</summary>
-      <p class="hint">推荐方案已配齐参数。已有数字设置会保留，包括零额度；需要调整时再展开。</p>
+      <p class="hint" id="shelter-config-summary"></p>
+      <p class="hint preset-summary" id="shelter-preset-summary"></p>
+      <button type="button" class="preset-button" id="shelter-preset">应用推荐并开启避难所</button>
       <details class="panel-subsection" data-panel-section="shelter-staff"><summary>生产与人口</summary>
       <label for="shelter-staff">避难所人员管理</label>
       <select id="shelter-staff">
@@ -3908,7 +3927,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <label class="staff-option">每任务每周最多尝试 <input id="shelter-campaign-attempts" type="number" min="1" max="3" step="1"></label>
       <label class="staff-option">常规及冷却期训练目标 <input id="shelter-campaign-trainTarget" type="number" min="2" max="10" step="1"></label>
       <button type="button" id="shelter-campaign-save">保存探险与养成设置</button>
-      <p class="hint">人口发展模式优选并保存两对无亲缘父母，双方七项基础属性（含魅力）均达10后才开始新的生育安排。每对同时最多一人训练，完成一格回预留岗位、结算后接续；候选培养不受生育冷却期限限制。评估空闲训练室升级以加快培养，沿用建设开关、预算和供给检查，不中断已开始的训练。已有感情或待产继续收尾，未达标家庭不再新开生育。刷新保留候选和固定期限，真实断供优先返岗。普通探险要求血量90%，脚本派出的普通探险低于60%提前召回。不消费汽水。</p>
+      <p class="hint">父母双方基础属性全10才开始新生育。保护在训居民；探险血量90%以上出发，低于60%召回。不消费汽水。</p>
       </details>
       <details class="panel-subsection" data-panel-section="shelter-development"><summary>发展规划与建设</summary>
       <label class="staff-option"><input type="checkbox" id="shelter-build"> 按规划自动建造</label>
@@ -3925,22 +3944,21 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       </div></details>
       <details id="stock-settings" class="panel-section" data-panel-section="stock"><summary>模型股市</summary><div class="panel-section-body">
         <p class="hint" id="stock-status"></p>
-        <p><strong>推荐：净收益优先</strong></p>
-        <p class="hint">股票按扣费后的历史信号比较；预测缺乏胜率依据，推荐关闭。额度是上限，行情不合适则等待，仍可能亏损。</p>
-        <p class="hint preset-summary" id="stock-preset-summary"></p>
-        <button type="button" class="preset-button" id="stock-preset">应用推荐并开启股市</button>
         <div class="panel-actions"><button type="button" id="stock-pause">暂停股市</button>
         <button type="button" id="stock-check">检查股市</button></div>
         <p class="hint" id="stock-check-feedback" role="status" aria-live="polite"></p>
-        <p class="hint" id="stock-config-summary"></p>
+        <details class="panel-subsection" data-panel-section="stock-positions"><summary>持仓与账本详情</summary>
         <p class="hint" id="stock-performance"></p>
         <p class="hint" id="stock-period-status"></p>
         <div class="panel-actions"><button type="button" id="stock-period-start">封存旧账并开启新周期</button>
         <button type="button" id="stock-period-export">导出封存旧账</button></div>
         <p class="hint">新周期只可开启一次：旧账完整保留，旧盈亏不计入新周期；按启动时持仓的含费报价建立起点，本金最多40万，此后亏损最多10万。原24小时额度、冷却与持仓归属保留。导出旧账可另行备份。</p>
         <p class="hint" id="stock-manual-income"></p>
-        <details class="panel-subsection" data-panel-section="stock-positions"><summary>逐只持仓与退出条件</summary><p class="hint" id="stock-positions" style="white-space:pre-line">检查后显示脚本持仓及等待原因。</p></details>
+        <p class="hint" id="stock-positions" style="white-space:pre-line">检查后显示脚本持仓及等待原因。</p></details>
         <details class="panel-subsection" data-panel-section="stock-advanced"><summary>高级设置（可选）</summary>
+        <p class="hint" id="stock-config-summary"></p>
+        <p class="hint preset-summary" id="stock-preset-summary"></p>
+        <button type="button" class="preset-button" id="stock-preset">应用推荐并开启股市</button>
         <label class="staff-option"><input type="checkbox" id="stock-trade"> 管理脚本旧仓并按条件卖出</label>
         <label class="staff-option"><input type="checkbox" id="stock-observe"> 仅观察信号：不新增或续发交易，保留原请求待核对</label>
         <label class="staff-option"><input type="checkbox" id="stock-predict" disabled> 涨跌预测暂停</label>
@@ -3962,6 +3980,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         <p class="hint">交易按市价成交，无最高成交价保证；预留10%报价余量仍可能超出预估。上限只统计脚本支出，卖出及预测返还不补回24小时额度。手动持仓和历史仓由你处理。</p>
         <div class="panel-actions"><button type="button" id="stock-save">保存股市设置</button>
         </div></details></div></details>
+      </details>
 
     </div>`;
   document.body.append(host);
@@ -5016,10 +5035,9 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let shelterCampaignForm='',shelterCampaignNote='',shelterRecallWork=null,shelterCampaignEditing=false,shelterCampaignHeld='',shelterQuestSelection=null,shelterWorkConfirm=null,shelterCampaignWork=null;
   const shelterExecutionDeferrals=new Map();
   const campaignKind=kind=>['explore-start','explore-recall','quest-start','quest-claim','stimpak','craft'].includes(kind);
-  const workshopAutomatic=()=>shelterConstruction.upgrade&&shelterStaffMode!=='off'&&
-    (shelterUsesStockBudget(shelterConstruction)||shelterConstruction.partsLimit>0&&shelterConstruction.scrapLimit>0);
+  const workshopAutomatic=()=>shelterStaffMode!=='off';
   const campaignActive=()=>campaignFlags.some(k=>k!=='parentPreparation'&&shelterCampaign[k])||workshopAutomatic()||
-    shelterStaffMode!=='off'&&!shelterStaffHold||shelterState.campaign?.roles?.some(r=>['parent','production'].includes(r.purpose));
+    shelterStaffMode!=='off'&&!shelterStaffHold||shelterState.campaign?.roles?.some(r=>['parent','production','current'].includes(r.purpose));
   const validConstructionConfig=v=>objectState(v)&&['build','upgrade','dig'].every(k=>typeof v[k]==='boolean')&&
     (v.budgetMode===undefined||['stock','daily'].includes(v.budgetMode))&&
     ['scrapLimit','partsLimit','scrapReserve','partsReserve'].every(k=>Number.isSafeInteger(v[k])&&v[k]>=0);
@@ -6124,10 +6142,11 @@ function createShelterExistingState() {
   const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));
   const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));
   const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
-    (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production'].includes(r.purpose)&&
+    (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
       Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
     (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&
-      (r.purpose===undefined||['production','parent'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
+      (r.purpose===undefined||['production','parent','current'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
+      (r.purpose!=='current'||r.finishCurrent===true)&&
       (r.purpose!=='production'||['str','per','end','agi','int'].includes(r.stat)&&time(r.windowEnd)&&r.windowEnd>r.at&&id(r.destination)));
   const validMaterial=m=>m&&id(m.vaultNo)&&id(m.id)&&['power','diner','water','scrap','medbay','workshop','storage','quarters'].includes(m.type)&&
     m.level===3&&id(m.targetLevel)&&id(m.finalTarget)&&m.targetLevel<=m.finalTarget;
@@ -8337,7 +8356,7 @@ installShelterPlanningWorker(self);
   return {request,invalidate};
 };
   const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;
-    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG5cbiAgY29uc3Qgc3RhZmZSb29tVHlwZXMgPSBbJ3Bvd2VyJywnZGluZXInLCd3YXRlcicsJ3NjcmFwJ107XG4gIGNvbnN0IHN0YWZmUm9vbU5hbWVzID0geyBwb3dlcjon5Y+R55S156uZJyxkaW5lcjon6aSQ5Y6FJyx3YXRlcjon5YeA5rC056uZJyxzY3JhcDon5bqf5paZ5Zue5pS256uZJyxxdWFydGVyczon5a6/6IiNJyB9O1xuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gIC8vIOaooeaLn+avj+S4gOatpeeahOaIv+mXtOWuuemHj+S4juS+m+W6lO+8m+S4jeiDveWuieWFqOiFvuS9jeeahOa7oeWRmOaIv+mXtOS/neeVmeWOn+WuieaOkuOAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgY29uc3QgZmFtaWx5S2V5ID0gKGEsYikgPT4gW2EsYl0uc29ydCgoeCx5KT0+eC15KS5qb2luKCc6Jyk7XG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuXG4gICIsIlxubGV0IHNoZWx0ZXJTdGFmZk1vZGUsc2hlbHRlclN0YWZmSG9sZCxzaGVsdGVyUG9wdWxhdGlvblRhcmdldCxzaGVsdGVyT3B0aW1pemUsc2hlbHRlclN0YXRlO1xuY29uc3Qgc2F2ZVNoZWx0ZXI9KCk9Pnt0aHJvdyBFcnJvcihcIlJlYWQtb25seSBmYW1pbHkgcHJldmlldyBjYW5ub3Qgc2F2ZSBzdGF0ZVwiKTt9O1xuZnVuY3Rpb24gaW5zdGFsbFNoZWx0ZXJMZXZlbFdvcmtlcihlbmRwb2ludCxtb2RlbCxyb3V0ZXMsZmFtaWx5U3VwcGx5PW51bGwpIHtcbiAgZW5kcG9pbnQub25tZXNzYWdlPSh7ZGF0YX0pPT57XG4gICAgdHJ5e1xuICAgICAgaWYoZGF0YS5raW5kPT09J25hdGl2ZS1mYW1pbHktc3VwcGx5Jyl7XG4gICAgICAgIGlmKCFmYW1pbHlTdXBwbHkpdGhyb3cgRXJyb3IoJ0ZhbWlseS1zdXBwbHkga2VybmVsIHVuYXZhaWxhYmxlJyk7XG4gICAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6ZGF0YS5raW5kLHN1cHBseTpmYW1pbHlTdXBwbHkoZGF0YSl9KTtyZXR1cm47XG4gICAgICB9XG4gICAgICBjb25zdCByZXN1bHQ9cm91dGVzKG1vZGVsKGRhdGEudmlldyksZGF0YS5vcHRpb25zLGRhdGEudGFyZ2V0U2NvcmUsZGF0YS5maXJzdCxkYXRhLnBsYW5uaW5nKTtcbiAgICAgIGVuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGtpbmQ6J25hdGl2ZS1sZXZlbC1yb3V0ZXMnLHJvdXRlczpyZXN1bHR9KTtcbiAgICB9Y2F0Y2goZSl7ZW5kcG9pbnQucG9zdE1lc3NhZ2Uoe2lkOmRhdGEuaWQsZXJyb3I6U3RyaW5nKGU/Lm1lc3NhZ2U/P2UpfSk7fVxuICB9O1xufVxuaW5zdGFsbFNoZWx0ZXJMZXZlbFdvcmtlcihzZWxmLHNoZWx0ZXJNb2RlbCxzaGVsdGVyTGV2ZWxSb3V0ZXMsZGF0YT0+e1xuKHtzaGVsdGVyU3RhZmZNb2RlLHNoZWx0ZXJTdGFmZkhvbGQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsc2hlbHRlck9wdGltaXplLHNoZWx0ZXJTdGF0ZX09ZGF0YS5wb2xpY3kpO1xucmV0dXJuIHNoZWx0ZXJQb3B1bGF0aW9uRmFtaWx5U3VwcGx5KHNoZWx0ZXJNb2RlbChkYXRhLnZpZXcpLGRhdGEuY2FtcGFpZ24pO1xufSk7XG4iXQ=="),char=>char.charCodeAt(0))));
+    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuXG4gIGNvbnN0IHN0YWZmUm9vbVR5cGVzID0gWydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddO1xuICBjb25zdCBzdGFmZlJvb21OYW1lcyA9IHsgcG93ZXI6J+WPkeeUteermScsZGluZXI6J+mkkOWOhScsd2F0ZXI6J+WHgOawtOermScsc2NyYXA6J+W6n+aWmeWbnuaUtuermScscXVhcnRlcnM6J+Wuv+iIjScgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDmqKHmi5/mr4/kuIDmraXnmoTmiL/pl7Tlrrnph4/kuI7kvpvlupTvvJvkuI3og73lronlhajohb7kvY3nmoTmu6HlkZjmiL/pl7Tkv53nlZnljp/lronmjpLjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gIGNvbnN0IGZhbWlseUtleSA9IChhLGIpID0+IFthLGJdLnNvcnQoKHgseSk9PngteSkuam9pbignOicpO1xuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcblxuICAiLCJcbmxldCBzaGVsdGVyU3RhZmZNb2RlLHNoZWx0ZXJTdGFmZkhvbGQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsc2hlbHRlck9wdGltaXplLHNoZWx0ZXJTdGF0ZTtcbmNvbnN0IHNhdmVTaGVsdGVyPSgpPT57dGhyb3cgRXJyb3IoXCJSZWFkLW9ubHkgZmFtaWx5IHByZXZpZXcgY2Fubm90IHNhdmUgc3RhdGVcIik7fTtcbmZ1bmN0aW9uIGluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoZW5kcG9pbnQsbW9kZWwscm91dGVzLGZhbWlseVN1cHBseT1udWxsKSB7XG4gIGVuZHBvaW50Lm9ubWVzc2FnZT0oe2RhdGF9KT0+e1xuICAgIHRyeXtcbiAgICAgIGlmKGRhdGEua2luZD09PSduYXRpdmUtZmFtaWx5LXN1cHBseScpe1xuICAgICAgICBpZighZmFtaWx5U3VwcGx5KXRocm93IEVycm9yKCdGYW1pbHktc3VwcGx5IGtlcm5lbCB1bmF2YWlsYWJsZScpO1xuICAgICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOmRhdGEua2luZCxzdXBwbHk6ZmFtaWx5U3VwcGx5KGRhdGEpfSk7cmV0dXJuO1xuICAgICAgfVxuICAgICAgY29uc3QgcmVzdWx0PXJvdXRlcyhtb2RlbChkYXRhLnZpZXcpLGRhdGEub3B0aW9ucyxkYXRhLnRhcmdldFNjb3JlLGRhdGEuZmlyc3QsZGF0YS5wbGFubmluZyk7XG4gICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOiduYXRpdmUtbGV2ZWwtcm91dGVzJyxyb3V0ZXM6cmVzdWx0fSk7XG4gICAgfWNhdGNoKGUpe2VuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGVycm9yOlN0cmluZyhlPy5tZXNzYWdlPz9lKX0pO31cbiAgfTtcbn1cbmluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoc2VsZixzaGVsdGVyTW9kZWwsc2hlbHRlckxldmVsUm91dGVzLGRhdGE9Pntcbih7c2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGV9PWRhdGEucG9saWN5KTtcbnJldHVybiBzaGVsdGVyUG9wdWxhdGlvbkZhbWlseVN1cHBseShzaGVsdGVyTW9kZWwoZGF0YS52aWV3KSxkYXRhLmNhbXBhaWduKTtcbn0pO1xuIl0="),char=>char.charCodeAt(0))));
     const functions=[
       shelterWorkerRate,
       shelterStoredItems,
@@ -8403,6 +8422,7 @@ installShelterPlanningWorker(self);
       shelterTrainingProgress,
       shelterTrainingReturn,
       shelterWorkshopFeeding,
+      shelterExploreSlots,
       shelterCampaignPlan,
       validShelterMaterials,
       validCampaignRecord,
@@ -10493,7 +10513,12 @@ installShelterPlanningWorker(self);
     const a=assessment||shelterTrainingReturn(m,p,room,Math.min(168,Math.max(1/6,(windowEnd-m.now)/3600000)),
       {destination:role?.purpose==='production'?role.destination:undefined,partsTarget:cfg.partsTarget,
       scrapReserve:Math.max(cfg.workshopScrapReserve||0,record.constructionPolicy?.scrapReserve||0)});
-    return a.eligible&&a.best&&base.until<windowEnd?{...base,purpose:'production',windowEnd,destination:a.best.room}:null;
+    if(a.eligible&&a.best&&base.until<windowEnd)return {...base,purpose:'production',windowEnd,destination:a.best.room};
+    const {destination,windowEnd:previousWindowEnd,...continued}=base;
+    if(!continued.finishCurrent){
+      continued.at=m.now;continued.until=Math.min(continued.until,progress.finishAt+600000);continued.finishCurrent=true;
+    }
+    return {...continued,purpose:'current'};
   }
   function shelterTrainingPurpose(m,p,room) {
     const resource={str:'power',per:'water',end:'scrap',agi:'food',int:'parts'}[room?.trainStat];
@@ -10639,11 +10664,16 @@ installShelterPlanningWorker(self);
     const nextTickStock=s.resources.parts+working.reduce((n,r)=>n+Math.floor((r.stored+r.rate/6)/r.batch+1e-9)*r.batch,0);
     return {shortage,working,feeding,roomFeed,feed,nextTickStock};
   }
+  function shelterExploreSlots(m,record={}) {
+    const observed=record.exploreSlots,depth=m.state.depth;
+    if(observed?.depth===depth&&Number.isSafeInteger(observed.limit)&&observed.limit>0)return observed.limit;
+    return Number.isInteger(depth)&&depth>=1?Math.min(6,1+Math.floor(depth/8)):0;
+  }
   function shelterCampaignPlan(m,cfg={},record={},target=14) {
     const s=m.state,now=m.now,notes=[],reserved=new Set(),actions=[],projects=[],roles=[...(record.roles||[])];
     const preparationPairs=record.parentPreparation?.pairs||[],preparingPairs=preparationPairs.filter(f=>!shelterParentPrepared(m,f));
     const preparationOf=p=>preparingPairs.find(f=>[f.a,f.b].includes(p.id));
-    const enabled=cfg.development||['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>['parent','production'].includes(r.purpose));
+    const enabled=cfg.development||['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>['parent','production','current'].includes(r.purpose));
     const workshopWorkers=roles.filter(r=>r.role==='workshop'&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>r.id);
     const result={enabled,notes,reserved:[],dailyReserved:[],dailyProduction:[],actions,projects,events:[],partsReserve:cfg.partsReserve||0,workshopWorkers,
       materials:record.materials,populationPreparation:record.populationPreparation??null,constructionPolicy:record.constructionPolicy,trainingDestinations:[],adoptions:[],
@@ -10657,6 +10687,12 @@ installShelterPlanningWorker(self);
     const unique=(list,key)=>Array.isArray(list)&&list.every(x=>x&&Number.isSafeInteger(x[key])&&x[key]>0)&&new Set(list.map(x=>x[key])).size===list.length;
     if(!unique(s.residents,'id')||!unique(s.items,'id')||!unique(s.explorers,'id')||!unique(s.quests,'id')){
       notes.push('居民、装备或外出列表不可唯一核对，暂缓新的外出与养成。');return result;
+    }
+    const rejected=(record.rejections||[]).filter(entry=>entry.until>now);
+    const mayExplore=(kind,id)=>!rejected.some(entry=>entry.kind===kind&&entry.id===id);
+    for(const entry of rejected){
+      result.events.push(entry.until-now);
+      notes.push(`普通探险${entry.kind==='explore-start'?'派遣居民':'召回行程'} #${entry.id} 收到拒绝，${Math.ceil((entry.until-now)/1000)} 秒后按新状态重评，其他人员继续。`);
     }
     const normalized=x=>String(x??'').normalize('NFKC').replace(/\s+/g,' ').trim();
     const nameOK=p=>typeof p.name==='string'&&Boolean(normalized(p.name));
@@ -10806,7 +10842,7 @@ installShelterPlanningWorker(self);
       if(e.abyss!==false||!Number.isFinite(e.startedAt)||!p||p.deadAt!==null||!hp||!nameOK(p))continue;
       notes.push(`${normalized(p.name)}${trip.source==='existing-state'?'已接管普通探险，按接管时设置外出':'原计划外出'} ${trip.hours} 小时，${now>=due?'已到召回时间':'计划召回'} ${stamp(due)}；返程另需实际外出时长的一半。`);
       if(due>now)result.events.push(due-now);
-      if(hp.hp<.6*hp.max||now>=due)actions.push({kind:'explore-recall',targets:[e.id],id:p.id,name:normalized(p.name),
+      if((hp.hp<.6*hp.max||now>=due)&&mayExplore('explore-recall',e.id))actions.push({kind:'explore-recall',targets:[e.id],id:p.id,name:normalized(p.name),
         reason:hp.hp<.6*hp.max?'探险者血量低于60%，提前召回':'普通探险达到设定时长，召回后等待归来领取'});
     }
     const defense=shelterDefensePlan(m,cfg,record);
@@ -10908,7 +10944,7 @@ installShelterPlanningWorker(self);
     for(const role of roles){
       const p=s.residents.find(p=>p.id===role.id),r=p&&s.rooms.find(r=>r.id===p.roomId);
       if(!p||!home(p)||purposeProtectedIds.has(p.id)||role.room!==p.roomId)continue;
-      if(role.role==='training'&&(cfg.training||['parent','production'].includes(role.purpose))){
+      if(role.role==='training'&&(cfg.training||['parent','production','current'].includes(role.purpose))){
         if(role.purpose==='production'){
           const assessment=shelterTrainingReturn(m,p,r,Math.min(168,Math.max(1/6,(role.windowEnd-now)/3600000)),
             trainingCommitments({destination:role.destination}));
@@ -10940,10 +10976,11 @@ installShelterPlanningWorker(self);
           continue;
         }
         const parent=role.purpose==='parent',preparing=parent&&role.preparation===true;
-        const due=parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||now>=role.until||
+        const current=role.purpose==='current';
+        const due=current&&(!cfg.training||!cfg.development||now>=role.until)||parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||now>=role.until||
           (preparing?!preparationOf(p):!role.finishCurrent&&!(p.familyCooldownUntil>now)));
         if(due||p.stats[role.stat]>role.base||r?.trainStat!==role.stat||!role.finishCurrent&&p.stats[role.stat]>=(preparing?10:parent?cfg.trainTarget:daily?.goals.some(g=>g.key==='train'&&!g.claimed&&g.remaining)?10:cfg.trainTarget)||!active(r)||!trainingSafe([p.id])){
-          if(parent&&(!preparing||preparationOf(p))&&cfg.parentTraining&&parentIds.has(p.id)&&active(r)&&r.trainStat===role.stat&&
+          if((current||parent&&(!preparing||preparationOf(p))&&cfg.parentTraining&&parentIds.has(p.id))&&active(r)&&r.trainStat===role.stat&&
               finishTraining(p,r,role))continue;
           const destination=parent&&s.rooms.find(d=>d.id===role.destination),hp=shelterHealth(p);
           // Only a recorded real job may be promised. Near family readiness,
@@ -10954,7 +10991,7 @@ installShelterPlanningWorker(self);
           actions.push(assign(p,returnJob?destination:null,'training-release',returnJob?(preparing?'候选父母本格训练结束，回预留生产岗后继续核对全项10目标':'父母本格训练结束，直接回到预留生产岗，保留原家庭和冷却期限'):!trainingSafe([p.id])?'训练期间真实供应或两小时储备不足，返岗补供给':role.finishCurrent?'当前训练格已完成、到达固定期限或供应变化，结束收尾并返岗':
             parent?'父母本轮训练完成、冷却到期或供应变化，交回人口与生产调度':'训练轮次结束，释放人选回到探险和生产候选池'));
         }
-        else {reserve(p);if(parent)result.events.push(role.until-now);}
+        else {reserve(p);if(parent||current)result.events.push(role.until-now);}
       }
       else if(role.role==='craftDaily'){
         const goal=daily?.goals.some(g=>g.key==='craft'&&!g.claimed&&g.remaining>0);
@@ -11000,7 +11037,7 @@ installShelterPlanningWorker(self);
       else if(!rooms.length)projects.push({type,priority,person:p.id,stat,role,benefit:`已为${shelterBuildRules[type][0]}预留可安全离岗人选，建成后自动安排`});
     };
     // 先为汽水普通探险留人，再评估整支周任务队的离岗成本。
-    const slots=Number.isInteger(s.depth)&&s.depth>=1?Math.min(6,1+Math.floor(s.depth/8)):0;
+    const slots=shelterExploreSlots(m,record);
     const drops=m.view.drops,dropsOK=drops?.enabled===true&&Number.isFinite(drops.minMinutes)&&drops.minMinutes>=0&&
       Array.isArray(drops.tierPermille)&&drops.tierPermille.length>0&&drops.tierPermille.every(n=>Number.isFinite(n)&&n>=0&&n<=1000);
     const expedition=shelterExploreEfficiency(m,cfg),free=Math.max(0,slots-s.explorers.length),tripHours=expedition?.hours??Infinity;
@@ -11034,7 +11071,7 @@ installShelterPlanningWorker(self);
       };
       support('workshop','int',shortage>0&&funded,'workshop',24,preservesProject,(cfg.partsTarget||0)>nextTickStock);
       notes.push(shortage>0?`近期备料目标还需 ${Math.ceil(shortage)} 可领取零件，按整批预留 ${Math.ceil(feed)} 废料供料；${funded?'按需安排工坊，材料备齐后释放自动值班':'供料会触及建设资金或废料保留量，暂缓自动加工'}。`:
-        '当前升级零件已备齐或暂无近期需求，释放自动工坊值班；人工岗位保持。');
+        '零件库存与近期工程需求已备齐，释放自动工坊值班；人工岗位保持。');
     }
     const fitsFamilyTrip=p=>{
       if(p.romance||expecting.has(p.id))return false;
@@ -11213,7 +11250,7 @@ installShelterPlanningWorker(self);
       else if(s.resources.stimpak<cfg.stimpaks+cfg.reserve)notes.push('治疗针不足携带量及保留量，先补充医务室产出。');
       else for(let i=0;i<free;i++){
         const effectiveLuck=p=>{const outfit=s.items.find(i=>i.id===p.outfitId);return Math.min(17,(p.stats.lck||0)+(outfit?.bonus?.lck||0));};
-        const p=fighters(true).filter(nameOK).sort((a,b)=>combat(b)-combat(a)||effectiveLuck(b)-effectiveLuck(a)||loss([a.id])-loss([b.id])||a.id-b.id)
+        const p=fighters(true).filter(p=>nameOK(p)&&mayExplore('explore-start',p.id)).sort((a,b)=>combat(b)-combat(a)||effectiveLuck(b)-effectiveLuck(a)||loss([a.id])-loss([b.id])||a.id-b.id)
           .find(p=>safe([...projectedIds(),p.id])&&guarded([p],loadout([p])));if(!p)break;
         if(s.resources.stimpak-cfg.stimpaks*i<cfg.stimpaks+cfg.reserve)break;
         reserve(p);
@@ -11362,17 +11399,23 @@ installShelterPlanningWorker(self);
   function validCampaignRecord(v) {
     const positive=x=>Number.isSafeInteger(x)&&x>0,at=x=>Number.isFinite(x)&&x>=0;
     return objectState(v)&&['roles','trips','attempts','heals','trainingRest'].every(k=>Array.isArray(v[k])&&v[k].length<=2000)&&
+      (v.exploreSlots===undefined||objectState(v.exploreSlots)&&positive(v.exploreSlots.depth)&&positive(v.exploreSlots.limit))&&
+      (v.rejections===undefined||Array.isArray(v.rejections)&&v.rejections.length<=400&&v.rejections.every(entry=>
+        objectState(entry)&&['explore-start','explore-recall'].includes(entry.kind)&&positive(entry.id)&&at(entry.at)&&
+        at(entry.until)&&entry.until>entry.at&&positive(entry.count)&&entry.count<=4)&&
+        new Set(v.rejections.map(entry=>`${entry.kind}:${entry.id}`)).size===v.rejections.length)&&
       (v.materials===undefined||validShelterMaterials(v.materials))&&
       (v.defense===undefined||Array.isArray(v.defense)&&v.defense.length<=200&&v.defense.every(r=>positive(r.id)&&positive(r.room)&&
         (r.from===null||positive(r.from))&&at(r.at))&&new Set(v.defense.map(r=>r.id)).size===v.defense.length)&&
       (v.defenseManual===undefined||Array.isArray(v.defenseManual)&&v.defenseManual.length<=200&&v.defenseManual.every(positive))&&
       v.roles.every(r=>positive(r.id)&&positive(r.room)&&at(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
         (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&!r.finishCurrent&&r.base<10)&&
-        (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production'].includes(r.purpose)&&
+        (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
           Number.isInteger(r.base)&&r.base<10&&r.until-r.at<=130*60000)&&
         (r.role!=='training'||(r.purpose==='production'?['str','per','end','agi','int'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
           at(r.windowEnd)&&r.windowEnd>r.at&&positive(r.destination):r.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
             (r.destination===undefined||positive(r.destination)):
+          r.purpose==='current'?r.finishCurrent===true&&['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at:
           r.purpose===undefined&&['str','end','agi'].includes(r.stat))&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10))&&
       new Set(v.roles.map(r=>r.id)).size===v.roles.length&&
       v.trips.every(r=>positive(r.id)&&positive(r.resident)&&at(r.at)&&Number.isFinite(r.hours)&&r.hours>=0&&r.hours<=24&&
@@ -16125,6 +16168,8 @@ installShelterPlanningWorker(self);
           populationHousingSupply(m,shelterState.families,pair).growthAllowed&&populationCanHouse(m,shelterState.families,pair);
       }).flatMap(f=>[f.a,f.b]):[];
     const cfg={...shelterCampaign,workshop:workshopAutomatic(),partsReserve:record.constructionPolicy.partsReserve,workshopFamilyReady,
+      partsTarget:m.state.rooms.some(room=>room.type==='workshop')?Math.min(m.caps.parts,Math.max(100,record.constructionPolicy.partsReserve)):undefined,
+      workshopScrapReserve:record.constructionPolicy.scrapReserve,
       development:shelterStaffMode!=='off'&&!shelterStaffHold,optimize:shelterOptimize,
       populationGrowth:shelterStaffMode==='population'&&!shelterStaffHold,
       parentTraining:Boolean(shelterCampaign.training&&['family','population'].includes(shelterStaffMode)&&!shelterStaffHold)};
@@ -16184,7 +16229,7 @@ installShelterPlanningWorker(self);
     const retained=development.retainedProject;
     const upgrade=next?.kind==='upgrade'?next:retained&&(next?.employment||!retained.blocks.length)?retained:
       (materialStep?development.partsProject:null);
-    const target=upgrade?.cost.parts?upgrade.cost.parts+record.constructionPolicy.partsReserve:0;
+    const target=Math.max(cfg.partsTarget||0,upgrade?.cost.parts?upgrade.cost.parts+record.constructionPolicy.partsReserve:0);
     const scheduled=shelterCampaignPlan(m,{...cfg,workshop:true,partsTarget:target,developmentProject:next,
       workshopProject:upgrade?.id,
       workshopScrapReserve:record.constructionPolicy.scrapReserve+(upgrade?.cost.scrap||0)},record,shelterPopulationTarget);
@@ -16496,6 +16541,32 @@ installShelterPlanningWorker(self);
       {operation:pending.id,room,status:result.status,message:result.error||null,snapshotAt:m.now,incidentActive:active});
     return true;
   }
+  function reconcileShelterExpedition(m) {
+    const pending=shelterPending,result=pending?.result;
+    if(!['explore-start','explore-recall'].includes(pending?.kind)||pending.emergency||
+      pending.lifecycle?.phase!=='request-bound'||!/^[A-Za-z0-9-]{8,64}$/.test(pending.lifecycle.requestKey||'')||
+      pending.campaignKey!==pending.lifecycle.requestKey||!validCampaignPending(pending)||
+      !Number.isFinite(pending.lifecycle.boundAt)||pending.lifecycle.boundAt<pending.at||
+      pending.lifecycle.boundAt>result?.responseFinishedAt||!Number.isFinite(pending.before.serverTime)||
+      ![400,422].includes(result?.status)||result.outcome!=='http-error'||result.retry!==false||
+      typeof result.error!=='string'||!result.error.trim()||result.campaignProof||
+      continueShelterAction||awaitingShelterConfirmation||shelterWorkConfirm||accountStopReason()||
+      !shelterRead||Date.now()-shelterRead.at>1500||!shelterCanIsolateDefense(pending,m,shelterRead.startedAt))return false;
+    const campaign=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
+    const entries=(campaign.rejections||[]).filter(entry=>m.now-entry.at<86400000);
+    const previous=entries.find(entry=>entry.kind===pending.kind&&entry.id===pending.targets[0]);
+    const count=Math.min(4,(previous?.count||0)+1),until=m.now+[60000,120000,300000,900000][count-1];
+    const rejections=[...entries.filter(entry=>entry!==previous),{kind:pending.kind,id:pending.targets[0],at:m.now,until,count}];
+    shelterWriteGuard();if(shelterPending?.id!==pending.id)return false;
+    saveShelter({...shelterState,campaign:{...campaign,rejections},
+      campaignRecovery:{at:Date.now(),outcome:'http-rejected',original:pending,snapshotAt:m.now,until},
+      nextAt:0,pendingReadOnly:undefined,note:'普通探险拒绝已归档，其他人员继续；退避后重新核对目标'});
+    saveShelterPending(null);cancelQueued();cancelShelterRead();
+    shelterCampaignWork=null;shelterRecallWork=null;
+    log.add('shelter-expedition-rejected','普通探险拒绝已归档，解除全局等待；不记成功、不重放原单',
+      {original:pending,snapshotAt:m.now,until,count});
+    return true;
+  }
   function closeShelterRescue() {
     const work=shelterRescueWork;if(!work)return false;
     if(work.dialog?.isConnected&&visible(work.dialog)){
@@ -16551,7 +16622,7 @@ installShelterPlanningWorker(self);
     return {...maintenance,choice:maintenance.choice||(maintenance.healing?{...maintenance.healing,maintenanceMedical:true}:null),
       checkSoloDeparture:shelterCampaign.explore&&m.view.drops?.enabled===true&&
         m.state.resources.stimpak>=shelterCampaign.reserve+shelterCampaign.stimpaks&&
-        m.state.explorers.length<Math.min(6,1+Math.floor(m.state.depth/8)),
+        m.state.explorers.length<shelterExploreSlots(m,shelterState.campaign),
       reserved:[...new Set([...(maintenance.reserved||[]),...roles.map(r=>r.id),...defense.map(r=>r.id)])],
       trainingDestinations:[...(maintenance.trainingDestinations||[]),...shelterTrainingDestinations(m,roles)]};
   }
@@ -16646,6 +16717,9 @@ installShelterPlanningWorker(self);
       trips:previous.trips.filter(r=>m.now-r.at<7*86400000||m.state.explorers.some(e=>e.id===r.id)),
       attempts:previous.attempts.filter(a=>a.week===m.view.env?.week||a.week===c.week),
       heals:previous.heals.filter(r=>m.now-r.at<86400000),trainingRest:previous.trainingRest.filter(r=>m.now-r.at<86400000)};
+    if(previous.exploreSlots)record.exploreSlots=previous.exploreSlots;
+    if(previous.rejections)record.rejections=previous.rejections.filter(entry=>m.now-entry.at<86400000&&
+      !(entry.kind===p.kind&&entry.id===p.targets[0]));
     if(previous.materials)record.materials=previous.materials;
     if(c.role==='workshop'&&validShelterMaterials(c.materials))record.materials=c.materials;
     const id=p.targets[0],at=proof.at;
@@ -16760,6 +16834,16 @@ installShelterPlanningWorker(self);
     if(!root)return holdShelterCampaign('未能唯一定位废土模块，本轮保留原安排，其他领取继续');
     const labelControl=pattern=>locator.pick([...root.querySelectorAll('label')].filter(l=>pattern.test(textOf(l))))?.querySelector('select,input');
     if(c.kind==='explore-start'){
+      const capacity=textOf(root.querySelector('h2')).match(/^单人探险\s*\((\d+)\/(\d+)\)$/);
+      const count=Number(capacity?.[1]),limit=Number(capacity?.[2]);
+      if(!Number.isSafeInteger(limit)||limit<1||count!==m.state.explorers.length)
+        return holdShelterCampaign('页面探险人数与新快照不一致，暂缓派遣，稍后重新核对');
+      const previous=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
+      if(previous.exploreSlots?.depth!==m.state.depth||previous.exploreSlots.limit!==limit){
+        saveShelter({...shelterState,campaign:{...previous,exploreSlots:{depth:m.state.depth,limit}}});
+        shelterCampaignWork=null;cancelQueued();cancelShelterRead();schedule();return true;
+      }
+      if(count>=limit)return holdShelterCampaign('普通探险名额已满，返程人员领取后再补派');
       const abyss=labelControl(/^深渊门票/);
       if(!abyss||abyss.type!=='checkbox'||abyss.checked)return holdShelterCampaign('页面深渊选项已勾选或不可核对，保留手动设置，不出发');
       for(const [pattern,value,key] of [[/^探险者/,c.id,'person'],[/^区域/,c.targets[1],'tier'],[/^带治疗针/,c.targets[2],'stimpaks']]){
@@ -17357,9 +17441,12 @@ installShelterPlanningWorker(self);
     const unassessed=observed.filter(p=>!available.has(p.id));
     const children=living.filter(p=>p.away===null&&Number.isFinite(p.adultAt)&&p.adultAt>m.now);
     const rooms=s.rooms.filter(r=>r.type==='scrap').map(r=>{
-      const occupied=living.filter(p=>p.roomId===r.id).length,slots=Math.max(0,r.width*2-occupied);
+      const occupied=living.filter(p=>p.roomId===r.id).length;
+      const reserved=new Set((campaign?.trainingDestinations||[]).filter(destination=>destination.room===r.id&&
+        living.some(person=>person.id===destination.id&&person.roomId!==r.id)).map(destination=>destination.id)).size;
+      const slots=Math.max(0,r.width*2-occupied-reserved);
       const pending=r.builtAt>m.now||r.upgradeAt!==null,blocked=Boolean(r.incident||r.unpowered);
-      return {kind:'employment-room',id:r.id,capacity:r.width*2,occupied,slots,
+      return {kind:'employment-room',id:r.id,capacity:r.width*2,occupied,reserved,slots,
         status:blocked?'blocked':pending?'construction':'ready',
         readyAt:pending?(r.builtAt>m.now?r.builtAt:r.upgradeAt):null,
         awaitingConfirmation:pending&&r.builtAt<=m.now&&r.upgradeAt<=m.now,
@@ -17386,7 +17473,7 @@ installShelterPlanningWorker(self);
       readySlots:ready,pendingSlots:pending,blockedSlots:total('blocked'),
       shortageNow:Math.max(0,adults.length-ready),shortageAfterConstruction:Math.max(0,adults.length-ready-pending),
       potentialShortageAfterChildren:Math.max(0,adults.length+children.length-ready-pending),
-      scope:'仅核对回收岗位数量，已扣除外出占位；在建岗位未计当前产出，儿童未计可调成人；未来缺口不代表授权提前建设'},
+      scope:'仅核对回收岗位数量，已扣除外出占位与训练返岗预留；在建岗位未计当前产出，儿童未计可调成人；未来缺口不代表授权提前建设'},
       rows:[...adults.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'eligible-adult'})),
         ...unassessed.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'not-eligible-or-unassessed'})),
         ...children.map(p=>({kind:'employment-person',id:p.id,roomId:p.roomId,status:'child',adultAt:p.adultAt,
@@ -17798,7 +17885,7 @@ installShelterPlanningWorker(self);
           const rewardProofs=Array.isArray(pending.result?.rewardProofs)?pending.result.rewardProofs:[];
           const rewards=rewardProof?[...rewardProofs.filter(p=>p.target!==rewardProof.target),rewardProof]:rewardProofs;
           persist({ ...pending, result:{status:result.status,outcome:result.outcome,
-            ...(kind==='rescue'?{retry:body?.code==='retry',error:typeof body?.error==='string'?body.error.slice(0,300):null}:{}),
+            ...(['rescue','explore-start','explore-recall'].includes(kind)?{retry:body?.code==='retry',error:typeof body?.error==='string'?body.error.slice(0,300):null}:{}),
             ...(Number.isFinite(pending.result?.responseFinishedAt)?{responseFinishedAt:pending.result.responseFinishedAt}:{}),
             ...(proof?{proof}:{}),...(constructionProof?{constructionProof}:{}),...(campaignProof?{campaignProof}:{}),...(rescueProof?{rescueProof}:{}),
             ...(sodaProof?{sodaProof}:{}),...(inspectionProof?{inspectionProof}:{}),...(revivalProof?{revivalProof}:{}),...(rewards.length?{rewardProofs:rewards}:{})} });
@@ -18200,6 +18287,7 @@ installShelterPlanningWorker(self);
     }
     if (shelterPending) {
       if(reconcileShelterRescue(m))return;
+      if(reconcileShelterExpedition(m))return;
       if(reconcileShelterOldAssignment(m,dialogs))return;
       if(constructionKind(shelterPending.kind)&&closeShelterBuild())return;
       if(shelterPending.kind==='season'&&shelterPending.sentCount<shelterPending.targets.length&&
@@ -19523,6 +19611,7 @@ installShelterPlanningWorker(self);
       shelterWork = null; shelterStaffHold = false;shelterBuildWork=null;shelterRecallWork=null;shelterRescueWork=null;
     }
     if (host.hidden === onPage()) host.hidden = !onPage();
+    if(logSummaryDay!==Math.floor((Date.now()+8*3600000)/86400000))renderLogIncome();
     if (onPage()) log.receipts();
     if (accountStopReason()) {
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
