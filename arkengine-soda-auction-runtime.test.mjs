@@ -51,6 +51,20 @@ test('拍卖加固：每次上下文刷新包含行情，读间隔不跨过开�
   assert.equal(state.reads.filter(read=>read.path==='/api/shelter/auction').length,3);
 });
 
+test('拍卖补位：避难所慢读取不阻塞下一轮行情和余额刷新',async()=>{
+  const state=setup();let finish;
+  state.context.createReadSession=()=>({fetch:async path=>{
+    state.reads.push({path,at:state.context.clock});
+    if(path==='/api/shelter')await new Promise(resolve=>{finish=resolve;});return {};
+  },json:async()=>({}),close(){}});
+  state.context.clock=now-1000;state.api.read();await drain();
+  state.context.clock=now;state.api.read();await drain();
+  assert.equal(state.reads.filter(read=>read.path==='/api/shelter/auction').length,2);
+  assert.equal(state.reads.filter(read=>read.path==='/api/me/balance').length,2);
+  assert.equal(state.reads.filter(read=>read.path==='/api/shelter').length,1);
+  finish();await drain();
+});
+
 for(const reason of ['round','quote-age','balance','sold','price','quota'])test('拍卖加固：确认后发请求前重新核对 '+reason,()=>{
   const state=setup();state.api.prepare();
   if(reason==='round'){state.context.clock+=600000;state.body.auction.released=6;state.refresh();}

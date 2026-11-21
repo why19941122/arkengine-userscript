@@ -47,7 +47,10 @@ window.finishPlant=()=>{
  const pending=fm.pendingPlant;
  if(!pending) throw Error('没有待完成的种植');
  const c=fc.find(c=>c.key===pending.key);
- fm.stamina-=pending.plots.length;fm.inventory[c.key]-=pending.plots.length;
+ fm.stamina-=pending.plots.length;
+ const shortage=Math.max(0,pending.plots.length-fm.inventory[c.key]);
+ if(shortage){fm.tokens-=shortage*c.buyPriceTokens;fm.seedPurchases=(fm.seedPurchases||0)+shortage;}
+ fm.inventory[c.key]=Math.max(0,fm.inventory[c.key]-pending.plots.length);
  pending.plots.forEach(plot=>fm.crops.push({plot,key:c.key,name:c.name,at:clock+c.minutes*60000}));
  fm.pendingPlant=null;fm.busy=false;fm.message='种下了 '+pending.plots.length+' 块';
  closeSeeds();renderFarm();
@@ -56,7 +59,8 @@ window.plantFarm = c=>{
  if(fm.busy) throw Error('重复种植请求');
  const empty=Array.from({length:12},(_,i)=>i+1).filter(plot=>!fm.crops.some(c=>c.plot===plot));
  const target=fm.all?empty:empty.slice(0,1);
- if(fm.stamina<target.length || fm.inventory[c.key]<target.length) throw Error('资源不足');
+ const shortage=Math.max(0,target.length-fm.inventory[c.key]);
+ if(fm.stamina<target.length || shortage&&(!fm.buySeeds||fm.tokens<shortage*c.buyPriceTokens)) throw Error('资源不足');
  fm.calls.push({type:'plant',name:c.name,count:target.length,at:clock}); fm.busy=true;
  fm.pendingPlant={key:c.key,plots:target};
  // 与网站一致：种植请求结束后才关闭窗口；处理中仍可手动关闭。
@@ -69,6 +73,7 @@ window.openSeeds=()=>{
  fm.calls.push({type:'open'});fm.all=false;
  const dialog=document.createElement('div');dialog.setAttribute('role','dialog');
  dialog.innerHTML='<h2>选择种子</h2><button aria-label="关闭">关闭</button><button id="all-plots"></button><label>希望多久内收获<select><option value="0">不限</option><option value="1">1小时</option></select></label><div id="seed-buttons"></div>';
+ if(fm.buySeeds){const label=document.createElement('label');label.innerHTML='种源与品质<select><option value="safe">安全种源</option></select>';dialog.append(label);}
  const update=()=>{
   const empty=12-fm.crops.length;
   const all=dialog.querySelector('#all-plots');all.textContent=fm.all?'种满全部 '+empty+' 块空地':'只种这一块（点此改为种满 '+empty+' 块）';all.setAttribute('aria-pressed',String(fm.all));
@@ -79,7 +84,8 @@ window.openSeeds=()=>{
     const quantity=c.yieldQuantity*1.1;
     const yieldText=Number.isInteger(quantity)?quantity:Math.floor(quantity)+'~'+Math.ceil(quantity)+'（均值 '+quantity.toFixed(1)+'）';
     const duration=c.minutes<60?c.minutes+'分':Math.floor(c.minutes/60)+'时'+c.minutes%60+'分';
-    b.innerHTML='<img alt=""><div><div><span class="font-semibold">'+c.name+'</span><span>免费 · 存货 '+fm.inventory[c.key]+'</span></div><p>预计 '+duration+' 成熟（已含当前地块加速） · 预计产量 '+yieldText+' · 基准价 999</p></div><span title="种植消耗 1 体力">1</span>';
+    const seedLabel=fm.inventory[c.key]?'免费 · 存货 '+fm.inventory[c.key]:String(c.buyPriceTokens||0);
+    b.innerHTML='<img alt=""><div><div><span class="font-semibold">'+c.name+'</span><span>'+seedLabel+'</span></div><p>预计 '+duration+' 成熟（已含当前地块加速） · 预计产量 '+yieldText+' · 基准价 999</p></div><span title="种植消耗 1 体力">1</span>';
     b.onclick=()=>plantFarm(c);container.append(b);
     const pin=document.createElement('button');pin.textContent='☆';pin.setAttribute('aria-label','置顶'+c.name);pin.onclick=()=>fm.calls.push({type:'pin'});container.append(pin);
   }

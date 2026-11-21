@@ -6,15 +6,34 @@ export async function farmRecoveryTests({t,setupFarm,evaluate,drive,pulse}) {
   const twoClosers=`const open=openSeeds;window.openSeeds=()=>{open();const dialog=document.querySelector('[role=dialog]');
     const header=document.createElement('header');const close=document.createElement('button');
     close.setAttribute('aria-label','关闭');close.onclick=closeSeeds;header.append(close);dialog.prepend(header);};`;
-  await t.test('农场阻塞修复：双关闭按钮缺种时退出，补足库存后重新开启可种植',async()=>{
+  for(const crop of ['红薯','燕麦'])await t.test('新作物补种：首次'+crop+'无存货买满空地，收获后留种不重复购买',async()=>{
+    await setupFarm(`addRuns(6);fm.buySeeds=true;fm.tokens=10000;
+      fc.push({name:'${crop}',key:'new-crop',id:100,minutes:12,yieldQuantity:6,price:2,buyPriceTokens:8});
+      fm.inventory['new-crop']=0;fm.prices[100]=2;
+      localStorage.setItem('arkengine:auto-farm:crop:v1','${crop}');
+      const data=farmData;window.farmData=()=>{const view=data();view.inventory=view.inventory.map(item=>({...item,quality:'normal'}));return view;};`,'/farm');
+    await drive('fm.crops.length===12','new crop fills all plots');
+    assert.equal(await evaluate('fm.seedPurchases'),12);
+    assert.equal(await evaluate('fm.tokens'),9904);
+    assert.equal(await evaluate("fm.calls.filter(call=>call.type==='plant').length"),1);
+    await drive("!JSON.parse(sessionStorage.getItem('arkengine:auto-farm:pending:v1'))",'plant acknowledged');
+    await evaluate('clock+=13*60000;renderFarm();');
+    await pulse(0);
+    await drive("fm.calls.filter(call=>call.type==='plant').length===2&&fm.crops.length===12",'next crop uses harvest');
+    assert.equal(await evaluate('fm.seedPurchases'),12);
+    assert.equal(await evaluate('fm.tokens'),9904);
+    assert.notEqual(await evaluate("localStorage.getItem('arkengine:auto-farm:enabled:v1')"),'false');
+  });
+  await t.test('农场阻塞修复：双关闭按钮缺种时预约退出，补足库存后自动恢复',async()=>{
     await setupFarm(`addRuns(6);for(const key in fm.inventory)fm.inventory[key]=0;${twoClosers}`,'/farm');
-    await drive("localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'",'missing seed pauses');
+    await drive(`${noDialog}&&${state}?.nextAt>clock`,'missing seed defers');
     assert.equal(await evaluate(noDialog),true);
     assert.match(await evaluate(`${state}.note`),/没有足够免费存货/);
     assert.doesNotMatch(await evaluate(`${state}.note`),/无法自动关闭/);
     assert.equal(await evaluate("fm.calls.filter(call=>call.type==='plant').length"),0);
-    await evaluate(`for(const key in fm.inventory)fm.inventory[key]=100;
-      document.getElementById('ark-auto-expedition').shadowRoot.getElementById('farm-toggle').click();`);
+    assert.notEqual(await evaluate("localStorage.getItem('arkengine:auto-farm:enabled:v1')"),'false');
+    await evaluate('for(const key in fm.inventory)fm.inventory[key]=100;');
+    await pulse(30*60000);
     await drive('fm.crops.length===12','plant after replenishing seeds');
     assert.equal(await evaluate("fm.calls.filter(call=>call.type==='plant').length"),1);
   });
@@ -46,7 +65,8 @@ export async function farmRecoveryTests({t,setupFarm,evaluate,drive,pulse}) {
         const read=farmData;window.farmData=()=>{const data=read();data.seedPouch=Object.fromEntries(fc.map(crop=>[crop.key,100]));
           data.inventory=data.inventory.map(item=>({...item,quality:${JSON.stringify(source==='fine'?'rare':'fine')}}));
           if('${source}'==='safe')data.seedPouch={};return data;};`,'/farm');
-      await drive("localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'",'selected source cannot supply seeds');
+      await drive(source==='changed'?"localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'":
+        `${noDialog}&&${state}?.nextAt>clock`,'selected source cannot supply seeds');
       assert.equal(await evaluate("fm.calls.filter(call=>call.type==='plant').length"),0,source);
       assert.equal(await evaluate(noDialog),true,source);
     }

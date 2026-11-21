@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.150
+// @version      1.17.151
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -369,6 +369,27 @@
         } else say(`${reason}；等待页面更新${state.reloaded ? '（已核对一次）' : ''}`);
       },
     };
+  }
+
+  function createPageScheduler(run,urgent) {
+    let queued=false,timer=null,nextAt=0;
+    const schedule=(immediate=false)=>{
+      if(queued)return;
+      const delay=nextAt-performance.now();
+      if(immediate!==true&&!urgent()&&delay>0){
+        if(timer===null)timer=setTimeout(()=>{timer=null;schedule();},delay);
+        return;
+      }
+      if(timer!==null){clearTimeout(timer);timer=null;}
+      queued=true;
+      queueMicrotask(()=>{
+        queued=false;
+        const startedAt=performance.now();nextAt=startedAt+500;
+        run();
+        nextAt=Math.max(nextAt,performance.now()+Math.min(2000,Math.max(100,(performance.now()-startedAt)*4)));
+      });
+    };
+    return schedule;
   }
 
   // 每页共享一个 Worker 和 DOM 观察器；非当前功能组不扫描整页。
@@ -1635,7 +1656,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.150';
+  const SCRIPT_VERSION = '1.17.151';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -1722,13 +1743,14 @@
       !(event.data?.blockedMs>=90000)&&!(event.data?.attempt>0));
   const normalLog = event => routineLog(event)||['state', 'heartbeat'].includes(event.type) ||
     event.type === 'request-result' && event.data?.status >= 200 && event.data.status < 400;
-  const LOG_PRIORITY_VERSION = 9;
+  const LOG_PRIORITY_VERSION = 10;
   const criticalLog = event => Boolean(event.receiptId) || !routineLog(event)&&([
     'stock-submit','stock-response','stock-confirmed','stock-income','stock-prediction-settled',
     'shelter-submitted','shelter-prepared','shelter-dig-request','shelter-confirmed','shelter-campaign-confirmed','shelter-work-cancelled','shelter-assignment-reconciled',
     'shelter-population','shelter-training-adopted','shelter-defense-settled','shelter-trips-recovered','shelter-rescue-rejected',
     'shelter-execution-evidence','shelter-recall-cancelled','shelter-recall-opened','shelter-recall-control-wait','encounter-quota','shelter-user-interaction','shelter-paused',
     'page-lifecycle','reward','pause',
+    'soda-auction-priority','soda-auction-release','soda-auction-rejected','soda-auction-unconfirmed','soda-auction-aborted',
   ].includes(event.type) || /-(error|held|blocked|recovered|resumed)$/.test(event.type) ||
     event.type==='request-result' && Number.isFinite(event.data?.status) && event.data.status>=400);
   // Shelter decisions cannot be reconstructed from stock observations. Retain
@@ -2607,8 +2629,16 @@
         }
       } catch { /* 只观察能与已保存原请求完全匹配的 JSON，不改变网页请求。 */ }
       const promise = Reflect.apply(originalFetch, this, args);
-      if(auctionObservation)promise.then(response=>response.clone().json().then(body=>auctionObservation(response.status,body)),
-        ()=>auctionObservation(null,null)).catch(()=>auctionObservation(null,null));
+      if(auctionObservation)promise.then(response=>{
+        const json=response.json;
+        try{response.json=function(...input){
+          return Reflect.apply(json,this,input).then(body=>{
+            try{if(this===response)auctionObservation(response.status,body);}catch{}
+            return body;
+          });
+        };}catch{}
+        return response.clone().json().then(body=>auctionObservation(response.status,body));
+      },()=>auctionObservation(null,null)).catch(()=>auctionObservation(null,null));
       if(dungeonReceipt)promise.then(r=>r.clone().json().then(body=>dungeonReceipt(r.status,body))).catch(()=>{});
       if(stockIncomeRead)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.view(stockIncomeRead,r.status,body))).catch(()=>{});
       if(stockIncomeRequest&&!stockBound)promise.then(r=>r.clone().json().then(body=>observeStockIncome?.result(stockIncomeContext,stockIncomeRequest,r.status,body))).catch(()=>{});
@@ -3809,7 +3839,6 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let releaseLock = null;
   let queued = null;
   let offered = false;
-  let scheduled = false;
   let nextStepAt = 0;
   let auctionExclusive = false;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
@@ -3967,7 +3996,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <select id="farm-crop">
         <option value="auto">自动：当前收益最高的单一作物</option>
       </select>
-      <p class="hint" id="farm-selection">每次种植前读取最新行情，每块扣除留种 1 份。</p>
+      <p class="hint" id="farm-selection">指定作物缺种时用代币补满空地；自动选种只用免费种源。</p>
       <div class="panel-actions"><button type="button" id="farm-toggle"></button>
       <button type="button" id="farm-check">检查农场</button>
       </div></div></details>
@@ -4812,7 +4841,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       }
       catch(error){if(!stockRetryChange(error))stockFault='股市记录无法保存';}
     }).finally(()=>{controller.close();
-      if(generation===stockGeneration){stockController=null;stockReadAt=Date.now()+2000;schedule();}});
+      if(generation===stockGeneration){stockController=null;stockReadAt=Date.now()+2000;schedule(true);}});
   }
   function stockNative() {
     const records=[];
@@ -14069,7 +14098,7 @@ installShelterPlanningWorker(self);
           else pauseShelter('避难所状态无法核对，已暂停并保留原记录');
         }catch(error){if(!shelterRetryChange(error))pauseShelter('避难所记录无法保存，已暂停并保留原记录');}
       })
-      .finally(() => { controller.close();if (generation === shelterGeneration) { shelterController = null; schedule(); } });
+      .finally(() => { controller.close();if (generation === shelterGeneration) { shelterController = null; schedule(true); } });
   }
   function shelterReadRetry(note) {
     shelterReadFailures++;
@@ -16802,9 +16831,10 @@ installShelterPlanningWorker(self);
       !Number.isInteger(result?.status)||result.status<500||result.status>599||result.outcome!=='http-error'||
       result.campaignProof||pending.before.campaign&&(!validCampaignPending(pending)||pending.campaignKey!==pending.lifecycle.requestKey)||
       continueShelterAction||awaitingShelterConfirmation||shelterWorkConfirm||accountStopReason()||
-      !shelterRead||Date.now()-shelterRead.at>1500||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
+      !shelterRead||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
     if(dialogs.length)return dialogs.length===1&&shelterWork?.submitted&&!shelterWork.manual&&
       shelterWork.dialog===dialogs[0]?closeShelterWork():false;
+    if(Date.now()-shelterRead.at>1500){readShelter();return true;}
     const residents=model.state.residents.filter(person=>person.id===pending.targets[0]),resident=residents.length===1?residents[0]:null;
     if(!resident||resident.deadAt!==null||resident.away!==null||resident.adultAt>model.now||!shelterResidentIdentity(model.state,resident)||
       resident.roomId!==null&&!model.state.rooms.some(room=>room.id===resident.roomId)||
@@ -16869,9 +16899,10 @@ installShelterPlanningWorker(self);
       !Number.isInteger(result?.status)||result.status<500||result.status>599||result.outcome!=='http-error'||
       result.campaignProof||pending.before.campaign&&(!validCampaignPending(pending)||pending.campaignKey!==pending.lifecycle.requestKey)||
       continueShelterAction||awaitingShelterConfirmation||shelterWorkConfirm||accountStopReason()||
-      !shelterRead||Date.now()-shelterRead.at>1500||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
+      !shelterRead||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
     if(dialogs.length)return dialogs.length===1&&shelterWork?.submitted&&!shelterWork.manual&&
       shelterWork.dialog===dialogs[0]?closeShelterWork():false;
+    if(Date.now()-shelterRead.at>1500){readShelter();return true;}
     const [residentId,itemId,kind]=pending.targets,slot=kind==='weapon'?'weapon':'outfit',state=model.state;
     const choice=pending.before.campaign?.choice,snapshot=pending.before.equipment;
     const fromItem=snapshot?snapshot.fromItem:choice&&Object.hasOwn(choice,'fromItem')?choice.fromItem:
@@ -19377,7 +19408,7 @@ installShelterPlanningWorker(self);
     setPanelText(farmToggle,farmEnabled ? '暂停农场' : '开启农场');
     const selected = shadow.getElementById('farm-selection');
     const description = farmState.selection || (farmCrop === 'auto' ?
-      '每次种植前读取最新行情，每块扣除留种 1 份。' : `指定：${farmCrop}；下次种植生效`);
+      '按最新行情选种，只用免费种源，每块留种 1 份。' : `指定：${farmCrop}；缺种用代币补满空地，下次种植生效`);
     if (selected.textContent !== description) selected.textContent = description;
   }
   function pauseFarm(message) {
@@ -19525,8 +19556,8 @@ installShelterPlanningWorker(self);
     // Ordinary visits compete by their existing due time. A short continuation
     // must not repeatedly overtake an older stock/farm/shelter appointment.
     // Each visitor still checks pending operations, enabled state and return time.
-    if(shelterReload(true)){cancelShelterRead();cancelQueued();}
-    if(stockReload(true)){cancelStockRead();cancelQueued();}
+    if(shelterReload(true)){cancelShelterRead();cancelQueued();schedule();}
+    if(stockReload(true)){cancelStockRead();cancelQueued();schedule();}
     if(excludePath!=='/stock'&&stockCheckRequested&&maybeVisitStock(running))return true;
     const visits=scheduledVisits().filter(visit=>visit.path!==excludePath&&Number.isFinite(visit.at));
     visits.sort((left,right)=>left.at-right.at);
@@ -19736,6 +19767,11 @@ installShelterPlanningWorker(self);
       if(matches)matches.push(seed);else seedsByName.set(name,[seed]);
     }
     const usePouch=['safe','auto','inventory'].includes(source);
+    const selected=seedsByName.get(farmCrop);
+    if(farmCrop!=='auto'&&!selected)return {error:`当前目录没有${farmCrop}，等待目录更新`,retry:true};
+    if(farmCrop!=='auto'&&selected?.length!==1)return {error:`${farmCrop}的种子数据无法核对`};
+    if(farmCrop!=='auto'&&selected?.length===1&&(selected[0].minSoilLevel||0)>(data.soilLevel||0))
+      return {error:`${farmCrop}需要沃土等级 ${selected[0].minSoilLevel}，当前 ${data.soilLevel||0}；等待解锁`,retry:true};
     let best=null;
     for (const button of dialog.querySelectorAll('button')) {
       if (!usable(button)) continue;
@@ -19744,15 +19780,24 @@ installShelterPlanningWorker(self);
       if (farmCrop !== 'auto' && name !== farmCrop) continue;
       const text = textOf(button);
       const free = text.match(/免费\s*·\s*存货\s*(\d+)/);
-      if (!free || +free[1] < s.empty.length) continue; // 不自动补购种子。
+      if(farmCrop==='auto'&&(!free||Number(free[1])<empty.length))continue;
       const seeds = seedsByName.get(name)||[];
       if (seeds.length !== 1) return { error: `${name}的种子数据无法核对` };
       const seed = seeds[0];
       const available = (usePouch?data.seedPouch?.[seed.key]??0:0) + (stock.get(seed.key)??0);
-      if (!(available >= empty.length) || (seed.minSoilLevel || 0) > (data.soilLevel || 0)) continue;
+      if(!Number.isSafeInteger(available)||available<0)return {error:`${name}的种源数量无法核对`};
+      if((seed.minSoilLevel||0)>(data.soilLevel||0))continue;
+      const supply=Math.min(available,free?Number(free[1]):0);
+      const paid=farmCrop!=='auto'&&['safe','auto','shop'].includes(source)&&supply<empty.length;
+      if(paid&&(!Number.isSafeInteger(seed.buyPriceTokens)||seed.buyPriceTokens<=0))
+        return {error:`${name}的购买种子价格无法核对，暂不消费代币`};
+      if(!paid&&supply<empty.length)continue;
+      const count=empty.length;
+      const seedCost=paid?(empty.length-supply)*seed.buyPriceTokens:0;
       const cost = button.querySelector('[title*="种植消耗"]')?.title.match(/种植消耗\s*(\d+)\s*体力/);
       if (!cost || Number(cost[1]) !== 1) return { error: '种植体力规则变化，请手动核对' };
-      if (farmCrop !== 'auto' && name === farmCrop) return { button, name, description: `指定种植：${name}；每块留种 1 份` };
+      if (farmCrop !== 'auto' && name === farmCrop) return { button, name, count, seedCost,
+        description: `指定种植：${name}；本次 ${count} 块${seedCost?`，补种预计 ${seedCost} 代币`:'，使用免费种源'}` };
       // 与网站展示预计时间/产量的公式相同；读到的是本轮最新种子、地块、活动参数。
       const durations = data.plots.map(p => Math.round(1000 * seed.growSeconds *
         Math.max(.4, Math.max(.5, data.growthMultiplier ?? 1) * (1-Math.max(0,Math.min(20,p.growthPct))/100)) /
@@ -19767,10 +19812,10 @@ installShelterPlanningWorker(self);
       // 统一作物长期循环：全场一轮需 2N 体力，每块减一份留种。
       const cycle = Math.max(growth, 2 * data.plots.length * regen);
       const income = harvest * price * 3600000 / cycle;
-      if(!best||income>best.income)best={button,name,income};
+      if(!best||income>best.income)best={button,name,count,income};
     }
-    if (farmCrop !== 'auto') return { error: `${farmCrop}未解锁或免费存货不足，暂不种植` };
-    if (!best) return { error: '没有足够免费存货的可选作物，请核对当前种源与品质或补足存货后开启农场' };
+    if (farmCrop !== 'auto') return { error: `${farmCrop}在当前种源下免费存货不足，或种子按钮尚不可用；稍后核对`,retry:true };
+    if (!best) return { error: '没有足够免费存货的可选作物，等待当前种源补足存货或解锁',retry:true };
     return { ...best, description: `当前选 ${best.name}：留种后约 ${best.income.toFixed(1)} 代币/小时（普通品质）` };
   }
   for(const type of ['pointerdown','keydown','input','change'])document.addEventListener(type,event=>{
@@ -19805,7 +19850,7 @@ installShelterPlanningWorker(self);
         if(closeFeatureWindow(seedWindow,dialogs,'farm',pauseFarm)){
           const closed=seedWindow;ownSeedDialog=null;seedWindow=null;openingSeedsAt=0;
           if(closed.pauseAfter)pauseFarm(closed.pauseAfter);
-          if(closed.defer&&!farmPlan)planFarmVisit(Date.now()+60000,closed.cancelReason);
+          if(closed.defer&&!farmPlan)planFarmVisit(closed.retryAt||Date.now()+60000,closed.cancelReason);
           else schedule();
         }return;
       }
@@ -19857,7 +19902,7 @@ installShelterPlanningWorker(self);
         s.empty.length < farmPlan.empty && s.entries.some(e => !farmPlan.plots.includes(e.plot) && e.crop === farmPlan.crop);
       if (confirmed && Date.now() - farmChangedAt >= 1500) {
         log.add(`farm-${farmPlan.action}-confirmed`, '田地变化已确认；不计作出售收入',
-          { crop: farmPlan.crop || '', plots: farmPlan.action === 'harvest' ? farmPlan.plots.length : farmPlan.empty });
+          { crop: farmPlan.crop || '', plots: farmPlan.action === 'harvest' ? farmPlan.plots.length : farmPlan.count??farmPlan.empty });
         saveFarmPlan(null); farmMarket = null;
       } else {
         if (Date.now() - farmPlan.at > 30000 && !farmPlan.reloaded) {
@@ -19886,13 +19931,6 @@ installShelterPlanningWorker(self);
         requestSeedClose('关闭种子窗口并等待体力');
         return;
       }
-      const all = buttonIn(dialog, /^(?:只种这一块|种满全部)/);
-      if (s.empty.length > 1 && (!all || all.getAttribute('aria-pressed') !== 'true')) {
-        if(seedWindow?.allAttempted&&Date.now()-seedWindow.at>30000){waitSeedWindow('等待全场种植模式生效');return;}
-        if (usable(all)) offer('farm:all', `选择种满 ${s.empty.length} 块空地`, () => { seedWindow.allAttempted=true;all.click(); });
-        else waitSeedWindow('等待种满全部空地按钮');
-        return;
-      }
       // 用户曾设置收获时间筛选时，自动模式仍需比较完整作物列表。
       const filter = [...dialog.querySelectorAll('label')].find(l => textOf(l).startsWith('希望多久内收获'))?.querySelector('select');
       if (filter && filter.value !== '0') {
@@ -19912,13 +19950,26 @@ installShelterPlanningWorker(self);
       if (!checkFarmStamina(s, s.empty.length, '种植', true)) return;
       const best = bestFarmSeed(dialog,s);
       if (best.error) {
-        requestSeedClose('关闭种子窗口',best.error);
+        if(best.retry){
+          seedWindow.defer=true;
+          const maturity=s.entries.map(entry=>entry.at).filter(at=>at>Date.now());
+          seedWindow.retryAt=Math.min(Date.now()+30*60000,...maturity);
+          requestSeedClose(best.error);
+        }else requestSeedClose('关闭种子窗口',best.error);
+        return;
+      }
+      const all=buttonIn(dialog,/^(?:只种这一块|种满全部)/);
+      if(s.empty.length>1&&(!all||all.getAttribute('aria-pressed')!=='true')){
+        if(seedWindow?.allAttempted&&Date.now()-seedWindow.at>30000){waitSeedWindow('等待种植数量生效');return;}
+        if(usable(all))offer('farm:all',`选择种满 ${best.count} 块空地`,()=>{
+          seedWindow.allAttempted=true;all.click();
+        });else waitSeedWindow('等待种植数量按钮');
         return;
       }
       if (farmState.selection !== best.description) saveFarmState({ ...farmState, selection: best.description });
-      offer(`farm:plant:${best.name}:${s.empty.length}:${farmCrop}`, `种植 ${s.empty.length} 块${best.name}`, () => {
-        log.add('farm-estimate', best.description, { crop: best.name, estimatedHourlyValue: best.income ?? null });
-        saveFarmPlan({ action:'plant', crop:best.name, empty:s.empty.length, plots:s.entries.map(e=>e.plot), at:Date.now() });
+      offer(`farm:plant:${best.name}:${best.count}:${farmCrop}`, `种植 ${best.count} 块${best.name}`, () => {
+        log.add('farm-estimate', best.description, { crop: best.name, estimatedHourlyValue: best.income ?? null,seedCost:best.seedCost??0 });
+        saveFarmPlan({ action:'plant', crop:best.name, count:best.count, empty:s.empty.length, plots:s.entries.map(e=>e.plot), at:Date.now() });
         best.button.click();
       });
       return;
@@ -19989,7 +20040,7 @@ installShelterPlanningWorker(self);
       auctionCore.whole(receipt.vault)&&auctionCore.whole(receipt.unitPrice)&&receipt.unitPrice>0&&receipt.unitPrice<400000);
   let auctionState=loadState(localStorage,AUCTION_STATE,emptyAuction(),'auction',auctionValid);
   let auctionRaw=localStorage.getItem(AUCTION_STATE),auctionView=null,auctionIdentity=null,auctionBalance=null;
-  let auctionSequence=0,auctionAccountFloor=0,auctionWindow=null,auctionIssue='',auctionContextRead=null,auctionReadAt=0,auctionLogging=false;
+  let auctionSequence=0,auctionAccountFloor=0,auctionWindow=null,auctionIssue='',auctionContextRead=null,auctionReadAt=0,auctionLogging=false,auctionSummary=null;
   const auctionToggle=shadow.getElementById('auction-enabled');
   auctionToggle.checked=localStorage.getItem(AUCTION_PREF)!=='false';
   function auctionSave(value) {
@@ -20018,24 +20069,30 @@ installShelterPlanningWorker(self);
     if(path!=='/api/shelter'&&sequence<auctionAccountFloor)return;
     if(path==='/api/shelter/auction'&&sequence>(auctionView?.sequence||0)){
       const model=auctionCore.model(body);
-      if(model||body?.enabled===false)auctionView={model,disabled:body?.enabled===false,sequence,at};
+      if(!model&&body?.enabled!==false)return;
+      auctionView={model,disabled:body?.enabled===false,sequence,at};
     }else if(path==='/api/shelter'&&sequence>(auctionIdentity?.sequence||0)&&auctionCore.whole(body?.vaultNo)){
       if(auctionIdentity&&auctionIdentity.vault!==body.vaultNo){auctionAccountFloor=sequence;auctionView=null;auctionBalance=null;}
       auctionIdentity={vault:body.vaultNo,sequence,at};
     }else if(path==='/api/me/balance'&&sequence>(auctionBalance?.sequence||0)&&Number.isFinite(body?.tokens)&&body.tokens>=0){
       auctionBalance={tokens:body.tokens,sequence,at};
-    }
+    }else return;
     if(auctionExclusive)schedule();
   }
   function auctionContext() {
-    if(auctionContextRead||Date.now()<auctionReadAt||!auctionAllowed())return;
+    if(Date.now()<auctionReadAt||!auctionAllowed())return;
     const now=Date.now(),visit=auctionCore.visit(auctionView?.model,now);
     auctionReadAt=Math.min(now+15000,visit.releaseAt>now?visit.releaseAt:Infinity);
-    const controller=createReadSession(10000,()=>auctionAllowed()&&auctionExclusive);auctionContextRead=controller;
+    const reads=auctionContextRead??={pending:new Map(),close(){for(const controller of this.pending.values())controller.close();this.pending.clear();}};
     const paths=['/api/shelter','/api/me/balance','/api/shelter/auction'];
-    void Promise.allSettled(paths.map(async path=>{
-      const response=await controller.fetch(path,{cache:'no-store'});await controller.json(response);
-    })).finally(()=>{controller.close();if(auctionContextRead===controller)auctionContextRead=null;schedule();});
+    for(const path of paths){
+      if(reads.pending.has(path))continue;
+      const controller=createReadSession(10000,()=>auctionAllowed()&&auctionExclusive);
+      reads.pending.set(path,controller);
+      void controller.fetch(path,{cache:'no-store'}).then(response=>controller.json(response)).catch(()=>{}).finally(()=>{
+        controller.close();if(reads.pending.get(path)===controller)reads.pending.delete(path);schedule();
+      });
+    }
   }
   function auctionRequestResult(id,status,body) {
     auctionReload();const pending=auctionState.pending;
@@ -20047,6 +20104,7 @@ installShelterPlanningWorker(self);
     }else{
       const receipts=[...auctionState.receipts],rounds=[...auctionState.rounds];
       if(outcome==='success'){
+        if(auctionSummary)auctionSummary.bought=true;
         if(!rounds.includes(pending.round))rounds.push(pending.round);
         if(pending.batch&&!rounds.includes(pending.batch))rounds.push(pending.batch);
         const startsAt=Number(pending.round.split(':')[0]);
@@ -20055,7 +20113,7 @@ installShelterPlanningWorker(self);
           if(!rounds.includes(slot))rounds.push(slot);
         }
         receipts.push({id:pending.id,at:Date.now(),quantity:1,unitPrice:body.unitPrice,vault:pending.vault});
-      }else log.add('soda-auction-rejected','本次未成交，继续驻留等待新的购买条件',{status});
+      }else log.add('soda-auction-rejected','本次未成交，继续驻留等待新的购买条件',{status,reason:body.error});
       auctionSave({...auctionState,pending:null,rounds,receipts,rejected:outcome==='rejected'?pending.signature:''});
       auctionWindow=null;auctionRecord();
     }
@@ -20072,6 +20130,7 @@ installShelterPlanningWorker(self);
     if(url.origin!==location.origin)return null;
     const method=String(args[1]?.method??input?.method??'GET').toUpperCase();
     if(method==='GET'&&['/api/shelter/auction','/api/shelter','/api/me/balance'].includes(url.pathname)){
+      if(url.pathname!=='/api/shelter/auction'&&!auctionExclusive&&!auctionState.pending)return null;
       const sequence=++auctionSequence;
       return (status,body)=>auctionObserveRead(url.pathname,sequence,at,status,body);
     }
@@ -20108,6 +20167,7 @@ installShelterPlanningWorker(self);
       try{auctionSave({...auctionState,pending:{...pending,phase:'submitted',key:body.idempotencyKey}});}
       catch(error){auctionIssue='拍卖原请求无法持久保存，已阻止提交';work.confirming=false;schedule();throw error;}
       work.sent=true;
+      if(auctionSummary){auctionSummary.submitted=true;auctionSummary.submitDelayMs=Date.now()-pending.at;}
       return (status,response)=>{
         try{auctionRequestResult(work.id,status,response);}
         catch{auctionIssue='拍卖回执无法保存，保留原单等待核对';schedule();}
@@ -20201,7 +20261,11 @@ installShelterPlanningWorker(self);
     auctionExclusive=false;
     auctionContextRead?.close();auctionContextRead=null;
     shelterEntryAt=inShelter()?Date.now():0;shelterLeave=inShelter();stockEntryAt=0;nextStepAt=0;
-    log.add('soda-auction-release','本轮拍卖守候结束，恢复其他玩法');
+    log.add('soda-auction-release','本轮拍卖守候结束，恢复其他玩法',{
+      ...auctionSummary,endedAt:Date.now(),pending:Boolean(auctionState.pending),
+      boughtToday:auctionView?.model?.boughtToday??null,dailyLimit:auctionView?.model?.perUserDaily??null,
+      quoteAgeMs:auctionView?Math.max(0,Date.now()-auctionView.at):null});
+    auctionSummary=null;
   }
   function auctionStep() {
     auctionReload();auctionRecord();auctionToggle.checked=localStorage.getItem(AUCTION_PREF)!=='false';
@@ -20225,6 +20289,8 @@ installShelterPlanningWorker(self);
     }
     if(!auctionExclusive){
       auctionExclusive=true;cancelQueued();cultivation.cancel();cancelFarmRead();cancelShelterRead();cancelShelterAuxReads();cancelShelterWatch();cancelStockRead();
+      shelterLevelPlanner?.invalidate();shelterLevelReplays.clear();shelterFamilyPlanner?.invalidate();shelterBackgroundPlanner?.invalidate();
+      auctionSummary={releaseAt:visit.releaseAt,enteredAt:now,bought:false,submitted:false,reason:'等待账号与行情'};
       if(captureShelterCaravan&&!captureShelterCaravan.sent)captureShelterCaravan.cancelled=true;
       if(captureShelterHelp&&!captureShelterHelp.sent)captureShelterHelp.cancelled=true;
       if(navigation?.to!=='/shelter')clearNavigation();
@@ -20264,6 +20330,7 @@ installShelterPlanningWorker(self);
     }
     if(!current||now-auctionView.at>20000){say('驻留汽水交易，等待原生拍卖行情');return true;}
     const choice=auctionCore.decision(current,auctionState,auctionBalance.tokens,now);
+    if(auctionSummary)auctionSummary.reason=choice.reason||choice.kind;
     if(choice.kind==='done'){
       auctionSave({...auctionState,doneDay:today});auctionRelease();return false;
     }
@@ -20273,6 +20340,7 @@ installShelterPlanningWorker(self);
     const buttons=[...(panel?.querySelectorAll('button')||[])].filter(button=>textOf(button)==='买入');
     const button=buttons.length===1?buttons[0]:null;
     if(!price||Number(price[1].replaceAll(',',''))!==choice.price||!usable(quantity)||!usable(button)){
+      if(auctionSummary)auctionSummary.reason='购买按钮或页面价格尚未就绪';
       say('驻留汽水交易，等待购买按钮与最新价格一致');return true;
     }
     if(Number(quantity.value)!==1){
@@ -20583,12 +20651,8 @@ installShelterPlanningWorker(self);
     }).catch(() => setEnabled(false, '无法取得远征运行锁，请刷新后重试'))
       .finally(() => { acquiring = false; });
   }
-  function schedule() {
-    if (scheduled) return;
-    scheduled = true;
-    // 与奇遇相同：唤醒后直接检查，避免普通定时器在后台再延迟一分钟。
-    queueMicrotask(() => {
-      scheduled = false;
+  function schedule(immediate=false) {
+    schedule.run??=createPageScheduler(() => {
       offered = false;
       idleChecked = false;
       idleBlocked = false;
@@ -20602,7 +20666,9 @@ installShelterPlanningWorker(self);
         if (enabled && active && !auctionExclusive && farmEnabled && inFarm()) farmWait.finish();
         if (enabled && active && !auctionExclusive && onPage()) expeditionLoadWait.finish();
       }
-    });
+    },()=>Boolean(auctionWindow)||enabled&&auctionToggle.checked&&
+      auctionState.doneDay!==auctionCore.day(Date.now())&&auctionCore.visit(auctionView?.model,Date.now()).active);
+    schedule.run(immediate===true);
   }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
     auctionEnabled:auctionToggle.checked,auctionExclusive,pendingAuction:Boolean(auctionState.pending),

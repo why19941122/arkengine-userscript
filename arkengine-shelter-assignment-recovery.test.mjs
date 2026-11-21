@@ -21,6 +21,7 @@ function setup(position='original'){
   Object.assign(context,{shelterPending:original,continueShelterAction:null,awaitingShelterConfirmation:null,
     shelterWorkConfirm:null,shelterWork:null,accountStopReason:()=>'',shelterWriteGuard(){},cancelQueued(){},
     cancelShelterRead(){},schedule(){},shelterExecutionDeferrals:new Map()});
+  context.readShelter=()=>{context.reads=(context.reads||0)+1;};
   context.saveShelterPending=value=>context.shelterPending=value;
   const start=source.indexOf('  function reconcileShelterAssignment(');
   const recover=start<0?()=>false:vm.runInContext(source.slice(start,source.indexOf('\n  function ',start+1))+
@@ -101,9 +102,26 @@ test('调岗520恢复：尚在请求、身份错误、旧读取、人工窗口�
     if(boundary==='account')context.accountStopReason=()=> 'stopped';
     if(boundary==='name')record.before.campaign.choice.name='其他居民';
     if(boundary==='missing-resident')state.model.state.residents=state.model.state.residents.filter(person=>person.id!==state.resident.id);
-    assert.equal(state.recover(state.model,boundary==='dialog'?[{}]:[]),false,boundary);
+    assert.equal(state.recover(state.model,boundary==='dialog'?[{}]:[]),boundary==='stale',boundary);
     assert.equal(context.shelterPending,record,boundary);
+    assert.equal(context.shelterState.campaign.assignmentHolds,undefined,boundary);
+    assert.equal(context.reads||0,boundary==='stale'?1:0,boundary);
   }
+});
+
+test('调岗520恢复：排队关闭已提交窗口不要求新快照，归档仍须重新读取',()=>{
+  const state=setup(),context=state.context,dialog={};
+  context.shelterRead.at-=2000;context.shelterWork={submitted:true,dialog};
+  let closed=0;context.closeShelterWork=()=>{closed++;return true;};
+  assert.equal(state.recover(state.model,[dialog]),true);
+  assert.equal(closed,1);assert.equal(context.reads,undefined);
+  assert.equal(context.shelterPending,state.original);
+  context.shelterWork.manual=true;
+  assert.equal(state.recover(state.model,[dialog]),false);assert.equal(closed,1);
+  assert.equal(state.recover(state.model,[]),true);
+  assert.equal(context.reads,1);assert.equal(context.shelterPending,state.original);
+  context.shelterWork=null;context.shelterRead.at=state.now;
+  assert.equal(state.recover(state.model,[]),true);assert.equal(context.shelterPending,null);
 });
 
 test('调岗520恢复：归档写入失败保留原单，中途刷新不会重复归档或丢失其他记录',()=>{

@@ -35,6 +35,7 @@ function equipmentSetup(slot='weapon'){
   Object.assign(context,{shelterPending:original,continueShelterAction:null,awaitingShelterConfirmation:null,
     shelterWorkConfirm:null,shelterWork:null,accountStopReason:()=>'',shelterWriteGuard(){},cancelQueued(){},
     cancelShelterRead(){},schedule(){},shelterExecutionDeferrals:new Map(),shelterRead:{model,at:model.now,startedAt:model.now-500}});
+  context.readShelter=()=>{context.reads=(context.reads||0)+1;};
   context.saveShelterPending=value=>context.shelterPending=value;
   const extract=name=>{
     const start=source.indexOf('  function '+name+'(');
@@ -123,9 +124,27 @@ test('装备恢复：未结束、网络未知、过期读取、身份不符、�
     if(boundary==='account')context.accountStopReason=()=> 'stopped';
     if(boundary==='missing-item')state.model.state.items=[];
     if(boundary==='missing-resident')state.model.state.residents=state.model.state.residents.filter(person=>person.id!==4);
-    assert.equal(state.recover(state.model,boundary==='dialog'?[{}]:[]),false,boundary);
+    assert.equal(state.recover(state.model,boundary==='dialog'?[{}]:[]),boundary==='stale',boundary);
     assert.equal(context.shelterPending,record,boundary);
+    assert.equal(context.shelterState.campaign.equipmentHolds,undefined,boundary);
+    assert.equal(context.reads||0,boundary==='stale'?1:0,boundary);
   }
+});
+
+test('装备恢复：排队关闭已提交窗口不要求新快照，归档仍须重新读取',()=>{
+  const state=equipmentSetup(),context=state.context,dialog={};
+  context.shelterRead.at-=2000;
+  context.shelterWork={submitted:true,dialog};
+  let closed=0;context.closeShelterWork=()=>{closed++;return true;};
+  assert.equal(state.recover(state.model,[dialog]),true);
+  assert.equal(closed,1);assert.equal(context.reads,undefined);
+  assert.equal(context.shelterPending,state.original);
+  context.shelterWork.manual=true;
+  assert.equal(state.recover(state.model,[dialog]),false);assert.equal(closed,1);
+  assert.equal(state.recover(state.model,[]),true);
+  assert.equal(context.reads,1);assert.equal(context.shelterPending,state.original);
+  context.shelterWork=null;context.shelterRead.at=state.model.now;
+  assert.equal(state.recover(state.model,[]),true);assert.equal(context.shelterPending,null);
 });
 
 test('装备恢复：存储失败保留原单，其他成功回执保留装备隔离记录',()=>{

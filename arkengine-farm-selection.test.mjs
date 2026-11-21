@@ -5,10 +5,10 @@ import vm from 'node:vm';
 
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const selectSeed=source.match(/^  function bestFarmSeed\([^]*?^  }/m)[0];
-function setup(plantingSource='safe',count=3) {
+function setup(plantingSource='safe',count=3,plots=1) {
   const seeds=Array.from({length:count},(_,index)=>({id:index+1,key:`crop-${index}`,name:`作物${index}`,growSeconds:3600,yieldQuantity:10}));
   const data={seeds,prices:seeds.map(seed=>({seedId:seed.id,priceMilli:1000})),
-    crops:[],plots:[{plotIndex:0,growthPct:0,yieldPct:0}],stamina:{current:10,regenMinutes:4},seedPouch:{},
+    crops:[],plots:Array.from({length:plots},(_,plotIndex)=>({plotIndex,growthPct:0,yieldPct:0})),stamina:{current:100,regenMinutes:4},seedPouch:{},
     inventory:seeds.map(seed=>({seedKey:seed.key,quality:'normal',quantity:10}))};
   const buttons=seeds.map(seed=>({textContent:'免费 · 存货 10',querySelector(selector){
     return selector==='span.font-semibold'?{textContent:seed.name}:{title:'种植消耗 1 体力'};
@@ -17,8 +17,33 @@ function setup(plantingSource='safe',count=3) {
   const dialog={querySelectorAll:selector=>selector==='label'?labels:buttons};
   const context={farmMarket:{data},farmCrop:'auto',usable:()=>true,textOf:element=>element?.textContent||''};
   const choose=vm.runInNewContext(selectSeed+'\nbestFarmSeed',context);
-  return {data,context,buttons,choose:()=>choose(dialog,{entries:[],empty:[{}],total:1})};
+  return {data,context,buttons,choose:()=>choose(dialog,{entries:[],empty:Array.from({length:plots},()=>({})),total:plots})};
 }
+
+test('新作物：指定作物按缺少份数补买并种满十二块地',()=>{
+  const state=setup('safe',1,12);state.context.farmCrop='作物0';
+  state.data.seeds[0].buyPriceTokens=12;
+  state.data.inventory[0].quantity=2;state.buttons[0].textContent='免费 · 存货 2';
+  const choice=state.choose();assert.ok(choice.button);assert.equal(choice.count,12);assert.equal(choice.seedCost,120);
+});
+
+test('新作物：首次无库存可买满空地，土壤未达标仍等待解锁',()=>{
+  const state=setup('safe',1,12);state.context.farmCrop='作物0';
+  state.data.seeds[0].buyPriceTokens=12;
+  state.data.inventory[0].quantity=0;state.buttons[0].textContent='12 代币';
+  let choice=state.choose();assert.equal(choice.count,12);assert.equal(choice.seedCost,144);
+  state.data.seeds[0].minSoilLevel=6;state.data.soilLevel=5;
+  choice=state.choose();assert.equal(choice.retry,true);assert.match(choice.error,/沃土.*6.*5/);
+});
+
+test('新作物：自动收益模式不买种，指定作物仍遵守仅库存的种源设置',()=>{
+  for(const mode of ['safe','normal','fine','rare','inventory']){
+    const state=setup(mode,1,12);state.data.seeds[0].buyPriceTokens=12;
+    state.data.inventory[0].quantity=0;state.buttons[0].textContent='12 代币';
+    if(mode!=='safe')state.context.farmCrop='作物0';
+    assert.equal(state.choose().button,undefined,mode);
+  }
+});
 
 test('农场选种：当前种源分别核对品质与种子袋，库存不足不点击',()=>{
   const scenarios=[['safe','normal',0,true],['safe','rare',0,false],['safe','rare',1,true],
@@ -35,7 +60,7 @@ test('农场选种：最高收益与同收益顺序保持，指定作物不被�
   const state=setup();assert.equal(state.choose().name,'作物0');
   state.data.prices[2].priceMilli=2000;assert.equal(state.choose().name,'作物2');
   state.context.farmCrop='作物1';assert.equal(state.choose().name,'作物1');
-  state.data.inventory[1].quantity=0;assert.match(state.choose().error,/免费存货不足/);
+  state.data.inventory[1].quantity=0;assert.match(state.choose().error,/购买种子价格无法核对/);
 });
 
 test('农场选种：同名种子、缺价与地块变化仍不猜测',()=>{

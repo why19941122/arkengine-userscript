@@ -6,6 +6,41 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  await t.test('拍卖补位：网页已显示新一批但响应副本延迟，按钮亮起500毫秒内仍付款',async testContext=>{
+    await setupAuction(`am.busy=true;am.view.auction.available=0;
+      const fetchOriginal=window.fetch;window.fetch=async(...args)=>{
+        const response=await fetchOriginal(...args);
+        if(args[0]==='/api/shelter/auction'&&args[1]?.method!=='POST'){
+          const clone=response.clone.bind(response);response.clone=()=>{
+            const copy=clone(),json=copy.json.bind(copy);copy.json=async()=>{
+              const body=await json();if(am.delayQuote)await new Promise(resolve=>(am.quoteGates??=[]).push(resolve));return body;
+            };return copy;
+          };
+        }return response;
+      };`);
+    await until(()=>evaluate("sm.tab==='汽水交易'&&!!document.getElementById('auction-buy')"),'old sold-out quote');
+    await evaluate(`(async()=>{am.delayQuote=true;am.busy=false;am.view.auction.available=3;am.readyWall=performance.now();
+      await refreshAuction();setTimeout(()=>{document.getElementById('auction-buy').disabled=true;},500);})()`);
+    try{
+      await ready();
+      const elapsed=await evaluate('am.posts[0].wall-am.readyWall');
+      assert.ok(elapsed<500,'native quote to payment: '+elapsed+'ms');
+      testContext.diagnostic('native quote to payment: '+elapsed.toFixed(1)+' ms');
+    }finally{await evaluate('am.delayQuote=false;for(const finish of am.quoteGates||[])finish();');}
+  });
+  await t.test('拍卖补位：漏掉首轮后续每轮一瓶，达到网页每日三瓶才停止',async()=>{
+    await setupAuction('am.view.auction.available=0;am.view.auction.perUserDaily=3;');
+    await until(()=>evaluate("sm.tab==='汽水交易'"),'first sold-out round');
+    for(let index=1;index<=3;index++){
+      await fresh(`clock=Date.parse('2026-11-20T20:00:00+08:00')+${index}*600000;
+        am.view.auction.released=${(index+1)*3};am.view.auction.available=3;`);
+      await until(()=>evaluate(`am.posts.length===${index}&&${state}.pending===null`),'next round settled');
+      assert.equal(await evaluate(`am.posts[${index-1}].body.quantity`),1);
+    }
+    await fresh("clock+=600000;am.view.auction.released+=3;am.view.auction.available=3;");
+    assert.equal(await evaluate('am.posts.length'),3);
+    assert.equal(await evaluate(`${state}.doneDay`),'2026-11-20');
+  });
   await t.test('农场阻塞修复：双关闭选种窗口及时给汽水拍卖让路',async()=>{
     await setupAuction(`localStorage.setItem('arkengine:auto-soda-auction:enabled:v1','false');
       localStorage.setItem('arkengine:auto-farm:enabled:v1','true');history.replaceState({},'','/farm');

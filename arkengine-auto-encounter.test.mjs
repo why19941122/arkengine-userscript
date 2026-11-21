@@ -52,6 +52,7 @@ const source = rawSource.replace('const logStore = createLogStore();', 'const lo
   .replace('function historyTotals(entries,archive={}) {','$& if(window.panelProbe)panelProbe.totals++;')
   .replace('function spend(entries,action,now) {','$& if(window.panelProbe)panelProbe.spend++;')
   .replace('function stockHint() {','$& if(window.panelProbe)panelProbe.ticks++;')
+  .replace('function step() {','$& if(window.schedulerProbe)schedulerProbe.checks++;')
   .replace('function checkPage() {','$& if(window.cultivateProbe)cultivateProbe.checks++;')
   .replace('function syncDialogAnimations() {','$& if(window.cultivateProbe)cultivateProbe.animations++;')
   .replace('function updateDungeonHint() {','$& if(window.cultivateProbe)cultivateProbe.hints++;')
@@ -595,6 +596,21 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       trustedAuctionKey:()=>cdp.send('Input.dispatchKeyEvent',{type:'keyDown',key:'Shift',code:'ShiftLeft'},tab.sessionId)});
     const confirmed = `model.calls.filter(c => c.type === 'dispatch')`;
 
+    await t.test('运行减负浏览器：页面每秒二十次变化仅合并检查，输入与渲染仍可执行',async testContext=>{
+      await setupExp('addRuns(6);window.schedulerProbe={checks:0};');
+      const result=await evaluate(`new Promise(resolve=>{
+        const probe=document.createElement('span'),button=document.createElement('button');
+        let mutations=0,inputs=0,frames=0;button.onclick=()=>inputs++;
+        document.body.append(probe,button);
+        const before=schedulerProbe.checks,started=performance.now();
+        const frame=()=>{frames++;if(performance.now()-started<2200)requestAnimationFrame(frame);};requestAnimationFrame(frame);
+        const timer=setInterval(()=>{mutations++;probe.textContent=String(mutations);button.click();},50);
+        setTimeout(()=>{clearInterval(timer);probe.remove();button.remove();resolve({checks:schedulerProbe.checks-before,mutations,inputs,frames});},2200);
+      })`);
+      assert.ok(result.mutations>=20);assert.equal(result.inputs,result.mutations);assert.ok(result.frames>5);
+      assert.ok(result.checks<=6,JSON.stringify(result));testContext.diagnostic(JSON.stringify(result));
+    });
+
     await t.test('页面性能：空闲远征连续更新不重绘不变面板，不解析未变大记录，仍能识别同页存储变化',async()=>{
       await setupExp(`addRuns(6);window.perfKey='arkengine:auto-shelter:schedule:v1';window.stockPerfKey='arkengine:auto-stock:ledger:v1';
         localStorage.setItem(stockPerfKey,JSON.stringify({version:1,userId:null,nextAt:clock+3600000,note:'未交易',hold:false,owned:{},entries:[],pending:null,reportFixture:'perf-stock:'.repeat(12000)}));
@@ -629,6 +645,9 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         localStorage.setItem(ledgerKey,JSON.stringify({version:1,userId:null,nextAt:clock+3600000,note:'测试',hold:false,owned:{},entries,pending:null}));`);
       await pulse();await pulse();
       const panel=`document.getElementById('ark-auto-expedition').shadowRoot`,status=`${panel}.getElementById('stock-status').textContent`;
+      await evaluate('window.schedulerProbe={checks:0};');
+      await drive('schedulerProbe.checks>=4','warm actual stock panel checks');
+      await evaluate('delete window.schedulerProbe;');
       assert.match(await evaluate(status),/24小时买入 31\/0；预测 12\/0/);
       assert.match(await evaluate(`${panel}.getElementById('stock-performance').textContent`),/已知已实现盈亏 1000/);
       const counts=await evaluate(`(async()=>{const root=${panel},probe=document.createTextNode('');document.body.append(probe);
@@ -636,17 +655,21 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         for(const id of ['shelter-level-target','shelter-cancel-old-assignment','stock-period-start','stock-period-export','stock-pause'])
           observer.observe(root.getElementById(id),{attributes:true,attributeFilter:['hidden','disabled']});
         try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}
+          await new Promise(resolve=>setTimeout(resolve,550));
           counts.attributes+=observer.takeRecords().length;return counts;
         }finally{delete window.panelProbe;observer.disconnect();probe.remove();}})()`);
       console.log('idle panel work '+JSON.stringify(counts));
-      assert.ok(counts.ticks>=20);assert.deepEqual([counts.totals,counts.spend,counts.attributes],[0,0,0]);
-      const at=offset=>evaluate(`(async()=>{clock=edge+(${offset});document.body.append(document.createTextNode(''));await Promise.resolve();await Promise.resolve();return ${status};})()`);
-      assert.match(await at(-1),/买入 31\/0；预测 12\/0/);assert.match(await at(0),/买入 0\/0；预测 12\/0/);
-      assert.match(await at(5000),/买入 0\/0；预测 0\/0/);assert.match(await at(-1),/买入 31\/0；预测 12\/0/);
+      assert.ok(counts.ticks>=1&&counts.ticks<=2);assert.deepEqual([counts.totals,counts.spend,counts.attributes],[0,0,0]);
+      const at=async(offset,expected)=>{
+        await evaluate(`clock=edge+(${offset});document.body.append(document.createTextNode(''));`);
+        await until(async()=>expected.test(await evaluate(status)),'stock deadline within normal scheduling interval',1000);
+      };
+      await at(-1,/买入 31\/0；预测 12\/0/);await at(0,/买入 0\/0；预测 12\/0/);
+      await at(5000,/买入 0\/0；预测 0\/0/);await at(-1,/买入 31\/0；预测 12\/0/);
       await evaluate(`const changed=JSON.parse(localStorage.getItem(ledgerKey));changed.userId=7;changed.entries[0].proceeds+=10;
-        changed.entries.at(-1).debit=19;localStorage.setItem(ledgerKey,JSON.stringify(changed));`);
-      await drive(`${status}.includes('预测 19/0')&&${panel}.getElementById('stock-performance').textContent.includes('已知已实现盈亏 1010')&&
-        !${panel}.getElementById('stock-period-start').disabled`,'same-length external ledger change');
+        changed.entries.at(-1).debit=19;localStorage.setItem(ledgerKey,JSON.stringify(changed));window.dispatchEvent(new Event('focus'));`);
+      await until(()=>evaluate(`${status}.includes('预测 19/0')&&${panel}.getElementById('stock-performance').textContent.includes('已知已实现盈亏 1010')&&
+        !${panel}.getElementById('stock-period-start').disabled`),'same-length external ledger change',1500);
     });
 
     await t.test('页面性能：避难所面板复用静态控件、阶段报告和建设预算，不延误到期与外部更新',async()=>{
@@ -664,20 +687,27 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       await pulse();await pulse();
       const root=`document.getElementById('ark-auto-expedition').shadowRoot`,budget=`${root}.getElementById('shelter-construction-status').textContent`,
         trace=`${root}.getElementById('shelter-development-trace').textContent`;
+      await evaluate('window.schedulerProbe={checks:0};');
+      await drive('schedulerProbe.checks>=4','warm actual shelter panel checks');
+      await evaluate('delete window.schedulerProbe;');
       assert.match(await evaluate(budget),/1000\/9000 废料、500\/700/);assert.match(await evaluate(trace),/目前 500 分/);
       const measure=()=>evaluate(`(async()=>{const root=${root},lookup=root.getElementById,format=Date.prototype.toLocaleString,probe=document.createTextNode('');document.body.append(probe);
         const counts=window.shelterProbe={reads:0,formats:0,lookups:0};window.panelProbe={ticks:0,totals:0,spend:0};
         root.getElementById=function(id){if(id.startsWith('shelter-'))counts.lookups++;return lookup.call(this,id);};
         Date.prototype.toLocaleString=function(...args){if(+this===stamp)counts.formats++;return format.apply(this,args);};
-        try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}return {...counts,ticks:panelProbe.ticks};}
+        try{for(let index=0;index<24;index++){probe.data=String(index);await Promise.resolve();await Promise.resolve();}
+          await new Promise(resolve=>setTimeout(resolve,550));return {...counts,ticks:panelProbe.ticks};}
         finally{delete root.getElementById;Date.prototype.toLocaleString=format;delete window.shelterProbe;delete window.panelProbe;probe.remove();}})()`);
       const daily=await measure();
-      const at=offset=>evaluate(`(async()=>{clock=edge+(${offset});document.body.append(document.createTextNode(''));await Promise.resolve();await Promise.resolve();return ${budget};})()`);
-      assert.match(await at(-1),/1000\/9000/);assert.match(await at(0),/0\/9000 废料、0\/700/);assert.match(await at(-1),/1000\/9000/);
+      const at=async(offset,expected)=>{
+        await evaluate(`clock=edge+(${offset});document.body.append(document.createTextNode(''));`);
+        await until(async()=>expected.test(await evaluate(budget)),'construction deadline within normal scheduling interval',1000);
+      };
+      await at(-1,/1000\/9000/);await at(0,/0\/9000 废料、0\/700/);await at(-1,/1000\/9000/);
       await evaluate(`setBudget('stock');const record=JSON.parse(localStorage.getItem(stateKey));record.developmentTrace.active.latest.score=510;localStorage.setItem(stateKey,JSON.stringify(record));`);
       await drive(`${budget}.includes('按实际库存，未决预留 0 废料')&&${trace}.includes('目前 510 分')`,'refresh shelter budget and trace');
       const stock=await measure();console.log('idle shelter panel '+JSON.stringify({daily,stock}));
-      for(const result of [daily,stock]){assert.ok(result.ticks>=20);assert.deepEqual([result.reads,result.formats,result.lookups],[0,0,0]);}
+      for(const result of [daily,stock]){assert.ok(result.ticks>=1&&result.ticks<=2);assert.deepEqual([result.reads,result.formats,result.lookups],[0,0,0]);}
       await evaluate(`{const record=JSON.parse(localStorage.getItem(stateKey));record.developmentTrace={version:-1};
         record.caravan={pending:{id:'cart',day:'fixture',vaultNo:77,slot:0,at:clock,cost:{scrap:36,parts:3}}};localStorage.setItem(stateKey,JSON.stringify(record));}`);
       await drive(`${trace}.includes('阶段记录无法核对')&&${budget}.includes('未决预留 36 废料 / 3 零件')`,'refresh corrupt report and new reservation');
@@ -872,6 +902,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     const reloadStock=async(code='')=>{
       // Let the SPA route observation finish before simulating a later user reload.
       await pulse(1000);
+      await until(()=>evaluate("sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')===null"),'stock SPA navigation observed');
       const state=await evaluate('({km,clock,model,fm})');
       await cdp.send('Page.navigate',{url:`${origin}/stock?stock-fixture=${++pageSerial}`},tab.sessionId);
       await until(()=>evaluate(`typeof renderStock==='function' && !document.getElementById('ark-auto-expedition') && location.search==='?stock-fixture=${pageSerial}'`),'reloaded stock');
@@ -1086,10 +1117,11 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     await t.test('农场新增作物：指定目录外或缺货作物时等待，不切回自动种其他作物', async () => {
       for(const crop of ['测试已移除作物','测试新作物丙']) {
         await setupFarm(`addRuns(6);${additionalFarmCrops}fm.inventory['new-crop-c']=0;localStorage.setItem('arkengine:auto-farm:crop:v1',${JSON.stringify(crop)});`);
-        await drive(`localStorage.getItem('arkengine:auto-farm:enabled:v1')==='false'`,'unavailable manual crop stops planting');
+        await drive(`${farmState}?.nextAt>clock&&!document.querySelector('[role=dialog]')`,'unavailable manual crop defers planting');
         assert.equal(await evaluate(`${farmCropSelect}.value`),crop);
         assert.equal(await evaluate(`${farmCalls('plant')}.length`),0);
-        assert.match(await evaluate(`${farmState}.note`),/未解锁或免费存货不足/);
+        assert.match(await evaluate(`${farmState}.note`),/免费存货不足|当前目录没有/);
+        assert.notEqual(await evaluate("localStorage.getItem('arkengine:auto-farm:enabled:v1')"),'false');
       }
     });
     await t.test('农场新增作物：缺少售价、同名种子或按钮目录不一致时不猜测种植', async () => {

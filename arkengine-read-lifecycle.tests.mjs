@@ -29,8 +29,8 @@ export async function readLifecycleTests({t,setupShelter,setupFarm,setupFeatures
   const held=()=>until(()=>evaluate(`typeof heldReads[0]?.release==='function'`),'read body held');
   await t.test('读取生命周期：避难所挂起读取超时后重读并领取，旧响应不重复操作',async()=>{
     await setupShelter(quiet+holdBody('/api/shelter'));await held();
-    await pulse(13000);await pulse(6000);await pulse();
-    assert.ok(await evaluate('sm.reads>=2'),'main shelter read slot must be released');
+    await pulse(13000);await until(()=>evaluate('heldReads[0].signal.aborted'),'shelter read times out at the next check',1500);
+    await pulse(6000);await until(()=>evaluate('sm.reads>=2'),'main shelter read slot must be released',1500);
     await drive('sm.calls.some(c=>c.type===\'collect_all\')','collect after fresh read');
     await drive(`location.pathname==='/activities/expedition'`,'shelter yields after recovery');
     const calls=await evaluate('sm.calls');await evaluate('heldReads[0].release();');await pulse();
@@ -38,8 +38,8 @@ export async function readLifecycleTests({t,setupShelter,setupFarm,setupFeatures
   });
   await t.test('读取生命周期：农场挂起读取按原退避恢复，不阻塞种植',async()=>{
     await setupFarm('addRuns(6);'+holdBody('/api/farm'),'/farm');await drive(`typeof heldReads[0]?.release==='function'`,'farm body held');
-    await pulse(16000);await pulse(6000);await pulse();
-    assert.ok(await evaluate('fm.reads>=2'),'farm timeout must release its loading slot');
+    await pulse(16000);await until(()=>evaluate('heldReads[0].signal.aborted'),'farm read times out at the next check',1500);
+    await pulse(6000);await until(()=>evaluate('fm.reads>=2'),'farm timeout must release its loading slot',1500);
     await drive(`fm.calls.some(c=>c.type==='plant')`,'farm plants after replacement read');
     const count=await evaluate('fm.calls.filter(c=>c.type===\'plant\').length');await evaluate('heldReads[0].release();');await pulse();
     assert.equal(await evaluate('fm.calls.filter(c=>c.type===\'plant\').length'),count);
