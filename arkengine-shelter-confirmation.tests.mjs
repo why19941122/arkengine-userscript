@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import {readyCampaignConstructionScene} from './arkengine-shelter-growth-investment.fixture.mjs';
 
-export async function shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey,secondShelter}){
+export async function shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey,secondShelter}){
   const pending="JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))";
   const state="JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))";
   const scene=()=>{
@@ -26,6 +26,14 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
   };
   const open=async()=>{await setupShelter(scene());await drive(`!!document.querySelector('[role="alertdialog"]')`,'native family confirmation',60);};
   const originalCalls='sm.calls.filter(c=>c.type==="assign"&&c.residentId===5&&c.roomId===5)';
+  await t.test('确认快照交接：面板刷新超过保鲜窗口时仍能完成同一调岗',async()=>{
+    await setupShelter(scene()+`sm.confirmPanelCostMs=1600;`);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'confirmation before slow panel refresh');
+    const initialReads=await evaluate('sm.confirmReads.length');
+    await drive(`${originalCalls}.length===1&&!${pending}`,'fresh confirmation precedes slow panel refresh',25);
+    assert.equal(await evaluate(`${originalCalls}.length`),1);
+    assert.ok(await evaluate(`sm.confirmReads.length-${initialReads}<=4`),'bounded reads include final receipt verification');
+  });
   await t.test('居民定位提速：目标已在当前页且身份唯一时直接打开，不重复筛选岗位',async()=>{
     await setupShelter(scene()+`sm.roomFilterEdits=0;document.addEventListener('change',event=>{
       if(event.target.getAttribute('aria-label')==='按房间筛选')sm.roomFilterEdits++;});`);
@@ -129,7 +137,7 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
     assert.ok(events.some(e=>e.type==='shelter-confirmed'&&e.data.kind==='assign'));
   });
   for(const latency of [0,4000,7000])await t.test('确认并行准备：五秒等待与'+latency+'毫秒读取重叠，发送仍用新状态',async()=>{
-    await setupShelter(scene()+`Math.random=()=>.9999;sm.confirmChecks=[];sm.confirmWrites=[];
+    await setupShelter(scene()+`Math.random=()=>.9999;window.schedulerProbe={checks:0};sm.confirmChecks=[];sm.confirmWrites=[];
       const before=window.fetch;window.fetch=(url,options)=>{
         if(url==='/api/shelter/action')sm.confirmWrites.push({at:clock,readAt:sm.confirmChecks.at(-1)?.done});
         if(url!=='/api/shelter'||!document.querySelector('[role="alertdialog"]'))return before(url,options);
@@ -140,15 +148,25 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
           const abort=()=>{cleanup();reject(new DOMException('aborted','AbortError'));};
           window.addEventListener('focus',check);options.signal.addEventListener('abort',abort,{once:true});check();
         });};`);
-    await drive(`!!document.querySelector('[role="alertdialog"]')`,'confirmation opens');
+    const driveObserved=async(expression,label)=>{
+      for(let round=0;round<60&&!await evaluate(expression);round++){
+        const checks=await evaluate('schedulerProbe.checks');await pulse();
+        await until(()=>evaluate(`schedulerProbe.checks>${checks}`),'scheduler observes the simulated second');
+      }
+      assert.equal(await evaluate(expression),true,label);
+    };
+    await driveObserved(`!!document.querySelector('[role="alertdialog"]')`,'confirmation opens');
     const preparedAt=await evaluate(`${pending}.at`);
-    await drive(`${originalCalls}.length===1&&!${pending}`,'overlapping confirmation completes',60);
+    await until(()=>evaluate('sm.confirmChecks.length>0'),'unsent confirmation begins its read',1500);
+    await driveObserved(`${originalCalls}.length===1&&!${pending}`,'overlapping confirmation completes');
     const checks=await evaluate('sm.confirmChecks'),writes=await evaluate('sm.confirmWrites');
     assert.equal(writes.length,1);
-    assert.ok(checks[0].started-preparedAt<1000,'no post-send polling delay before an unsent confirmation');
+    assert.ok(checks[0].started-preparedAt<1000,
+      'no post-send polling delay before an unsent confirmation: '+JSON.stringify({preparedAt,checks,writes}));
     assert.equal(checks.length,latency===0?2:1,'no repeated reads during the confirmation countdown');
     assert.ok(writes[0].at-preparedAt>=5000,'the full confirmation wait is retained');
-    assert.ok(writes[0].at-preparedAt<=Math.max(5000,latency)+1000,'read latency and countdown overlap');
+    assert.ok(writes[0].at-preparedAt<=Math.max(5000,latency)+1000,
+      'read latency and countdown overlap: '+JSON.stringify({preparedAt,checks,writes}));
     assert.ok(writes[0].at-writes[0].readAt<=1500,'fresh completed read before transport');
   });
   await t.test('执行耗时浏览器：确认条件改变后固定取消，不重读重置或覆盖原因',async()=>{
@@ -274,6 +292,7 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
     await evaluate(`Array.from(document.querySelector('[role="alertdialog"]').querySelectorAll('button')).find(button=>button.textContent==='取消').focus();`);
     await trustedStaffKey('Enter');await pulse(1000);
     assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false,'trusted cancellation closes the native dialog');
+    await until(()=>evaluate(`${pending}===null`),'manual cancellation reconciled');
     assert.equal(await evaluate('sm.calls.length'),0);assert.equal(await evaluate(pending),null);
     const cancelled=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.find(event=>event.type==='shelter-work-cancelled'&&event.data.operation===${JSON.stringify(original.id)})`);
     assert.equal(cancelled?.data.ownerCancelled,true);
@@ -300,6 +319,7 @@ export async function shelterConfirmationTests({t,setupShelter,reloadShelter,eva
       button.addEventListener('click',()=>{const next=document.createElement('div');next.id='owner-next-dialog';next.setAttribute('role','dialog');
         next.innerHTML='<h2>主人自己的窗口</h2><button>确认</button>';document.body.append(next);});button.focus();`);
     await trustedStaffKey('Enter');await pulse(1000);
+    await until(()=>evaluate(`${pending}===null`),'old cancellation reconciled while preserving the new dialog');
     assert.equal(await evaluate(pending),null);
     assert.equal(await evaluate('sm.calls.length'),0);
     assert.equal(await evaluate(`!!document.getElementById('owner-next-dialog')`),true);

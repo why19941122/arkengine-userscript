@@ -6,6 +6,30 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  await t.test('v136拍卖：先取消升级二次确认与房间详情，再守候汽水且不发送旧升级',async()=>{
+    const fixture=readyCampaignConstructionScene(),timestamp=Date.parse('2026-11-20T19:55:00+08:00');
+    fixture.view.serverTime=timestamp;fixture.view.state.lastSettledAt=timestamp;
+    await setupAuction(`clock=${timestamp};am.view.auction.live=false;sm.view=${JSON.stringify(fixture.view)};
+      sm.ui20261121=true;sm.ui20261109=true;sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;
+      history.replaceState({},'','/shelter');localStorage.setItem('arkengine:auto-shelter:enabled:v1','true');
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      localStorage.setItem('arkengine:auto-shelter:population:v1','14');
+      localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');
+      localStorage.setItem('arkengine:auto-shelter:level-target:v1','8');
+      localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify({combatGear:false,tier:0,hours:6,stimpaks:2,reserve:2,chance:70,attempts:1,trainTarget:6,...${JSON.stringify(fixture.campaign)}}));
+      localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(${JSON.stringify(fixture.construction)}));
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({...${JSON.stringify(fixture.state)},vaultNo:77,nextAt:0,note:'auction upgrade interruption'}));`);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'upgrade before auction',120);
+    assert.equal(await evaluate(`document.querySelector('[role="alertdialog"] h2').textContent`),'确认升级房间？');
+    await evaluate(`clock=Date.parse('2026-11-20T19:58:00+08:00')`);await pulse(0);
+    await until(()=>evaluate(`sm.tab==='汽水交易'&&!document.querySelector('[role="dialog"],[role="alertdialog"]')`),'upgrade yields to auction');
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="upgrade")'),false);
+    await fresh(`clock=Date.parse('2026-11-20T20:00:00+08:00');am.view.auction.live=true;`);await ready();
+    await evaluate(`localStorage.setItem('arkengine:auto-shelter:enabled:v1','false');document.getElementById('ark-auto-expedition').shadowRoot.getElementById('auction-enabled').click()`);
+    await pulse(5000);
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="upgrade")'),false);
+    assert.equal(await evaluate('am.posts.length'),1);
+  });
   await t.test('拍卖补位：网页已显示新一批但响应副本延迟，按钮亮起500毫秒内仍付款',async testContext=>{
     await setupAuction(`am.busy=true;am.view.auction.available=0;
       const fetchOriginal=window.fetch;window.fetch=async(...args)=>{

@@ -52,6 +52,7 @@ const source = rawSource.replace('const logStore = createLogStore();', 'const lo
   .replace('function historyTotals(entries,archive={}) {','$& if(window.panelProbe)panelProbe.totals++;')
   .replace('function spend(entries,action,now) {','$& if(window.panelProbe)panelProbe.spend++;')
   .replace('function stockHint() {','$& if(window.panelProbe)panelProbe.ticks++;')
+  .replace('function farmHint() {','$& if(window.sm?.confirmPanelCostMs&&document.querySelector("[role=alertdialog]")){clock+=sm.confirmPanelCostMs;sm.confirmPanelCalls=(sm.confirmPanelCalls||0)+1;}')
   .replace('function step() {','$& if(window.schedulerProbe)schedulerProbe.checks++;')
   .replace('function checkPage() {','$& if(window.cultivateProbe)cultivateProbe.checks++;')
   .replace('function syncDialogAnimations() {','$& if(window.cultivateProbe)cultivateProbe.animations++;')
@@ -864,7 +865,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         {type,key,code,windowsVirtualKeyCode,modifiers,...(key==='Enter'&&type==='keyDown'?{text:'\r'}:{})},tab.sessionId);
     };
     await shelterExplorationTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
-    await shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,trustedStaffKey});
+    await shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey});
     const withShelterBackground=async run=>{
       const foreground=await createTab();
       try{
@@ -886,7 +887,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     await shelterParentPreparationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterPlanningBrowserTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey});
-    await shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey,secondShelter});
+    await shelterConfirmationTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey,secondShelter});
     await shelterAssignmentRecoveryTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterRecoveryTests({t,setupShelter,reloadShelter,evaluate,pulse,drive});
     await shelterProductionTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive });

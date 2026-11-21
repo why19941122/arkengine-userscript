@@ -53,6 +53,57 @@ test('完成返岗期限修复：岗位占用、属性回退、供给下降、�
   }
 });
 
+test('完成返岗独立复核：他人练完一格及日常计数增长不撤销固定生产岗',()=>{
+  const context=completedReturn(),other=context.f.view.state.residents.find(person=>person.id!==5);
+  other.training=.99;
+  context.f.view.state.ticks=100;context.f.view.state.radioProgress=.1;
+  context.f.view.state.daily.counters={train:1};
+  const work=context.capture(context.returnChoice),original=structuredClone(work.execution.choice);
+  context.advance(7000);other.stats.agi++;other.training=0;
+  context.f.view.state.ticks++;context.f.view.state.radioProgress=.2;
+  context.f.view.state.daily.counters.train++;context.f.view.state.season.points++;
+  assert.equal(context.api.current(context.model(),work),work.execution);
+  assert.deepEqual(structuredClone(work.execution.choice),original);
+});
+test('v136训练确认：他人按属性结算不撤销固定返岗，本人当前90%仍保护',()=>{
+  const context=completedReturn(),other=context.f.view.state.residents.find(person=>person.id!==5);
+  Object.assign(other,{trainingStat:'agi',training:.99,trainingByStat:{agi:.99,end:.4}});
+  const work=context.capture(context.returnChoice);
+  other.stats.agi++;other.training=0;other.trainingByStat.agi=0;
+  assert.equal(context.api.current(context.model(),work),work.execution);
+  context.c.shelterCampaign.training=true;
+  const person=context.f.view.state.residents.find(person=>person.id===5);
+  Object.assign(person,{trainingStat:'agi',training:0,trainingByStat:{end:.9,agi:0}});
+  context.c.shelterState.campaign.roles[0].finishCurrent=true;
+  const protectedWork=context.capture(context.returnChoice);
+  assert.equal(context.api.current(context.model(),protectedWork),null);
+  assert.equal(protectedWork.executionFailure.reason,'training-in-progress');
+});
+test('v136训练确认：属性进度连续增长可交接，回退或未知属性变化仍撤销',()=>{
+  for(const change of ['increase','decrease','unknown']){
+    const context=setup(),person=context.f.view.state.residents[0];
+    Object.assign(person,{trainingStat:'agi',training:.5,trainingByStat:{agi:.5,end:.2}});
+    const work=context.capture({kind:'explore-start',id:5,targets:[5,0,2]});
+    if(change==='increase'){person.training=.6;person.trainingByStat.agi=.6;}
+    if(change==='decrease')person.trainingByStat.end=.1;
+    if(change==='unknown')person.trainingByStat.unknown=.5;
+    assert.equal(context.api.current(context.model(),work),change==='increase'?work.execution:null,change);
+  }
+});
+
+for(const field of ['stat','health','room','equipment','counter','unknown'])test('完成返岗独立复核：'+field+'安全条件变化仍撤销',()=>{
+  const context=completedReturn(),other=context.f.view.state.residents.find(person=>person.id!==5);
+  context.f.view.state.daily.counters={train:2};
+  const work=context.capture(context.returnChoice);context.advance(7000);
+  if(field==='stat')other.stats.agi--;
+  if(field==='health')other.hp--;
+  if(field==='room')other.roomId=4;
+  if(field==='equipment')other.weaponId=10000;
+  if(field==='counter')context.f.view.state.daily.counters.train--;
+  if(field==='unknown')context.f.view.state.unknownActionConstraint=true;
+  assert.equal(context.api.current(context.model(),work),null);
+});
+
 test('跨格训练保护：返岗最终确认发现当前格已到90%则撤销旧动作',()=>{
   const context=completedReturn();context.c.shelterCampaign.training=true;
   context.c.shelterState.campaign.roles[0].finishCurrent=true;

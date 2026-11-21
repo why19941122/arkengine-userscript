@@ -207,11 +207,16 @@ window.fixtureConfirm=async(title,description)=>{
  d.remove();prior.forEach(el=>el.removeAttribute('inert'));return yes;
 };
 window.shelterAct=async a=>{
+ if(sm.ui20261121&&a.type==='upgrade'){
+   const room=sm.view.state.rooms.find(room=>room.id===a.roomId),base={power:100,diner:100,water:100,scrap:80,quarters:120,storage:80,medbay:300,workshop:500,training:400}[room.type];
+   const scrap=Math.ceil(base*room.width*(room.level===1?2.5:6)),parts=room.level===1?0:15*room.width;
+   if(!await fixtureConfirm('确认升级房间？','将扣除 '+scrap.toLocaleString('en-US')+' 废料和 '+parts+' 零件，施工期间暂停生产。'))return false;
+ }
  if(sm.ui20261109){
    const s=sm.view.state,p=s.residents.find(p=>p.id===a.residentId),reasons=[];
    if(a.type==='assign'&&p){
      const from=s.rooms.find(r=>r.id===p.roomId),to=s.rooms.find(r=>r.id===a.roomId);
-     if(from?.type==='training')reasons.push('正在训练室·'+({str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[from.trainStat])+(from.width>1?' ×'+from.width:'')+'训练（'+(100*(p.training||0)).toFixed(1)+'%），调离后暂停，进度保留；换训练属性时从 0 开始');
+     if(from?.type==='training')reasons.push('正在训练室·'+({str:'力量',per:'感知',end:'耐力',cha:'魅力',int:'智力',agi:'敏捷',lck:'幸运'}[from.trainStat])+(from.width>1?' ×'+from.width:'')+'训练（'+(100*(p.training||0)).toFixed(1)+'%），调离后暂停，进度保留；'+(sm.ui20261121?'换属性后仍可回来继续':'换训练属性时从 0 开始'));
      if(to?.type==='quarters'&&!to.incident){
        const others=s.residents.filter(o=>o.id!==p.id&&o.roomId===to.id&&o.away===null&&o.deadAt===null&&o.adultAt<=clock);
        if(p.romance&&!others.some(o=>o.id===p.romance.partnerId))reasons.push('本人已与其他居民培养感情，调岗会暂停原感情');
@@ -353,7 +358,9 @@ window.renderShelter=()=>{
    const needles=supply.querySelector('input');needles.value=sm.exploreStimpaks??2;
    const abyssLabel=document.createElement('label');abyssLabel.innerHTML='深渊门票<input type="checkbox">';root.append(abyssLabel);const abyss=abyssLabel.querySelector('input');abyss.checked=Boolean(sm.abyss);
    person.onchange=()=>sm.explorePerson=Number(person.value);tier.onchange=()=>sm.exploreTier=Number(tier.value);needles.oninput=()=>sm.exploreStimpaks=Number(needles.value);abyss.onchange=()=>sm.abyss=abyss.checked;
-   const start=button(root,'出发',{type:'explore_start'});start.onclick=()=>shelterAct({type:'explore_start',residentId:Number(person.value),tier:Number(tier.value),stimpaks:Number(needles.value),abyss:abyss.checked});content.append(root);
+   if(sm.ui20261121){const commission=select('废土委托 · 每周可选一种，走满时长并安全返回才取得补给',[
+     ['','普通探险'],['salvage','短途回收 · 2 小时后返程'],['survey','长途勘查 · 12 小时后返程']],sm.commission||'');commission.onchange=()=>sm.commission=commission.value;}
+   const start=button(root,'出发',{type:'explore_start'});start.onclick=()=>shelterAct({type:'explore_start',residentId:Number(person.value),tier:Number(tier.value),stimpaks:Number(needles.value),abyss:abyss.checked,...(sm.ui20261121&&sm.commission?{commission:sm.commission}:{})});content.append(root);
    for(const e of s.explorers||[]){
      const p=s.residents.find(p=>p.id===e.residentId);if(!p)continue;
      const row=document.createElement('li'),title=document.createElement('p'),status=document.createElement('p');

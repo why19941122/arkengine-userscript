@@ -20,6 +20,7 @@ test('诊断优先级修复：真实故障、长等待、页面丢弃与所有�
     {type:'page-blocked',data:{attempt:1}}, {type:'runtime-error'}, {type:'shelter-execution-evidence'}, {type:'shelter-paused'},
     {type:'page-lifecycle',receiptId:'actual-receipt'}, {type:'stock-confirmed'}, {type:'shelter-rescue-rejected'},
     {type:'shelter-recall-opened'}, {type:'shelter-recall-control-wait'}, {type:'encounter-quota'},
+    {type:'shelter-confirmation-trace'}, {type:'shelter-work-control-wait'}, {type:'shelter-read-retry'},
     {type:'soda-auction-priority'}, {type:'soda-auction-release'}, {type:'soda-auction-rejected'}, {type:'soda-auction-unconfirmed'}]){
     assert.equal(api.critical(event),true,JSON.stringify(event));assert.equal(api.priority(event),2);
   }

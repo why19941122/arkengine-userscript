@@ -491,6 +491,15 @@ const adoptionScene=()=>{
   const e={id:194,residentId:5,tier:0,abyss:false,startedAt:now-3*3600000,recalledAt:null,returnAt:null};
   v.state.explorers=[e];return {v,e,c:cfg({explore:true,sodaEfficiency:true,hours:6})};
 };
+test('v136废土委托：不按普通探险接管或提前召回长途勘查',()=>{
+  const {v,e,c}=adoptionScene();e.commission='survey';
+  const model=api.model(v);
+  assert.equal(api.adopt(model,e,c),null);
+  const record={trips:[{id:e.id,resident:e.residentId,hours:2,at:e.startedAt,startedAt:e.startedAt,vaultNo:v.vaultNo}]};
+  const plan=api.plan(model,c,record,14);
+  assert.equal(plan.actions.some(action=>action.kind==='explore-recall'&&action.targets[0]===e.id),false);
+  assert.equal(plan.trips.find(trip=>trip.id===e.id).managed,false);
+});
 test('接管时长：新派遣和接管共同使用网页两小时资格，固定模式也共用规则',()=>{
   const {v,e,c}=adoptionScene(),m=api.model(v);
   for(const sodaEfficiency of [true,false]){

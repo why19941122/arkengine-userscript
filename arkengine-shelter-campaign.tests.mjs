@@ -60,6 +60,20 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     sm.fixtureSearch=location.search;sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;const s=sm.view.state;
     localStorage.setItem('${key}',JSON.stringify(${JSON.stringify({...defaults,...flags})}));${extra}`;
   const construction=`localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0}));`;
+  for(const commission of ['', 'survey'])await t.test('v136废土：'+(commission?'保留人工委托选择且不创建错误派遣原单':'新增委托选项不影响普通探险派遣'),async()=>{
+    await setupShelter(scene({explore:true},`sm.ui20261109=true;sm.ui20261121=true;sm.commission=${JSON.stringify(commission)};`));
+    if(commission){
+      await settle('manual commission preserved');
+      assert.equal(await evaluate('sm.calls.some(call=>call.type==="explore_start")'),false);
+      assert.equal(await evaluate(pending),null);
+      assert.equal(await evaluate('sm.commission'),'survey');
+      assert.equal(await evaluate(`localStorage.getItem('arkengine:auto-shelter:enabled:v1')`),'true');
+    }else{
+      await drive(`sm.calls.some(call=>call.type==='explore_start')&&!${pending}`,'ordinary exploration with commission control',120);
+      const call=await evaluate('sm.calls.find(call=>call.type==="explore_start")');
+      assert.equal(call.abyss,false);assert.equal(call.commission,undefined);
+    }
+  });
   await t.test('父母质量浏览器：高基础属性组合实际入住，已有关系刷新后保留',async()=>{
     await setupShelter(scene({},`sm.ui20261109=true;sm.confirmFamily=true;s.rooms.find(r=>r.id===4).width=3;
       s.residents.slice(4).forEach(p=>p.roomId=4);
@@ -221,6 +235,14 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     for(const p of s.residents){p.stats.agi=10;p.training=0;}
     s.residents[5].roomId=4;Object.assign(s.residents[4],{roomId:30,xp:0,hp:100,training:0});
     localStorage.setItem('arkengine:auto-shelter:staff:v1','production');${extra}`);
+  await t.test('v136训练：新版保留属性进度说明能确认完成后的返岗',async()=>{
+    await setupShelter(trainingConfirmScene('sm.ui20261121=true;'));
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'current training description');
+    assert.match(await evaluate(`document.querySelector('[role="alertdialog"]').textContent`),/换属性后仍可回来继续/);
+    await drive(`sm.calls.some(call=>call.type==='assign'&&call.residentId===5)&&!${pending}`,'current training return',35);
+    assert.equal(await evaluate('sm.calls.filter(call=>call.type==="assign"&&call.residentId===5).length'),1);
+    assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false);
+  });
   await t.test('训练室升级浏览器：40%及90%跨刷新不调岗、不弹确认，完成一格才返岗',async()=>{
     await setupShelter(scene({training:true},`sm.ui20261109=true;
       s.rooms.push({...s.rooms[0],id:79,type:'training',trainStat:'per',floor:3,col:2,level:2,upgradeAt:clock+3*3600000});
@@ -5062,12 +5084,40 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     }
   });
   await t.test('跨格训练浏览器：确认前当前格变成90%则取消未发送调岗',async()=>{
-    await setupShelter(advancedProductionScene(0));
+    await setupShelter(advancedProductionScene(0)+`const confirm=fixtureConfirm;window.fixtureConfirm=(...args)=>{
+      const result=confirm(...args);sm.view.state.residents.find(person=>person.id===5).training=.9;return result;};`);
     await drive(`!!document.querySelector('[role="alertdialog"]')`,'return confirmation before progress changes');
-    await evaluate('sm.view.state.residents.find(person=>person.id===5).training=.9;');
     await drive(`!document.querySelector('[role="alertdialog"]')&&!${pending}`,'cancel stale return confirmation');
-    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0);
+    assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),0,
+      JSON.stringify(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>/prepared|confirmation|cancelled/.test(event.type))`)));
     assert.equal(await evaluate('sm.view.state.residents.find(person=>person.id===5).roomId'),90);
+  });
+  for(const latency of [0,7000])await t.test(`训练返岗后台读取：${latency}毫秒响应、定时器受限时只确认一次`,async()=>{
+    await setupShelter(advancedProductionScene(0)+`Math.random=()=>.9999;sm.returnReads=[];sm.confirmPanelCostMs=1600;
+      s.ticks=100;s.radioProgress=.1;s.daily.counters={...s.daily.counters,train:1};s.residents[0].training=.99;
+      const originalRead=window.fetch;window.fetch=(url,options)=>{
+        if(url!=='/api/shelter'||!document.querySelector('[role="alertdialog"]'))return originalRead(url,options);
+        const entry={start:clock,done:null};sm.returnReads.push(entry);const due=clock+${latency};
+        return new Promise((resolve,reject)=>{
+          const cleanup=()=>{window.removeEventListener('focus',check);options.signal.removeEventListener('abort',abort);};
+          const check=()=>{if(clock<due)return;cleanup();entry.done=clock;originalRead(url,options).then(resolve,reject);};
+          const abort=()=>{cleanup();reject(new DOMException('aborted','AbortError'));};
+          window.addEventListener('focus',check);options.signal.addEventListener('abort',abort,{once:true});check();
+        });};`);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'completed training opens confirmation');
+    await withShelterBackground(async()=>{
+      if(latency)await evaluate(`s.ticks++;s.radioProgress=.2;s.daily.counters.train++;s.season.points++;
+        s.residents[0].stats.agi++;s.residents[0].training=0;`);
+      await evaluate(`const timeout=window.setTimeout;window.setTimeout=(callback,ms,...args)=>timeout(callback,Math.max(ms||0,60000),...args);
+        window.requestAnimationFrame=()=>0;`);
+      await drive(`sm.calls.some(action=>action.type==='assign'&&action.residentId===5&&action.roomId===4)&&!${pending}`,
+        'fresh response completes the original background confirmation',25);
+      assert.equal(await evaluate('sm.calls.filter(action=>action.residentId===5).length'),1);
+      assert.ok(await evaluate('sm.returnReads.length<=2'));
+      const trace=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='shelter-confirmation-trace')`);
+      assert.equal(trace.length,1);assert.equal(trace[0].data.phase,'confirm-click');
+      assert.ok(trace[0].data.reads<=2);assert.equal(trace[0].visibility,'hidden');
+    });
   });
   const delayedAssignment=alternativeTrainingReturnScene()+`sm.ui20261109=true;
     const appendWork=document.body.append.bind(document.body);document.body.append=(...nodes)=>{
@@ -5082,6 +5132,13 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
       for(let pass=0;pass<4;pass++)await pulse(10000);
       assert.equal(await evaluate(recallEnabled),'true');assert.equal(await evaluate(`${pending}?.id`),original.id);
       assert.deepEqual(await evaluate('sm.assignClicks'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+      let trace;
+      await until(async()=>{
+        trace=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='shelter-confirmation-trace'&&event.data.operation===${JSON.stringify(original.id)})`);
+        return trace.length>0;
+      },'background scheduler records the long wait',5000);
+      assert.equal(trace.length,1,JSON.stringify(await diagnose()));assert.equal(trace[0].data.phase,'waiting');
+      assert.equal(trace[0].data.confirmUsable,false);assert.equal(trace[0].data.control,'confirm',JSON.stringify(trace));
     });
     await pulse(9000);await evaluate(`assignDialog.style.opacity='1';${changed?'sm.view.state.rooms.find(r=>r.id===4).unpowered=true;':''}`);
     await drive(`!assignDialog.isConnected&&!${pending}`,'resolve original assignment');

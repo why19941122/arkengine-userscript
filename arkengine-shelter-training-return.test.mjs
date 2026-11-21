@@ -15,6 +15,26 @@ const api=vm.runInNewContext(`${declarations}\n${code}\n${staff}\n({model:shelte
   objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
   shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'}});
 const hour=3600000;
+test('v136训练：回到同一属性按存储进度估算，不把另一属性进度当成本格',()=>{
+  const context=scene('end',5),{p,room,v}=context;
+  p.trainingStat='agi';p.training=.2;p.trainingByStat={end:.9,agi:.2};
+  const candidate=context.estimate();
+  assert.equal(candidate.progress,.9);
+  p.roomId=room.id;
+  const active=context.estimate();
+  assert.equal(active.progress,.9);
+  assert.equal(active.finishAt-v.serverTime,40*60000);
+  p.trainingStat='end';p.training=.8;
+  assert.equal(context.estimate().progress,.8);
+});
+test('v136训练：升级期间保护目标属性90%并按该属性计算固定截止',()=>{
+  const context=scene('cha',5),{p,room,v}=context;
+  Object.assign(p,{roomId:room.id,trainingStat:'agi',training:.1,trainingByStat:{cha:.9,agi:.1}});
+  room.upgradeAt=v.serverTime+hour;
+  const retained=context.run().adoptions.find(role=>role.id===p.id);
+  assert.ok(retained);
+  assert.equal(retained.until,room.upgradeAt+50*60000);
+});
 test('141日志训练：魅力64.3%及25%先完成当前格，不因缺少生产用途调走，刷新期限固定',()=>{
   for(const [base,progress] of [[6,.643],[5,.25]]){
     const context=scene('cha',base),{p,room,record,v}=context;

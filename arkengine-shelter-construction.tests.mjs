@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 
-export async function shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,trustedStaffKey}) {
+export async function shelterConstructionTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey}) {
   const panel="document.getElementById('ark-auto-expedition').shadowRoot";
   const pending="JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))";
   const state="JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))";
@@ -20,6 +20,51 @@ export async function shelterConstructionTests({t,setupShelter,reloadShelter,eva
   const digLogs=`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`;
 
   const stockBudget=config({scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0});
+  const currentUpgrade=scene+config()+`sm.ui20261121=true;sm.ui20261109=true;`;
+  await t.test('v136升级：原生二次确认只提交一次并核对扣款',async()=>{
+    await setupShelter(currentUpgrade);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'current upgrade confirmation');
+    assert.equal(await evaluate(calls+'.length'),0);
+    assert.equal((await evaluate(pending)).lifecycle.phase,'prepared');
+    assert.equal(await evaluate(`document.querySelector('[role="alertdialog"] h2').textContent`),'确认升级房间？');
+    await drive(`${calls}.length===1&&!${pending}`,'current upgrade confirmed once',45);
+    assert.equal(await evaluate('sm.view.state.resources.scrap'),100);
+    assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+    assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),false);
+  });
+  await t.test('v136升级：双层窗口人工接管后不自动确认，取消可清理未发送原单',async()=>{
+    await setupShelter(currentUpgrade);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'upgrade before manual takeover');
+    await evaluate(`document.querySelector('[role="alertdialog"] button').focus()`);
+    await trustedStaffKey();await pulse(6000);
+    assert.equal(await evaluate(calls+'.length'),0);
+    assert.equal(await evaluate(`!!document.querySelector('[role="alertdialog"]')`),true);
+    await evaluate(`document.querySelector('[role="alertdialog"] button').focus()`);
+    await trustedStaffKey('Enter');await pulse(1000);
+    await until(()=>evaluate(`${pending}===null`),'manual cancellation reconciled');
+    assert.equal(await evaluate(pending),null,JSON.stringify(await evaluate(`({dialogs:[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].map(dialog=>dialog.textContent),
+      status:${panel}.getElementById('status').textContent,events:(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.slice(-8)})`)));
+    assert.equal(await evaluate(calls+'.length'),0);
+  });
+  await t.test('v136升级：面板延迟不耗尽新快照，二次确认后仍只扣一次',async()=>{
+    await setupShelter(currentUpgrade+'sm.confirmPanelCostMs=1600;');
+    await drive(`${calls}.length===1&&!${pending}`,'upgrade before slow panel rendering',55);
+    assert.equal(await evaluate(`${state}.constructionLedger.length`),1);
+  });
+  for(const [label,mutation] of [
+    ['费用改变',`document.getElementById('fixture-confirm-description').textContent='将扣除 201 废料和 0 零件，施工期间暂停生产。';`],
+    ['附加消费',`document.getElementById('fixture-confirm-description').textContent+='另扣 1 代币。';`],
+    ['库存减少',`sm.view.state.resources.scrap=100;`],
+    ['关闭升级',config({upgrade:false})],
+    ['房间被替换',`sm.view.state.rooms.find(room=>room.id===4).type='water';`]
+  ])await t.test('v136升级：'+label+'取消原生确认且不扣款',async()=>{
+    await setupShelter(currentUpgrade);
+    await drive(`!!document.querySelector('[role="alertdialog"]')`,'upgrade before change');
+    await evaluate(mutation);
+    await drive(`!document.querySelector('[role="dialog"],[role="alertdialog"]')&&!${pending}`,'changed upgrade cancelled',45);
+    assert.deepEqual(await evaluate(calls),[]);
+    assert.equal(await evaluate(`${state}.constructionLedger?.length||0`),0);
+  });
   const spent=`localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:sm.view.vaultNo,nextAt:0,note:'已付历史',
     constructionLedger:[{id:'already-paid',at:clock-1000,scrap:10000,parts:100}]}));`;
   await t.test('实际库存预算浏览器：旧默认日额已用尽仍按库存开工，回执记账与刷新均不重复',async()=>{
