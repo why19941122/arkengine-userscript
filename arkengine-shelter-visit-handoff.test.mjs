@@ -36,7 +36,7 @@ test('避难所新访问：统一导航清理旧时限，四十分钟后的远�
   state.storage.set('arkengine:auto-shelter:handoff:v1',JSON.stringify({vaultNo:77,entryAt:state.start-10*60000,
     expeditionAt:state.start+40*60000,regularEnd:state.start-300000,key:null}));
   assert.equal(state.api.budget().limitMs,-300000);
-  state.c.location={pathname:'/stock'};state.c.NAV_JOURNAL='navigation';state.c.navigation=null;
+  state.c.location={pathname:'/stock'};state.c.NAV_JOURNAL='navigation';state.c.navigation=null;state.c.auctionExclusive=false;
   const navigate=vm.runInNewContext(part('  function startNavigation(','  function waitForNavigation(')+'\nstartNavigation',state.c);
   navigate('/shelter',{click(){state.c.location.pathname='/shelter';}});
   assert.equal(state.api.budget().limitMs,300000);

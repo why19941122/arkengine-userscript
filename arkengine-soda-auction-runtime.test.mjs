@@ -9,7 +9,7 @@ const runtime=source.slice(source.indexOf("  const AUCTION_PREF="),source.indexO
 const now=Date.parse('2026-11-20T20:00:00+08:00');
 function setup(){
   const storage=new Map(),reads=[],events=[];
-  const context={clock:now,URL,location:{origin:'https://fixture.invalid',pathname:'/shelter'},
+  const context={clock:now,URL,AbortSignal,location:{origin:'https://fixture.invalid',pathname:'/shelter'},
     document:{baseURI:'https://fixture.invalid/'},objectState:value=>value!==null&&typeof value==='object'&&!Array.isArray(value),
     localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)},
     shadow:{getElementById:()=>({})},loadState:(store,key,fallback)=>JSON.parse(store.getItem(key)||'null')??fallback,
@@ -109,4 +109,44 @@ for(const mode of ['throw','silent'])test('拍卖加固：订单持久保存失�
   state.context.localStorage.setItem=()=>{if(mode==='throw')throw Error('fixture storage failure');};
   assert.throws(()=>state.request());
   assert.equal(state.api.state.pending.phase,'opening');assert.notEqual(state.api.work.sent,true);
+});
+
+test('拍卖拒绝修复：非旧关键词400释放原单，不重复同报价，下轮仍能购买',()=>{
+  const state=setup(),pending=state.api.prepare(),receive=state.request();
+  receive(400,{error:'当前批次可购买数量不够'});receive(400,{error:'当前批次可购买数量不够'});
+  assert.equal(state.api.state.pending,null);
+  assert.equal(state.api.state.receipts.length,0);
+  assert.equal(state.api.core.decision(state.api.core.model(state.body),state.api.state,3000000,now).kind,'wait');
+  const rejected=state.events.filter(event=>event[0]==='soda-auction-rejected');
+  assert.equal(rejected.length,1);assert.equal(rejected[0][2].id,pending.id);
+  assert.equal(rejected[0][2].reason,'当前批次可购买数量不够');
+  state.context.clock+=600000;state.body.auction.released=6;state.refresh();
+  assert.equal(state.api.core.decision(state.api.core.model(state.body),state.api.state,3000000,state.context.clock).kind,'buy');
+});
+
+test('拍卖拒绝修复：未知回执记录原单与错误，重复观察只写一次，迟到成功仍可归档',async()=>{
+  const state=setup(),pending=state.api.prepare(),receive=state.request();
+  const body={code:'retry',error:'结果暂未确认'};
+  receive(503,body);receive(503,body);
+  assert.equal(state.api.state.pending.id,pending.id);assert.equal(state.api.state.pending.unknown,true);
+  assert.deepEqual(JSON.parse(JSON.stringify(state.api.state.pending.result)),{status:503,code:'retry',reason:body.error});
+  const events=state.events.filter(event=>event[0]==='soda-auction-unconfirmed');
+  assert.equal(events.length,1);assert.equal(events[0][2].id,pending.id);
+  assert.equal(events[0][2].reason,body.error);assert.equal(events[0][2].code,'retry');
+  receive(null,null);
+  assert.equal(state.events.filter(event=>event[0]==='soda-auction-unconfirmed').length,1);
+  assert.equal(state.api.state.pending.result.status,503);
+  receive(200,{quantity:1,unitPrice:399999});await drain();
+  assert.equal(state.api.state.pending,null);
+  assert.equal(state.events.filter(event=>event[0]==='soda-auction-bought').length,1);
+});
+
+test('拍卖拒绝修复：旧版缺少回执的未知原单不因刷新行情被自动清空',()=>{
+  const state=setup(),pending=state.api.prepare();state.request();
+  state.api.restore({...state.api.state,pending:{...state.api.state.pending,unknown:true}});
+  state.context.clock+=600000;state.body.auction.released=6;state.refresh();
+  assert.equal(state.api.state.pending.id,pending.id);
+  assert.equal(state.api.state.pending.phase,'submitted');
+  assert.equal(state.api.state.pending.unknown,true);
+  assert.equal(state.api.state.receipts.length,0);
 });

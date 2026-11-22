@@ -10,6 +10,11 @@ const valid=vm.runInNewContext(source.slice(source.indexOf('  const validShelter
 const pending=()=>({at:1000,id:'intent',kind:'assign',vaultNo:77,targets:[5,6],before:{room:4,collected:0,day:'2026-11-12',month:'2026-11'}});
 const prepared=()=>({...pending(),lifecycle:{version:1,phase:'prepared',page:'page-A'}});
 const bound=()=>({...pending(),lifecycle:{version:1,phase:'request-bound',page:'page-A',requestKey:'native-key-123',boundAt:1001}});
+test('后台退出记录：只允许当前准备之后的时间，绑定原单不能标为未发送退出',()=>{
+  const original=prepared();original.lifecycle.hiddenExitAt=2000;assert.equal(valid(original),true);
+  for(const invalid of [999,NaN,'2000']){original.lifecycle.hiddenExitAt=invalid;assert.equal(valid(original),false);}
+  const sent=bound();sent.lifecycle.hiddenExitAt=2000;assert.equal(valid(sent),false);
+});
 test('确认记录：兼容旧格式，明确准备及绑定记录均有效',()=>{
   for(const p of [pending(),prepared(),bound()])assert.equal(valid(p),true);
 });

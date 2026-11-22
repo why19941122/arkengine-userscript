@@ -6,6 +6,29 @@ export async function singlePageTests({t,setupUnified,reloadUnified,evaluate,pul
   const schedule=`JSON.parse(localStorage.getItem('arkengine:auto-encounter:schedule:v1'))`;
   const home=`location.pathname==='/activities/expedition'`;
   const disableDungeon=`localStorage.setItem('arkengine:auto-dungeon:enabled:v1','false');`;
+  const brokenHall=`const draw=window.renderFeature;window.renderFeature=()=>{draw();if(location.pathname==='/cultivate'&&!window.restoreHall)document.querySelector('[aria-label="刷新修炼状态"]')?.remove();};
+    sessionStorage.setItem('arkengine:auto-page-wait:cultivate:v1',JSON.stringify({at:clock-20000,since:clock-110000,path:'/cultivate',reloaded:true,refreshes:1,recoverable:true}));`;
+  await t.test('夜间修炼退让：重读仍缺控件时领取远征，预约不立即回跳，届时重试成功',async()=>{
+    await setupUnified(disableDungeon+brokenHall+`model.runs[0].done=true;`,'/cultivate');
+    await drive(`${home}&&model.calls.some(call=>call.type==='claim')`,'claim during hall outage',25);
+    assert.deepEqual(await evaluate('cm.calls'),[]);
+    const retry=await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-encounter:hall-retry:v1'))`);
+    assert.ok(retry>await evaluate('clock'));
+    await reloadUnified();await pulse(15000);
+    assert.equal(await evaluate('location.pathname'),'/activities/expedition');
+    assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-encounter:hall-retry:v1'))`),retry);
+    await evaluate(`const drawExp=window.renderExp;window.renderExp=()=>{drawExp();addUnifiedLinks();};renderExp();window.restoreHall=true;clock=${retry};`);
+    await drive(`cm.calls.includes('choose')`,'recovered hall is visited again',40);
+    assert.deepEqual(await evaluate('cm.calls'),['seek','choose']);
+  });
+  for(const guard of ['foreign-request','encounter','dialog'])await t.test('夜间修炼退让保护：'+guard,async()=>{
+    const guarded=guard==='foreign-request'?`sessionStorage.setItem('cultivation:operation:other','{"input":{"action":"other"}}');`:
+      guard==='encounter'?`dm.encounter=true;`:`const modal=document.createElement('div');modal.setAttribute('role','dialog');modal.textContent='人工操作';document.body.append(modal);`;
+    await setupUnified(brokenHall+guarded,'/cultivate');await pulse(60000);await pulse(60000);
+    assert.equal(await evaluate('location.pathname'),'/cultivate');
+    assert.equal(await evaluate(`sessionStorage.getItem('arkengine:auto-encounter:hall-retry:v1')`),null);
+    assert.deepEqual(await evaluate('cm.calls'),[]);
+  });
   const timedExpedition=`window.returnAt=clock+40*60000;
     const render=renderFeature;window.renderFeature=()=>{render();if(location.pathname==='/activities/expedition'){
       const date=new Date(returnAt),pad=value=>String(value).padStart(2,'0'),time=document.createElement('p');

@@ -81,3 +81,14 @@ test('汽水拍卖：不完整、异常字段不会成为购买依据',()=>{
     {endsAt:'2026-11-20T19:00:00+08:00'},{nextReleaseAt:'bad'}])assert.equal(core.model(view(field)),null);
   assert.equal(core.model({enabled:false}),null);
 });
+
+test('拍卖拒绝修复：完整400或422业务错误不依赖中文关键词，冲突和未知仍保留',()=>{
+  const pending={price:399999};
+  for(const status of [400,422])for(const error of ['当前批次可购买数量不够','拍卖暂不可用','购买数量不正确'])
+    assert.equal(core.outcome(pending,status,{error}),'rejected');
+  for(const [status,body] of [[400,{}],[400,null],[400,{error:''}],[400,{error:'   '}],
+    [400,{code:'retry',error:'当前批次可购买数量不够'}],[409,{error:'请求冲突'}],
+    [409,{error:'订单处理中'}],[503,{error:'当前批次可购买数量不够'}],
+    [null,{error:'当前批次可购买数量不够'}],[200,{error:'当前批次可购买数量不够'}]])
+    assert.equal(core.outcome(pending,status,body),'unknown');
+});

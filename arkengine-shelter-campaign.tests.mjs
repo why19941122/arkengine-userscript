@@ -8,7 +8,7 @@ import {parent72Scene} from './arkengine-shelter-parent72.fixture.mjs';
 import {createShelterResourceSimulation} from './arkengine-shelter-resource-simulation.mjs';
 import {campaignView,levelGateView,upperStageView,materialCycleView,storageChoiceView,handyMaterialView,capacityRouteView,powerPrerequisiteView,digPowerPrerequisiteView,fullPowerPrerequisiteView,workshopUpgradeView,multiWorkshopView,workshopBuildView,workshopPowerCycleView,materialProducerCycleView,populationGrowthView,familyGrowthView,workshopChurnView,dormWorkshopCycleView,familyWorkshopCycleView,workshopFamilyReturnView} from './arkengine-shelter-campaign.fixture.mjs';
 
-export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground}){
+export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground,injectAutomation}){
   const key='arkengine:auto-shelter:campaign:v1',state=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))`,
     pending=`JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))`,panel=`document.getElementById('ark-auto-expedition').shadowRoot`,
     done=`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`;
@@ -5156,6 +5156,34 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
     });
     await drive(`!assignDialog.isConnected&&!${pending}`,'cancel only the restored dialog');
     assert.deepEqual(await evaluate('sm.assignClicks'),['取消']);assert.deepEqual(await evaluate('sm.calls'),[]);
+  });
+  await t.test('夜间调岗退让：取消窗持续透明，整页返回后才释放原准备并领取到期远征',async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned transparent confirmation');
+    const original=await evaluate(pending);
+    await evaluate(`window.addEventListener('pagehide',()=>sessionStorage.setItem('night-exit-proof',JSON.stringify({clicks:sm.assignClicks,calls:sm.calls,clock,original:${pending}})));`);
+    await withShelterBackground(async()=>{
+      await pulse(9*60000);
+      await until(()=>evaluate(`${panel}.getElementById('status').textContent.includes('取消按钮')`),'hidden cancel wait begins');
+      await pulse(65000);
+      await until(()=>evaluate(`location.pathname==='/activities/expedition'&&typeof addRuns==='function'`),'hidden confirmation yields to expedition',4500);
+      const proof=await evaluate(`JSON.parse(sessionStorage.getItem('night-exit-proof'))`);
+      assert.deepEqual(proof.clicks,[]);assert.deepEqual(proof.calls,[]);
+      assert.equal(proof.original.id,original.id);assert.equal(proof.original.lifecycle.phase,'prepared');
+      await evaluate(`clock=${proof.clock};Math.random=()=>0;model.burst=0;model.runs=[];addRuns(6);model.runs[0].done=true;renderExp();`);
+      await injectAutomation();await drive(`model.calls.some(call=>call.type==='claim')&&!${pending}`,'fresh document recovers and claims',30);
+      assert.ok(await evaluate(`${state}.nextAt>clock`));
+    });
+  });
+  for(const guard of ['manual','overlay'])await t.test('夜间调岗退让保护：'+guard,async()=>{
+    await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned assignment before takeover');
+    const original=await evaluate(pending);
+    if(guard==='manual'){await evaluate('assignDialog.querySelector("button").focus()');await trustedStaffKey();}
+    else await evaluate(`const other=document.createElement('div');other.setAttribute('role','dialog');other.textContent='人工操作';document.body.append(other);`);
+    await withShelterBackground(async()=>{
+      await pulse(9*60000);await pulse(65000);await pulse(65000);
+      assert.equal(await evaluate('location.pathname'),'/shelter');assert.deepEqual(await evaluate(pending),original);
+      assert.deepEqual(await evaluate('sm.assignClicks'),[]);assert.deepEqual(await evaluate('sm.calls'),[]);
+    });
   });
   await t.test('后台调岗：后台访问到期只取消，窗口恢复时不必切回前台',async()=>{
     await setupShelter(delayedAssignment);await drive('window.assignDialog?.isConnected','owned assignment before visit deadline');

@@ -878,7 +878,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         await until(()=>evaluate(`document.visibilityState==='visible'`),'shelter tab visible');
       }
     };
-    await shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground});
+    await shelterCampaignTests({t,setupShelter,reloadShelter,evaluate,drive,pulse,until,trustedStaffKey,withShelterBackground,injectAutomation:()=>evaluate(source)});
     await currentGrowthTests({t,setupShelter,reloadShelter,evaluate,drive,pulse});
     await shelterStaffTests({ t, setupShelter, reloadShelter, evaluate, pulse, drive, until, expStatus, trustedStaffKey });
     await shelterRevivalTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey});
@@ -3053,20 +3053,21 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       await drive('fm.crops.length===12','farm recovers after enable');
       assert.equal(await evaluate(farmCalls('plant')+'.length'),1);
     });
-    await t.test('加载故障恢复：修仙刷新用尽仍开启，手动刷新后数据恢复会继续', async () => {
+    await t.test('加载故障恢复：修仙刷新用尽仍开启并让出页面，重新进入可继续处理原选项', async () => {
       const loading=`window.clock=10000;Date.now=()=>clock;refresh.remove();`;
       await setup(`${loading}
         sessionStorage.setItem('arkengine:auto-page-wait:cultivate:v1',JSON.stringify({at:0,path:'/cultivate',reloaded:true,refreshes:5}));`);
       await pulse(3600000);
       assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
-      assert.match(await status(),/刷新.*5.*等待页面恢复/);
-      await cdp.send('Page.reload',{},tab.sessionId);
-      await until(()=>evaluate(`typeof base==='function'&&!document.getElementById('ark-auto-expedition')`),'manual reload after outage');
-      await evaluate(`${loading}Math.random=()=>0;`);
+      await drive(`location.pathname==='/activities/expedition'`,'exhausted hall yields the page',15);
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-page-wait:cultivate:v1')).refreshes`),5);
+      await evaluate(`clock=3610000;model.burst=0;addRuns(6);renderExp();`);await evaluate(source);
+      await drive(`!sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')`,'new document acknowledges navigation',15);
+      await cdp.send('Page.navigate',{url:`${origin}/cultivate?test=${++pageSerial}`},tab.sessionId);
+      await until(()=>evaluate(`location.search==='?test=${pageSerial}'&&typeof base==='function'`),'manual return after outage');
+      await evaluate(`window.clock=3615000;Date.now=()=>clock;Math.random=()=>0;base();choices(['修为 +1','修为 +2','钻石 +1']);`);
       await evaluate(source);
-      await pulse(5000);
       assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-encounter:enabled:v1')`),'false');
-      await evaluate(`base();choices(['修为 +1','修为 +2','钻石 +1']);`);
       await drive('clicks.length===1','cultivate resumes after outage',10);
       assert.deepEqual(await clickLog(),[2]);
     });

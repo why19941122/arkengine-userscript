@@ -6,6 +6,63 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
   const status=()=>evaluate("document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent");
   const ready=()=>until(()=>evaluate('am.posts.length===1'),'auction first order');
   const fresh=async(code='')=>{await evaluate(`${code};refreshAuction()`);await pulse(0);};
+  for(const mode of ['retry','network','empty','lost-response'])await t.test('拍卖自动恢复：同一原单恢复且只扣一次 '+mode,async()=>{
+    await setupAuction(`am.mode=${JSON.stringify(mode)};`);await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'original response is unknown');
+    const original=await evaluate('am.posts[0].body');
+    await evaluate(`am.mode='success';`);await pulse(3000);
+    await until(()=>evaluate(`${state}.pending===null&&am.posts.length===2`),'automatic original retry resolves');
+    assert.deepEqual(await evaluate('am.posts[1].body'),original);
+    assert.equal(await evaluate('am.tokens'),2600001);assert.equal(await evaluate('am.view.auction.boughtToday'),1);
+    await until(()=>evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='soda-auction-bought').length===1`),'one receipt');
+    await fresh();assert.equal(await evaluate('am.posts.length'),2);
+  });
+  await t.test('拍卖自动恢复：刷新保留原单和退避，换轮恢复后本轮不再新买',async()=>{
+    await setupAuction(`am.mode='retry';`);await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'persisted original');
+    const original=await evaluate('am.posts[0].body');
+    await reloadAuction();await pulse(0);assert.equal(await evaluate('am.posts.length'),1);
+    await fresh(`clock+=600000;am.view.auction.released=6;am.mode='success';`);
+    await until(()=>evaluate(`${state}.pending===null&&am.posts.length===2`),'same order after refresh and next round');
+    assert.deepEqual(await evaluate('am.posts[1].body'),original);
+    for(let index=0;index<3;index++)await fresh();
+    assert.equal(await evaluate('am.posts.length'),2);
+  });
+  await t.test('拍卖调度节流：未知原单离场后DOM变化仍合并，不保留紧急扫描',async testContext=>{
+    await setupAuction(`am.mode='retry';`);await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'unknown original');
+    await evaluate(`clock+=60000;`);await pulse(0);
+    await drive(`location.pathname==='/activities/expedition'`,'release auction page');
+    await evaluate(`window.schedulerProbe={checks:0};window.schedulerChanges=0;
+      const marker=document.createElement('span');document.body.append(marker);
+      window.mutationTimer=setInterval(()=>{marker.textContent=String(++schedulerChanges);},25);`);
+    await new Promise(resolve=>setTimeout(resolve,1200));
+    const probe=await evaluate(`clearInterval(mutationTimer);({checks:schedulerProbe.checks,changes:schedulerChanges})`);
+    testContext.diagnostic(JSON.stringify(probe));assert.ok(probe.changes>=20);assert.ok(probe.checks<=5);
+  });
+  await t.test('拍卖自动恢复：持续未知只退避三次，刷新不续次数，保留核对入口并释放页面',async()=>{
+    await setupAuction("am.mode='retry';");await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'first unknown');
+    const original=await evaluate('am.posts[0].body');
+    for(const [index,wait] of [2000,6000,18000].entries()){
+      await pulse(wait-1);assert.equal(await evaluate('am.posts.length'),index+1);
+      await pulse(1);await until(()=>evaluate(`am.posts.length===${index+2}`),'retry after backoff');
+    }
+    await drive(`location.pathname==='/activities/expedition'&&!sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')`,'cap yields page and navigation settles');
+    await pulse(60001);await reloadAuction();
+    assert.deepEqual(await evaluate('am.posts.map(post=>post.body)'),Array(4).fill(original));
+    assert.equal(await evaluate(`${state}.pending.retries`),3);assert.equal(await evaluate('am.tokens'),3000000);
+    await until(()=>evaluate(`!document.getElementById('ark-auto-expedition').shadowRoot.getElementById('auction-review').hidden`),'manual review after exhausted retries');
+  });
+  for(const mode of ['换账号','已闭拍','关闭开关'])await t.test('拍卖自动恢复：'+mode+'不重放旧请求',async()=>{
+    await setupAuction("am.mode='retry';");await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'first unknown');
+    const id=await evaluate(`${state}.pending.id`);
+    await evaluate(mode==='换账号'?`sm.view.vaultNo=88;`:mode==='已闭拍'?`clock=Date.parse(am.view.auction.endsAt);`:
+      `document.getElementById('ark-auto-expedition').shadowRoot.getElementById('auction-enabled').click();`);
+    await pulse(3000);await pulse(30000);await pulse(1000);
+    assert.equal(await evaluate('am.posts.length'),1);assert.equal(await evaluate(`${state}.pending.id`),id);
+  });
   await t.test('v136拍卖：先取消升级二次确认与房间详情，再守候汽水且不发送旧升级',async()=>{
     const fixture=readyCampaignConstructionScene(),timestamp=Date.parse('2026-11-20T19:55:00+08:00');
     fixture.view.serverTime=timestamp;fixture.view.state.lastSettledAt=timestamp;
@@ -226,7 +283,9 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
     await evaluate("clock=Date.parse('2026-11-20T20:08:00+08:00');");await pulse(0);
     await until(()=>evaluate("location.pathname==='/shelter'&&sm.tab==='汽水交易'"),'unknown order returns next window');
     await fresh("clock=Date.parse('2026-11-20T20:10:00+08:00');am.view.auction.released=6;");
-    assert.equal(await evaluate('am.posts.length'),1);
+    const posts=await evaluate('am.posts');assert.ok(posts.length>1&&posts.length<=4);
+    for(const post of posts)assert.deepEqual(post.body,posts[0].body);
+    assert.equal(await evaluate('am.view.auction.boughtToday'),0);
     assert.equal(await evaluate(`${state}.pending.id`),original);
   });
   await t.test('汽水拍卖：默认开启，提前两分钟驻留，其他玩法和到期远征均让路',async()=>{
@@ -292,7 +351,9 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
     const original=await evaluate(`${state}.pending`);
     await reloadAuction();await pulse(600000);
     await fresh('am.view.auction.released=6;am.view.auction.available=3;');
-    assert.equal(await evaluate('am.posts.length'),1);
+    await until(()=>evaluate(`am.posts.length===2&&${state}.pending?.retries===1`),'exactly one original retry after refresh');
+    assert.deepEqual(await evaluate('am.posts[1].body'),await evaluate('am.posts[0].body'));
+    assert.equal(await evaluate('am.view.auction.boughtToday'),0);
     assert.equal((await evaluate(`${state}.pending`)).id,original.id);
   });
   await t.test('汽水拍卖：明确售罄拒绝不反复提交，下一批继续',async()=>{
@@ -311,6 +372,70 @@ export async function sodaAuctionTests({t,setupAuction,reloadAuction,evaluate,pu
     await fresh();assert.equal(await evaluate('am.posts.length'),2);
     assert.equal(await evaluate('am.posts[0].body.idempotencyKey===am.posts[1].body.idempotencyKey'),true);
     await until(()=>evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='soda-auction-bought').length===1`),'one recovered purchase receipt');
+  });
+  await t.test('拍卖拒绝修复：首轮400新措辞不封锁全天，刷新后后续三轮各买一瓶',async()=>{
+    await setupAuction("am.mode='business-error';am.view.auction.perUserDaily=3;");await ready();
+    await until(()=>evaluate(`${state}.pending===null`),'business rejection clears original order');
+    for(let index=0;index<3;index++)await fresh();
+    assert.equal(await evaluate('am.posts.length'),1);
+    const rejected=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(event=>event.type==='soda-auction-rejected')`);
+    assert.equal(rejected.length,1);assert.equal(rejected[0].data.reason,'当前批次可购买数量不够');
+    await reloadAuction();await pulse(0);
+    assert.equal(await evaluate('am.posts.length'),1);
+    for(let round=1;round<=3;round++){
+      await fresh(`clock=Date.parse('2026-11-20T20:00:00+08:00')+${round}*600000;
+        am.view.auction.released=${(round+1)*3};am.view.auction.available=3;am.mode='success';`);
+      await until(()=>evaluate(`am.posts.length===${round+1}&&${state}.pending===null`),'next round after business rejection');
+      assert.equal(await evaluate(`am.posts[${round}].body.quantity`),1);
+    }
+    await until(()=>evaluate(`${state}.doneDay==='2026-11-20'`),'stop after daily three bottles');
+    assert.equal(await evaluate('am.view.auction.boughtToday'),3);
+    assert.equal(await evaluate('am.tokens'),1800003);
+    await fresh("clock+=600000;am.view.auction.released+=3;am.view.auction.available=3;");
+    assert.equal(await evaluate('am.posts.length'),4);
+  });
+  await t.test('拍卖旧单核对：人工确认未扣款未到账后先备份，当前轮不重买，下轮恢复',async()=>{
+    await setupAuction("am.mode='retry';");await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'unknown order for legacy fixture');
+    await evaluate(`{const value=${state};delete value.pending.result;delete value.pending.expiresAt;localStorage.setItem('arkengine:auto-soda-auction:state:v1',JSON.stringify(value));clock+=60000;}`);
+    await evaluate("localStorage.setItem('arkengine:auto-panel:expedition:collapsed:v1','true')");
+    await reloadAuction();
+    const button="document.getElementById('ark-auto-expedition').shadowRoot.getElementById('auction-review')";
+    await until(()=>evaluate(`${button}&&!${button}.hidden`),'legacy order review visible');
+    assert.ok(await evaluate(`${button}.getBoundingClientRect().width>0`));
+    const original=await evaluate(`${state}.pending`);
+    await evaluate(`window.confirm=()=>false;${button}.click();`);
+    assert.equal(await evaluate(`${state}.pending.id`),original.id);
+    await evaluate(`window.confirm=()=>true;${button}.click();`);
+    assert.equal(await evaluate(`${state}.pending`),null);
+    assert.equal(await evaluate(`${button}.hidden`),true);
+    const backup=await evaluate(`JSON.parse(localStorage.getItem('arkengine:auto-soda-auction:state:v1:reviewed:'+${JSON.stringify(original.id)}))`);
+    assert.equal(backup.pending.id,original.id);assert.equal(backup.pending.key,original.key);
+    assert.equal(await evaluate('am.posts.length'),1);
+    await reloadAuction();
+    await fresh("clock=Date.parse('2026-11-20T20:10:00+08:00');am.view.auction.released=6;am.view.auction.available=3;am.mode='success';");
+    await until(()=>evaluate(`am.posts.length===2&&${state}.pending===null`),'legacy review restores next round');
+    assert.equal(await evaluate('am.view.auction.boughtToday'),1);
+  });
+  await t.test('拍卖旧单核对：备份失败或确认时原单变化均保留等待，新版未知单不显示入口',async()=>{
+    await setupAuction("am.mode='retry';");await ready();
+    await until(()=>evaluate(`${state}.pending?.unknown===true`),'unknown order retained');
+    const button="document.getElementById('ark-auto-expedition').shadowRoot.getElementById('auction-review')";
+    assert.equal(await evaluate(`${button}.hidden`),true);
+    await evaluate(`{const value=${state};delete value.pending.result;delete value.pending.expiresAt;localStorage.setItem('arkengine:auto-soda-auction:state:v1',JSON.stringify(value));clock+=60000;}`);
+    await reloadAuction();
+    await until(()=>evaluate(`!${button}.hidden`),'legacy recovery available');
+    const original=await evaluate(`${state}.pending.id`);
+    for(const mode of ['throw','silent']){
+      await evaluate(`window.confirm=()=>true;window.savedStorageWrite=Storage.prototype.setItem;
+        Storage.prototype.setItem=function(key,value){if(key.includes(':reviewed:')){if(${JSON.stringify(mode)}==='throw')throw Error('fixture backup failure');return;}return savedStorageWrite.call(this,key,value);};
+        ${button}.click();Storage.prototype.setItem=savedStorageWrite;`);
+      assert.equal(await evaluate(`${state}.pending.id`),original);
+    }
+    await evaluate(`window.confirm=()=>{const value=${state};value.pending.id='replacement-order';
+      localStorage.setItem('arkengine:auto-soda-auction:state:v1',JSON.stringify(value));return true;};${button}.click();`);
+    assert.equal(await evaluate(`${state}.pending.id`),'replacement-order');
+    assert.equal(await evaluate('am.posts.length'),1);
   });
   for(const variant of ['title','amount','request'])await t.test('汽水拍卖：确认框或原生请求不匹配时不花费 '+variant,async()=>{
     const code=variant==='title'?"am.title='买入 1 瓶，399999 代币/瓶';":variant==='amount'?'am.wrongAmount=true;':'am.requestPatch={quantity:2};';

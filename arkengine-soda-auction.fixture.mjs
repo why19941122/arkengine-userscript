@@ -1,7 +1,7 @@
 import {singlePageMarkup} from './arkengine-single-page.fixture.mjs';
 
 export const auctionMarkup=singlePageMarkup+`<script>
-window.am={tokens:3000000,posts:[],clicks:[],reads:[],tabs:[],market:0,quantity:1,mode:'success',confirmDisabled:false,
+window.am={tokens:3000000,posts:[],clicks:[],reads:[],tabs:[],receipts:{},market:0,quantity:1,mode:'success',confirmDisabled:false,
   view:{enabled:true,auction:{startsAt:'2026-11-20T20:00:00+08:00',endsAt:'2026-11-20T21:00:00+08:00',
     supply:18,sold:0,released:3,remaining:18,available:3,perUserDaily:10,boughtToday:0,live:true,price:399999,
     floorPrice:100000,nextReleaseAt:'2026-11-20T20:10:00+08:00',cooldownHours:24}}};
@@ -18,15 +18,20 @@ window.fetch=async(input,options)=>{
   }
   const body=JSON.parse(options.body);am.posts.push({at:clock,body,wall:performance.now(),
     pending:JSON.parse(localStorage.getItem('arkengine:auto-soda-auction:state:v1'))?.pending});
+  if(am.receipts[body.idempotencyKey])return new Response(JSON.stringify(am.receipts[body.idempotencyKey]));
   if(am.mode==='network')throw Error('fixture network');
   if(am.mode==='retry')return new Response(JSON.stringify({code:'retry',error:'结果未确认'}),{status:503});
   if(am.mode==='sold')return new Response(JSON.stringify({error:'本批已售罄'}),{status:400});
+  if(am.mode==='business-error')return new Response(JSON.stringify({error:'当前批次可购买数量不够'}),{status:400});
   if(am.mode==='empty')return new Response('{}');
   const respond=()=>{
+    if(am.receipts[body.idempotencyKey])return new Response(JSON.stringify(am.receipts[body.idempotencyKey]));
     am.view.auction.sold++;am.view.auction.boughtToday++;am.view.auction.available--;am.view.auction.remaining--;
     am.tokens-=body.maxUnitPrice;
-    return new Response(JSON.stringify({quantity:body.quantity,unitPrice:body.maxUnitPrice}));
+    const receipt={quantity:body.quantity,unitPrice:body.maxUnitPrice};am.receipts[body.idempotencyKey]=receipt;
+    return new Response(JSON.stringify(receipt));
   };
+  if(am.mode==='lost-response'){respond();throw Error('fixture response lost after commit');}
   if(am.mode==='hold')return new Promise(resolve=>{window.finishAuction=()=>resolve(respond());});
   return respond();
 };
