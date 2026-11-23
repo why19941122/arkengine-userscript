@@ -3033,12 +3033,47 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
         await until(()=>evaluate(`document.hidden`),'expedition hidden');
         const requests=expeditionRequests;
         await pulse(3600000);
+        await until(async()=>/刷新.*5.*等待页面恢复/.test(await expStatus()),'exhausted expedition still checking');
         assert.match(await expStatus(),/刷新.*5.*等待页面恢复/);
         assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
         assert.equal(expeditionRequests,requests);
         await evaluate(`window.renderExp=renderCurrent;renderExp();`);
         await drive('model.runs.length===6','expedition resumes after loading outage');
       } finally { await cdp.send('Target.closeTarget',{targetId:foreground.targetId}); }
+    });
+    for(const blocked of [false,true])await t.test('夜间远征表单：'+(blocked?'有待领取不让出':'全队在途时缺表单不独占农场'),async()=>{
+      await setupFarm(`addRuns(6);model.runs[0].done=${blocked};const draw=renderExp;window.renderExp=()=>{draw();document.querySelector('#auto input[type="number"]').remove();};
+        sessionStorage.setItem('arkengine:auto-page-wait:expedition:v1',JSON.stringify({at:clock-120000,path:'/activities/expedition',reloaded:true,refreshes:5}));`);
+      if(blocked){await pulse(20000);await pulse(20000);assert.equal(await evaluate('location.pathname'),'/activities/expedition');assert.deepEqual(await evaluate('model.calls'),[]);}
+      else {await drive('fm.crops.length===12','independent farm works while dispatch form is broken',30);assert.deepEqual(await evaluate('model.calls'),[]);}
+    });
+    for(const mode of ['underway','ready','inconsistent','loading','duplicate'])await t.test('夜间远征整块派遣区：'+mode,async()=>{
+      await setupFarm(`addRuns(6);model.runs[0].done=${mode==='ready'};const originalRender=renderExp;
+        window.renderExp=()=>{originalRender();const auto=document.getElementById('auto');
+          if('${mode}'==='duplicate')auto.after(auto.cloneNode(true));else auto.remove();
+          if('${mode}'==='inconsistent')document.querySelector('#running button').remove();
+          if('${mode}'==='loading')document.getElementById('running').append(Object.assign(document.createElement('span'),{className:'animate-spin'}));};
+        sessionStorage.setItem('arkengine:auto-page-wait:expedition:v1',JSON.stringify({at:clock-120000,path:'/activities/expedition',reloaded:true,refreshes:5}));`);
+      if(mode==='underway'){
+        await drive('fm.crops.length===12','independent farm works when the entire dispatch section is absent',30);
+        assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-page-wait:expedition:v1')).refreshes`),5);
+        assert.deepEqual(await evaluate('model.calls'),[]);
+        await evaluate(`clock+=8*3600000;model.runs[0].done=true;window.renderExp=originalRender;navFarm('/activities/expedition');window.dispatchEvent(new Event('focus'));`);
+        await drive(`model.calls.filter(call=>call.type==='claim').length===1&&model.runs.length===6&&!model.runs.some(run=>run.done)`,'restored dispatch collects once and replaces the team',45);
+        assert.equal(await evaluate(`model.calls.filter(call=>call.type==='dispatch').length`),1);
+        assert.equal(await evaluate(`sessionStorage.getItem('arkengine:auto-page-wait:expedition:v1')`),null);
+        return;
+      }
+      await pulse(20000);await pulse(20000);assert.equal(await evaluate('location.pathname'),'/activities/expedition');assert.equal(await evaluate('fm.crops.length'),0);
+      assert.deepEqual(await evaluate('model.calls'),[]);
+    });
+    for(const guard of ['normal','burst','grace'])await t.test('夜间远征让路限制：'+guard,async()=>{
+      await setupFarm(`addRuns(${guard==='normal'?5:6});model.burst=${guard==='burst'?6:0};const draw=renderExp;window.renderExp=()=>{draw();document.getElementById('auto').remove();};
+        sessionStorage.setItem('arkengine:auto-page-wait:expedition:v1',JSON.stringify({at:clock-${guard==='grace'?0:120000},path:'/activities/expedition',reloaded:true,refreshes:5}));`);
+      await until(async()=>/等待远征页面和额度加载/.test(await expStatus()),'blocked expedition really checked');
+      await pulse(10000);
+      assert.equal(await evaluate('location.pathname'),'/activities/expedition');assert.deepEqual(await evaluate('model.calls'),[]);
+      if(guard==='grace'){await pulse(6000);await drive('fm.crops.length===12','grace expires without another page reload',30);}
     });
     await t.test('加载故障恢复：农场旧超时后重新开启，先等待加载再种植', async () => {
       await setupFarm(`addRuns(6);localStorage.setItem('arkengine:auto-farm:enabled:v1','false');
@@ -3237,7 +3272,40 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       await pulse(3600000);
       assert.equal(expeditionRequests,requests);
       assert.equal(await evaluate(farmCalls('navigate')+'.length'),0);
+      await until(async()=>/切换农场仍未完成/.test(await expStatus()),'legacy failed navigation stays held');
       assert.match(await expStatus(),/切换农场仍未完成/);
+    });
+    await t.test('夜间导航原单：切页等待中开始的农场写入结束前不整页重载，结束后继续',async()=>{
+      await setupFarm(`sessionStorage.setItem('arkengine:auto-expedition:navigation:v1',JSON.stringify({from:'/farm',to:'/activities/expedition',at:clock,reloaded:false}));
+        const originalFetch=window.fetch;window.fetch=(url,options)=>url==='/api/farm/harvest-all'?
+          new Promise(resolve=>window.finishManualHarvest=()=>resolve(new Response('{}'))):originalFetch(url,options);`,'/farm');
+      await evaluate(`void fetch('/api/farm/harvest-all',{method:'POST'})`);
+      await pulse(31000);
+      await until(()=>evaluate(`location.pathname!=='/farm'||document.getElementById('ark-auto-expedition')?.shadowRoot.getElementById('status').textContent.includes('农场操作仍待核对')`),'navigation fallback reached');
+      assert.equal(await evaluate('location.pathname'),'/farm');
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')).reloaded`),false);
+      await evaluate('finishManualHarvest()');await pulse(1000);
+      await until(()=>evaluate(`location.pathname==='/activities/expedition'`),'original navigation continues after the write settles');
+    });
+    await t.test('夜间导航原单：农场已关闭仍等两笔手工请求分别结束，拒绝后不重发',async()=>{
+      await setupFarm(`localStorage.setItem('arkengine:auto-farm:enabled:v1','false');sessionStorage.setItem('arkengine:auto-expedition:navigation:v1',JSON.stringify({from:'/farm',to:'/activities/expedition',at:clock,reloaded:false}));
+        window.writes=[];window.fetch=()=>new Promise((resolve,reject)=>writes.push({resolve,reject}));`,'/farm');
+      await evaluate(`void fetch('/api/farm/harvest',{method:'POST'});void fetch('/api/farm/plant',{method:'POST'}).catch(()=>{});writes[0].resolve(new Response('{}'));`);
+      await pulse(31000);
+      await until(()=>evaluate(`location.pathname!=='/farm'||document.getElementById('ark-auto-expedition')?.shadowRoot.getElementById('status').textContent.includes('农场操作仍待核对')`),'second write remains protected');
+      assert.equal(await evaluate('location.pathname'),'/farm');assert.equal(await evaluate('writes.length'),2);
+      await evaluate(`writes[1].reject(Error('network error'))`);await pulse(1000);
+      await until(()=>evaluate(`location.pathname==='/activities/expedition'`),'rejection releases navigation without another write');
+    });
+    await t.test('夜间导航弹窗：原生确认框未关闭不整页重载，关闭后继续原预约',async()=>{
+      await setupFarm(`sessionStorage.setItem('arkengine:auto-expedition:navigation:v1',JSON.stringify({from:'/farm',to:'/activities/expedition',at:clock,reloaded:false}));`,'/farm');
+      await evaluate(`const manual=document.createElement('dialog');manual.textContent='确认手动操作';document.body.append(manual);manual.showModal();`);
+      await pulse(31000);
+      await until(()=>evaluate(`location.pathname!=='/farm'||document.getElementById('ark-auto-expedition')?.shadowRoot.getElementById('status').textContent.includes('弹窗尚未关闭')`),'navigation checked the manual dialog');
+      assert.equal(await evaluate('location.pathname'),'/farm');
+      assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:navigation:v1')).reloaded`),false);
+      await evaluate('manual.close()');await pulse(1000);
+      await until(()=>evaluate(`location.pathname==='/activities/expedition'`),'closed dialog does not block the original navigation');
     });
     await t.test('切页故障恢复：等待中暂停农场或出现弹窗不整页跳转', async () => {
       for(const stop of ['farm','dialog']) {

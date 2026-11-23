@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.153
+// @version      1.17.154
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1601,6 +1601,7 @@
   const diagnosticLogs = {};
   // 仅在本脚本点击领取的同步调用期间绑定原网页请求，不读取请求正文。
   let captureExpeditionClaim = null;
+  let farmWritesInFlight = 0;
   let captureShelterAction = null;
   let awaitingShelterConfirmation = null;
   let continueShelterAction = null;
@@ -1657,7 +1658,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.153';
+  const SCRIPT_VERSION = '1.17.154';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -2680,6 +2681,11 @@
         if (url?.origin === location.origin && paths.has(url.pathname) && group) {
           const info = { group, path: url.pathname, at };
           const method = String(args[1]?.method || (input instanceof Request ? input.method : 'GET')).toUpperCase();
+          if (info.path.startsWith('/api/farm') && method !== 'GET' && method !== 'HEAD') {
+            farmWritesInFlight++;
+            const settled = () => { farmWritesInFlight--; };
+            promise.then(settled, settled);
+          }
           const report = (result,response) => {
             record(info, result);
             if (claimCapture?.path === info.path && method === 'POST') claimCapture.result(result);
@@ -19115,7 +19121,7 @@ installShelterPlanningWorker(self);
       idleWait = { ...(idleWait || { at: now, reloaded: false }), since: idleWait?.since || idleWait?.at || now, reason };
       sessionStorage.setItem(IDLE_JOURNAL, JSON.stringify(idleWait));
     }
-    const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]').length;
+    const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]').length;
     const pending = Boolean(plan || claimWait || nativePending().length);
     let loadExpired = null;
     if (detail.pageLoading) {
@@ -19277,10 +19283,11 @@ installShelterPlanningWorker(self);
     return !dialog||!shelterDialogClosed(dialog)&&!shelterDialogTransparent(dialog);
   }
   function currentElement(elements) { return locator.pick(elements); }
-  function section(title) {
-    return currentElement([...document.querySelectorAll('section')].filter(el =>
-      [...el.querySelectorAll('h2')].some(heading => textOf(heading) === title)));
+  function sectionsNamed(title) {
+    return [...document.querySelectorAll('section')].filter(el =>
+      [...el.querySelectorAll('h2')].some(heading => textOf(heading) === title));
   }
+  function section(title) { return currentElement(sectionsNamed(title)); }
   function buttonIn(root, matcher) {
     return currentElement([...(root?.querySelectorAll('button') || [])].filter(button =>
       typeof matcher === 'string' ? textOf(button) === matcher : matcher.test(textOf(button))));
@@ -19311,7 +19318,7 @@ installShelterPlanningWorker(self);
     const teams = buttons.filter(b => /^(领取|远征中)$/.test(textOf(b)));
     const ready = teams.filter(b => textOf(b) === '领取').length;
     const underway = teams.filter(b => textOf(b) === '远征中' && b.matches(':disabled')).length;
-    const loading = Boolean(fields.root.querySelector('.animate-spin') || running?.querySelector('.animate-spin'));
+    const loading = Boolean((fields.root ?? document).querySelector('.animate-spin') || running?.querySelector('.animate-spin'));
     const consistent = !errors && !loading && (!running || visible(running)) && teams.length === q.running;
     return { consistent, teams: teams.length, ready, underway, loading, error: errors.slice(0, 300),
       allUnderway: consistent && underway === q.running && !buttons.some(b => /^一键领取/.test(textOf(b))) };
@@ -19323,7 +19330,7 @@ installShelterPlanningWorker(self);
     return { total: Number(match[1]), normal: Number(match[2]), burst: Number(match[3]) };
   }
   function form() {
-    const root = section('自动组队派遣');
+    const panels = sectionsNamed('自动组队派遣'), root = currentElement(panels);
     const routes = section('选择路线');
     const count = currentElement(root?.querySelectorAll('input[aria-label="最多派遣队数"]'));
     const label = currentElement([...(root?.querySelectorAll('label') || [])].filter(el => textOf(el) === '允许使用今日突发额度'));
@@ -19331,7 +19338,7 @@ installShelterPlanningWorker(self);
     const high = buttonIn(currentElement(root?.querySelectorAll('[aria-label="自动组队偏好"]')), '高星优先');
     const routeButton = name => currentElement([...(routes?.querySelectorAll('button') || [])].filter(el =>
       [...el.querySelectorAll('span')].some(span => textOf(span) === name)));
-    return { root, count, burst, high, routeButton, forecast: forecast(root) };
+    return { root, absent: panels.length === 0, count, burst, high, routeButton, forecast: forecast(root) };
   }
   function nativePending() {
     const records = [];
@@ -19575,10 +19582,10 @@ installShelterPlanningWorker(self);
     const target = navigation.to === '/farm' ? '农场' : navigation.to === '/shelter' ? '避难所' : navigation.to === '/stock' ? '股市' :
       navigation.to === '/cultivate' ? '奇遇' : navigation.to === '/cultivate/dungeon' ? '秘境' : '远征';
     if (!navigator.onLine) { say(`切换${target}时网络离线，等待连接恢复`); return true; }
-    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].some(visible)) {
+    if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]')].some(visible)) {
       say(`等待切换${target}；网页弹窗尚未关闭`);return true;
     }
-    const pendingReason=plan?'远征派遣':claimWait?'远征领取':farmEnabled&&farmPlan?'农场操作':nativePending().length?'原生远征请求':
+    const pendingReason=plan?'远征派遣':claimWait?'远征领取':(farmWritesInFlight || (farmEnabled && farmPlan))?'农场操作':nativePending().length?'原生远征请求':
       cultivation.onPage()&&cultivation.pending()?'奇遇或秘境原请求':'';
     if(pendingReason){say(`等待切换${target}；${pendingReason}仍待核对，不重复操作`);return true;}
     if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
@@ -20676,11 +20683,19 @@ installShelterPlanningWorker(self);
       shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending),
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
+      if (q?.running > 0 && q.normal === 0 && (fields.root || fields.absent) && expeditionLoadWait.retriedHere(15000) &&
+          !plan && !claimWait && !farmPlan && !farmWritesInFlight && !dispatchWindow && !errors && navigator.onLine &&
+          !document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]') && !nativePending().length) {
+        const time = beijingTime(), running = section('进行中的远征');
+        if ((!time.canBurst || q.burst === 0 || q.burst < q.burstMax || localStorage.getItem(BURST_DAY) === time.day) &&
+            running && claimPageState(q, fields, errors).allUnderway && !overduePatrol(running) && maybeVisitScheduled(running)) return;
+      }
       waitForIdlePage('等待远征页面和额度加载', { pageLoading: true,
         ...(!q ? { quotaRead } : {}),
         missing: { quota: !q, form: !fields.root, count: !fields.count, burst: !fields.burst, preference: !fields.high } });
       return;
     }
+    expeditionLoadWait.finish();
     if (!expeditionObserved) { noteQuotaSync(); expeditionObserved = true; }
     const records = nativePending();
     if (plan) { handlePlan(q, fields, records, dialogs); return; }
@@ -20881,7 +20896,6 @@ installShelterPlanningWorker(self);
         if (!offered) cancelQueued();
         if (idleChecked && !idleBlocked) clearIdleWait(true);
         if (enabled && active && !auctionExclusive && farmEnabled && inFarm()) farmWait.finish();
-        if (enabled && active && !auctionExclusive && onPage()) expeditionLoadWait.finish();
       }
     },()=>Boolean(auctionWindow&&!auctionWindow.sent)||enabled&&auctionToggle.checked&&
       auctionState.pending?.phase!=='submitted'&&auctionState.doneDay!==auctionCore.day(Date.now())&&auctionCore.visit(auctionView?.model,Date.now()).active);
