@@ -413,6 +413,42 @@ test('生产训练返岗房升级：完成、关闭、到期、断供或岗位�
   }
 });
 
+test('废土堵塞：返岗席位已满时只保留当前训练格，不占队首、原座位或延长期限',()=>{
+  for(const finishing of [true,false]){
+    const context=upgradingTrainingScene(),{v,s,p,record,destination}=context;
+    destination.upgradeAt=null;s.residents[5].roomId=destination.id;
+    p.stats.end=4;p.training=.9;p.trainingStat='end';
+    const role=record.roles[0];Object.assign(role,{base:4,until:v.serverTime+hour});
+    if(finishing)role.finishCurrent=true;
+    assert.ok(api.valid(record));
+    const plan=context.run();assert.ok(!plan.actions.some(action=>action.id===p.id&&action.role==='training-release'));
+    const retained=plan.adoptions.find(entry=>entry.id===p.id);
+    assert.equal(retained?.purpose,'current');assert.equal(retained.destination,undefined);assert.equal(retained.windowEnd,undefined);
+    assert.ok(retained.until<=role.until);assert.ok(plan.reserved.includes(p.id));
+    assert.ok(!plan.trainingDestinations.some(seat=>seat.id===p.id));
+    record.roles=[retained];assert.ok(api.valid(record));v.serverTime+=60000;const next=context.run();
+    assert.equal(next.adoptions.length,0);assert.ok(next.reserved.includes(p.id));
+    p.stats.end++;p.training=0;
+    assert.ok(context.run().actions.some(action=>action.id===p.id&&action.role==='training-release'));
+  }
+});
+
+test('废土堵塞：90%进度不能越过训练开关、固定期限、供给和房间状态',()=>{
+  for(const condition of ['training-off','development-off','expired','window-ended','supply-low','training-inactive']){
+    const context=upgradingTrainingScene(),{v,s,p,record,cfg,room,destination}=context;
+    destination.upgradeAt=null;s.residents[5].roomId=destination.id;p.training=.9;p.trainingStat='end';
+    Object.assign(record.roles[0],{finishCurrent:true,until:v.serverTime+hour});
+    if(condition==='training-off')cfg.training=false;
+    if(condition==='development-off')cfg.development=false;
+    if(condition==='expired')record.roles[0].until=v.serverTime;
+    if(condition==='window-ended')record.roles[0].windowEnd=v.serverTime;
+    if(condition==='supply-low')s.resources.power=0;
+    if(condition==='training-inactive')room.unpowered=true;
+    const plan=context.run();assert.ok(!plan.adoptions.some(entry=>entry.id===p.id),condition);
+    assert.ok(plan.actions.some(action=>action.id===p.id&&action.role==='training-release'),condition);
+  }
+});
+
 test('生产训练返岗房升级：多个训练者仍共享真实容量，不重复预留最后一席',()=>{
   const context=upgradingTrainingScene(),{s,room,record,destination}=context;
   const second=s.residents[5];second.roomId=room.id;second.stats.end=2;second.training=1/6;

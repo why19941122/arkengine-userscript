@@ -39,6 +39,12 @@ test('页面预约：远征四十分钟后归来，无到期任务不切换、�
   assert.deepEqual(state.navigations,['/activities/expedition']);
 });
 
+test('避难所等待预约时显示本次撤销原因，不把未执行动作报成本轮完成',()=>{
+  const {api,context}=setup('/shelter');let message;
+  context.say=text=>{message=text;};context.shelterState.note='已撤销动作本轮先让路，一分钟内重新核对';
+  api.finish('shelter');assert.ok(message.includes(context.shelterState.note));assert.doesNotMatch(message,/本轮完成/);
+});
+
 test('页面预约：到期奇遇直接从农场进入，跨页不清空归来时间',()=>{
   const state=setup();state.context.cultivation.dueAt=()=>state.context.clock;
   state.api.finish('farm');assert.equal(state.offers.length,1);state.offers[0].callback();

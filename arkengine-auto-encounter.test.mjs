@@ -3811,7 +3811,7 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       assert.equal(expeditionRequests,synced,'正常操作已更新状态，不按旧截止时间刷新');
     });
 
-    await t.test('减少重复操作：领取结果跨刷新保留，只核对一次后暂停', async () => {
+    await t.test('减少重复操作：领取结果跨刷新保留，完整待领列表只暂停远征写入', async () => {
       await setupExp(`addRuns(6,false,true);window.claimRuns=()=>model.calls.push({type:'claim'});`);
       await drive(`model.calls.some(c=>c.type==='claim')`, 'claim submitted');
       const snapshot=await evaluate('({model,clock:clock+33000})');
@@ -3821,7 +3821,8 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;window.claimRuns=()=>model.calls.push({type:'claim'});renderExp();`);
       await evaluate(source);
       await pulse(61000);
-      await until(async ()=>(await expStatus())?.includes('原领取结果仍无法确认'),'unknown claim paused');
+      await drive(`!!JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1'))?.reviewAt`,'unknown claim held after one reload');
+      assert.notEqual(await evaluate(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`),'false');
       assert.equal(await evaluate(`model.calls.filter(c=>c.type==='claim').length`),1);
       assert.equal(await evaluate(`JSON.parse(sessionStorage.getItem('arkengine:auto-expedition:claim:v1')).reloaded`),true);
     });
@@ -3833,6 +3834,46 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
     const reloadedNetworkClaim = `sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({
       running:6,ready:6,at:clock-61000,submittedAt:clock-95000,reloaded:true,reloadFrom:'previous-page',
       retries:0,attemptId:'original-attempt',result:{outcome:'network-error',status:null}}));`;
+    await t.test('远征领取缺回执：6待领6在途不补领不关总开关，农场照常种植，稍后只读核对',async()=>{
+      await setupFarm(`addRuns(6,false,true);addRuns(6,true,false);${reloadedNetworkClaim}
+        const original=${claimJournal};original.running=12;delete original.result;
+        sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify(original));`);
+      const enabled=`localStorage.getItem('arkengine:auto-expedition:enabled:v1')`;
+      await drive(`!!${claimJournal}?.reviewAt||${enabled}==='false'`,'classify fresh unchanged claim',12);
+      assert.notEqual(await evaluate(enabled),'false');
+      const held=await evaluate(claimJournal);
+      assert.ok(held.reviewAt>held.at);assert.equal(held.retries,0);assert.equal(held.attemptId,'original-attempt');
+      await drive('fm.crops.length===12','farm completes while claim is held');
+      assert.equal(await evaluate(`${farmCalls('plant')}.length`),1);
+      await evaluate(`clock=${held.reviewAt}+1`);
+      await drive(`location.pathname==='/activities/expedition'&&${claimJournal}?.reviewAt>${held.reviewAt}`,'read-only expedition review');
+      assert.equal(await evaluate('model.calls.length'),0,'neither claim nor dispatch is repeated');
+      assert.equal(await evaluate(`${claimJournal}.submittedAt`),held.submittedAt);
+      const nextReview=await evaluate(`${claimJournal}.reviewAt`);
+      await evaluate(`model.runs.splice(model.runs.findIndex(run=>run.done),1);clock=${nextReview}+1;renderExp()`);
+      await drive(`!${claimJournal}||${claimJournal}.reviewAt>${nextReview}`,'read the partial manual result');
+      assert.equal(await evaluate(`${claimJournal}?.attemptId`),held.attemptId,'one manual claim does not settle the remaining five');
+      assert.equal(await evaluate('model.calls.length'),0);
+      await evaluate('model.runs=model.runs.filter(run=>!run.done);renderExp()');
+      await drive(`${claimJournal}===null`,'manual claim reconciled from the complete team list');
+      assert.equal(await evaluate('model.calls.filter(call=>call.type==="claim").length'),0);
+    });
+    await t.test('远征领取缺回执：重开页面保留原单，人工暂停和待确认派遣不能被绕过',async()=>{
+      await setupFarm(`addRuns(6,false,true);addRuns(6,true,false);${reloadedNetworkClaim}
+        const saved=${claimJournal};delete saved.result;
+        sessionStorage.setItem('arkengine:auto-expedition:claim:v1',JSON.stringify({...saved,running:12,reviewAt:clock+300000}));
+        localStorage.setItem('arkengine:auto-expedition:enabled:v1','false');
+        sessionStorage.setItem('expedition:77:auto',JSON.stringify({idempotencyKey:'manual-test'}));`);
+      const original=await evaluate(claimJournal);await pulse(61000);
+      assert.equal(await evaluate('fm.calls.length+model.calls.length'),0);
+      await evaluate(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('toggle').click()`);
+      await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent.includes('手动派遣')`,'manual dispatch still blocks navigation');
+      assert.deepEqual(await evaluate(claimJournal),original);
+      assert.equal(await evaluate('fm.calls.length+model.calls.length'),0);
+      await evaluate(`sessionStorage.removeItem('expedition:77:auto')`);
+      await drive('fm.crops.length===12','parked claim survives reload and explicit start');
+      assert.equal(await evaluate('model.calls.length'),0);
+    });
     const reloadClaimPage = async (after = '') => {
       const snapshot=await evaluate('({model,clock:clock+35000})');
       await pulse(31000);
@@ -4095,7 +4136,8 @@ test('单页奇遇、秘境、远征与农场：真实 Chromium DOM 集成检查
       await evaluate(`Object.assign(window,${JSON.stringify(snapshot)});Math.random=()=>0;renderExp();`);
       await evaluate(source);
       await pulse(61000);
-      await until(async ()=>(await expStatus())?.includes('原领取结果仍无法确认'),'still ambiguous pauses again');
+      await drive(`localStorage.getItem('arkengine:auto-expedition:enabled:v1')==='false'`,'legacy claim without attempt evidence still pauses');
+      assert.equal(await evaluate(`${claimJournal}.reviewAt`),undefined);
       assert.equal(await evaluate('model.calls.length'),0,'核对只刷新，不重新领取');
       assert.equal(await evaluate(`${claimJournal}.submittedAt`),original.at);
     });

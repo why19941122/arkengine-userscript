@@ -4627,6 +4627,22 @@ export async function shelterCampaignTests({t,setupShelter,reloadShelter,evaluat
   });
   const fourExplorerScene=extra=>scene({explore:true},`Object.assign(sm.view,${JSON.stringify(fourExplorerView())});
     sm.view.serverTime=clock;sm.view.state.lastSettledAt=clock;sm.ui20261109=true;sm.simulateResources=true;${extra||''}`);
+  await t.test('废土堵塞：291号耐力90%失去返岗席位，其他四人仍实际出发',async()=>{
+    await setupShelter(fourExplorerScene(`const vault=sm.view.state,origin=vault.residents[0];
+      vault.rooms.push({...vault.rooms[0],id:642,type:'training',trainStat:'end',floor:4,col:2});
+      vault.residents.push({...origin,id:291,name:'李向晚',roomId:642,stats:{...origin.stats,end:4},trainingStat:'end',training:.9});
+      localStorage.setItem('${key}',JSON.stringify({...JSON.parse(localStorage.getItem('${key}')),training:true}));
+      localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({nextAt:0,note:'返岗席位失效',campaign:{
+        roles:[{id:291,room:642,role:'training',at:clock-600000,stat:'end',base:4,purpose:'production',finishCurrent:true,
+          until:clock+3600000,windowEnd:clock+168*3600000,destination:315}],trips:[],attempts:[],heals:[],trainingRest:[]}}));`));
+    await drive(`sm.calls.filter(call=>call.type==='explore_start').length===4&&!${pending}`,'four departures despite unavailable return seat',240);
+    const departures=await evaluate('sm.calls.filter(call=>call.type==="explore_start").map(call=>call.residentId)');
+    assert.equal(new Set(departures).size,4);assert.ok(!departures.includes(291));
+    assert.equal(await evaluate('sm.calls.some(call=>call.type==="assign"&&call.residentId===291)'),false);
+    const role=await evaluate(`${state}.campaign.roles.find(entry=>entry.id===291)`);
+    assert.equal(role?.purpose,'current');assert.equal(role.destination,undefined);
+  });
   await t.test('普通废土四人轮转：27层四人同派，逐人召回、返程占位、领取补派，32层增至五人',async()=>{
     await setupShelter(fourExplorerScene());
     await drive(`sm.calls.filter(call=>call.type==='explore_start').length===4&&!${pending}`,'four expedition departures',200);

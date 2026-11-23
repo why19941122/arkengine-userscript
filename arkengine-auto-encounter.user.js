@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.154
+// @version      1.17.155
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1658,7 +1658,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.154';
+  const SCRIPT_VERSION = '1.17.155';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -3866,6 +3866,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let nextStepAt = 0;
   let auctionExclusive = false;
   const CLAIM_JOURNAL = 'arkengine:auto-expedition:claim:v1';
+  const CLAIM_REVIEW_MS = 5*60000;
   let pageFrozen = false;
   const claimPageId = crypto.randomUUID();
   const claimResultValid = v => objectState(v) && ['ok', 'network-error', 'aborted', 'http-error', 'login-redirect'].includes(v.outcome) &&
@@ -3876,6 +3877,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     (v.ready === undefined || Number.isInteger(v.ready) && v.ready > 0 && v.ready <= v.running) &&
     (v.reloadFrom === undefined || typeof v.reloadFrom === 'string') &&
     (v.attemptId === undefined || typeof v.attemptId === 'string') &&
+    (v.reviewAt === undefined || Number.isSafeInteger(v.reviewAt) && v.reviewAt>v.at && v.reloaded===true &&
+      Boolean(v.reloadFrom&&v.attemptId) && v.retries===0 && v.ready>0 && v.result===undefined) &&
     (v.result === undefined || claimResultValid(v.result)));
   let claimStable = null;
   let legacyClaimLookup = null;
@@ -5091,7 +5094,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     if(stockRecoverRejectedHold()){cancelStockRead();cancelQueued();}
     if(!stockLedger.pending&&stockLedger.rejectionCooldownUntil>Date.now()){stockBack();return;}
     if(!navigator.onLine){stockFinish('网络离线，保留股市记录，稍后检查');return;}
-    if(plan || claimWait || farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait() || nativePending().length){stockFinish('其他玩法有原操作待核对，先返回远征');return;}
+    if(plan || claimBlocksVisits() || farmEnabled&&farmPlan || shelterEnabled&&shelterPending&&!shelterReadOnlyWait() || nativePending().length){stockFinish('其他玩法有原操作待核对，先返回远征');return;}
     if(stockLedger.hold && !stockLedger.pending?.result && !stockCapacityWait() && !stockCanConfirmHere()){stockFinish(stockLedger.note);return;}
     if(stockLedger.pending && Date.now()-stockEntryAt>60000 && !stockLedger.pending.result){stockFinish('原交易待核对，先回远征，下次只核对同一请求');return;}
     if(Date.now()-stockEntryAt>STOCK_VISIT_TIMEOUT){stockFinish('本轮股市检查已到时限，五分钟后继续');return;}
@@ -8998,7 +9001,7 @@ installShelterPlanningWorker(self);
     const stockReturned=stockPending?.key&&Number.isFinite(stockPending.responseAt)&&
       stockPending.responseAt>=Math.max(stockPending.at,stockPending.lastRetryAt||0)&&
       (!stockRequests.length||stockOwnNative(stockPending,stockRequests));
-    if(plan||claimWait||farmEnabled&&farmPlan||nativePending().length||
+    if(plan||claimBlocksVisits()||farmEnabled&&farmPlan||nativePending().length||
       cultivation.onPage()&&(cultivation.pending()||document.querySelector('#cultivation-encounter'))||
       (stockPending||stockRequests.length)&&!stockReturned||
       shelterPending&&shelterWatchRaid.confirmedPending!==shelterPending.id&&shelterWatchRaid.independentPending!==shelterPending.id||
@@ -11201,6 +11204,9 @@ installShelterPlanningWorker(self);
                 !(upgradingDestination&&assessment.reason==='no-payback-in-window')){
             if(cfg.training&&cfg.development&&(seat||upgradingDestination)&&r?.trainStat===role.stat&&active(r)&&
                 now<role.windowEnd&&assessment.eligible&&finishTraining(p,r,role,assessment))continue;
+            if(!seat&&!upgradingDestination&&active(r)&&r.trainStat===role.stat&&p.stats[role.stat]===role.base&&
+                !expired&&now<role.windowEnd&&finishTraining(p,r,{...role,until:Math.min(role.until,role.windowEnd)},
+                  shelterTrainingProgress(m,p,r)))continue;
             actions.push(assign(p,seat?destination:null,'training-release',completed?'生产训练完成一格，按实际供给与空岗返岗':
               expired?'生产训练到达最晚返岗时间，结束本轮投入并重评':
                 !trainingSafe([...projectedIds(),p.id])?'生产训练期间真实供应或两小时储备不足，返岗补供给':
@@ -18786,7 +18792,7 @@ installShelterPlanningWorker(self);
     if (shelterLeave) { if (!closeShelterRescue()&&!closeShelterSocial()&&!closeShelterRecall()&&!closeShelterBuild()&&!closeShelterWork()) leaveShelter(); return; }
     if (shelterReadOnlyWait() && shelterState.nextAt > Date.now()&&!shelterPending.emergency) { if (!closeShelterRescue()&&!closeShelterRecall()&&!closeShelterBuild()&&!closeShelterWork()) leaveShelter(); return; }
     if (!navigator.onLine) { say('避难所：网络离线，等待恢复'); return; }
-    if (plan || claimWait || farmEnabled&&farmPlan || nativePending().length) {
+    if (plan || claimBlocksVisits() || farmEnabled&&farmPlan || nativePending().length) {
       finishShelter(null,'其他玩法正在核对原操作，先返回远征，一分钟后再检查避难所',60000);return;
     }
     // Ordinary work yields before arrival. Only the original necessary handoff
@@ -19232,7 +19238,7 @@ installShelterPlanningWorker(self);
         clearAccountStop(); recoveryBudget.clear(); clearIdleWait();
         farmWait.clear(); expeditionLoadWait.clear(); clearNavigation();
         clearStaminaSync();
-        if (claimWait) {
+        if (claimBlocksVisits()) {
           // 用户明确开始后重新给状态核对计时；保留原领取，不再次提交领取请求。
           saveClaimWait({ ...claimWait, submittedAt: claimWait.submittedAt ?? claimWait.at,
             at: Date.now(), reloaded: false });
@@ -19585,7 +19591,7 @@ installShelterPlanningWorker(self);
     if ([...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open]')].some(visible)) {
       say(`等待切换${target}；网页弹窗尚未关闭`);return true;
     }
-    const pendingReason=plan?'远征派遣':claimWait?'远征领取':(farmWritesInFlight || (farmEnabled && farmPlan))?'农场操作':nativePending().length?'原生远征请求':
+    const pendingReason=plan?'远征派遣':claimBlocksVisits()?'远征领取':(farmWritesInFlight || (farmEnabled && farmPlan))?'农场操作':nativePending().length?'原生远征请求':
       cultivation.onPage()&&cultivation.pending()?'奇遇或秘境原请求':'';
     if(pendingReason){say(`等待切换${target}；${pendingReason}仍待核对，不重复操作`);return true;}
     if (!navigation.reloaded && Date.now() - navigation.at >= 30000) {
@@ -19637,6 +19643,15 @@ installShelterPlanningWorker(self);
     if (farmState.expeditionAt !== nextAt || farmState.expeditionReviewAt <= now || !farmState.expeditionReviewAt)
       saveFarmState({ ...farmState, expeditionAt: nextAt, expeditionReviewAt:reviewAt });
   }
+  function claimBlocksVisits() { return claimWait && !claimWait.reviewAt; }
+  function waitForClaimReview(running,errors) {
+    if (navigator.onLine&&!errors&&!plan&&!farmWritesInFlight&&!nativePending().length&&
+        !document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]')) {
+      if (Date.now()>=claimWait.reviewAt) saveClaimWait({...claimWait,reviewAt:Date.now()+CLAIM_REVIEW_MS});
+      if (maybeVisitScheduled(running)) return;
+    }
+    say('原领取结果仍无法确认；远征不补领、不新派，其他玩法继续。可手动领完剩余队伍，列表无待领后自动恢复');
+  }
   function overduePatrol(running) {
     // 巡逻卡公开的北京时间只精确到分钟，宽限两分钟再核对。
     // 只推断短途巡逻，避免把跨日深渊的 HH:mm 当作今天。
@@ -19666,8 +19681,9 @@ installShelterPlanningWorker(self);
       say('等待当前弹窗处理完成，再调度到期页面');return;
     }
     const now=Date.now(),path='/'+feature;
-    const returnAt=Math.min(farmState.expeditionAt?farmState.expeditionAt-15000:0,farmState.expeditionReviewAt||Infinity);
-    if (returnAt<=now || plan || claimWait || nativePending().length) {
+    const returnAt=Math.min(farmState.expeditionAt?farmState.expeditionAt-15000:(claimWait?.reviewAt??0),
+      farmState.expeditionReviewAt||Infinity,claimWait?.reviewAt??Infinity);
+    if (returnAt<=now || plan || claimBlocksVisits() || nativePending().length) {
       offer(`${feature}:return`,'远征临近归来或需要核对，切换远征',()=>startNavigation('/activities/expedition',travelLink('/activities/expedition')));
       return;
     }
@@ -19681,7 +19697,8 @@ installShelterPlanningWorker(self);
       schedule();return;
     }
     const nextAt=Math.min(returnAt,...scheduledVisits().map(visit=>visit.at));
-    say(`本轮完成，等待下次预约（约 ${Math.max(1,Math.ceil((nextAt-now)/60000))} 分钟）；远征归来前再切换`);
+    const outcome=feature==='shelter'&&shelterState.note?`避难所：${shelterState.note}`:'本轮完成';
+    say(`${outcome}；等待下次预约（约 ${Math.max(1,Math.ceil((nextAt-now)/60000))} 分钟）；${claimWait?.reviewAt?'原远征领取待核对，不重复领取':'远征归来前再切换'}`);
   }
   function maybeVisitScheduled(running,excludePath=null) {
     // Every idle expedition path shares explicit requests and ordinary ordering.
@@ -19696,7 +19713,7 @@ installShelterPlanningWorker(self);
     return visits.some(({visit})=>visit(running));
   }
   function maybeVisitCultivation(running) {
-    if (cultivation.dueAt() > Date.now() || plan || claimWait || nativePending().length ||
+    if (cultivation.dueAt() > Date.now() || plan || claimBlocksVisits() || nativePending().length ||
         farmEnabled && farmPlan || shelterEnabled && shelterPending && !shelterReadOnlyWait() || stockLedger.pending) return false;
     rememberExpeditionTime(running);
     if (farmState.expeditionAt > Date.now() && farmState.expeditionAt - Date.now() < 75000) return false;
@@ -19798,7 +19815,7 @@ installShelterPlanningWorker(self);
       if (staminaSync) {
         if (Date.now() - farmEntryAt >= 10000) pauseFarm('最新体力已足够，但刷新后农场仍显示旧值；请核对页面后开启农场');
         else say('已刷新核对体力，等待农场页面更新');
-      } else if (!plan && !claimWait && !nativePending().length &&
+      } else if (!plan && !claimBlocksVisits() && !nativePending().length &&
           !document.querySelector('[role="dialog"], [role="alertdialog"]')) {
         offer('farm:stamina-sync', '刷新农场，核对已恢复的体力', () => {
           staminaSync = { at: Date.now(), reloadFrom: claimPageId };
@@ -20683,6 +20700,7 @@ installShelterPlanningWorker(self);
       shelterEnabled, shelterDueAt:shelterState.nextAt, pendingShelter:Boolean(shelterPending),
       pendingDispatch: Boolean(plan), pendingClaim: Boolean(claimWait) };
     if (!q || !fields.root || !fields.count || !fields.burst || !fields.high) {
+      if(claimWait?.reviewAt){waitForClaimReview(section('进行中的远征'),errors);return;}
       if (q?.running > 0 && q.normal === 0 && (fields.root || fields.absent) && expeditionLoadWait.retriedHere(15000) &&
           !plan && !claimWait && !farmPlan && !farmWritesInFlight && !dispatchWindow && !errors && navigator.onLine &&
           !document.querySelector('[role="dialog"], [role="alertdialog"], dialog[open]') && !nativePending().length) {
@@ -20708,10 +20726,11 @@ installShelterPlanningWorker(self);
     const claim = usable(claimAll) ? claimAll : usable(claimOne) ? claimOne : null;
     if (claimWait) {
       const current = claimPageState(q, fields, errors);
+      const unreceipted=claimWait.attemptId&&claimWait.retries===0&&claimWait.ready>0&&!claimWait.result;
       diagnostic.claim = { beforeRunning: claimWait.running, since: claimWait.submittedAt ?? claimWait.at,
         reloaded: Boolean(claimWait.reloaded), retries: claimWait.retries || 0,
         result: claimWait.result || null, ...current };
-      if (current.consistent && (q.running < claimWait.running || current.allUnderway)) {
+      if (current.consistent && (current.allUnderway || !unreceipted && q.running < claimWait.running)) {
         if (q.running < claimWait.running) {
           log.add('expedition-claimed', '远征领取后队伍减少已确认', { teams: claimWait.running - q.running });
         } else {
@@ -20725,6 +20744,7 @@ installShelterPlanningWorker(self);
         noteQuotaSync();
       }
       else {
+        if(claimWait.reviewAt){waitForClaimReview(running,errors);return;}
         if (!navigator.onLine) { claimStable = null; say('领取结果待核对；网络离线，恢复连接后继续'); return; }
         if (recoverLegacyClaimEvidence()) { say('正在从本地日志核对旧领取请求'); return; }
         const freshPage = claimWait.reloaded && claimWait.reloadFrom && claimWait.reloadFrom !== claimPageId;
@@ -20745,6 +20765,10 @@ installShelterPlanningWorker(self);
             return;
           }
           log.add('expedition-claim-unconfirmed', '一次刷新后仍无法确认原领取', diagnostic.claim);
+          if(freshPage&&unreceipted&&current.consistent&&current.ready>0&&current.ready<=claimWait.ready&&
+              current.underway===claimWait.running-claimWait.ready&&current.ready+current.underway===q.running){
+            saveClaimWait({...claimWait,reviewAt:Date.now()+CLAIM_REVIEW_MS});waitForClaimReview(running,errors);return;
+          }
           setEnabled(false, claimWait.retries ? `${claimReason()}；补领一次后仍未确认，已暂停。请手动一键领取，到账后再开始` :
             '原领取结果仍无法确认，已暂停并保留记录；请手动一键领取，到账后再开始');
         } else if (!claimWait.reloaded && Date.now() - claimWait.at > 30000) {

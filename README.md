@@ -1,6 +1,8 @@
 # Ark Engine 油猴脚本
 
-**1.17.154 夜间热修（2026-11-23）**：[安装或更新脚本](https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js?v=1.17.154)，刷新游戏页后确认面板显示 1.17.154。无需清空设置，汽水拍卖策略不变。
+**1.17.155（2026-11-23）**：[安装或更新脚本](https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js?v=1.17.155)，刷新游戏页后确认面板显示 1.17.155。活动远征领取缺回执，新页面核对到待领和在途队数仍与原单一致时，只暂停远征领取和派遣，其他玩法继续。也可手动领完剩余队伍，脚本核对到列表无待领后恢复，不需要清空记录。避难所的单人探险不再被失去返岗席位、但仍应练完当前格的居民挡住。
+
+**1.17.154 夜间热修（2026-11-23）**：[下载历史版本](https://raw.githubusercontent.com/why19941122/arkengine-userscript/76394f8a81c47b880f3b4c338aae4822690c1d67/arkengine-auto-encounter.user.js)。无需清空设置，汽水拍卖策略不变。
 
 - 远征派遣区缺失时，安全重读至少 15 秒后，只有额度与队伍列表都证明全队在途、无需领取或补派，才让到期页面继续。暂时离开不重置刷新次数；完整表单恢复后再清除等待记录。
 - 切页已等满 30 秒时，农场原生写请求仍未结束，或可见的网页确认框仍打开，就不整页刷新。等所有写请求结束、窗口关闭后沿原预约继续，不补发请求。
