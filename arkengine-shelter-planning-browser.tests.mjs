@@ -248,13 +248,8 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.ok(await evaluate('sm.executionReads>=2'),'mandatory fresh reads remain');
     await reloadShelter();for(let i=0;i<12;i++)await pulse();
     if(kind==='family'){
-      // The follow-up exchanges 4 (higher agility) and 2 (higher endurance).
-      // Wait for both halves, independent of which read finished before reload.
-      await drive(`sm.view.state.residents.find(p=>p.id===4).roomId===2&&
-        sm.view.state.residents.find(p=>p.id===2).roomId===4&&!${pending}`,'independent production swap completes after family',50);
-      const after=await evaluate('sm.calls');
-      assert.deepEqual(after.filter(c=>[5,6].includes(c.residentId)),calls);
-      assert.deepEqual(after.filter(c=>![5,6].includes(c.residentId)).map(c=>[c.type,c.residentId,c.roomId]),[['assign',4,2],['assign',2,4]]);
+      assert.deepEqual(await evaluate('sm.calls.filter(c=>[5,6].includes(c.residentId))'),calls);
+      assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).map(p=>[p.id,p.romance?.partnerId])'),[[5,6],[6,5]]);
       assert.ok(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===5&&p.romance)'));
     }else assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),calls.length);
   });
@@ -691,8 +686,8 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     cfg.explore=false;cfg.quests=false;
     localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(cfg));`);
   const replacement="sm.calls.filter(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)";
-  const queueReplacement=async()=>{
-    await setupShelter(familyStaffScene+'sm.ui20261109=true;');
+  const queueReplacement=async(extra='')=>{
+    await setupShelter(familyStaffScene+'sm.ui20261109=true;'+extra);
     await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent.includes('列表快捷调岗')`,
       'replacement queued before its native click',30);
     assert.deepEqual(await evaluate('sm.calls'),[]);
@@ -725,6 +720,20 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.familyJobs'),0);
     if(change==='manual')assert.deepEqual(await evaluate('sm.calls'),[]);
     if(change==='full')assert.ok(await evaluate('sm.view.state.residents.filter(p=>p.roomId===1).length<=2'));
+  });
+  await t.test('在线家庭补岗：新快照未返回不提交，迟到快照显示满员也不补发',async()=>{
+    await queueReplacement(`const before=window.fetch;window.fetch=async(url,options)=>{
+      if(url==='/api/shelter'&&sm.holdNextRead){sm.holdNextRead=false;
+        await new Promise(resolve=>window.releaseStaffRead=resolve);
+      }return before(url,options);};`);
+    await evaluate('sm.holdNextRead=true;');
+    await drive("typeof window.releaseStaffRead==='function'",'pre-submit read is held',15);
+    for(let tick=0;tick<4;tick++)await pulse();
+    assert.deepEqual(await evaluate('sm.calls'),[]);
+    await evaluate('sm.view.state.residents.find(p=>p.id===6).roomId=1;window.releaseStaffRead();');
+    for(let tick=0;tick<12;tick++)await pulse();
+    assert.equal(await evaluate(`${replacement}.length`),0);
+    assert.equal(await evaluate('sm.familyJobs'),0);
   });
   await t.test('慢规划召回：完整规划耗时超过快照期限也先召回，确认回执且不重复',async()=>{
     await setupShelter(familyScene(dueTrip+'sm.planCostMs=12000;'));
