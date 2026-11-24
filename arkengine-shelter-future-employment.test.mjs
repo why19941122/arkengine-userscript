@@ -2,16 +2,20 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import {setupFutureEmployment,futureEmploymentScene} from './arkengine-shelter-future-employment.fixture.mjs';
+import {finishParentStats} from './arkengine-shelter-parent72.fixture.mjs';
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const setup=()=>setupFutureEmployment(source),plain=x=>JSON.parse(JSON.stringify(x)),hour=3600000;
-test('未来岗位：当前成人全就业仍须为已有儿童预留名额，暂停电台及新配对',()=>{
+test('未来岗位：儿童缺岗仍报告，电台关闭，新配对按床位与供给独立判断',()=>{
   const x=setup(),before=JSON.stringify(x.f),result=x.api.growthEmployment(x.m(),x.context.shelterState);
   assert.equal(result.unemployed.length,0);assert.equal(result.allowed,false);assert.equal(result.future.missing.length,1);
-  assert.equal(x.choose(),null);assert.ok(!x.api.schedule(x.m()).actions.some(a=>a.role==='radio'));
   assert.equal(JSON.stringify(x.f),before);
+  finishParentStats(x.f.view);
+  assert.ok(x.choose());
+  assert.ok(!x.api.schedule(x.m()).actions.some(a=>a.role==='radio'));
 });
 test('未来岗位：建设真实儿童岗位可解除暂停，未成年不提前上岗或计产量',()=>{
-  const x=setup(),s=x.f.view.state,before=x.m().production.scrap,c=x.api.construction(x.m());
+  const x=setup(),s=x.f.view.state;finishParentStats(x.f.view);
+  const before=x.m().production.scrap,c=x.api.construction(x.m());
   assert.equal(c?.type,'scrap');assert.equal(c.kind,'build');assert.deepEqual(plain(c.futureEmployment.residents),[13]);
   assert.equal(x.api.idle(x.m(),x.api.schedule(x.m())),null);
   s.resources.scrap-=c.cost.scrap;s.rooms.push({...s.rooms[3],id:40,width:1,level:1,floor:c.floor,col:c.col,stored:0,builtAt:x.f.view.serverTime+600000});
@@ -73,7 +77,8 @@ test('未来岗位：预算、开关与供应继续约束提前建设，未来�
   assert.deepEqual(plain(x.api.routes(x.m(),[c],999,c,{deep:false})),[]);
 });
 test('未来岗位：原配对承诺继续完成，不因后续缺岗撤销当前家庭',()=>{
-  const x=setupFutureEmployment(source,futureEmploymentScene(0)),s=x.f.view.state,first=x.choose();assert.ok(first);
+  const x=setupFutureEmployment(source,futureEmploymentScene(0)),s=x.f.view.state;finishParentStats(x.f.view);
+  const first=x.choose();assert.ok(first);
   s.residents.find(p=>p.id===first.id).roomId=first.room;
   s.residents.push(...futureEmploymentScene().view.state.residents.filter(p=>p.id>=12).map(p=>({...p,parents:[]})));
   const a=x.choose();assert.ok(a);assert.notEqual(a.id,first.id);assert.equal(a.room,first.room);

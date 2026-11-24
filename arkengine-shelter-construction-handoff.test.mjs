@@ -10,10 +10,11 @@ function setup(role='training'){
   x.context.shelterOptimize=true;return x;
 }
 
-test('建设交接：训练、电台和普通医疗候选有效，但不能绕过已就绪工程',()=>{
+test('建设交接：关闭旧电台设置，训练和普通医疗不能绕过已就绪工程',()=>{
   for(const role of ['training','radio','medical']){
     const x=setup(role),before=JSON.stringify(x.f),{m,campaign,development}=x.plan();
-    assert.equal(campaign.choice.role,role,'must have a real competing duty');
+    if(role==='radio')assert.equal(campaign.actions.some(a=>a.role==='radio'),false,'old radio settings cannot recruit');
+    else assert.equal(campaign.choice.role,role,'must have a real competing duty');
     assert.equal(development.next.status,'ready');assert.equal(x.api.construction(m).id,4);
     assert.equal(x.api.choice(m),null,'executor hands off before elective assignment');
     assert.equal(x.api.staff(m),null,'ordinary optimizer also hands off');

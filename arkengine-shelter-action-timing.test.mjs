@@ -8,7 +8,7 @@ const offer=source.slice(source.indexOf('  function shelterPreparationAction('),
 const cancel=source.slice(source.indexOf('  function cancelQueued('),source.indexOf('  function clearIdleWait('));
 function setup(random=0){
   let now=100,id=0;const timers=new Map(),calls=[];
-  const context={queued:null,nextStepAt:600,offered:false,Date:{now:()=>now},Math:Object.assign(Object.create(Math),{random:()=>random}),
+  const context={auctionExclusive:false,queued:null,nextStepAt:600,offered:false,Date:{now:()=>now},Math:Object.assign(Object.create(Math),{random:()=>random}),
     accountStopReason:()=>null,setEnabled:()=>{throw Error('unexpected pause');},shelterEmergency:()=>true,inShelter:()=>true,
     setTimeout:(fn,delay)=>{timers.set(++id,{fn,delay});return id;},clearTimeout:key=>timers.delete(key),
     schedule:()=>calls.push('wake'),say:()=>{},log:{add:()=>{}}};

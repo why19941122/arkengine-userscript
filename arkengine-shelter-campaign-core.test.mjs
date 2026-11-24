@@ -454,7 +454,7 @@ test('收益完善：医疗只为有效探险补双程携针，关闭探险或�
   s.resources.stimpak=2;
   assert.ok(!run(v,{medical:true},record).actions.some(a=>a.role==='medical-release'),'至少留一支能用于治疗的针');
   s.resources.stimpak=4;s.residents[5].hp=40;
-  assert.ok(!run(v,{medical:true},record).actions.some(a=>a.role==='medical-release'),'仍有伤员时保持医疗');
+  assert.ok(run(v,{medical:true},record).actions.some(a=>a.role==='medical-release'),'治疗后仍有足够库存时结束补针值班');
 });
 test('汽水效率收益：零掉落不新派遣或占用队员，仍可做周任务；非效率模式允许收集其他战利品',()=>{
   const v=campaignView();v.drops.tierPermille=[0,0];

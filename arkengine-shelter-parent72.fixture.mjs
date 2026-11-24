@@ -4,6 +4,11 @@ import vm from 'node:vm';
 import {createShelterResourceSimulation} from './arkengine-shelter-resource-simulation.mjs';
 import {createShelterFamilySimulation} from './arkengine-shelter-family-simulation.mjs';
 
+export function finishParentStats(view,ids=[7,8]){
+  for(const person of view.state.residents.filter(person=>ids.includes(person.id)))
+    for(const stat of Object.keys(person.stats))person.stats[stat]=10;
+}
+
 // All existing adults already work; one uncommitted recycler seat can receive
 // one child. This deliberately excludes the separate idle-adult employment issue.
 export function parent72Scene(){

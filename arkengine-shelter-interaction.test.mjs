@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const extract=name=>source.match(new RegExp(`^  function ${name}\\([^]*?^  }`,'m'))[0];
-const dialog=()=>({contains:target=>target==='inside'});
+const dialog=()=>({contains:target=>target==='inside'||target?.scope==='inside'});
 function interaction(overrides={}){
   const handlers=new Map(),counts={scans:0,schedules:0,holds:0,cancels:0,stops:0},windows=[];
   const context={document:{querySelectorAll(){counts.scans++;return windows;},addEventListener(type,handler){
@@ -20,7 +20,8 @@ function interaction(overrides={}){
   assert.ok(listeners.length);
   vm.runInNewContext([extract('shelterUserInteraction'),extract('shelterBindDialog'),...listeners].join('\n'),context);
   return {context,counts,windows,emit(type='keydown',target='outside',extra={}){
-    const event={type,target,key:'ArrowDown',isTrusted:true,composedPath:()=>[],...extra};
+    const element=typeof target==='string'?{scope:target,closest:()=>({matches:()=>false})}:target;
+    const event={type,target:element,key:'ArrowDown',isTrusted:true,composedPath:()=>[],...extra};
     for(const handler of handlers.get(type)||[])handler(event);
   }};
 }
@@ -70,7 +71,7 @@ test('弹窗绑定：迟到窗口仍可绑定，隐藏及旧窗口忽略，多�
 
 test('奖励精简：待领奖励判断复用已定位页签，空奖励不点击或重复查找',()=>{
   const model={state:{season:{points:0,claimedFree:[]},daily:{claimed:[]}}};let queries=0,clicks=0;
-  const context={shelterStage:1,shelterUiWait:null,shelterTab(label){queries++;return {label,text:label,getAttribute:()=> 'false',click(){clicks++;}};},
+  const context={shelterStage:1,shelterUiSkipped:new Set(),shelterUiWait:null,shelterTab(label){queries++;return {label,text:label,getAttribute:()=> 'false',click(){clicks++;}};},
     usable:()=>true,textOf:tab=>tab.text,offer(key,label,perform){perform();},schedule(){}};
   const step=vm.runInNewContext(['shelterReadyTab','shelterRewardTabDue','shelterRewardStep'].map(extract).join('\n')+'\nshelterRewardStep',context);
   assert.equal(step(model),false);assert.equal(queries,2);assert.equal(clicks,0);

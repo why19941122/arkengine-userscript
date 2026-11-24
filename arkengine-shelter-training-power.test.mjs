@@ -63,10 +63,11 @@ test('训练返岗占位补电：先执行补电工程并补员，再回到就�
   assert.equal(s.residents.filter(p=>p.roomId===3001).length,1,'训练返回前仍保留其座位');
 });
 
-test('训练返岗占位补电：真正空岗优先调岗，工程开关、未决原单、人工暂停和保留量保持',()=>{
+test('训练返岗占位补电：不预留旧席位，已就绪工程可先执行，原安全门槛保持',()=>{
   const free=setup();free.context.shelterState.campaign.roles[0].destination=4;
   assert.equal(free.plan().campaign.powerPreparation,null);
-  assert.equal(free.api.staff(free.plan().m)?.room,3001,'没有返回预留时先用原有空岗');
+  assert.equal(free.plan().campaign.trainingDestinations.length,0);
+  assert.equal(free.api.construction(free.plan().m)?.id,3001,'the funded existing power upgrade remains executable');
   for(const change of ['construction-off','pending','held','reserve']){
     const x=setup();
     if(change==='construction-off'){x.context.shelterConstruction.upgrade=false;x.context.shelterConstruction.build=false;}

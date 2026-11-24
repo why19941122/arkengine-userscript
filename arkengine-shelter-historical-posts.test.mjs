@@ -81,9 +81,9 @@ test('历史训练：无用途释放；未知属性或进度不猜；家庭、�
 });
 test('历史特殊岗：有效医疗与工坊用途保留，需求结束后可释放',()=>{
   const med=setup('medbay');med.p.training=undefined;
-  med.s.residents[5].hp=30;
+  med.s.residents[5].hp=30;med.s.resources.stimpak=0;
   assert.ok(med.run({medical:true}).reserved.includes(med.p.id));
-  med.s.residents[5].hp=142;
+  med.s.residents[5].hp=142;med.s.resources.stimpak=10;
   assert.ok(med.run({medical:true}).actions.some(a=>a.id===med.p.id&&a.role==='medical-release'));
   const workshop=setup('workshop');
   assert.ok(workshop.run({workshop:true,partsTarget:40,workshopScrapReserve:100}).reserved.includes(workshop.p.id));
@@ -106,7 +106,7 @@ test('发展关闭养成后仍能执行必要释放；用户手动操作和人�
   assert.equal(x.api.allowed({kind:'assign',role:'training-release'}),false);
 });
 
-test('历史训练：多人及已有生产训练承诺不能争用最后一个返岗席位',()=>{
+test('历史训练：多人可保留当前格，既有生产目的地不占返岗席位',()=>{
   for(const existing of [false,true]){
     const x=setup(),other=x.s.residents[5];
     Object.assign(other,{roomId:90,xp:0,hp:100,training:.9,stats:{...x.p.stats}});
@@ -114,9 +114,8 @@ test('历史训练：多人及已有生产训练承诺不能争用最后一个�
       stat:'end',base:5,purpose:'production',until:x.v.serverTime+3600000,
       windowEnd:x.v.serverTime+168*3600000,destination:4}]}:{};
     const before=JSON.stringify(record),plan=x.run({},record);
-    assert.equal(plan.trainingDestinations.filter(d=>d.room===4).length,1);
+    assert.equal(plan.trainingDestinations.length,0);
     assert.equal(plan.adoptions.filter(r=>r.purpose==='production').length,existing?0:1);
-    if(existing)assert.equal(plan.trainingDestinations[0].id,other.id);
     assert.equal(JSON.stringify(record),before);
   }
 });
@@ -198,11 +197,11 @@ test('训练收尾：关闭训练、无实际家庭收益、未知进度或供�
     assert.ok(!x.plan().adoptions.some(r=>r.id===5&&r.finishCurrent),reason);
   }
 });
-test('训练收尾：已有生产收益的历史训练达到目标后保留当前格和返岗席位',()=>{
+test('训练收尾：已有生产收益的历史训练达到目标后保留当前格，不预留返岗席位',()=>{
   const x=setup();x.p.stats.end=6;x.p.training=5/7;
   const plan=x.run(),role=plan.adoptions.find(r=>r.id===x.p.id);
   assert.equal(role?.finishCurrent,true);assert.equal(role.purpose,'production');assert.equal(role.destination,4);
-  assert.ok(plan.trainingDestinations.some(d=>d.id===x.p.id&&d.room===4));
+  assert.equal(plan.trainingDestinations.length,0);
 });
 test('训练收尾：保存收尾承诺并刷新后仍按同一属性和期限核对',()=>{
   const x=finishingParent();x.context.shelterStaffMode='population';

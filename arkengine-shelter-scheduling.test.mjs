@@ -37,7 +37,7 @@ test('深层预算边界：固定30人15级所需下挖单笔10268超过10000总
   assert.match(api.allowance(project,m,context.shelterConstruction,context.shelterState,null,v.serverTime),/单笔需 10268.*总额度 10000.*等待额度恢复也不足/);
   assert.equal(api.construction(m),null);assert.equal(context.shelterConstruction.scrapLimit,10000);
 });
-function setup(v=workshopChurnView(),explore=true){
+function setup(v=workshopChurnView(),explore=true,offlineComparison=false){
   const context={objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
     shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'},
     shelterStaffMode:'population',shelterStaffHold:'',shelterOptimize:false,shelterGear:false,shelterPopulationTarget:14,shelterLevelTarget:10,
@@ -47,7 +47,8 @@ function setup(v=workshopChurnView(),explore=true){
     Date:class extends Date{constructor(...args){super(...(args.length?args:[v.serverTime]));}static now(){return v.serverTime;}},
     crypto:{randomUUID:()=>String(v.serverTime)},log:{add:()=>{}},workshopAutomatic:()=>true};
   context.saveShelter=x=>context.shelterState=x;
-  const api=vm.runInNewContext(`${implementation}\nshelterCampaign={...campaignDefaults,explore:${explore},sodaEfficiency:true};
+  const kernel=offlineComparison?implementation.replace('offlineComparison:false,runtimeSimple:true','offlineComparison:true,runtimeSimple:false'):implementation;
+  const api=vm.runInNewContext(`${kernel}\nshelterCampaign={...campaignDefaults,explore:${explore},sodaEfficiency:true};
     ({model:shelterModel,campaign:shelterCampaignSchedule,staff:shelterStaffPlan,record:recordShelterCampaign,development:shelterDevelopmentPlan,
       valid:validCampaignRecord,releasePreview:shelterWorkshopReleasePlan,powerReserve:shelterConstructionPowerReserve,populationDiagnostics:shelterPopulationDiagnostics,
       allowance:shelterConstructionAllowance,construction:shelterConstructionChoice,materials:shelterConstructionMaterials,
@@ -186,8 +187,17 @@ test('普通升级供电等待：当前供给正常但未来升级缺电缺件�
     context.shelterState=JSON.parse(JSON.stringify(context.shelterState));assert.ok(step<13);
   }
   assert.ok(actions.length>0);assert.ok(plan().m.production.parts>0);assert.ok(s.residents.some(p=>p.roomId===4));
-  context.shelterConstruction.upgrade=false;assert.equal(api.staff(api.model(v))?.from,4,'取消升级后解除最后生产者保护');
+  context.shelterConstruction.upgrade=false;checkFreedProducer(v,api,4);
 });
+
+function checkFreedProducer(view,api,id){
+  const state=view.state,room=state.rooms.find(room=>room.id===id),worker=state.residents.find(person=>person.roomId===id);
+  assert.equal(api.staff(api.model(view)),null,'微小增产不足以离岗');
+  room.level=1;worker.stats.end=10;
+  for(const person of state.residents)if(person!==worker&&state.rooms.some(room=>room.id===person.roomId&&room.type==='scrap'))person.stats.end=0;
+  const model=api.model(view),choice=api.staff(model);
+  assert.equal(choice?.from,id,'升级取消后可为明显增产调离最后生产者');assert.ok(choice.gain>=.05*model.production.scrap);
+}
 
 test('工坊扩建供电接续：先建工坊仍保留原升级的联合用电，不在补电与回收之间往返',()=>{
   const snapshot=JSON.parse(readFileSync(new URL('./arkengine-shelter-workshop-power-chain.fixture.json',import.meta.url),'utf8'));
@@ -581,19 +591,21 @@ test('工坊供电复岗边界：未授权工程、库存不足、无有效空�
     if(kind==='power-off')s.rooms.find(r=>r.id===1).unpowered=true;
     if(kind==='current-power')for(const p of s.residents.filter(p=>p.roomId===1))p.stats.str=0;
     if(kind==='food')s.rooms.find(r=>r.id===2).unpowered=true;
-    const {c}=plan();assert.ok(!c.actions.some(a=>a.role==='workshop-release'&&a.room===1),kind);
+    const {c}=plan(),power=c.actions.find(a=>a.role==='workshop-release'&&a.room===1);
+    if(kind==='current-power')assert.match(power?.reason,/补足电力供应/);
+    else assert.equal(power,undefined,kind);
   }
 });
 
-function expansionBindingSetup(){
+function expansionBindingSetup(offlineComparison=false){
   const snapshot=JSON.parse(readFileSync(new URL('./arkengine-shelter-expansion-binding.fixture.json',import.meta.url),'utf8'));
-  const result=setup(snapshot.view,false),{context}=result;
+  const result=setup(snapshot.view,false,offlineComparison),{context}=result;
   context.shelterState=snapshot.state;context.shelterPopulationTarget=30;context.shelterOptimize=true;context.shelterConstruction.scrapReserve=0;
   return result;
 }
 
-test('工坊扩产原工程绑定：已有六人无需再调岗时，开工候选仍携带本次投入服务的餐厅升级',()=>{
-  const {v,context,api,plan}=expansionBindingSetup(),before=JSON.stringify({v,state:context.shelterState});
+test('离线工坊扩产原工程绑定：已有六人无需再调岗时，开工候选仍携带本次投入服务的餐厅升级',()=>{
+  const {v,context,api,plan}=expansionBindingSetup(true),before=JSON.stringify({v,state:context.shelterState});
   const {m,c}=plan(),prep=c.workshopPreparation,choice=api.construction(m);
   assert.equal(context.shelterState.campaign.materials,undefined);assert.equal(c.actions.length,0);
   assert.equal(prep.original.id,2);assert.equal(prep.project.cost.scrap,800);assert.equal(choice.type,'workshop');
@@ -616,8 +628,8 @@ test('工坊扩产原工程绑定：已有六人无需再调岗时，开工候�
   assert.notEqual(plan().p.next.project?.levelTarget,8,'取消等级目标后不能凭原记录强制继续等级投资');
 });
 
-test('持续升级材料归属：自动目标解析为下一等级，扩产确认与刷新仍接续原工程',()=>{
-  const {v,context,api,plan}=expansionBindingSetup();context.shelterLevelTarget='auto';
+test('离线持续升级材料归属：自动目标解析为下一等级，扩产确认与刷新仍接续原工程',()=>{
+  const {v,context,api,plan}=expansionBindingSetup(true);context.shelterLevelTarget='auto';
   const choice=api.construction(api.model(v));
   assert.equal(choice.type,'workshop');assert.equal(choice.materials.id,2);
   assert.equal(choice.materials.finalTarget,v.progress.level+1);assert.equal(choice.materials.targetLevel,v.progress.level+1);
@@ -628,6 +640,19 @@ test('持续升级材料归属：自动目标解析为下一等级，扩产确�
   context.shelterState=JSON.parse(JSON.stringify(context.shelterState));
   assert.ok(api.valid(context.shelterState.campaign));assert.equal(context.shelterState.campaign.materials.finalTarget,8);
   const next=plan();assert.equal(next.p.next.project.id,2);assert.equal(next.p.next.status,'saving');
+});
+
+test('在线工坊：不为推演中的餐厅提前花钱，但继续为已绑定的同一餐厅备料',()=>{
+  const {v,context,api,plan}=expansionBindingSetup();
+  const resources=structuredClone(v.state.resources),first=plan();
+  assert.equal(first.c.workshopPreparation,null);
+  assert.equal(first.p.next.status,'ready');assert.equal(api.construction(first.m).id,1004);
+  const original={vaultNo:77,id:2,type:'diner',level:3,targetLevel:8,finalTarget:10};
+  context.shelterState.campaign.materials=original;
+  const next=plan(),choice=api.construction(next.m);
+  assert.equal(next.c.workshopPreparation.original.id,original.id);assert.equal(choice.type,'workshop');
+  assert.deepEqual(structuredClone(choice.materials),original);
+  assert.deepEqual(v.state.resources,resources);
 });
 
 test('高等级供电备料：工坊释放后按可行单房供料保留发电前提，不在原仓库与补电间反复调岗',()=>{
@@ -1278,5 +1303,5 @@ test('备料生产者稳定：不能为短期回收增产抽空原升级房，�
   assert.equal(plan().p.next.project?.id,1016);assert.equal(actions.filter(a=>a.role==='workshop-release').length,0);
   assert.ok(s.residents.some(p=>p.roomId===1016));
   context.shelterConstruction.upgrade=false;
-  const next=api.staff(api.model(v));assert.equal(next?.from,1016,'取消升级后不再保留原房生产者');
+  checkFreedProducer(v,api,1016);
 });

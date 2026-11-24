@@ -14,7 +14,7 @@ function setup(v=powerPrerequisiteView()){
   // Isolate construction staffing from the later automatic dorm employment feature.
   // These cases only vary production workers; resting residents are unavailable here.
   for(const p of v.state.residents)if(v.state.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'))p.hp=1;
-  const context={objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
+  const context={structuredClone,objectState:x=>x!==null&&typeof x==='object'&&!Array.isArray(x),
     shelterResources:{power:'电力',food:'食物',water:'净水',scrap:'废料',parts:'零件',stimpak:'治疗针'},
     shelterStaffMode:'production',shelterStaffHold:'',shelterOptimize:false,shelterGear:false,shelterPopulationTarget:14,shelterLevelTarget:10,
     shelterConstruction:{build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:0,partsReserve:0},
@@ -25,6 +25,9 @@ function setup(v=powerPrerequisiteView()){
   const api=vm.runInNewContext(`${implementation}\nshelterCampaign={...campaignDefaults};
     ({model:shelterModel,staff:shelterStaffPlan,campaign:shelterCampaignSchedule,
       development:shelterDevelopmentPlan,construction:shelterConstructionChoice})`,context);
+  // Concrete inventory demand replaces the obsolete full-basic-resources trigger.
+  const cap=api.model(v).itemCap;
+  v.state.items=Array.from({length:cap},(_,i)=>({id:10000+i,slot:'outfit',bonus:{end:1}}));
   return {v,context,api};
 }
 
@@ -40,7 +43,7 @@ test('满岗供电扩产：当前电力够用但下一工程缺电，满级发�
   assert.equal(JSON.stringify(v),before,'规划不预支库存、不提前调岗');
   v.state.resources.scrap-=c.cost.scrap;
   v.state.digging={floor:9,doneAt:v.serverTime+3600000};
-  assert.equal(api.construction(api.model(v)),null,'正在下挖不重复付费');
+  assert.notEqual(api.construction(api.model(v))?.kind,'dig','正在下挖不重复付费，可让路给独立工程');
   v.state.digging=null;v.state.depth=9;v.progress.score+=3;
   v.state.rooms.push({...v.state.rooms.find(r=>r.type==='elevator'),id:2009,floor:9});
   // 新楼层出现后可先执行耗电更低且合法的仓库；最多两格便用尽原供电余量，随后必须补发电。
@@ -56,7 +59,7 @@ test('满岗供电扩产：当前电力够用但下一工程缺电，满级发�
   const room={...v.state.rooms[0],id:3001,type:'power',floor:build.floor,col:build.col,width:1,level:1,builtAt:v.serverTime+600000,stored:0};
   v.state.rooms.push(room);
   assert.equal(api.model(v).production.power,90.72,'施工中的空房不能提前计产');
-  assert.equal(api.construction(api.model(v)),null,'等待发电完工，不重复扩建');
+  assert.notEqual(api.construction(api.model(v))?.type,'power','等待发电完工，不重复扩建');
   v.serverTime+=600000;v.state.lastSettledAt=v.serverTime;v.progress.score++;
   const move=api.staff(api.model(v));assert.equal(move?.room,3001,'完工后须实际有人接续');
   assert.equal(v.state.rooms.find(r=>r.id===move.from)?.type,'scrap');

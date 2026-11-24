@@ -47,26 +47,31 @@ test('调岗520恢复：先完整留档并隔离居民，再解除全局等待�
   assert.equal(plan.actions.some(action=>action.id===state.resident.id),false);
 });
 
-test('调岗520恢复：已入训练室也不重复调岗，90%进度到当前属性提升后才解除隔离',()=>{
+test('免费调岗恢复：请求已结束且目标训练室已满足，归档原单并按新鲜训练状态接管',()=>{
   const state=setup('training');assert.equal(state.recover(state.model,[]),true);
-  const entry=state.context.shelterState.campaign.assignmentHolds[0];
-  assert.equal(entry.stat,state.room.trainStat);assert.equal(entry.base,3);
-  state.context.shelterRead.startedAt=state.now;
-  assert.equal(state.release(state.model),false);
-  state.resident.training=.99;
-  assert.equal(state.release(state.api.model(state.f.view)),false);
-  state.resident.stats[state.room.trainStat]=4;state.resident.training=0;
-  assert.equal(state.release(state.api.model(state.f.view)),true);
-  assert.equal(state.context.shelterState.campaign.assignmentHolds[0].resolvedAt,state.now);
-  assert.deepEqual(structuredClone(state.context.shelterState.campaign.assignmentHolds[0].original),state.original);
+  assert.equal(state.context.shelterPending,null);
+  assert.deepEqual(structuredClone(state.context.shelterState.assignmentRecovery.original),state.original);
+  assert.equal(state.context.shelterState.assignmentRecovery.outcome,'target-observed');
+  assert.equal(state.context.shelterState.assignmentRecovery.original.result.campaignProof,undefined);
+  assert.equal(state.context.shelterState.campaign.assignmentHolds,undefined);
 });
 
-test('调岗520恢复：当前普通目标岗已满足可继续，仍不把原错误认作成功',()=>{
+test('免费调岗恢复：普通目标岗已满足可继续，仍不把原错误认作成功',()=>{
   const state=setup();state.original.targets[1]=state.resident.roomId;
   Object.assign(state.original.before.campaign.choice,{role:'workshop',room:state.resident.roomId,targets:state.original.targets});
   assert.equal(state.recover(state.model,[]),true);
-  assert.equal(state.context.shelterState.campaign.assignmentHolds[0].resolvedAt,state.now);
-  assert.equal(state.context.shelterState.campaign.assignmentHolds[0].original.result.status,520);
+  assert.equal(state.context.shelterState.assignmentRecovery.original.result.status,520);
+  assert.equal(state.context.shelterPending,null);
+});
+
+test('免费调岗恢复：原请求结束的200或400且实际目标满足可归档，保留原响应',()=>{
+  for(const status of [200,400]){
+    const x=setup('training');x.original.result.status=status;
+    assert.equal(x.recover(x.model,[]),true);
+    assert.equal(x.context.shelterPending,null);
+    assert.equal(x.context.shelterState.assignmentRecovery.original.result.status,status);
+    assert.equal(x.context.shelterState.assignmentRecovery.original.result.campaignProof,undefined);
+  }
 });
 
 test('调岗520恢复：岗位后续改变才解除原地隔离，时间流逝不触发同人重试',()=>{

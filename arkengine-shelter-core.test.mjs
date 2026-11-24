@@ -166,6 +166,10 @@ function developmentScene(){
   return x;
 }
 
+function fillEquipment(view){
+  view.state.items=Array.from({length:model(view).itemCap},(_,index)=>({id:5000+index,slot:'weapon',damage:[1,2]}));
+}
+
 test('人员离岗产量：容量外成人不减产，多人离岗时按实际替补人数重算且不改原状态',()=>{
   const {state:s,view}=scene('diner'),adult=s.residents[0];
   s.residents=[1,2,3,4].map(id=>({...structuredClone(adult),id,stats:{...adult.stats,agi:0}}));
@@ -763,6 +767,7 @@ test('发展规划：施工名额与电力不足写明前提，未解锁仓库�
   s.rooms.find(r=>r.type==='power').unpowered=true;
   s.rooms.push({...s.rooms[0],id:30,type:'training',floor:2,col:5,builtAt:now+600000},
     {...s.rooms[0],id:31,type:'medbay',floor:3,col:3,builtAt:now+600000});
+  fillEquipment(view);
   const c=plan(model(view)).candidates.find(c=>c.type==='storage'&&c.kind==='build');
   assert.ok(c.blocks.some(x=>x.includes('施工名额')));assert.ok(c.blocks.some(x=>x.includes('电力余量不足')));
   assert.ok(c.blocks.some(x=>x.includes('2 级解锁')));
@@ -818,6 +823,7 @@ test('发展规划扩仓：在建容量仍不足以缓解满仓时保留后续�
   const {state:s,view}=developmentScene(),warehouse=s.rooms.find(r=>r.type==='storage');
   warehouse.width=3;warehouse.level=3;s.resources.scrap=12800;
   s.rooms.push({...warehouse,id:30,col:5,width:1,level:1,builtAt:now+600000});
+  fillEquipment(view);
   const p=plan(model(view));assert.ok(p.candidates.some(c=>c.kind==='build'&&c.type==='storage'));
   assert.match(render(p),/完工后仍.*接近满仓/);
 });
@@ -832,10 +838,12 @@ test('发展规划扩仓：生产房间完工也增加对应资源容量，未�
 
 test('发展规划扩仓：传承加成按扩容前后总容量取整求差，治疗针不能把6写成5',()=>{
   const {state:s,view}=developmentScene();s.legacy={perks:{storage:1}};s.resources.scrap=3200;
+  fillEquipment(view);
   const p=plan(model(view)),build=p.candidates.find(c=>c.kind==='build'&&c.type==='storage'),upgrade=p.candidates.find(c=>c.kind==='upgrade'&&c.type==='storage');
   assert.equal(model(view).caps.stimpak,15);
   assert.match(build.benefit,/治疗针 6/);assert.match(upgrade.benefit,/治疗针 6/);
   const warehouse=s.rooms.find(r=>r.type==='storage');warehouse.width=3;s.resources.scrap=5700;
+  fillEquipment(view);
   const wide=plan(model(view)).candidates.find(c=>c.kind==='upgrade'&&c.type==='storage');
   assert.match(wide.benefit,/治疗针 16/);assert.match(wide.benefit,/装备 30/);
 });

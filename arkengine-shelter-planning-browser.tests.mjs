@@ -5,7 +5,7 @@ import {levelPlanningView} from './arkengine-shelter-level-planning.fixture.mjs'
 import {idleTrainingScene} from './arkengine-shelter-idle-training.fixture.mjs';
 import {readyCampaignConstructionScene} from './arkengine-shelter-growth-investment.fixture.mjs';
 
-export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,until,trustedStaffKey}){
+export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,evaluate,pulse,drive,trustedStaffKey}){
   const state="JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'))";
   const pending="JSON.parse(localStorage.getItem('arkengine:auto-shelter:pending:v1'))";
   const continuousScene=(extra='')=>{
@@ -218,7 +218,9 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     const f=readyCampaignConstructionScene();
     f.campaign.training=false;f.view.state.residents.forEach(p=>p.familyCooldownUntil=f.view.serverTime+86400000);
     if(kind==='family'){
-      for(const p of f.view.state.residents.slice(4))p.familyCooldownUntil=0;
+      for(const p of f.view.state.residents.slice(4)){
+        p.familyCooldownUntil=0;for(const stat of Object.keys(p.stats))p.stats[stat]=10;
+      }
       f.state.families=[{a:5,b:6,room:5}];
       f.construction={...f.construction,build:false,upgrade:false,dig:false};
     }
@@ -330,7 +332,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.view.state.explorers.some(e=>e.id===172)'),false);
     assert.equal(await evaluate('sm.view.state.explorers.find(e=>e.id===160).returnAt'),f.view.state.explorers.find(e=>e.id===160).returnAt);
   });
-  const familyScene=(mode,extra='')=>{
+  const familyScene=(extra='')=>{
     const input=campaignView(2_000_000_000);
     for(const p of input.state.residents)p.training=0;
     return `sm.view=${JSON.stringify(input)};clock=sm.view.serverTime;sm.fixtureSearch=location.search;
@@ -348,19 +350,13 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
         if(url==='/api/shelter')sm.view.state.resources.water+=.001;
         return nativeRead(url,options);
       };
-      sm.familyJobs=0;window.Worker=class{
-        postMessage(data){
-          if(data.kind==='native-family-supply')sm.familyJobs++;
-          if(data.kind==='native-family-supply'&&sm.holdFamily){sm.heldFamily={worker:this,data};return;}
-          if(data.kind==='native-family-supply'&&'${mode}'==='running')return;
-          setTimeout(()=>{if(!this.closed)this.onmessage?.({data:data.kind==='native-family-supply'?
-            {id:data.id,kind:data.kind,supply:null,...('${mode}'==='failed'?{error:'fixture family failure'}:{})}:
-            {id:data.id,error:'fixture unrelated development failure'}});},40);
-        }
-        terminate(){this.closed=true;}
+      sm.familyJobs=0;const NativeWorker=window.Worker;
+      window.Worker=class extends NativeWorker{
+        postMessage(data,...rest){if(data?.kind==='native-family-supply')sm.familyJobs++;
+          return super.postMessage(data,...rest);}
       };`;
   };
-  const idleScene=(mode,extra='')=>familyScene(mode,`
+  const idleScene=(extra='')=>familyScene(`
     const cfg=JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'));
     cfg.explore=false;cfg.quests=false;localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(cfg));
     s.rooms.find(r=>r.id===4).width=2;${extra}`)+captureEmploymentTiming;
@@ -386,7 +382,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
       return employmentFetch(url,options);
     };`;
   await t.test('慢规划就业：完整规划超过快照期限仍在首轮完成闲人补岗',async()=>{
-    await setupShelter(idleScene('running',`sm.ui20261109=true;sm.planCostMs=12000;`));
+    await setupShelter(idleScene(`sm.ui20261109=true;sm.planCostMs=12000;`));
     await drive(`sm.view.state.residents.slice(4).every(p=>p.roomId===4)&&!${pending}`,'idle jobs bypass full planning',60);
     const timing=await evaluate('sm.employmentTiming');
     assert.deepEqual(timing.map(x=>x.id).sort(),[5,6]);
@@ -450,12 +446,12 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&[115,116].includes(c.residentId)).length'),0);
     assert.ok(await evaluate('[115,116].every(id=>sm.view.state.residents.find(p=>p.id===id).roomId===null)'));
   });
-  const fullSupplyScene=(resource,roomId,stat)=>idleScene('running',`
+  const fullSupplyScene=(resource,roomId,stat)=>idleScene(`
     sm.ui20261109=true;s.residents[4].roomId=4;
     s.rooms.find(r=>r.id===${roomId}).level=1;s.residents[${roomId-1}].stats.${stat}=0;
     // Native capacity: base 600 + 3 warehouse cells * 400 + one level-1 production cell * 250.
     s.resources.${resource}=2050;`);
-  const competingSupplyScene=()=>idleScene('running',`
+  const competingSupplyScene=()=>idleScene(`
     sm.ui20261109=true;s.residents[4].roomId=4;
     s.rooms.find(r=>r.id===2).level=1;s.rooms.find(r=>r.id===3).level=1;
     s.residents[1].stats.agi=2;s.residents[2].stats.per=0;
@@ -506,13 +502,13 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     await drive(`sm.view.state.residents[5].roomId===4&&!${pending}`,'new visit uses new supply snapshot',45);
     assert.deepEqual(await evaluate('sm.calls.filter(c=>c.type==="assign").map(c=>[c.residentId,c.roomId])'),[[6,4]]);
   });
-  const complementaryScene=()=>idleScene('running',`
+  const complementaryScene=()=>idleScene(`
     sm.ui20261109=true;localStorage.setItem('arkengine:auto-shelter:optimize:v1','true');
     s.rooms.find(r=>r.id===1).level=1;s.residents[0].stats.str=0;s.rooms.find(r=>r.id===4).width=1;
     s.rooms.push({...s.rooms.find(r=>r.id===5),id:90,width:1,level:1,floor:3});
     for(const p of s.residents.slice(4))Object.assign(p,{roomId:90,xp:0,hp:100});
     Object.assign(s.residents[4].stats,{str:10,end:10});Object.assign(s.residents[5].stats,{str:9,end:0});`);
-  const coolingFamilyScene=()=>idleScene('running',`
+  const coolingFamilyScene=()=>idleScene(`
     sm.ui20261109=true;s.rooms.push({...s.rooms.find(r=>r.id===5),id:90,floor:3,width:1});
     record.families.push({a:5,b:6,room:90});
     sm.cooldownUntil=clock+6*3600000;
@@ -573,7 +569,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===5&&c.roomId===1).length'),1);
   });
   await t.test('闲置就业优先：家庭计算未返回时实际安排两个闲置成人，原供给和家庭人员不动',async()=>{
-    await setupShelter(idleScene('running'));
+    await setupShelter(idleScene());
     await drive(`sm.view.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===4)&&!${pending}`,
       'idle employment does not wait for unrelated family search',55);
     assert.deepEqual(await evaluate('sm.calls.filter(c=>c.type==="assign").map(c=>c.residentId).sort()'),[5,6]);
@@ -581,7 +577,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.ok(await evaluate('sm.employmentTiming.length===2&&sm.employmentTiming.every(x=>x.familyJobs===0)'), 'employment precedes family search');
   });
   await t.test('宿舍快速就业：新版居民页将两名单人宿舍成人补到回收岗，刷新不重复',async()=>{
-    await setupShelter(idleScene('running',`
+    await setupShelter(idleScene(`
       sm.ui20261109=true;s.rooms.push({...s.rooms.find(r=>r.id===5),id:90,floor:3});
       s.residents[4].roomId=5;s.residents[5].roomId=90;`));
     const employed=`sm.view.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.roomId===4)&&!${pending}`;
@@ -601,7 +597,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate(pending),null);
   });
   for(const change of ['目标已满','开始恋爱'])await t.test(`宿舍快速就业：提交前${change}时取消原调岗`,async()=>{
-    await setupShelter(idleScene('running',`
+    await setupShelter(idleScene(`
       sm.ui20261109=true;s.rooms.find(r=>r.id===4).width=1;
       s.residents[4].roomId=5;s.residents[5].roomId=1;`));
     await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent.includes('列表快捷调岗')`,
@@ -616,7 +612,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.view.state.residents[4].roomId'),5);
     assert.equal(await evaluate(pending),null);
   });
-  const batchEmploymentScene=idleScene('ready',`
+  const batchEmploymentScene=idleScene(`
       sm.ui20261109=true;sm.visitStart=clock;
       s.rooms.find(r=>r.id===4).width=3;
       s.rooms.push({...s.rooms.find(r=>r.id===4),id:90,floor:3,col:2},
@@ -665,7 +661,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(events.filter(e=>e.type==='shelter-handoff').length,1);
   });
   await t.test('闲置就业接续：五分钟上限后仍会接续未完成岗位',async()=>{
-    await setupShelter(idleScene('ready',`
+    await setupShelter(idleScene(`
       s.rooms.find(r=>r.id===4).width=3;
       s.rooms.push({...s.rooms.find(r=>r.id===4),id:90,floor:3,col:2});
       for(let id=7;id<=14;id++)s.residents.push({...structuredClone(s.residents[5]),id,name:'待就业'+id,roomId:null});
@@ -687,198 +683,68 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     s.explorers=[{id:11,residentId:5,tier:0,abyss:false,startedAt:clock-6*3600000,
       recalledAt:null,returnAt:null,stimpaks:2,loot:{scrap:0,parts:0,stimpak:0,items:[]}}];
     record.campaign.trips=[{id:11,resident:5,at:clock-6*3600000,hours:6}];`;
-  const familyStaffScene=familyScene('ready',`
+  const familyStaffScene=familyScene(`
     for(const p of s.residents)if(![1,2].includes(p.id))p.familyCooldownUntil=clock+86400000;
-    // This suite exercises moving an existing producer, which still depends on family search.
+    for(const p of s.residents.filter(p=>[1,2].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
     s.rooms.find(r=>r.id===4).width=2;for(const p of s.residents)if([5,6].includes(p.id))p.roomId=4;
     const cfg=JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'));
     cfg.explore=false;cfg.quests=false;
     localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(cfg));`);
-  await t.test('供给变化执行：库存增加保留原等待期限，家庭生产接替实际提交',async()=>{
-    await setupShelter(familyStaffScene+`sm.familyJobsOnAssign=[];const assignFetch=window.fetch;
-      window.fetch=(url,options)=>{if(url==='/api/shelter/action'){
-        const action=JSON.parse(options.body).action;if(action.type==='assign')sm.familyJobsOnAssign.push({
-          id:action.residentId,room:action.roomId,jobs:sm.familyJobs});}
-        return assignFetch(url,options);};`);
-    await until(()=>evaluate('sm.familyJobs>0'),'family job before dependent staffing');
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)&&${pending}===null`,
-      'production replacement survives changing stock and repeated family jobs',45);
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1).length'),1);
-    assert.deepEqual(await evaluate('sm.familyJobsOnAssign.filter(a=>a.id===4&&a.room===1)'),[{id:4,room:1,jobs:1}],
-      'stock growth must reuse the first family decision through submission; actual reassignment may start a later job');
-    assert.ok(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
-      e.type==='shelter-confirmed'&&e.data.kind==='assign'&&e.data.targets[0]===4)`));
-  });
-  const holdStaffRefresh=async(extra='')=>{
-    // This flow explicitly waits for the current UI's list assignment control.
+  const replacement="sm.calls.filter(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)";
+  const queueReplacement=async()=>{
     await setupShelter(familyStaffScene+'sm.ui20261109=true;');
     await drive(`document.getElementById('ark-auto-expedition').shadowRoot.getElementById('status').textContent.includes('列表快捷调岗')`,
-      'production replacement queued',25);
-    assert.equal(await evaluate('sm.calls.length'),0);
-    await evaluate(`sm.holdFamily=true;sm.view.state.resources.water-=1;${extra}`);
-    await drive('Boolean(sm.heldFamily)','fresh family job held before submission',12);
-    for(let i=0;i<4;i++)await pulse();
-    assert.deepEqual(await evaluate('sm.calls'),[],'elapsed click delay must never execute while family result is pending');
-  };
-  const releaseFamily=`sm.holdFamily=false;const held=sm.heldFamily;
-    held.worker.onmessage?.({data:{id:held.data.id,kind:held.data.kind,supply:null}});`;
-  await t.test('家庭重算调岗：供给下降撤销旧安排，计算返回后下一轮按当前现场接续',async()=>{
-    await holdStaffRefresh();await evaluate(releaseFamily);
-    // The fresh read reduced actual water. The selected operation is deferred
-    // for this visit even when a later family result becomes ready.
-    await drive(`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`,'invalidated action yields the current visit',25);
-    assert.equal(await evaluate('sm.calls.length'),0);
-    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
-    assert.ok(events.some(e=>e.type==='shelter-execution-deferred'&&e.data.kind==='assign'));
-    await pulse(61000);
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)&&${pending}===null`,
-      'next visit reassesses the production replacement after supply regression',45);
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1).length'),1);
-  });
-  await t.test('家庭重算调岗：重算失败取消已到期动作，不使用上一次结果',async()=>{
-    await holdStaffRefresh();
-    await evaluate(`const held=sm.heldFamily;held.worker.onmessage?.({data:{id:held.data.id,error:'fixture fresh family failure'}});`);
-    await drive(`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`,'failed recomputation leaves safely',25);
-    assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
-  });
-  await t.test('家庭重算调岗：最新读取发现目标满员，旧调岗不能续发',async()=>{
-    await holdStaffRefresh('sm.view.state.residents[5].roomId=1;');
-    await evaluate(releaseFamily);
-    for(let i=0;i<25;i++)await pulse();
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="assign"&&c.residentId===4&&c.roomId===1).length'),0);
-    assert.ok(await evaluate('sm.view.state.residents.filter(p=>p.roomId===1).length<=2'));
-  });
-  await t.test('家庭重算调岗：真实键盘接手后迟到结果不恢复旧动作',async()=>{
-    await holdStaffRefresh();await trustedStaffKey();await evaluate(releaseFamily);
-    for(let i=0;i<15;i++)await pulse();
-    assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
-  });
-  await t.test('家庭重算调岗：本轮访问超时后取消原等待，迟到结果不补发',async()=>{
-    await holdStaffRefresh();await pulse(305000);
-    await drive(`location.pathname==='/activities/expedition'&&${state}?.nextAt>clock`,'visit expires while family is held',15);
-    await evaluate(releaseFamily);await pulse(1000);
-    assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
-  });
-  await t.test('家庭失败恢复：一次后台故障结束当前轮，相同现场下一轮重新计算并只调岗一次',async()=>{
-    await setupShelter(familyStaffScene+`
-      window.fetch=nativeRead;sm.retryJobs=0;
-      window.Worker=class{
-        postMessage(data){
-          if(data.kind!=='native-family-supply'){setTimeout(()=>this.onmessage?.({data:{id:data.id,error:'unrelated worker'}}),20);return;}
-          sm.retryJobs++;const first=sm.retryJobs===1;
-          setTimeout(()=>{if(!this.closed)this.onmessage?.({data:first?{id:data.id,error:'one transient worker error'}:
-            {id:data.id,kind:data.kind,supply:null}});},40);
-        }
-        terminate(){this.closed=true;}
-      };`);
-    await drive(`location.pathname==='/activities/expedition'&&${state}.nextAt>clock`,'failed family search exits the visit',35);
-    assert.equal(await evaluate('sm.retryJobs'),1,'no repeated attempt in the failed visit');
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'assign\').length'),0);
-    await pulse(61000);
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)&&${pending}===null`,
-      'next visit can recover without an unrelated state change or manual reload',75);
-    assert.ok(await evaluate('sm.retryJobs>=2'));
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'assign\'&&c.residentId===4&&c.roomId===1).length'),1);
-  });
-  await t.test('后台规划截止：定时器延迟仍结束挂起家庭任务，迟到结果不调岗且下轮恢复一次',async()=>{
-    await setupShelter(familyStaffScene+`
-      window.fetch=nativeRead;sm.deadlineJobs=0;sm.deadlineTimers=[];
-      const deadlineTimeout=window.setTimeout.bind(window);
-      window.setTimeout=(fn,ms,...args)=>{
-        if(ms===45000){sm.deadlineTimers.push(fn);return deadlineTimeout(()=>{},3600000);}
-        return deadlineTimeout(fn,ms,...args);
-      };
-      window.Worker=class{
-        postMessage(data){
-          if(data.kind!=='native-family-supply'){setTimeout(()=>this.onmessage?.({data:{id:data.id,error:'unrelated worker'}}),20);return;}
-          sm.deadlineJobs++;
-          if(sm.deadlineJobs===1){sm.deadlineJob={worker:this,data,at:clock};return;}
-          setTimeout(()=>{if(!this.closed)this.onmessage?.({data:{id:data.id,kind:data.kind,supply:null}});},40);
-        }
-        terminate(){this.closed=true;}
-      };`);
-    await until(()=>evaluate('Boolean(sm.deadlineJob)'),'family Worker hangs with deadline timer withheld');
+      'replacement queued before its native click',30);
     assert.deepEqual(await evaluate('sm.calls'),[]);
-    await pulse(46000);
-    await drive(`location.pathname==='/activities/expedition'&&${state}.nextAt>clock`,
-      'wake-up expires the original task and yields the visit',20);
-    assert.equal(await evaluate('sm.deadlineJobs'),1);
-    assert.equal(await evaluate('sm.deadlineJob.worker.closed'),true);
-    const statuses=()=>evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events
-      .filter(e=>e.type==='shelter-family-planning').map(e=>e.data.status)`);
-    assert.deepEqual(await statuses(),['timeout']);
-    const timing=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events
-      .find(e=>e.type==='shelter-family-planning').data`);
-    assert.equal(timing.timingScope,'queue-to-result-wall-clock');
-    assert.ok(Number.isSafeInteger(timing.requestedAt)&&Number.isSafeInteger(timing.finishedAt));
-    assert.ok(timing.finishedAt-timing.requestedAt>=45000);
-    await evaluate(`const held=sm.deadlineJob;
-      held.worker.onmessage?.({data:{id:held.data.id,kind:held.data.kind,supply:null}});
-      sm.deadlineTimers.forEach(fn=>fn());`);
-    assert.deepEqual(await statuses(),['timeout']);
-    assert.deepEqual(await evaluate('sm.calls'),[]);assert.equal(await evaluate(pending),null);
-    await pulse(61000);
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)&&${pending}===null`,
-      'next visit recomputes and confirms one valid assignment',75);
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'assign\'&&c.residentId===4&&c.roomId===1).length'),1);
+  };
+  await t.test('在线家庭补岗：库存递增仍只提交一次，观察到目标岗位后归档且刷新不重发',async()=>{
+    await queueReplacement();
+    await drive(`${replacement}.length===1&&!${pending}`,'local production replacement confirmed',50);
+    assert.equal(await evaluate('sm.view.state.residents.find(p=>p.id===4).roomId'),1);
+    const archive=await evaluate(`${state}.assignmentRecovery`);
+    assert.equal(archive.outcome,'target-observed');
+    assert.deepEqual(archive.original.targets,[4,1]);
+    assert.equal(archive.original.lifecycle.phase,'request-bound');
+    assert.equal(await evaluate('sm.familyJobs'),0);
+    await reloadShelter();for(let tick=0;tick<8;tick++)await pulse();
+    assert.equal(await evaluate(`${replacement}.length`),1);
   });
-  await t.test('家庭慢计算：连续产出跨过状态刷新仍完成供给比较，实际调岗一次',async()=>{
-    await setupShelter(familyStaffScene+`
-      sm.slowFamilyJobs=[];sm.familyDeliveries=[];sm.familyGrowthReads=0;
-      const growthRead=window.fetch;window.fetch=(url,options)=>{
-        if(url==='/api/shelter'){
-          sm.familyGrowthReads++;
-          for(const r of sm.view.state.rooms)r.stored+=.001;
-          for(const p of sm.view.state.residents){p.xp+=.001;p.training+=.001;}
-        }return growthRead(url,options);
-      };
-      window.Worker=class{
-        postMessage(data){
-          if(data.kind!=='native-family-supply'){setTimeout(()=>this.onmessage?.({data:{id:data.id,error:'unrelated worker'}}),20);return;}
-          const job={id:data.id,at:clock};sm.slowFamilyJobs.push(job);
-          const deliver=()=>{
-            if(this.closed||clock<job.at+12000)return;
-            window.removeEventListener('focus',deliver);
-            sm.familyDeliveries.push({id:data.id,jobs:sm.slowFamilyJobs.length});
-            this.onmessage?.({data:{id:data.id,kind:data.kind,supply:null}});
-          };
-          window.addEventListener('focus',deliver);this.removeListener=()=>window.removeEventListener('focus',deliver);
-        }
-        terminate(){this.closed=true;this.removeListener?.();}
-      };`);
-    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===1)&&${pending}===null`,
-      'slow family comparison survives ordinary production and reaches a confirmed assignment',100);
-    assert.ok(await evaluate('sm.familyGrowthReads>=3'));
-    assert.equal(await evaluate('sm.familyDeliveries[0].jobs'),1,'refresh must not repeatedly cancel the first search');
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'assign\'&&c.residentId===4&&c.roomId===1).length'),1);
+  for(const change of ['supply','full','manual'])await t.test(`在线家庭补岗：${change}变化后不发送排队的旧动作`,async()=>{
+    await queueReplacement();
+    if(change==='supply')await evaluate('sm.view.state.resources.water=0;');
+    if(change==='full'){
+      await evaluate('sm.view.state.residents.find(p=>p.id===6).roomId=1;');
+      assert.equal(await evaluate('sm.view.state.residents.filter(p=>p.roomId===1).length'),2);
+    }
+    if(change==='manual'){
+      await evaluate(`const button=[...document.querySelectorAll('button')].find(b=>b.offsetWidth&&!b.disabled);button.focus();`);
+      await trustedStaffKey();
+    }
+    for(let tick=0;tick<12;tick++)await pulse();
+    assert.equal(await evaluate(`${replacement}.length`),0,change);
+    assert.equal(await evaluate('sm.familyJobs'),0);
+    if(change==='manual')assert.deepEqual(await evaluate('sm.calls'),[]);
+    if(change==='full')assert.ok(await evaluate('sm.view.state.residents.filter(p=>p.roomId===1).length<=2'));
   });
   await t.test('慢规划召回：完整规划耗时超过快照期限也先召回，确认回执且不重复',async()=>{
-    await setupShelter(familyScene('running',dueTrip+'sm.planCostMs=12000;'));
+    await setupShelter(familyScene(dueTrip+'sm.planCostMs=12000;'));
     await drive(`sm.calls.some(c=>c.type==='explore_recall')`,'recall before slow elective search',35);
     assert.equal(await evaluate('sm.planCalls||0'),0);
     await drive(`${pending}===null`,'recall receipt confirmed before other work',15);
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="explore_recall").length'),1);
     assert.ok(await evaluate('sm.view.state.explorers[0].returnAt>clock'));
   });
-  for(const mode of ['ready','running','failed'])await t.test(`家庭等待收尾：${mode}下到期召回只提交一次并核对回执`,async()=>{
-    // Exercise family-dependent reassignment. An idle adult may legally take a
-    // basic production vacancy before family search, covered by the idle suite.
-    await setupShelter(familyScene(mode,dueTrip+'s.residents[5].roomId=4;'));
-    assert.equal(await evaluate('sm.familyJobs'),0,'existing recall must not wait for a family search to start');
-    await drive(`sm.calls.some(c=>c.type==='explore_recall')&&${pending}===null`,'recall while family recalculates',40);
+  await t.test('在线家庭收尾：到期召回只提交一次并核对回执',async()=>{
+    await setupShelter(familyScene(dueTrip+'s.residents[5].roomId=4;'));
+    await drive(`sm.calls.some(c=>c.type==='explore_recall')&&${pending}===null`,'recall confirmed without family planning',40);
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="explore_recall").length'),1);
     assert.ok(await evaluate('sm.view.state.explorers[0].returnAt>clock'));
     assert.ok(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
       e.type==='shelter-confirmed'&&e.data.kind==='explore-recall')`));
-    if(mode!=='ready'){
-      for(let i=0;i<30;i++)await pulse();
-      assert.ok(await evaluate('sm.familyJobs>0'),'family planning was actually requested');
-      assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['explore_recall'],
-        'family-dependent staffing, construction and new departures must still wait');
-    }
+    assert.equal(await evaluate('sm.familyJobs'),0);
   });
-  for(const mode of ['ready','running','failed'])await t.test(`家庭等待收尾：${mode}下归来领取和安全巡检日奖继续`,async()=>{
-    await setupShelter(familyScene(mode,dueTrip+`
+  await t.test('在线家庭收尾：归来领取和安全巡检日奖继续',async()=>{
+    await setupShelter(familyScene(dueTrip+`
       s.explorers[0].recalledAt=clock-3600000;s.explorers[0].returnAt=clock-1;
       s.residents[5].away={kind:'quest'};s.residents[5].roomId=null;
       s.quests=[{id:21,questId:'w1',team:[6],status:'returning',stage:3,nextStageAt:null,
@@ -890,15 +756,15 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
       s.daily.counters={incident:1,win:0,baby:0};sm.inspectionGoals=true;sm.ui20261109=true;`));
     assert.equal(await evaluate('sm.familyJobs'),0,'return and reward handling precedes family search');
     await drive(`sm.view.state.explorers.length===0&&sm.view.state.quests.length===0&&
-      sm.view.state.daily.claimed.includes(0)&&${pending}===null`,'returns and daily progress while family waits',55);
+      sm.view.state.daily.claimed.includes(0)&&${pending}===null`,'both returns and the daily inspection reward are reconciled',85);
     const calls=await evaluate('sm.calls.map(c=>c.type)');
     for(const kind of ['explore_claim','quest_claim','safety_inspection','claim_objective'])
       assert.equal(calls.filter(c=>c===kind).length,1,kind+' must submit once');
     assert.ok(await evaluate('sm.view.state.residents.filter(p=>[5,6].includes(p.id)).every(p=>p.away===null)'));
-    if(mode!=='ready')assert.equal(calls.length,4,'no family-dependent actions during the wait');
+    assert.equal(await evaluate('sm.familyJobs'),0);
   });
   await t.test('家庭等待收尾：未知召回跨刷新只读保留，不重发或穿插新动作',async()=>{
-    await setupShelter(familyScene('running',dueTrip+`sm.mode='unknown';`));
+    await setupShelter(familyScene(dueTrip+`sm.mode='unknown';`));
     await drive('sm.calls.length===1','unknown recall submitted',40);
     const original=await evaluate(pending);
     assert.equal(original.kind,'explore-recall');
@@ -910,29 +776,8 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate(`${pending}.id`),original.id);
     assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['explore_recall']);
   });
-  await t.test('避难所领取活锁：家庭供给跨刷新重算、未返回或失败仍能领取一次',async()=>{
-    for(const mode of ['ready','running','failed']){
-    const input=campaignView(2_000_000_000);
-    input.state.rooms.find(r=>r.id===4).stored=63;
-    for(const p of input.state.residents)p.training=0;
-    await setupShelter(`sm.view=${JSON.stringify(input)};clock=sm.view.serverTime;
-      sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;
-      localStorage.setItem('arkengine:auto-shelter:staff:v1','population');
-      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'collection refresh',families:[{a:1,b:2,room:5}]}));
-      const nativeRead=window.fetch;window.fetch=(url,options)=>{
-        if(url==='/api/shelter')sm.view.state.resources.water+=.001;
-        return nativeRead(url,options);
-      };
-      sm.familyJobs=0;window.Worker=class{
-        postMessage(data){
-          if(data.kind==='native-family-supply')sm.familyJobs++;
-          if(data.kind==='native-family-supply'&&'${mode}'==='running')return;
-          setTimeout(()=>{if(!this.closed)this.onmessage?.({data:data.kind==='native-family-supply'?
-            {id:data.id,kind:data.kind,supply:null,...('${mode}'==='failed'?{error:'fixture family failure'}:{})}:
-            {id:data.id,error:'fixture unrelated development failure'}});},40);
-        }
-        terminate(){this.closed=true;}
-      };`);
+  await t.test('在线家庭收尾：供给连续变化也只收一次满批产出',async()=>{
+    await setupShelter(familyScene(`s.rooms.find(r=>r.id===4).stored=63;`));
     assert.equal(await evaluate('sm.familyJobs'),0,'collection precedes family search');
     for(let i=0;i<12&&!await evaluate(`sm.calls.some(c=>c.type==='collect_all')&&${pending}===null`);i++)await pulse();
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="collect_all").length'),1,
@@ -943,9 +788,7 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     assert.equal(await evaluate('sm.calls.filter(c=>c.type==="collect_all").length'),1);
     assert.ok(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
       e.type==='shelter-confirmed'&&e.data.kind==='collect')`));
-    if(mode!=='ready')assert.deepEqual(await evaluate('sm.calls.map(c=>c.type)'),['collect_all'],
-      'dependent staffing and construction must still wait for family supply');
-    }
+    assert.equal(await evaluate('sm.familyJobs'),0);
   });
   const v=campaignView(2_000_000_000);v.state.rooms.find(r=>r.id===6).width=3;
   for(const p of v.state.residents){p.training=0;if(p.id!==5)p.hp=50;}
@@ -966,47 +809,28 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
       });}
       postMessage(data,...rest){if(data?.runtime)sm.planningRequests.push(structuredClone(data));return super.postMessage(data,...rest);}
     };`;
-  await t.test('后台规划分岗伴侣：真实Worker继续增产建议，原生调岗确认且保留伴侣岗位和进度',async()=>{
+  await t.test('在线调岗：不启用长线Worker，保留分岗伴侣的岗位和感情进度',async()=>{
     await setupShelter(scene+`
       const parent=sm.view.state.residents[0];
       sm.view.state.residents.push(...[[7,8,5],[8,7,2]].map(([id,partnerId,roomId])=>
         ({...structuredClone(parent),id,name:'分岗伴侣'+id,roomId,romance:{partnerId,progress:.4}})));
       const key='arkengine:auto-shelter:schedule:v1',saved=JSON.parse(localStorage.getItem(key));
       saved.families=[{a:7,b:8,room:5}];localStorage.setItem(key,JSON.stringify(saved));`);
-    await until(()=>evaluate('sm.planningReplies.some(x=>x.prepared?.action?.residentId===5)'),
-      'separated partners allow independent Worker proposal',10000);
     await drive(`${pending}===null&&sm.calls.some(c=>c.type==='assign'&&c.residentId===5&&c.roomId===4)`,
       'independent native assignment confirmed');
-    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
-      e.type==='shelter-staff-decision'&&e.data.developmentProposal?.candidateId==='assign:5:4')`),true);
+    assert.deepEqual(await evaluate('sm.planningRequests'),[]);
     assert.deepEqual(await evaluate('sm.view.state.residents.filter(p=>[7,8].includes(p.id)).map(p=>[p.id,p.roomId,p.romance.progress])'),
       [[7,5,.4],[8,2,.4]]);
     assert.deepEqual(await evaluate('sm.calls.filter(c=>c.type==="assign").map(c=>c.residentId)'),[5]);
   });
-  await t.test('后台规划浏览器：实际Worker建议通过原生调岗回执确认，刷新保留原窗口且不重复',async()=>{
+  await t.test('在线调岗：无需七日规划即可确认，刷新后不重复原调岗',async()=>{
     await setupShelter(scene);
-    await until(()=>evaluate('sm.planningReplies.some(x=>x.prepared?.action?.residentId===5)'),'actual planner worker reply',10000);
-    const window=await evaluate(`${state}.developmentWindow`);
-    assert.equal(await evaluate('sm.planningRequests[0].runtime.view.state.lastSettledAt'),v.state.lastSettledAt);
-    assert.equal(await evaluate('sm.planningRequests[0].runtime.view.serverTime>sm.planningRequests[0].runtime.view.state.lastSettledAt'),true);
-    await drive(`${pending}===null&&sm.calls.some(x=>x.type==='assign'&&x.residentId===5&&x.roomId===4)`,'native assignment confirmed');
-    assert.equal(await evaluate('sm.calls.filter(x=>x.type==="assign").length'),1);
-    const timing=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events
-      .find(e=>e.type==='shelter-planning'&&e.data.status==='ready').data`);
-    assert.equal(timing.timingScope,'request-to-result-wall-clock');
-    assert.ok(Number.isSafeInteger(timing.requestedAt)&&Number.isSafeInteger(timing.finishedAt));
-    assert.ok(timing.finishedAt>=timing.requestedAt);
-    assert.equal(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(e=>
-      e.type==='shelter-staff-decision'&&e.data.developmentProposal?.candidateId==='assign:5:4')`),true,
-      'the native execution decision must actually consume the background proposal: '+JSON.stringify(await evaluate(`({requests:sm.planningRequests.length,replies:sm.planningReplies.length,
-        schedule:${state},logs:(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type.includes('planning')||e.type==='shelter-staff-decision').map(e=>({type:e.type,data:e.data}))})`)));
-    assert.equal(await evaluate('sm.planningReplies[0].result.body.qualifiedForNativeExecution'),false);
-    assert.deepEqual(await evaluate('sm.planningReplies[0].result.body.coverage.exchange'),
-      {evaluated:false,reason:'native-current-assignment-only',emitted:0});
-    await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();
-    await pulse(10000);
-    assert.deepEqual(await evaluate(`${state}.developmentWindow`),window);
-    assert.equal(await evaluate('sm.calls.filter(x=>x.type==="assign").length'),1);
+    await drive(`${pending}===null&&sm.calls.some(c=>c.type==='assign'&&c.residentId===5&&c.roomId===4)`,'native assignment confirmed');
+    assert.deepEqual(await evaluate('sm.planningRequests'),[]);assert.deepEqual(await evaluate('sm.planningReplies'),[]);
+    const assignments=()=>evaluate('sm.calls.filter(c=>c.type==="assign").map(c=>[c.residentId,c.roomId])');
+    assert.deepEqual(await assignments(),[[5,4]]);
+    await evaluate(`history.replaceState({},'','/shelter'+sm.fixtureSearch);renderShelter();`);await reloadShelter();await pulse(10000);
+    assert.deepEqual(await assignments(),[[5,4]]);assert.equal(await evaluate(pending),null);
   });
   await t.test('后台规划浏览器：Worker被阻止时常规调岗仍可确认，不同步运行长搜索',async()=>{
     await setupShelter(scene+`window.Worker=class{constructor(){throw new Error('fixture CSP worker blocked');}};`);
@@ -1023,126 +847,35 @@ export async function shelterPlanningBrowserTests({t,setupShelter,reloadShelter,
     localStorage.setItem('arkengine:auto-shelter:level-target:v1',${JSON.stringify(String(lv.progress.level+1))});
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify({vaultNo:77,nextAt:0,note:'level worker fixture',constructionLedger:[]}));
     localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify({build:true,upgrade:true,dig:true,scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0}));
-    sm.levelReplies=[];sm.levelRequests=[];const ActualWorker=window.Worker;
+    sm.levelJobs=0;const ActualWorker=window.Worker;
     window.Worker=class extends ActualWorker{
-      constructor(...args){super(...args);this.addEventListener('message',e=>{if(e.data?.kind==='native-level-routes')sm.levelReplies.push(e.data);});}
-      postMessage(data,...rest){if(data?.targetScore)sm.levelRequests.push(structuredClone(data));return super.postMessage(data,...rest);}
-      set onmessage(listener){super.onmessage=e=>{
-        if(e.data?.kind==='native-level-routes'&&sm.delayLevelReply)setTimeout(()=>listener.call(this,e),sm.delayLevelReply);
-        else listener.call(this,e);
-      };}
+      postMessage(data,...rest){if(data?.kind==='native-level-routes'||data?.targetScore)sm.levelJobs++;
+        return super.postMessage(data,...rest);}
     };`;
-  await t.test('等级后台浏览器：完整路线返回后经当前原生窗口核对开工，刷新不重复',async()=>{
-    await setupShelter(levelScene);
-    try{await until(()=>evaluate('sm.levelReplies.some(r=>r.routes.some(x=>x.complete))'),'native level worker reply',10000);}
-    catch(error){t.diagnostic(JSON.stringify(await evaluate(`({requests:sm.levelRequests,replies:sm.levelReplies,calls:sm.calls,schedule:${state},logs:(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.slice(-12)})`)));throw error;}
-    try{await drive(`${pending}===null&&sm.calls.some(c=>c.type==='upgrade'&&c.roomId>=100)`,'native level upgrade confirmed');}
-    catch(error){t.diagnostic(JSON.stringify(await evaluate(`({requests:sm.levelRequests,replies:sm.levelReplies,calls:sm.calls,schedule:${state},logs:(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.slice(-12)})`)));throw error;}
-    const upgrades=await evaluate('sm.calls.filter(c=>c.type==="upgrade")');assert.equal(upgrades.length,1);
-    const firsts=await evaluate('sm.levelReplies.flatMap(r=>r.routes.filter(x=>x.complete).map(x=>x.steps[0].project.id))');
-    assert.ok(firsts.includes(upgrades[0].roomId));
-    await reloadShelter();await pulse(3000);
-    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='upgrade'&&c.roomId===${upgrades[0].roomId}).length`),1);
-  });
-  await t.test('等级后台刷新：响应版本与字段顺序持续变化仍消费完成路线并确认开工',async()=>{
-    await setupShelter(levelScene+`
-      sm.levelReadCount=0;const baseFetch=window.fetch;
-      const reorder=v=>Array.isArray(v)?v.map(reorder):v&&typeof v==='object'?
-        Object.fromEntries(Object.entries(v).reverse().map(([k,x])=>[k,reorder(x)])):v;
+  await t.test('在线等级策略：旧目标在刷新和持续产出时也不触发路线计算或纯等级扩仓',async()=>{
+    await setupShelter(levelScene+`sm.gradeReads=0;const nativeFetch=window.fetch;
       window.fetch=(url,options)=>{if(url==='/api/shelter'){
-        sm.view.revision=++sm.levelReadCount;sm.view=reorder(sm.view);
-      }return baseFetch(url,options);};`);
-    await until(()=>evaluate('sm.levelReplies.some(r=>r.routes.some(x=>x.complete))'),'route ready before refreshed read',10000);
-    await drive(`${pending}===null&&sm.calls.some(c=>c.type==='upgrade'&&c.roomId>=100)`,
-      'completed level route survives mandatory fresh reads',65);
-    assert.ok(await evaluate('sm.levelReadCount>1'));
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'upgrade\').length'),1);
-    const events=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events`);
-    assert.equal(events.filter(e=>e.type==='shelter-execution-evidence'&&e.data.reason==='facts'&&!e.data.fields.length).length,0);
+        sm.view.revision=++sm.gradeReads;sm.view.state.resources.food+=.001;
+      }return nativeFetch(url,options);};`);
+    await drive('sm.gradeReads>=2','fresh native observations before level decision',35);
+    for(let tick=0;tick<12;tick++)await pulse();
+    assert.equal(await evaluate('sm.levelJobs'),0);
+    const obsolete="sm.calls.filter(c=>c.type==='upgrade'&&c.roomId>=100)";
+    assert.deepEqual(await evaluate(obsolete),[]);
+    await reloadShelter();for(let tick=0;tick<10;tick++)await pulse();
+    assert.deepEqual(await evaluate(obsolete),[]);
   });
-  await t.test('等级规划连续生产：后台计算跨过刷新，正常积累中仍完成开工确认且不重复',async()=>{
-    await setupShelter(levelScene+`
-      sm.delayLevelReply=700;sm.growingReads=0;const baseFetch=window.fetch;
-      window.fetch=(url,options)=>{if(url==='/api/shelter'){
-        sm.growingReads++;sm.view.revision=sm.growingReads;
-        for(const p of sm.view.state.residents)p.xp+=.001;
-        for(const r of sm.view.state.rooms)r.stored+=.001;
-        for(const k of ['food','water','power','scrap'])sm.view.state.resources[k]+=.001;
-      }return baseFetch(url,options);};`);
-    try{await drive(`${pending}===null&&sm.calls.some(c=>c.type==='upgrade'&&c.roomId>=100)`,
-      'completed search reaches one confirmed construction during ordinary production',110);}
-    catch(error){t.diagnostic(JSON.stringify(await evaluate(`({reads:sm.growingReads,searches:sm.levelRequests.length,replies:sm.levelReplies.length,
-      evidence:(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-execution-evidence').map(e=>e.data)})`)));throw error;}
-    assert.ok(await evaluate('sm.growingReads>2'));
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'upgrade\').length'),1);
-    const id=await evaluate('sm.calls.find(c=>c.type===\'upgrade\').roomId');
-    await reloadShelter();for(let i=0;i<12;i++)await pulse();
-    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='upgrade'&&c.roomId===${id}).length`),1);
-    // Feed an explicit completed server snapshot; no simulated future income.
-    await evaluate(`const built=sm.view.state.rooms.find(r=>r.id===${id});clock=Math.max(clock,built.upgradeAt+1000);
-      built.level++;built.upgradeAt=null;sm.view.state.lastSettledAt=clock;
-      sm.view.progress.score+=built.width;sm.view.progress.level=1+Math.floor(Math.sqrt(Math.max(0,sm.view.progress.score-30))/1.5);`);
-    await evaluate(`const nextFetch=window.fetch;window.fetch=(url,options)=>{if(url==='/api/shelter'){
-      for(const p of sm.view.state.residents)p.xp+=.001;
-      for(const r of sm.view.state.rooms)r.stored+=.001;
-      for(const k of ['food','water','power','scrap'])sm.view.state.resources[k]+=.001;
-    }return nextFetch(url,options);};`);
-    await drive(`${pending}===null&&sm.calls.filter(c=>c.type==='upgrade').length===2`,
-      'confirmed completion leads to the next funded step under continuing production',110);
-    const entries=await evaluate(`${state}.constructionLedger`);
-    assert.equal(entries.length,2);assert.equal(new Set(entries.map(e=>e.id)).size,2);
-    assert.ok(entries.every(e=>e.scrap>0));
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'assign\').length'),0,'no staffing churn to complete the same route');
-  });
-  await t.test('等级慢计算：结果跨过十秒重读且产出持续增长，仍能完成当前工程',async()=>{
-    await setupShelter(levelScene+`
-      sm.slowJobs=0;sm.growthReads=0;const NativeWorker=window.Worker;
-      window.Worker=class extends NativeWorker{
-        set onmessage(listener){super.onmessage=e=>{
-          if(e.data?.kind!=='native-level-routes'){listener.call(this,e);return;}
-          sm.slowJobs++;const due=clock+12000;
-          const deliver=()=>{if(this.closed||clock<due)return;window.removeEventListener('focus',deliver);listener.call(this,e);};
-          window.addEventListener('focus',deliver);
-        };}
-        terminate(){this.closed=true;super.terminate();}
-      };
-      const fetchBefore=window.fetch;window.fetch=(url,options)=>{if(url==='/api/shelter'){
-        sm.growthReads++;for(const k of ['scrap','food','water','power'])sm.view.state.resources[k]+=.001;
-        for(const r of sm.view.state.rooms)r.stored+=.001;
-        for(const p of sm.view.state.residents)p.xp+=.001;
-      }return fetchBefore(url,options);};`);
-    try{await drive(`${pending}===null&&sm.calls.some(c=>c.type==='upgrade'&&c.roomId>=100)`,
-      'slow complete route survives the mandatory refreshing observations',100);}
-    catch(error){t.diagnostic(JSON.stringify(await evaluate('({reads:sm.growthReads,jobs:sm.slowJobs,calls:sm.calls})')));throw error;}
-    assert.ok(await evaluate('sm.growthReads>=3'));assert.equal(await evaluate('sm.calls.filter(c=>c.type===\'upgrade\').length'),1);
-  });
-  await t.test('等级复核缓存：已开窗的工程遇到预算降低仍撤销且不提交',async()=>{
-    await setupShelter(levelScene+`sm.delayLevelReply=700;`);
-    await drive(`Boolean(document.querySelector('[data-construction-dialog]'))`,
-      'level proposal rechecked and native construction dialog opened',100);
-    assert.equal(await evaluate('sm.calls.filter(c=>["upgrade","build","dig"].includes(c.type)).length'),0);
+  await t.test('在线等级策略：有实际用途的工程已开窗时预算下降仍撤销且不扣款',async()=>{
+    await setupShelter(executionScene('construction'));
+    await drive(`Boolean(document.querySelector('[data-construction-dialog]'))`,'native project opened before budget reduction',60);
+    const original=await evaluate('sm.view.state.resources.scrap');
     await evaluate(`const key='arkengine:auto-shelter:construction:v1',cfg=JSON.parse(localStorage.getItem(key));
       cfg.scrapLimit=0;cfg.partsLimit=0;localStorage.setItem(key,JSON.stringify(cfg));
       window.dispatchEvent(new StorageEvent('storage',{key}));`);
-    await drive(`!document.querySelector('[data-construction-dialog]')`,'changed budget cancels the cached proposal',35);
-    for(let i=0;i<8;i++)await pulse();
-    assert.equal(await evaluate('sm.calls.filter(c=>["upgrade","build","dig"].includes(c.type)).length'),0);
-    assert.equal(await evaluate(pending),null);
-  });
-  await t.test('等级后台浏览器：Worker不可用时不执行未经完整比较的纯等级投资',async()=>{
-    await setupShelter(levelScene+`window.Worker=class{constructor(){throw new Error('fixture level CSP blocked');}};`);
-    await pulse(10000);
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade"&&c.roomId>=100).length'),0);
-    assert.equal(await evaluate('sm.levelReplies.length'),0);
-  });
-  await t.test('等级后台浏览器：计算返回前预算降低，迟到完整路线不能开工',async()=>{
-    await setupShelter(levelScene+'sm.delayLevelReply=1500;');
-    await until(()=>evaluate('sm.levelReplies.some(r=>r.routes.some(x=>x.complete))'),'delayed complete level route',10000);
-    assert.equal(await evaluate('sm.calls.filter(c=>c.type==="upgrade").length'),0);
-    await evaluate(`const key='arkengine:auto-shelter:construction:v1';const config=JSON.parse(localStorage.getItem(key));
-      config.scrapLimit=0;config.partsLimit=0;localStorage.setItem(key,JSON.stringify(config));window.dispatchEvent(new StorageEvent('storage',{key}));`);
-    for(let i=0;i<12;i++)await pulse(1000);
-    assert.equal(await evaluate('sm.calls.filter(c=>["upgrade","build","dig"].includes(c.type)).length'),0);
+    await drive(`!document.querySelector('[data-construction-dialog]')`,'budget change cancels native project',35);
+    for(let tick=0;tick<8;tick++)await pulse();
+    assert.deepEqual(await evaluate('sm.calls.filter(c=>["upgrade","build","dig"].includes(c.type))'),[]);
+    assert.equal(await evaluate('sm.view.state.resources.scrap'),original);
     assert.equal(await evaluate(pending),null);
   });
 }

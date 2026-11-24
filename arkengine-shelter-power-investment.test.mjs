@@ -36,10 +36,10 @@ test('补电投资：现有电站一步可补足时，先打通生产房升级�
   assert.equal(x.api.staff(updated.m),null,'补电后不能立即抽回同一工人');
   assert.ok(updated.m.production.food>=41*1.2&&updated.m.production.water>=41*1.2);
 });
-test('补电投资：原始历史快照的训练返岗预留仍占座，不能把表面空位当成真实空岗',()=>{
+test('补电投资：原始历史快照不再预留训练返岗，空岗仍须核对实际工程用途',()=>{
   const seed=JSON.parse(readFileSync(new URL('./arkengine-shelter-latest-maintenance.fixture.json',import.meta.url),'utf8'));
   const x=setup(seed),{campaign,development}=x.plan();
-  assert.ok(campaign.trainingDestinations.some(d=>d.room===5));
+  assert.equal(campaign.trainingDestinations.length,0);
   assert.ok(!development.next.project?.powerStaffing);
 });
 test('补电投资：预算、保留量、材料、暂停、未决操作与无安全人手不允许提出补电支线',()=>{

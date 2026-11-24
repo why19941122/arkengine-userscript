@@ -21,7 +21,9 @@ export function parentTraining72Scene(){
   return f;
 }
 export function setupParentTraining72(source,seed=parentTraining72Scene()){
-  const x=setupPowerInvestment(source,seed,'population');x.context.shelterPopulationTarget=13;x.context.shelterLevelTarget=null;
+  // Historical multi-day comparisons are an explicit offline analysis mode.
+  const offline=source.replace('offlineComparison:false,runtimeSimple:true','offlineComparison:true,runtimeSimple:false');
+  const x=setupPowerInvestment(offline,seed,'population');x.context.shelterPopulationTarget=13;x.context.shelterLevelTarget=null;
   Object.assign(x.api,vm.runInContext(`({estimate:shelterParentTrainingEstimate,assessment:shelterParentAssessment,
     projection:typeof shelterParentTrainingProjection==='function'?shelterParentTrainingProjection:null,
     trainingChoice:typeof shelterParentTrainingChoice==='function'?shelterParentTrainingChoice:null})`,x.context));

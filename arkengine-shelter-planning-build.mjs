@@ -1,9 +1,7 @@
 import {readFileSync,writeFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 import {resolve} from 'node:path';
-import {createShelterPlanningClient} from './arkengine-shelter-planning-client.mjs';
-import {createShelterNativePlanning} from './arkengine-shelter-native-planning.mjs';
-import {createShelterLevelPlanning,installShelterLevelWorker} from './arkengine-shelter-level-planning.mjs';
+import {installShelterLevelWorker} from './arkengine-shelter-level-planning.mjs';
 
 export function shelterLevelWorkerSource(){
   // Reuse the actual native kernel, including manufacturing staffing and stock
@@ -46,33 +44,13 @@ export function shelterPlanningWorkerSource(){
   visit(new URL('./arkengine-shelter-planning-worker.mjs',import.meta.url));
   return "'use strict';\n"+chunks.join('\n')+'\ninstallShelterPlanningWorker(self);\n';
 }
-export function shelterPlanningBrowserBundle(){
-  const native=shelterLevelWorkerSource(),fragments=[],functions=[];
-  let offset=0;
-  for(const match of native.matchAll(/^  (function (\w+)\([^\n]*?\}(?=\r?$)|function (\w+)\([^]*?^  \})/gm)){
-    fragments.push(native.slice(offset,match.index+2));functions.push(match[2]??match[3]);
-    offset=match.index+match[0].length;
-  }
-  fragments.push(native.slice(offset));
-  const envelope=Buffer.from(JSON.stringify(fragments),'utf8').toString('base64');
-  const workerLiteral=shelterPlanningWorkerSource().replace(/[\\`\r]|\$\{/g,token=>token==='\r'?'\\r':'\\'+token);
-  return '  // BEGIN GENERATED SHELTER PLANNING WORKER\n'+
-    '  const shelterPlanningWorkerSource=()=>`'+workerLiteral+'`;\n'+
-    '  const createShelterPlanningClient='+createShelterPlanningClient.toString()+';\n'+
-    '  const createShelterNativePlanning='+createShelterNativePlanning.toString()+';\n'+
-    '  const createShelterLevelPlanning='+createShelterLevelPlanning.toString()+';\n'+
-    '  const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;\n'+
-    '    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('+JSON.stringify(envelope)+'),char=>char.charCodeAt(0))));\n'+
-    '    const functions=[\n      '+functions.join(',\n      ')+'\n    ];\n'+
-    "    return text=fragments.map((fragment,index)=>fragment+(functions[index]??'')).join('');\n  };})();\n"+
-    '  // END GENERATED SHELTER PLANNING WORKER';
-}
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
   const file=new URL('./arkengine-auto-encounter.user.js',import.meta.url),source=readFileSync(file,'utf8');
-  const pattern=/  \/\/ BEGIN GENERATED SHELTER PLANNING WORKER[\s\S]*?  \/\/ END GENERATED SHELTER PLANNING WORKER/;
-  if(!pattern.test(source))throw Error('Missing userscript planner bundle marker');
-  const next=source.replace(pattern,()=>shelterPlanningBrowserBundle());
-  if(process.argv.includes('--check')){if(next!==source)throw Error('Userscript planner bundle is stale');}
-  else writeFileSync(file,next);
-  console.log(process.argv.includes('--check')?'Planner bundle matches source':'Planner bundle updated');
+  const next=source.replace(/^  \/\/ BEGIN GENERATED SHELTER PLANNING WORKER\r?\n[\s\S]*?^  \/\/ END GENERATED SHELTER PLANNING WORKER\r?\n/m,'');
+  if(/GENERATED SHELTER PLANNING WORKER|installShelterPlanningWorker|shelterLevelWorkerSource/.test(next))throw Error('Unexpected offline planner in userscript');
+  if(next!==source){
+    if(process.argv.includes('--check'))throw Error('Userscript still embeds the offline planner');
+    writeFileSync(file,next);
+  }
+  console.log('Userscript excludes offline planning workers');
 }

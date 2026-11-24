@@ -132,6 +132,7 @@ function familySetup(){
 
 function familyTrainingSeatSetup(){
   const scene=familySetup();scene.v.state=familyTrainingSeatView(scene.v.serverTime).state;
+  for(const p of scene.v.state.residents.filter(p=>[6,7].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
   // Isolate existing production return-seat commitments from new breeding enrollment.
   scene.context.shelterCampaign={...scene.context.shelterCampaign,training:true,trainTarget:10,parentPreparation:false};
   scene.context.shelterState.campaign.roles=[11,12].map(id=>({id,room:8,role:'training',at:scene.v.serverTime,
@@ -140,14 +141,11 @@ function familyTrainingSeatSetup(){
   return scene;
 }
 
-test('家庭训练预留：两席已承诺返岗时评估真实扩产，不因表面空岗而只等待调岗',()=>{
+test('家庭训练预留：取消长期占位后复用现有空岗接替父母，无需额外建房',()=>{
   const {v,context,plan,api}=familyTrainingSeatSetup(),before=JSON.stringify([v,context.shelterState]),{c,p}=plan();
-  assert.deepEqual(Array.from(c.trainingDestinations,d=>[d.id,d.room]),[[11,108],[12,108]]);
-  assert.ok(c.populationFamilySupply,'physical vacancies reserved for trainees cannot suppress expansion');
-  const water=c.populationFamilySupply.resources.water;
-  assert.ok(water.capacity<water.need);assert.ok(water.donors.length>0);
-  assert.equal(p.next.status,'ready');assert.equal(p.next.project.kind,'build');assert.equal(p.next.project.type,'water');
-  const staff=api.staff(api.model(v));assert.ok(!staff||staff.room!==108,'staffing must retain both return seats');
+  assert.equal(c.trainingDestinations.length,0);
+  assert.equal(c.populationFamilySupply,null);assert.equal(p.next.project,undefined);
+  const staff=api.staff(api.model(v));assert.equal(staff?.room,108,'use the real vacancy before construction');
   assert.ok(v.state.residents.filter(p=>[11,12].includes(p.id)).every(p=>p.roomId===8&&p.training===.5));
   assert.equal(JSON.stringify([v,context.shelterState]),before,'preview does not start a swap or change training');
 });
@@ -341,13 +339,13 @@ test('人口扩产：成年子女先就业，就业后才为额外家庭备供�
   const {v,context,plan}=setup(reservedGrowthWithJobs());context.shelterPopulationTarget=50;
   const child=v.state.residents.at(-1);Object.assign(child,{away:null,roomId:5,parents:[17,18]});
   assert.equal(plan().c.populationPreparation,23);
-  child.roomId=4;assert.equal(plan().c.populationPreparation,23,'回收房已满，超过六岗不能算就业');
+  child.roomId=4;assert.equal(plan().c.populationPreparation,24,'就业不再是额外家庭的硬前提，实际产量仍按六岗计算');
   child.roomId=1;assert.equal(plan().c.populationPreparation,24,'进入有容量的有效岗位后自动恢复准备');
 });
 
-test('人口扩产：原21人场景不重复出借父母和训练返岗席位，补足岗位自动恢复',()=>{
+test('人口扩产：未来岗位缺口继续报告，不再强制暂停额外家庭供给准备',()=>{
   const {v,context,plan}=setup(reservedGrowthView());context.shelterPopulationTarget=50;
-  const before=plan();assert.equal(before.c.populationPreparation,23);
+  const before=plan();assert.equal(before.c.populationPreparation,24);
   assert.equal(before.c.futureEmployment.allowed,false);assert.equal(before.c.futureEmployment.missing.length,2);
   v.state.rooms.push(reservedGrowthWithJobs().state.rooms.at(-1));
   assert.equal(plan().c.populationPreparation,24);

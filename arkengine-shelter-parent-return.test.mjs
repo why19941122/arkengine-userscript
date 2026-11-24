@@ -14,24 +14,24 @@ function setup(){
   x.begin=()=>{const a=x.choose();assert.equal(a?.purpose,'parent');x.apply(a);return a;};
   return x;
 }
-test('父母返岗承诺：实际入训保存原生产岗，刷新后普通调度和快速就业共同保留',()=>{
+test('父母返岗承诺：旧目的地仅保留为参考，普通调度和快速就业不预留',()=>{
   const x=setup(),a=x.begin();assert.equal(a.destination,4);
   x.context.shelterState=plain(x.context.shelterState);
   const role=x.context.shelterState.campaign.roles.find(r=>r.id===a.id);assert.equal(role.destination,4);
   assert.equal(x.api.valid(x.context.shelterState.campaign),true);
   for(const plan of [x.api.schedule(x.m()),x.api.employment(x.m())])
-    assert.ok(plan.trainingDestinations.some(d=>d.id===a.id&&d.room===4));
+    assert.equal(plan.trainingDestinations.length,0);
 });
-test('父母返岗承诺：后来的闲置成人不能占用已在训父母的最后一个原岗位',()=>{
+test('父母返岗承诺：后来的闲置成人可使用在训父母离开的空岗位',()=>{
   const x=setup(),a=x.begin(),s=x.f.view.state;
   // Explicit stored destination isolates all consumers from the admission write.
   x.context.shelterState.campaign.roles[0].destination=4;
   s.rooms=s.rooms.filter(r=>r.id!==92);
   s.residents.push({...structuredClone(s.residents[3]),id:10,name:'已有工人',roomId:4},
     {...structuredClone(s.residents[3]),id:11,name:'后来成人',roomId:null});
-  const m=x.m(),fast=x.api.employment(m);assert.equal(x.api.idle(m,fast),null);
-  assert.equal(x.api.capacity({...m,trainingDestinations:fast.trainingDestinations},s.rooms.find(r=>r.id===4)),5);
-  assert.ok(x.api.schedule(m).trainingDestinations.some(d=>d.id===a.id&&d.room===4));
+  const m=x.m(),fast=x.api.employment(m);assert.equal(x.api.idle(m,fast)?.room,4);
+  assert.equal(x.api.capacity({...m,trainingDestinations:fast.trainingDestinations},s.rooms.find(r=>r.id===4)),6);
+  assert.equal(x.api.schedule(m).trainingDestinations.length,0);
 });
 test('父母返岗承诺：冷却内完成一格直接回原岗，记录只释放一次且不重练',()=>{
   const x=setup(),a=x.begin(),s=x.f.view.state,p=s.residents.find(p=>p.id===a.id);
@@ -65,10 +65,10 @@ test('父母返岗承诺：原房失效、满员、低健康或临近生育时�
     assert.ok(!x.api.schedule(x.m()).actions.some(c=>c.id===a.id&&c.room===4),kind);
   }
 });
-test('父母返岗承诺：实际离开训练后不残留虚假席位，原期限已过仍保护在训者',()=>{
+test('父母返岗承诺：在训及离训均不占用未来席位，原记录不虚构岗位',()=>{
   const x=setup(),a=x.begin(),p=x.f.view.state.residents.find(p=>p.id===a.id);
   x.context.shelterState.campaign.roles[0].until=x.f.view.serverTime-1;
-  assert.ok(x.api.employment(x.m()).trainingDestinations.some(d=>d.id===a.id));
+  assert.equal(x.api.employment(x.m()).trainingDestinations.length,0);
   p.roomId=null;
   assert.ok(!x.api.employment(x.m()).trainingDestinations.some(d=>d.id===a.id));
 });
@@ -81,18 +81,17 @@ test('父母返岗承诺：原训练房仍在的人工换房、属性不符或�
     assert.ok(!x.api.employment(x.m()).trainingDestinations.some(d=>d.id===a.id),kind);
   }
 });
-test('父母返岗承诺：训练室合并和当前格收尾保留同一原岗位，不重新推断',()=>{
+test('父母返岗承诺：训练室合并保留当前格和期限，旧目的地不占岗位',()=>{
   const x=setup(),a=x.begin(),s=x.f.view.state,p=s.residents.find(p=>p.id===a.id),room=s.rooms.find(r=>r.id===a.room);
   room.id=89;p.roomId=89;p.training=.7;
-  assert.ok(x.api.employment(x.m()).trainingDestinations.some(d=>d.id===a.id&&d.room===4),
-    'quick employment before the full rebind must still hold the original job');
+  assert.equal(x.api.employment(x.m()).trainingDestinations.length,0);
   x.api.schedule(x.m());
   assert.equal(x.context.shelterState.campaign.roles[0].room,89);
   assert.equal(x.context.shelterState.campaign.roles[0].destination,4);
   x.f.view.serverTime+=6*hour;s.lastSettledAt=x.f.view.serverTime;p.familyCooldownUntil=x.f.view.serverTime;
   const plan=x.api.schedule(x.m()),finish=x.context.shelterState.campaign.roles.find(r=>r.id===a.id);
   assert.ok(finish?.finishCurrent);assert.equal(finish.destination,4);
-  assert.ok(plan.trainingDestinations.some(d=>d.id===a.id&&d.room===4));
+  assert.equal(plan.trainingDestinations.length,0);
   const original=plain(finish);x.api.schedule(x.m());
   assert.deepEqual(plain(x.context.shelterState.campaign.roles.find(r=>r.id===a.id)),original);
 });

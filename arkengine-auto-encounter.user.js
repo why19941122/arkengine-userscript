@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.155
+// @version      1.17.156
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -245,6 +245,7 @@
       if (raw === null || raw === 'null') return fallback;
       const value = JSON.parse(raw);
       if (!validate(value)) throw new Error('InvalidState');
+      stateFaults.delete(key);
       return value;
     } catch {
       // 不删除或改写原文，更不能把损坏的未决操作当作“没有操作”。
@@ -379,6 +380,7 @@
       const delay=nextAt-performance.now();
       if(immediate!==true&&!urgent()&&delay>0){
         if(timer===null)timer=setTimeout(()=>{timer=null;schedule();},delay);
+        if(typeof armWakeup==='function')armWakeup(Date.now()+delay);
         return;
       }
       if(timer!==null){clearTimeout(timer);timer=null;}
@@ -395,35 +397,62 @@
 
   // 每页共享一个 Worker 和 DOM 观察器；非当前功能组不扫描整页。
   const wakeups = [];
-  function subscribeWakeup(schedule, onPage, enabled, beforeMutation = () => {}) {
-    wakeups.push({ schedule, onPage, enabled, beforeMutation, wasOnPage: onPage() });
+  let armWakeup=()=>{};
+  function wakeForMutation(record) {
+    const element=record.target.nodeType===1?record.target:record.target.parentElement;
+    if(element?.closest('#ark-auto-encounter, #ark-auto-expedition'))return false;
+    if(record.type==='attributes'||element?.closest('button,a,input,select,textarea,[role="button"],[role="dialog"],[role="alertdialog"],[role="alert"]'))return true;
+    const duration=text=>{
+      const value=String(text??'').trim(),seconds=/^(?:剩余\s*|倒计时\s*[:：]?\s*)?(\d+)\s*(?:秒|s)$/i.exec(value);
+      if(seconds)return Number(seconds[1]);
+      const clock=/^(?:剩余\s*|倒计时\s*[:：]?\s*)?(?:(\d+):)?(\d{1,2}):([0-5]\d)$/.exec(value);
+      return clock?(Number(clock[1]||0)*60+Number(clock[2]))*60+Number(clock[3]):NaN;
+    };
+    let before,after;
+    if(record.type==='characterData'){before=record.oldValue;after=record.target.data;}
+    else if(record.type==='childList'&&record.removedNodes.length===1&&record.addedNodes.length===1&&
+        record.removedNodes[0].nodeType===3&&record.addedNodes[0].nodeType===3){before=record.removedNodes[0].data;after=record.addedNodes[0].data;}
+    else return true;
+    const previous=duration(before),current=duration(after);
+    return !(current>0&&current<=previous);
+  }
+  function subscribeWakeup(schedule, onPage, enabled, beforeMutation = () => {}, cadence = () => 60000) {
+    wakeups.push({ schedule, onPage, enabled, beforeMutation, cadence, lastAt:0, wasOnPage: onPage() });
     if (wakeups.length > 1) return;
-    const wake = mutation => {
+    const wake = (mutation,deadline=false) => {
       observeSessionPage();
       for (const item of wakeups) {
         const current = item.onPage();
-        if ((current && (mutation || item.enabled())) || item.wasOnPage !== current) {
+        if ((current && item.enabled() && (mutation || deadline || Date.now()-item.lastAt>=item.cadence())) || item.wasOnPage !== current) {
           if (mutation) item.beforeMutation();
+          item.lastAt=Date.now();
           item.schedule();
         }
         item.wasOnPage = current;
       }
     };
     new MutationObserver(records => {
-      if (records.some(record => !(record.target.nodeType === Node.ELEMENT_NODE ? record.target : record.target.parentElement)
-        ?.closest('#ark-auto-encounter, #ark-auto-expedition'))) wake(true);
-    }).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true,
+      if(records.some(wakeForMutation))wake(true);
+    }).observe(document.body, { childList: true, subtree: true, characterData:true,characterDataOldValue:true,attributes: true,
       attributeFilter: ['disabled', 'aria-disabled', 'aria-pressed', 'aria-selected', 'aria-hidden', 'hidden', 'inert', 'class', 'style'] });
     for (const name of ['pageshow', 'focus', 'popstate', 'online', 'offline']) window.addEventListener(name, () => wake(true));
     for (const name of ['visibilitychange', 'resume']) document.addEventListener(name, () => wake(true));
     let worker;
     let timer;
-    const fallback = () => { worker?.terminate(); worker = null; if (!timer) timer = setInterval(() => wake(false), 2000); };
+    const fallback = () => { worker?.terminate(); worker = null; if (!timer) timer = setInterval(() => wake(false), 30000); };
     try {
-      const url = URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 2000);'], { type: 'text/javascript' }));
+      const url = URL.createObjectURL(new Blob([`let timer;
+        onmessage=event=>{clearTimeout(timer);const delay=event.data?.delay;
+          if(Number.isFinite(delay))timer=setTimeout(()=>postMessage('deadline'),Math.max(0,delay));};
+        setInterval(()=>postMessage('fallback'),30000);`], { type: 'text/javascript' }));
       try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
-      worker.onmessage = () => wake(false);
+      let wakeAt=Infinity;
+      worker.onmessage = event => {if(event.data==='deadline')wakeAt=Infinity;wake(false,event.data==='deadline');};
       worker.onerror = fallback;
+      armWakeup=at=>{
+        if(!Number.isFinite(at)){wakeAt=Infinity;worker?.postMessage({delay:null});}
+        else if(at<wakeAt){wakeAt=at;worker?.postMessage({delay:Math.max(0,at-Date.now())});}
+      };
     } catch { fallback(); }
   }
 
@@ -1658,7 +1687,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.155';
+  const SCRIPT_VERSION = '1.17.156';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -3754,7 +3783,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       const dungeonAt = dungeonEnabled && !stateFault('dungeon') ?
         !dungeon.run && dungeon.exhaustedDay === dungeonDay() ? nextDailyReset() : dungeon.nextAt : Infinity;
       return Math.max(hallRetryAt,Math.min(encounterSchedule.nextAt, dungeonAt));
-    }
+    },
+    nextWakeAt() {return pendingClick?.dueAt??this.dueAt();}
   };
 }
 
@@ -4054,12 +4084,12 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         <option value="family">自动生产＋已有配对生育轮换</option>
         <option value="population">自动生产＋人口发展（安排新配对）</option>
       </select>
-      <label class="staff-option"><input type="checkbox" id="shelter-population-continuous" checked> 持续分阶段增长，30→40→50……</label>
-      <label class="staff-option">人口阶段目标（关闭持续增长时为总上限）<input id="shelter-population" type="number" min="2" max="200" step="1" value="30"> 人</label>
-      <p class="hint" id="shelter-population-status">人口发展模式才使用此目标；首次阶段目标 30 人，按口粮与床位逐批推进。</p>
-      <label class="staff-option"><input type="checkbox" id="shelter-level-continuous" checked> 持续升级，每达一级继续下一级</label>
-      <label class="staff-option">指定终点<input id="shelter-level-target" type="number" min="1" max="20" step="1" value="10"> 级</label>
-      <p class="hint">默认持续升级；取消后按指定终点推进，设为1停止主动追级。人口持续增长单独设置；建设仍受开关、预算及供应条件限制。</p>
+      <label class="staff-option"><input type="checkbox" id="shelter-population-continuous" disabled> 人口固定上限200</label>
+      <label class="staff-option">人口总上限<input id="shelter-population" type="number" min="200" max="200" step="1" value="200" disabled> 人</label>
+      <p class="hint" id="shelter-population-status">目标固定200人，按口粮与床位逐批推进，预留待产和恢复人口。</p>
+      <label class="staff-option"><input type="checkbox" id="shelter-level-continuous" disabled> 持续追级已关闭；仅使用明确等级目标，留空关闭</label>
+      <label class="staff-option">指定解锁目标<input id="shelter-level-target" type="number" min="1" max="20" step="1"> 级</label>
+      <p class="hint">默认按实际需求建设；需要解锁时可填写明确等级，完成后不自动追加。留空关闭额外追级，建设仍受开关、预算及供应限制。</p>
       <label class="staff-option"><input type="checkbox" id="shelter-gear"> 自动穿戴闲置生产服装</label>
       <label class="staff-option"><input type="checkbox" id="shelter-optimize"> 优化生产岗位分配</label>
       <p class="hint" id="shelter-staff-status"></p>
@@ -4071,8 +4101,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-explore"> 普通探险出发、召回与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-quests"> 周任务选队、出发与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-training"> 居民训练：生产培养与父母训练</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation"> 父母预培养：优选两对，七项基础属性均达10后生育</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-campaign-medical"> 医务室值班、伤员用针及废料救回（共用建设预算，保留安全库存）</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation" checked disabled> 父母预培养：优选两对，七项基础属性均达10后生育</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-campaign-medical"> 医务室值班、伤员用针及废料救回（按实际库存，保留安全储备）</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-defense"> 房间一键救援（每批最多3人，目标在场101名成人，游戏自动归岗）</label>
       <label class="staff-option">出发后至少留守健康成人 <input id="shelter-campaign-guardResidents" type="number" min="0" max="200" step="1"> 人</label>
       <label class="staff-option">留守力量与武器指标至少占全体成人 <input id="shelter-campaign-guardPowerPercent" type="number" min="0" max="100" step="1"> %</label>
@@ -4081,7 +4111,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-craftDaily"> 每日制作：为已有制作房补员做0档，完工返岗，共用建设额度</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-caravanDaily"> 每日商队：有目标时交付最低成本订单，保留建设本金</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-help"> 每日互助：选择有废料奖励的避难所</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-campaign-radio"> 电台招募与满床心情值班</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-campaign-radio" disabled> 主动广播已关闭，历史值班自动释放</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-combatGear"> 自动装备：出发前配装、留守武器及制作服装</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-sodaEfficiency"> 汽水效率优先：按资格时长召回，显示已知领取统计</label>
       <label class="staff-option">探险区域上限（0＝网页最高已解锁区域）<input id="shelter-campaign-tier" type="number" min="0" max="100" step="1"></label>
@@ -5205,6 +5235,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     (v.sodaEfficiency===undefined||typeof v.sodaEfficiency==='boolean')&&
     Object.entries(campaignNumbers).every(([k,[min,max]])=>['guardResidents','guardPowerPercent'].includes(k)&&v[k]===undefined||Number.isInteger(v[k])&&v[k]>=min&&v[k]<=max);
   let shelterCampaign=loadState(localStorage,SHELTER_CAMPAIGN,campaignDefaults,'shelter',validCampaignConfig);
+  shelterCampaign={...shelterCampaign,radio:false,parentPreparation:true};
   let shelterCampaignForm='',shelterCampaignNote='',shelterRecallWork=null,shelterCampaignEditing=false,shelterCampaignHeld='',shelterQuestSelection=null,shelterWorkConfirm=null,shelterCampaignWork=null;
   const shelterExecutionDeferrals=new Map();
   const campaignKind=kind=>['explore-start','explore-recall','quest-start','quest-claim','stimpak','craft'].includes(kind);
@@ -5219,18 +5250,16 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   const constructionKind=kind=>['build','upgrade','dig'].includes(kind);
   let shelterBuildWork=null,shelterConstructionDone=false,shelterConstructionHeld=false,shelterConstructionNote='',shelterConstructionForm='';
   function populationTarget(storage=localStorage) {
-    const raw = storage.getItem(SHELTER_POPULATION), value = raw === null ? 30 : Number(raw);
-    return Number.isInteger(value) && value >= 2 && value <= 200 ? value : null;
+    return 200;
   }
   let shelterPopulationTarget = populationTarget(), shelterPopulationNote = '';
   function populationContinuous(storage=localStorage) {
-    const raw=storage.getItem(SHELTER_POPULATION_CONTINUOUS);
-    return raw==='true'||raw===null&&storage.getItem(SHELTER_POPULATION)===null;
+    return false;
   }
   let shelterPopulationContinuous=populationContinuous();
   function levelTarget(storage=localStorage) {
     const raw=storage.getItem(SHELTER_LEVEL_TARGET);
-    if(raw===null||raw==='auto')return 'auto';
+    if(raw===null||raw==='auto'||raw==='off')return null;
     const value=Number(raw);
     return Number.isInteger(value)&&value>=1&&value<=20?value:null;
   }
@@ -5260,8 +5289,6 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     (v.social===undefined||validShelterSocial(v.social))&&
     (v.caravan===undefined||validShelterCaravan(v.caravan))&&
     (v.sodaReceipts===undefined||validShelterSodaReceipts(v.sodaReceipts))&&
-    (v.developmentWindow===undefined||objectState(v.developmentWindow)&&Number.isSafeInteger(v.developmentWindow.start)&&
-      v.developmentWindow.start>=0&&v.developmentWindow.end-v.developmentWindow.start===168*3600000)&&
     (v.constructionLedger===undefined||Array.isArray(v.constructionLedger)&&v.constructionLedger.every(e=>objectState(e)&&
       typeof e.id==='string'&&Number.isFinite(e.at)&&['scrap','parts'].every(k=>Number.isSafeInteger(e[k])&&e[k]>=0)));
   let shelterState = loadState(localStorage, SHELTER_STATE, { nextAt: 0, note: '等待首次检查' }, 'shelter',validShelterState);
@@ -5322,3511 +5349,22 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   let shelterPending = loadState(localStorage, SHELTER_PENDING, null, 'shelter', validShelterPending);
   function shelterReadOnlyWait() { return Boolean(shelterPending && shelterState.pendingReadOnly === shelterPending.id); }
   let shelterRead = null, shelterController = null, shelterGeneration = 0, shelterReadAt = 0;
-  // BEGIN GENERATED SHELTER PLANNING WORKER
-  const shelterPlanningWorkerSource=()=>`'use strict';
-const {createShelterSelectionDigest}=(()=>{
-// Synchronous SHA-256 for the identical Node/browser planner. No external script loads.
-function createShelterSelectionDigest() {
-  const constants=[],initial=[];
-  for(let n=2;constants.length<64;n++){
-    let prime=true;for(let d=2;d*d<=n;d++)if(n%d===0){prime=false;break;}
-    if(!prime)continue;
-    if(initial.length<8)initial.push((Math.sqrt(n)%1*4294967296)|0);
-    constants.push((Math.cbrt(n)%1*4294967296)|0);
-  }
-  const rotate=(v,n)=>(v>>>n)|(v<<(32-n)),encoder=new TextEncoder();
-  return value=>{
-    const input=encoder.encode(JSON.stringify(value)),length=Math.ceil((input.length+9)/64)*64;
-    const bytes=new Uint8Array(length);bytes.set(input);bytes[input.length]=128;
-    const view=new DataView(bytes.buffer),bits=input.length*8;
-    view.setUint32(length-8,Math.floor(bits/4294967296));view.setUint32(length-4,bits>>>0);
-    const state=initial.slice(),words=new Int32Array(64);
-    for(let offset=0;offset<length;offset+=64){
-      for(let i=0;i<16;i++)words[i]=view.getInt32(offset+i*4);
-      for(let i=16;i<64;i++){
-        const a=words[i-15],b=words[i-2];
-        words[i]=(words[i-16]+(rotate(a,7)^rotate(a,18)^(a>>>3))+words[i-7]+(rotate(b,17)^rotate(b,19)^(b>>>10)))|0;
-      }
-      let [a,b,c,d,e,f,g,h]=state;
-      for(let i=0;i<64;i++){
-        const t1=(h+(rotate(e,6)^rotate(e,11)^rotate(e,25))+((e&f)^(~e&g))+constants[i]+words[i])|0;
-        const t2=((rotate(a,2)^rotate(a,13)^rotate(a,22))+((a&b)^(a&c)^(b&c)))|0;
-        h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;
-      }
-      for(const [i,v] of [a,b,c,d,e,f,g,h].entries())state[i]=(state[i]+v)|0;
-    }
-    return state.map(v=>(v>>>0).toString(16).padStart(8,'0')).join('');
-  };
-}
-
-return {createShelterSelectionDigest};
-})();
-const {createShelterResourceSimulation}=(()=>{
-// Deterministic resource transitions for offline development comparisons and opt-in DOM fixtures.
-// Production, capacity and batching equations are independently transcribed from the saved public
-// page (eP/et/tw). Consumption uses the script's explicit adult/child and room-demand contract.
-// This is a conditional model: constant mood/XP/health, no random rewards, births or auto-upgrades.
-// Callers must apply confirmed non-resource events between advances; it is not a server emulator.
-// Room array order resolves competing feed/automatic collection here; the public projection does
-// not establish server settlement order. Route selection must disclose/test that assumption.
-// Rates sample each tick's start, using the supplied roster. Missing historical assignments or
-// changes within a partly elapsed tick cannot be reconstructed from a later snapshot.
-// Keep this factory self-contained so the same transition can run in the browser fixture.
-function createShelterResourceSimulation() {
-  const tick=600000,keys=['power','food','water','scrap','parts','stimpak'],multipliers=[0,1,1.5,2.1];
-  const rules={power:['str','power',12,30],diner:['agi','food',8,25],water:['per','water',8,25],
-    scrap:['end','scrap',8,30],medbay:['int','stimpak',.5,2],workshop:['int','parts',.6,3]};
-  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));
-  const finite=n=>Number.isFinite(n)&&n>=0;
-  function check(view) {
-    const s=view?.state;
-    if(!s||!finite(view.serverTime)||!finite(s.lastSettledAt)||s.lastSettledAt>view.serverTime||
-      !Array.isArray(s.rooms)||!Array.isArray(s.residents)||!Array.isArray(s.items)||!finite(s.stats?.collected)||
-      !keys.every(k=>finite(s.resources?.[k])))throw Error('Incomplete resource simulation state');
-    if(s.rooms.some(r=>!multipliers[r.level]||![1,2,3].includes(r.width)||!finite(r.stored)||!finite(r.builtAt)||
-      !(r.upgradeAt===null||finite(r.upgradeAt)))||
-      new Set(s.rooms.map(r=>r.id)).size!==s.rooms.length)throw Error('Invalid resource simulation rooms');
-    for(const p of s.residents)if(!finite(p.adultAt)||!finite(p.xp)||!finite(p.happiness)||
-      !(p.away===null||p.away&&typeof p.away==='object')||!(p.deadAt===null||finite(p.deadAt))||
-      !['str','per','end','cha','int','agi','lck'].every(k=>finite(p.stats?.[k])))throw Error('Invalid resource simulation resident');
-    if(!Array.isArray(s.births)||s.births.some(b=>!finite(b.dueAt))||
-      s.digging!=null&&!finite(s.digging.doneAt))throw Error('Invalid resource simulation future event');
-    for(const k of ['storage','production'])if(!Number.isInteger(s.legacy?.perks?.[k]??0)||
-      (s.legacy?.perks?.[k]??0)<0||(s.legacy?.perks?.[k]??0)>10)throw Error('Invalid resource simulation perk');
-    if((view.env?.events??[]).some(e=>e.kind==='production'&&(!finite(e.startsAt)||!finite(e.endsAt)||
-      e.endsAt<e.startsAt||!finite(e.percent))))throw Error('Invalid resource simulation event');
-  }
-  function capacities(view,at=view.serverTime) {
-    const s=view.state,built=s.rooms.filter(r=>r.builtAt<=at);
-    const storage=built.filter(r=>r.type==='storage').reduce((n,r)=>n+r.width*r.level,0);
-    return Object.fromEntries(keys.map(k=>{
-      const [base,warehouse,room]=k==='scrap'?[1500,1200,600]:k==='parts'?[100,60,40]:k==='stimpak'?[10,5,5]:[600,400,250];
-      const cells=built.filter(r=>rules[r.type]?.[1]===k).reduce((n,r)=>n+r.width*multipliers[r.level],0);
-      return [k,Math.floor((base+warehouse*storage+room*cells)*(1+.05*(s.legacy?.perks?.storage??0)))];
-    }));
-  }
-  function demand(view,at) {
-    const s=view.state,home=s.residents.filter(p=>p.away===null&&p.deadAt===null);
-    const mouths=home.reduce((n,p)=>n+(p.adultAt<=at?1:.5),0);
-    return {power:s.rooms.filter(r=>r.builtAt<=at).reduce((n,r)=>n+(['door','elevator','power'].includes(r.type)?0:
-      (rules[r.type]?1:.5)*r.width*r.level),0),food:mouths,water:mouths};
-  }
-  function rate(view,room,at) {
-    const s=view.state,rule=rules[room.type];
-    if(!rule||room.builtAt>at||room.incident||room.unpowered||room.upgradeAt!==null)return 0;
-    const [stat,,base]=rule,boost=Math.min(150,Math.max(100,...(view.env?.events??[])
-      .filter(e=>e.kind==='production'&&e.startsAt<=at&&at<e.endsAt).map(e=>e.percent)))/100;
-    const workers=s.residents.filter(p=>p.roomId===room.id&&p.away===null&&p.deadAt===null&&p.adultAt<=at).slice(0,room.width*2);
-    return workers.reduce((n,p)=>{
-      const bonus=s.items.find(i=>i.id===p.outfitId)?.bonus?.[stat]??0;
-      if(!finite(bonus))throw Error('Invalid resource simulation outfit');
-      return n+base*multipliers[room.level]*(.5+Math.min(17,p.stats[stat]+bonus)/10)*
-        (.6+.4*Math.min(100,p.happiness)/100)*(1+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*.01);
-    },0)*(1+.03*(s.legacy?.perks?.production??0))*boost;
-  }
-  function take(view,room,caps,ledger,{at=view.serverTime,sampledAt=at,method='manual'}={}) {
-    const rule=rules[room.type];if(!rule)return;
-    const key=rule[1],batch=rule[3]*room.width*multipliers[room.level];
-    const ready=Math.floor(room.stored/batch+1e-9)*batch;
-    const amount=Math.min(ready,Math.max(0,Math.floor(caps[key]-view.state.resources[key])));
-    if(amount<=0)return;
-    const storedBefore=room.stored;
-    room.stored=Math.max(0,room.stored-amount);view.state.resources[key]+=amount;
-    view.state.stats.collected+=amount;ledger.collected[key]+=amount;
-    // Preserve the actual room and roster, including the distinction between tick-start
-    // automatic collection and manual collection after adulthood/merges. Aggregated income
-    // cannot identify the workers entitled to collection XP.
-    ledger.collections.push({at,sampledAt,method,roomId:room.id,resource:key,batch,
-      readyBatches:Math.round(ready/batch),amount,storedBefore,storedAfter:room.stored,
-      workerIds:view.state.residents.filter(p=>p.roomId===room.id&&p.away===null&&p.deadAt===null&&p.adultAt<=sampledAt)
-        .slice(0,room.width*2).map(p=>p.id)});
-  }
-  function storedTotals(view) {
-    const stored=zero();for(const r of view.state.rooms)if(rules[r.type])stored[rules[r.type][1]]+=r.stored;
-    return stored;
-  }
-  function ledgerFor(view) {
-    return {initial:{...view.state.resources},initialStored:storedTotals(view),minimumInventory:{...view.state.resources},
-      produced:zero(),collected:zero(),consumed:zero(),feed:zero(),
-      unserved:zero(),roomOverflow:zero(),collections:[],feedBlockedParts:0,ticks:0,from:view.serverTime,to:view.serverTime};
-  }
-  function finish(view,ledger) {
-    ledger.final={...view.state.resources};ledger.finalStored=storedTotals(view);
-    for(const k of keys){
-      if(Math.abs(ledger.initial[k]+ledger.collected[k]-ledger.consumed[k]-ledger.feed[k]-ledger.final[k])>1e-7)
-        throw Error('Resource simulation conservation failed: '+k);
-      if(Math.abs(ledger.initialStored[k]+ledger.produced[k]-ledger.collected[k]-ledger.finalStored[k])>1e-7)
-        throw Error('Room storage conservation failed: '+k);
-    }
-    return {view,ledger};
-  }
-  function advanceResources(input,to,{scrapFloor=0}={},oneEventTick=false) {
-    check(input);
-    if(!finite(scrapFloor))throw Error('Invalid manufacturing scrap floor');
-    if(!finite(to)||to<input.serverTime||to-input.state.lastSettledAt>86400000)
-      throw Error('Advance requires monotone time and at most 24 hours; compose explicit event segments');
-    // A due non-resource event needs its own explicit transition. Do not silently freeze a child
-    // that ought to be born, or count production from an upgrade whose completion is unverified.
-    const cutoff=oneEventTick?input.serverTime:to;
-    if(input.state.births.some(b=>b.dueAt<=cutoff)||
-      input.state.rooms.some(r=>r.upgradeAt!==null&&r.upgradeAt<=cutoff)||
-      input.state.digging!=null&&input.state.digging.doneAt<=cutoff)
-      throw Error('Non-resource event requires an explicit transition');
-    const view=structuredClone(input),s=view.state,ledger=ledgerFor(view);
-    while(s.lastSettledAt+tick<=to) {
-      const at=s.lastSettledAt,caps=capacities(view,at),needs=demand(view,at);
-      // Consumption before collection is an explicit conservative ordering assumption.
-      for(const [k,hourly] of Object.entries(needs)) {
-        const wanted=hourly/6,used=Math.min(wanted,s.resources[k]);
-        s.resources[k]-=used;ledger.consumed[k]+=used;ledger.unserved[k]+=wanted-used;
-        ledger.minimumInventory[k]=Math.min(ledger.minimumInventory[k],s.resources[k]);
-      }
-      for(const room of s.rooms) {
-        const rule=rules[room.type];if(!rule)continue;
-        const key=rule[1],batch=rule[3]*room.width*multipliers[room.level],possible=rate(view,room,at)/6;
-        let made=Math.min(possible,Math.max(0,4*batch-room.stored));
-        ledger.roomOverflow[key]+=possible-made;
-        if(key==='parts'){
-          const funded=Math.min(made,Math.max(0,s.resources.scrap-scrapFloor)/6);
-          ledger.feedBlockedParts+=made-funded;made=funded;
-          s.resources.scrap-=made*6;ledger.feed.scrap+=made*6;
-          ledger.minimumInventory.scrap=Math.min(ledger.minimumInventory.scrap,s.resources.scrap);
-        }
-        room.stored+=made;ledger.produced[key]+=made;
-        if(room.builtAt<=at&&(s.handies??[]).some(h=>h.floor===room.floor))
-          take(view,room,caps,ledger,{at:at+tick,sampledAt:at,method:'automatic'});
-      }
-      s.lastSettledAt+=tick;ledger.ticks++;
-    }
-    view.serverTime=to;ledger.to=to;
-    return finish(view,ledger);
-  }
-  function advance(input,to,options) {return advanceResources(input,to,options);}
-  // One interval, sampled from its start, leaving its due events unprocessed. The event layer
-  // must resolve those events before another tick: overdue events still fail the cutoff above.
-  // No fractional initial interval is accepted because its earlier roster is unavailable.
-  function settleTick(input,options) {
-    check(input);
-    if(input.serverTime!==input.state.lastSettledAt)throw Error('Event tick requires a settled starting snapshot');
-    return advanceResources(input,input.serverTime+tick,options,true);
-  }
-  function collect(input,roomId=null) {
-    check(input);const view=structuredClone(input),ledger=ledgerFor(view),caps=capacities(view);
-    for(const r of view.state.rooms)if(r.builtAt<=view.serverTime&&(roomId===null||r.id===roomId))take(view,r,caps,ledger);
-    return finish(view,ledger);
-  }
-  return {advance,settleTick,collect,capacities,rate,demand,storedTotals,validate:check};
-}
-
-return {createShelterResourceSimulation};
-})();
-const {createShelterFamilySimulation}=(()=>{
-// Conditional family transitions used by offline route comparisons. The public page establishes
-// eligibility, charm speed, pregnancy/childhood duration, tick-start housing and cooldown.
-// Callers still declare their rule version and exact child template; random outcomes and
-// server ordering cannot be inferred from the public descriptions.
-function createShelterFamilySimulation() {
-  const tick=600000,stats=['str','per','end','cha','int','agi','lck'];
-  const id=n=>Number.isSafeInteger(n)&&n>0;
-  const time=n=>Number.isSafeInteger(n)&&n>=0;
-  const label=s=>typeof s==='string'&&s.trim().length>0;
-  const key=parents=>[...parents].sort((a,b)=>a-b).join('/');
-  const same=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&key(a)===key(b);
-  const stages=['planned','romance','pregnant','born','cancelled'];
-  function validate(plans,rules) {
-    if(!Array.isArray(plans))throw Error('Invalid family plans');
-    if(!plans.length)return;
-    if(!rules||rules.romance!=='base-charm-sum-per-120-per-tick'||!label(rules.source)||
-      ![rules.pregnancyMs,rules.childhoodMs,rules.cooldownMs].every(n=>time(n)&&n>=tick))
-      throw Error('Explicit conditional family rules required');
-    if(new Set(plans.map(p=>p.key)).size!==plans.length)throw Error('Duplicate family plan key');
-    const pairs=new Set(),children=new Set(),parents=new Set();
-    for(const p of plans){
-      if(!label(p.key)||!label(p.source)||!Array.isArray(p.parents)||p.parents.length!==2||!p.parents.every(id)||
-        p.parents[0]===p.parents[1]||!id(p.roomId)||!stages.includes(p.stage)||!p.child||!id(p.child.id)||
-        !same(p.child.parents,p.parents)||![null,p.roomId].includes(p.child.roomId)||p.child.away!==null||p.child.deadAt!==null||
-        p.child.romance!==null||p.child.training!==0||p.child.outfitId!==null||p.child.weaponId!==null||
-        !label(p.child.name)||!Number.isFinite(p.child.hp)||p.child.hp<=0||
-        !Number.isFinite(p.child.xp)||p.child.xp<0||!Number.isFinite(p.child.happiness)||p.child.happiness<0||p.child.happiness>100||
-        !stats.every(k=>Number.isInteger(p.child.stats?.[k])&&p.child.stats[k]>=0&&p.child.stats[k]<=10))
-        throw Error('Invalid explicit family or child template');
-      if(children.has(p.child.id))throw Error('Duplicate planned child identity');children.add(p.child.id);
-      if(!['born','cancelled'].includes(p.stage)){
-        if(pairs.has(key(p.parents)))throw Error('Overlapping family cycles');pairs.add(key(p.parents));
-        for(const id of p.parents){if(parents.has(id))throw Error('Parent has overlapping family plans');parents.add(id);}
-      }
-      for(const field of ['startedAt','conceivedAt','dueAt','bornAt','pausedAt'])if(p[field]!==undefined&&!time(p[field]))
-        throw Error('Invalid family event time');
-      if(['pregnant','born'].includes(p.stage)&&(!time(p.conceivedAt)||!time(p.dueAt)||p.dueAt<=p.conceivedAt))
-        throw Error('Incomplete confirmed family cycle');
-    }
-  }
-  function ancestry(view,residentId,path=new Set()) {
-    const p=view.state.residents.find(p=>p.id===residentId);
-    if(!p||path.has(residentId)||!Array.isArray(p.parents)||![0,2].includes(p.parents.length)||
-      !p.parents.every(id)||new Set(p.parents).size!==p.parents.length)return null;
-    const result=new Set([residentId]),next=new Set([...path,residentId]);
-    for(const parent of p.parents){const ancestors=ancestry(view,parent,next);if(!ancestors)return null;for(const a of ancestors)result.add(a);}
-    return result;
-  }
-  function eligibility(view,plan,{ignoreLocation=false,existing=false}={}) {
-    const s=view.state,at=view.serverTime,blocked=[],pair=plan.parents.map(id=>s.residents.find(p=>p.id===id));
-    const room=s.rooms.find(r=>r.id===plan.roomId);
-    const issue=reason=>blocked.push({kind:'family',key:plan.key,reason});
-    if(pair.some(p=>!p)){issue('missing-parent');return blocked;}
-    const left=ancestry(view,pair[0].id),right=ancestry(view,pair[1].id);
-    if(!left||!right)issue('unknown-ancestry');else if([...left].some(id=>right.has(id)))issue('related-parents');
-    for(const p of pair){
-      const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));
-      if(p.away!==null||p.deadAt!==null||p.adultAt>at||!Number.isFinite(p.hp)||p.hp<.6*maxHp)issue('parent-unavailable');
-      if(!Number.isFinite(p.happiness)||p.happiness<50)issue('low-happiness');
-      if(!(p.familyCooldownUntil==null||time(p.familyCooldownUntil)))issue('unknown-cooldown');
-      else if(p.familyCooldownUntil>at)issue('cooldown');
-      if(p.romance&&(!existing||p.romance.partnerId!==pair.find(q=>q.id!==p.id).id))issue('other-romance');
-      if(!ignoreLocation&&p.roomId!==plan.roomId)issue('parents-not-together');
-      if(!Number.isFinite(p.stats.cha)||p.stats.cha<0)issue('unknown-charm');
-    }
-    if(!room||room.type!=='quarters'||room.builtAt>at||room.upgradeAt!==null||room.incident||room.unpowered)issue('quarters-unavailable');
-    if(!existing&&s.births.some(b=>b.roomId===plan.roomId||b.parents?.some(id=>plan.parents.includes(id))))issue('pending-birth');
-    if(!existing&&s.residents.some(p=>p.deadAt===null&&p.adultAt<=at&&p.roomId===plan.roomId&&!plan.parents.includes(p.id)))
-      issue('quarters-not-cleared');
-    if(s.residents.some(p=>p.id===plan.child.id)&&plan.stage!=='born')issue('child-identity-already-used');
-    return blocked;
-  }
-  function prepare(view,plans,rules) {
-    validate(plans,rules);const next=structuredClone(plans),s=view.state,at=view.serverTime,end=at+tick;
-    const blocked=[],paused=[],updates=[],births=[],outcomes=[],events=[];
-    const issue=(p,reason)=>blocked.push({kind:'family',key:p?.key??null,reason});
-    const expected=new Set(next.filter(p=>p.stage==='romance').flatMap(p=>p.parents));
-    for(const p of s.residents)if(p.romance&&!expected.has(p.id))issue(null,'unregistered-romance');
-    const capacity=Math.min(200,s.rooms.filter(r=>r.type==='quarters'&&r.builtAt<=at)
-      .reduce((n,r)=>n+r.width*(2+2*r.level),0));
-    let occupied=s.residents.length+s.births.length;
-    // Competing simultaneous cycles cannot silently take the last bed by array order.
-    const ready=[];
-    for(const p of next){
-      if(['cancelled','born'].includes(p.stage))continue;
-      if(p.stage==='pregnant'){
-        if(!s.births.some(b=>b.dueAt===p.dueAt&&same(b.parents,p.parents)))issue(p,'confirmed-pregnancy-missing');
-        continue;
-      }
-      if(p.stage==='planned'){
-        if(!p.parents.every(id=>s.residents.some(q=>q.id===id&&q.roomId===p.roomId)))continue;
-        const reasons=eligibility(view,p);if(reasons.length){paused.push(...reasons);continue;}
-        p.stage='romance';p.startedAt=end;
-        updates.push(...p.parents.map((id,i)=>({id,romance:{partnerId:p.parents[1-i],progress:0}})));
-        events.push({kind:'romance-start',at:end,key:p.key,parents:[...p.parents],roomId:p.roomId,source:p.source});
-        continue;
-      }
-      const pair=p.parents.map(id=>s.residents.find(q=>q.id===id));
-      if(pair.some((q,i)=>!q?.romance||q.romance.partnerId!==p.parents[1-i]||
-        !Number.isFinite(q.romance.progress)||q.romance.progress<0||q.romance.progress>1)||
-        Math.abs(pair[0]?.romance?.progress-pair[1]?.romance?.progress)>1e-9){issue(p,'romance-state-mismatch');continue;}
-      const reasons=eligibility(view,p,{existing:true});
-      if(reasons.length){
-        p.pausedAt??=at;paused.push(...reasons);
-        // The page permits partner changes after a long pause. No deterministic re-pairing
-        // rule is known; do not keep a convenient old pair if a competing single is present.
-        const parentRooms=new Set(pair.map(q=>q.roomId).filter(roomId=>s.rooms.some(r=>r.id===roomId&&r.type==='quarters')));
-        if(end-p.pausedAt>1800000&&s.residents.some(q=>!p.parents.includes(q.id)&&q.deadAt===null&&q.away===null&&
-          q.adultAt<=at&&parentRooms.has(q.roomId)&&!q.romance))issue(p,'paused-repairing-rule-unknown');
-        continue;
-      }
-      delete p.pausedAt;
-      const progress=Math.min(1,pair[0].romance.progress+(pair[0].stats.cha+pair[1].stats.cha)/120);
-      updates.push(...pair.map(q=>({id:q.id,romance:{partnerId:q.romance.partnerId,progress}})));
-      if(progress>=1-1e-9)ready.push(p);
-    }
-    if(ready.length>Math.max(0,capacity-occupied)&&capacity>occupied){
-      issue(null,'simultaneous-pregnancies-exceed-known-capacity');return {plans:next,blocked,paused,updates:[],births:[],outcomes:[],events:[]};
-    }
-    for(const p of ready){
-      if(occupied>=capacity){paused.push({kind:'family',key:p.key,reason:'beds-at-tick-start'});continue;}
-      occupied++;p.stage='pregnant';p.conceivedAt=end;p.dueAt=end+rules.pregnancyMs;
-      const birth={roomId:p.roomId,parents:[...p.parents],dueAt:p.dueAt};births.push(birth);
-      outcomes.push({...birth,resident:{...structuredClone(p.child),adultAt:p.dueAt+rules.childhoodMs,familyCooldownUntil:0},source:p.source});
-      for(const id of p.parents){
-        const update=updates.find(u=>u.id===id);update.romance=null;update.familyCooldownUntil=end+rules.cooldownMs;
-      }
-      events.push({kind:'pregnancy',at:end,key:p.key,parents:[...p.parents],roomId:p.roomId,dueAt:p.dueAt,
-        childId:p.child.id,source:p.source});
-    }
-    return {plans:next,blocked,paused,updates,births,outcomes,events};
-  }
-  return {validate,eligibility,prepare};
-}
-
-return {createShelterFamilySimulation};
-})();
-const {createShelterMoodSimulation}=(()=>{
-// Public mood targets and ten-minute relaxation, with explicit interpretations for details
-// not established by the saved UI: stat basis/ties, room eligibility, sampling and rounding.
-// This changes mood only. It does not invent incident outcomes, recruitment, health or XP.
-function createShelterMoodSimulation() {
-  const stats=['str','per','end','cha','int','agi','lck'];
-  const roomStats={door:'end',power:'str',diner:'agi',water:'per',scrap:'end',quarters:'cha',
-    medbay:'int',workshop:'int',armory:'str',tailor:'cha',radio:'cha'};
-  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;
-  const active=(r,at)=>r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-  function validate(view,rules) {
-    if(!rules||!['base','equipped'].includes(rules.statBasis)||rules.matching!=='any-highest-staffed-room-stat'||
-      rules.shortage!=='unserved-interval'||rules.timing!=='tick-start'||rules.rounding!=='none'||
-      typeof rules.source!=='string'||!rules.source.trim())throw Error('Explicit conditional mood rules required');
-    if(!Number.isInteger(view.state.legacy?.perks?.happiness??0)||(view.state.legacy?.perks?.happiness??0)<0||
-      (view.state.legacy?.perks?.happiness??0)>10)throw Error('Invalid happiness legacy perk');
-    for(const p of view.state.residents)if(!Number.isFinite(p.happiness)||p.happiness<0||p.happiness>100||
-      !stats.every(k=>Number.isFinite(p.stats?.[k])&&p.stats[k]>=0&&p.stats[k]<=10))throw Error('Invalid mood resident state');
-  }
-  function step(view,unserved,rules) {
-    validate(view,rules);
-    if(!['food','water'].every(k=>Number.isFinite(unserved?.[k])&&unserved[k]>=0))throw Error('Mood needs interval shortage evidence');
-    const s=view.state,at=view.serverTime,updates=[],events=[],blocked=[];
-    const radio=s.rooms.some(r=>r.type==='radio'&&active(r,at)&&s.residents.some(p=>p.roomId===r.id&&present(p,at)));
-    for(const p of s.residents){
-      if(p.deadAt!==null||p.away!==null)continue;
-      const r=s.rooms.find(r=>r.id===p.roomId),adult=p.adultAt<=at,reasons={base:65,legacy:s.legacy?.perks?.happiness??0};
-      if(p.roomId!==null&&!r){blocked.push({kind:'mood',id:p.id,reason:'unknown-assigned-room'});continue;}
-      let values={...p.stats};
-      if(rules.statBasis==='equipped'&&p.outfitId!==null){
-        const outfit=s.items.find(i=>i.id===p.outfitId);
-        if(!outfit||!stats.every(k=>Number.isFinite(outfit.bonus?.[k]??0)&&(outfit.bonus?.[k]??0)>=0)){
-          blocked.push({kind:'mood',id:p.id,reason:'unknown-outfit-for-matching'});continue;
-        }
-        values=Object.fromEntries(stats.map(k=>[k,Math.min(17,p.stats[k]+(outfit.bonus?.[k]??0))]));
-      }
-      const stat=r?.type==='training'?r.trainStat:roomStats[r?.type];
-      if(r&&adult&&!['storage','elevator'].includes(r.type)&&!stats.includes(stat)){
-        blocked.push({kind:'mood',id:p.id,reason:'unknown-room-matching-stat'});continue;
-      }
-      // Matching is earned by an actual adult slot in an operational room. Extra occupants,
-      // children and a room still under construction cannot gain a free work bonus.
-      const assigned=r?s.residents.filter(q=>q.roomId===r.id&&present(q,at)).slice(0,r.width*2):[];
-      if(r&&adult&&active(r,at)&&assigned.some(q=>q.id===p.id)&&stat&&values[stat]===Math.max(...stats.map(k=>values[k])))reasons.matching=15;
-      if(radio)reasons.radio=10;
-      if(adult&&p.roomId===null)reasons.unassigned=-20;
-      if(r?.incident)reasons.incident=-20;
-      if(r?.unpowered)reasons.outage=-10;
-      if(unserved.food>1e-9)reasons.food=-25;
-      if(unserved.water>1e-9)reasons.water=-25;
-      const target=Math.min(100,Math.max(5,Object.values(reasons).reduce((a,b)=>a+b,0)));
-      const next=p.happiness+.05*(target-p.happiness);
-      updates.push({id:p.id,before:p.happiness,after:next,target,reasons});
-      if(adult&&(p.happiness>=50)!==(next>=50))events.push({kind:'family-mood-threshold',at:at+600000,id:p.id,
-        from:p.happiness,to:next,meetsMoodMinimum:next>=50});
-    }
-    const values=updates.map(u=>u.after);
-    return {updates,events,blocked,summary:{at:at+600000,radio,changed:updates.filter(u=>u.before!==u.after).length,
-      min:values.length?Math.min(...values):null,max:values.length?Math.max(...values):null,
-      belowFamilyMood:updates.filter(u=>u.after<50&&s.residents.find(p=>p.id===u.id).adultAt<=at).length}};
-  }
-  return {validate,step};
-}
-
-return {createShelterMoodSimulation};
-})();
-const {createShelterXpSimulation}=(()=>{
-// Public duty/collection XP and resident level/max-HP equations. This optional offline
-// model declares tick sampling and numerical precision. It does not invent healing,
-// activity multipliers or XP for an ambiguously capacity-limited collection.
-function createShelterXpSimulation() {
-  const tick=600000,precision=1e9;
-  const rooms=new Set(['door','elevator','power','diner','water','scrap','quarters','storage',
-    'medbay','training','workshop','armory','tailor','radio']);
-  const fields={duty:'tick-start-prorated',collection:'full-ready-batches',health:'fixed-current-hp',
-    activity:'block-unmodeled-xp',precision:'1e-9'};
-  const level=p=>Math.min(50,1+Math.floor(Math.sqrt(p.xp/3)));
-  const maxHp=p=>Math.round(100+(level(p)-1)*(2+.5*p.stats.end));
-  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;
-  function validate(view,rules) {
-    if(!rules||Object.entries(fields).some(([k,v])=>rules[k]!==v)||
-      Object.keys(rules).some(k=>!(k in fields)&&k!=='source')||typeof rules.source!=='string'||!rules.source.trim())
-      throw Error('Explicit conditional XP and fixed-health rules required');
-    for(const p of view.state.residents)if(!Number.isFinite(p.xp)||p.xp<0||!Number.isFinite(p.hp)||p.hp<0||
-      !Number.isFinite(p.stats?.end)||p.stats.end<0||p.stats.end>10)
-      throw Error('Invalid XP or current-health state');
-    for(const e of view.env?.events??[])if(e.kind==='xp'&&(!Number.isSafeInteger(e.startsAt)||e.startsAt<0||
-      !Number.isSafeInteger(e.endsAt)||e.endsAt<e.startsAt||!Number.isFinite(e.percent)||e.percent<0))
-      throw Error('Invalid XP activity interval');
-  }
-  function duty(view,rules) {
-    validate(view,rules);const at=view.serverTime,awards=[],blocked=[];
-    // The saved page identifies affected XP sources but does not prove the server's XP
-    // multiplier, cap or boundary handling. Do not silently assume no active boost.
-    if((view.env?.events??[]).some(e=>e.kind==='xp'&&e.startsAt<at+tick&&e.endsAt>at))
-      blocked.push({kind:'xp',at,reason:'xp-activity-rule-not-modeled'});
-    for(const p of view.state.residents)if(present(p,at)&&p.roomId!==null&&
-      !view.state.rooms.some(r=>r.id===p.roomId))blocked.push({kind:'xp',id:p.id,at,reason:'unknown-assigned-room'});
-    for(const r of view.state.rooms){
-      if(!rooms.has(r.type)){blocked.push({kind:'xp',roomId:r.id,at,reason:'unknown-duty-room-type'});continue;}
-      if(['quarters','elevator','storage'].includes(r.type)||r.builtAt>at||r.upgradeAt!==null||r.incident||r.unpowered)continue;
-      for(const p of view.state.residents.filter(p=>p.roomId===r.id&&present(p,at)).slice(0,r.width*2))
-        awards.push({id:p.id,roomId:r.id,amount:1/6,kind:'duty',at:at+tick,sampledAt:at});
-    }
-    return {awards,blocked};
-  }
-  function collection(view,receipts,rules) {
-    validate(view,rules);const awards=[],blocked=[],seen=new Set();
-    if(!Array.isArray(receipts))throw Error('Per-room collection receipts required for XP');
-    for(const r of receipts){
-      const room=view.state.rooms.find(room=>room.id===r.roomId),key=r.at+':'+r.method+':'+r.roomId;
-      const workers=room?view.state.residents.filter(p=>p.roomId===room.id&&present(p,r.sampledAt)).slice(0,room.width*2).map(p=>p.id):[];
-      if(!Number.isFinite(r.batch)||r.batch<=0||!Number.isSafeInteger(r.readyBatches)||r.readyBatches<1||
-        !Number.isFinite(r.amount)||r.amount<=0||r.amount>r.batch*r.readyBatches+1e-7||
-        !room||seen.has(key)||!Number.isFinite(r.storedBefore)||!Number.isFinite(r.storedAfter)||r.storedAfter<0||
-        Math.abs(r.storedBefore-r.amount-r.storedAfter)>1e-7||Math.floor(r.storedBefore/r.batch+1e-9)!==r.readyBatches||
-        !Array.isArray(r.workerIds)||new Set(r.workerIds).size!==r.workerIds.length||
-        !['automatic','manual'].includes(r.method)||!Number.isSafeInteger(r.at)||r.at!==view.serverTime||
-        !Number.isSafeInteger(r.sampledAt)||r.sampledAt!==(r.method==='automatic'?r.at-tick:r.at)||
-        JSON.stringify(r.workerIds)!==JSON.stringify(workers))
-        throw Error('Invalid per-room XP collection receipt');
-      seen.add(key);
-      if(r.workerIds.length&&Math.abs(r.amount-r.batch*r.readyBatches)>1e-7){
-        blocked.push({kind:'xp',roomId:r.roomId,at:r.at,reason:'partial-collection-xp-unknown',
-          amount:r.amount,readyBatches:r.readyBatches,batch:r.batch});continue;
-      }
-      for(const id of r.workerIds)awards.push({id,roomId:r.roomId,amount:2*r.readyBatches,
-        kind:'collection',method:r.method,at:r.at,sampledAt:r.sampledAt});
-    }
-    return {awards,blocked};
-  }
-  function apply(view,awards) {
-    // Called only on a private tick copy. Normalize tiny binary additions consistently
-    // across JSON/repeated advances; this precision is a model condition, not UI evidence.
-    for(const a of awards){const p=view.state.residents.find(p=>p.id===a.id);
-      if(!p||!Number.isFinite(a.amount)||a.amount<0)throw Error('Invalid XP award');
-      p.xp=Math.round((p.xp+a.amount)*precision)/precision;
-    }
-  }
-  function changes(before,after,awards) {
-    const events=[],at=after.serverTime;
-    for(const p of before.state.residents){
-      const q=after.state.residents.find(q=>q.id===p.id);if(!q)continue;
-      const oldLevel=level(p),newLevel=level(q),oldMax=maxHp(p),newMax=maxHp(q);
-      if(oldLevel!==newLevel)events.push({kind:'resident-level',at,id:p.id,from:oldLevel,to:newLevel,xp:q.xp});
-      if(oldMax!==newMax)events.push({kind:'resident-max-hp',at,id:p.id,from:oldMax,to:newMax,hp:q.hp});
-      if(present(p,before.serverTime)&&(p.hp>=.6*oldMax)!==(q.hp>=.6*newMax))
-        events.push({kind:'resident-health-threshold',at,id:p.id,hp:q.hp,maxHp:newMax,meetsHealthMinimum:q.hp>=.6*newMax});
-    }
-    return {events,summary:{at,duty:awards.filter(a=>a.kind==='duty').reduce((n,a)=>n+a.amount,0),
-      collection:awards.filter(a=>a.kind==='collection').reduce((n,a)=>n+a.amount,0),
-      workers:new Set(awards.map(a=>a.id)).size,levels:events.filter(e=>e.kind==='resident-level').length,
-      belowHealthMinimum:after.state.residents.filter(p=>present(p,at)&&p.hp<.6*maxHp(p)).length}};
-  }
-  return {validate,duty,collection,apply,changes,level,maxHp};
-}
-
-return {createShelterXpSimulation};
-})();
-const {createShelterEventSimulation}=(()=>{
-
-// Conditional, deterministic natural-event progression for D.14. This is an offline model,
-// not a server emulator and not an action executor. Every run declares the same timing,
-// training remainder and merge assumptions for all compared routes. Unknown outcomes stop
-// before their interval; no fake children, elevator IDs or training progress are synthesized.
-function createShelterEventSimulation() {
-  const resources=createShelterResourceSimulation(),family=createShelterFamilySimulation(),mood=createShelterMoodSimulation(),tick=600000;
-  const xp=createShelterXpSimulation();
-  const stats=['str','per','end','cha','int','agi','lck'];
-  const keys=['power','food','water','scrap','parts','stimpak'];
-  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));
-  const id=n=>Number.isSafeInteger(n)&&n>0;
-  const time=n=>Number.isSafeInteger(n)&&n>=0;
-  const sameParents=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&
-    a[0]!==a[1]&&a.every(id)&&b.every(id)&&a.every(p=>b.includes(p));
-  const sameBirth=(a,b)=>a.roomId===b.roomId&&a.dueAt===b.dueAt&&sameParents(a.parents,b.parents);
-  const active=(r,at)=>r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-  function validate(view,assumptions,outcomes) {
-    resources.validate(view);const s=view.state;
-    if(!assumptions||assumptions.eventTiming!=='tick-end'||assumptions.trainingOverflow!=='reset'||
-      assumptions.merge!=='left-neighbor'||typeof assumptions.source!=='string'||!assumptions.source.trim())
-      throw Error('Explicit conditional timing, training and merge assumptions required');
-    if(view.serverTime!==s.lastSettledAt)throw Error('Event simulation needs a settled snapshot; missing tick history');
-    if(!Number.isInteger(s.depth)||s.depth<1||s.rooms.some(r=>!id(r.id)||!Number.isInteger(r.floor)||r.floor<1||
-      !Number.isInteger(r.col)||r.col<0)||s.residents.some(p=>!id(p.id))||
-      new Set(s.residents.map(p=>p.id)).size!==s.residents.length)throw Error('Invalid event simulation identities or layout');
-    if(!outcomes||!Array.isArray(outcomes.births)||!Array.isArray(outcomes.digs))throw Error('Explicit outcome lists required');
-    for(const [i,b] of outcomes.births.entries())if(!time(b.dueAt)||!id(b.roomId)||!sameParents(b.parents,b.parents)||
-      !b.resident||typeof b.source!=='string'||!b.source.trim()||outcomes.births.slice(0,i).some(a=>sameBirth(a,b)))
-      throw Error('Invalid or duplicate birth outcome');
-    for(const [i,d] of outcomes.digs.entries())if(!time(d.doneAt)||!Number.isInteger(d.floor)||d.floor<2||
-      !d.elevator||typeof d.source!=='string'||!d.source.trim()||outcomes.digs.slice(0,i).some(a=>a.floor===d.floor&&a.doneAt===d.doneAt))
-      throw Error('Invalid or duplicate digging outcome');
-  }
-  function progress(view) {
-    const s=view.state,at=view.serverTime;
-    const score=2*s.residents.filter(p=>p.deadAt===null).length+3*s.depth+s.rooms
-      .filter(r=>r.builtAt<=at&&!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
-    let level=1;while(score>=30+Math.ceil(2.25*level*level))level++;
-    return {level,score,next:30+Math.ceil(2.25*level*level)};
-  }
-  function dueIssues(view,end,outcomes,familyPlans=[]) {
-    const s=view.state,start=view.serverTime,issues=[];
-    const issue=(kind,target,at,reason)=>issues.push({kind,target,at,reason});
-    const usedPeople=new Set(s.residents.map(p=>p.id)),usedRooms=new Set(s.rooms.map(r=>r.id));
-    if(view.switches?.frozen)issue('shelter',null,start,'frozen-shelter');
-    for(const b of s.births){
-      if(b.dueAt<=start){issue('birth',b.roomId,b.dueAt,'overdue-event-needs-snapshot');continue;}
-      if(b.dueAt>end)continue;
-      const o=outcomes.births.find(o=>sameBirth(o,b)),p=o?.resident;
-      if(!o){issue('birth',b.roomId,b.dueAt,'missing-child-outcome');continue;}
-      if(!id(p.id)||usedPeople.has(p.id)||!sameParents(p.parents,b.parents)||!time(p.adultAt)||p.adultAt<=end||
-        !(p.roomId===null||p.roomId===b.roomId&&s.rooms.some(r=>r.id===b.roomId&&r.type==='quarters'))||
-        p.deadAt!==null||p.away!==null||p.romance!==null||p.training!==0||
-        p.outfitId!==null||p.weaponId!==null||!Number.isFinite(p.hp)||p.hp<=0||
-        !stats.every(k=>Number.isInteger(p.stats?.[k])&&p.stats[k]>=0&&p.stats[k]<=10)||
-        !Number.isFinite(p.xp)||p.xp<0||!Number.isFinite(p.happiness)||p.happiness<0||p.happiness>100)
-        issue('birth',b.roomId,b.dueAt,'invalid-or-conflicting-child-outcome');
-      usedPeople.add(p.id);
-    }
-    for(const r of s.rooms)if(r.upgradeAt!==null){
-      if(r.upgradeAt<=start)issue('upgrade',r.id,r.upgradeAt,'overdue-event-needs-snapshot');
-      else if(r.upgradeAt<=end&&(r.level>=3||r.builtAt>start))issue('upgrade',r.id,r.upgradeAt,'invalid-upgrade-state');
-    }
-    // A merge would change the identity referenced by pending family/crafting outcomes.
-    // Until those dependencies have a remapping contract, stop before changing their room.
-    const after=s.rooms.map(r=>({...r,level:r.level+(r.upgradeAt!==null&&r.upgradeAt<=end?1:0),
-      upgradeAt:r.upgradeAt!==null&&r.upgradeAt<=end?null:r.upgradeAt}));
-    for(const original of s.rooms.filter(r=>r.builtAt>start&&r.builtAt<=end||r.upgradeAt!==null&&r.upgradeAt<=end)){
-      const r=after.find(r=>r.id===original.id),left=after.find(l=>l.id!==r.id&&l.floor===r.floor&&
-        !l.separate&&!r.separate&&l.col+l.width===r.col&&l.type===r.type&&l.level===r.level&&l.width+r.width<=3&&active(l,end)&&active(r,end)&&
-        (r.type!=='training'||l.trainStat===r.trainStat));
-      if(left&&(s.births.some(b=>b.roomId===r.id||b.roomId===left.id)||r.craft||left.craft||
-        familyPlans.some(p=>!['born','cancelled'].includes(p.stage)&&[r.id,left.id].includes(p.roomId))))
-        issue('merge',r.id,end,'dependent-room-outcome-remap-not-modeled');
-    }
-    const d=s.digging;
-    if(d&&d.doneAt<=start)issue('dig',d.floor,d.doneAt,'overdue-event-needs-snapshot');
-    else if(d&&d.doneAt<=end){
-      const o=outcomes.digs.find(o=>o.floor===d.floor&&o.doneAt===d.doneAt),r=o?.elevator;
-      if(!o)issue('dig',d.floor,d.doneAt,'missing-elevator-outcome');
-      else if(d.floor!==s.depth+1||!id(r.id)||usedRooms.has(r.id)||r.type!=='elevator'||r.floor!==d.floor||
-        r.col!==1||r.width!==1||r.level!==1||r.builtAt!==d.doneAt||r.upgradeAt!==null||r.stored!==0||r.incident||r.unpowered)
-        issue('dig',d.floor,d.doneAt,'invalid-or-conflicting-elevator-outcome');
-    }
-    for(const p of s.residents)if(p.romance&&!familyPlans.some(f=>f.stage==='romance'&&f.parents.includes(p.id)))
-      issue('romance',p.id,start,'future-romance-rule-not-supplied');
-    for(const r of s.rooms){
-      if(r.incident)issue('incident',r.id,start,'incident-evolution-not-modeled');
-      if(r.type==='radio'&&active(r,start)&&s.residents.some(p=>p.roomId===r.id&&p.deadAt===null&&p.away===null&&p.adultAt<=start)){
-        const capacity=Math.min(200,s.rooms.filter(q=>q.type==='quarters'&&q.builtAt<=start).reduce((n,q)=>n+q.width*(2+2*q.level),0));
-        if(s.residents.length+s.births.length<capacity)issue('radio',r.id,start,'recruitment-outcome-not-modeled');
-      }
-      if(r.craft&&(!time(r.craft.doneAt)||r.craft.doneAt<=end))issue('craft',r.id,r.craft.doneAt,'craft-outcome-not-supplied');
-    }
-    for(const e of s.explorers??[])if(e.returnAt===null||!time(e.returnAt)||e.returnAt<=end)
-      issue('explorer',e.id,e.returnAt,'exploration-outcome-not-supplied');
-    for(const q of s.quests??[])if(!time(q.nextStageAt)||q.nextStageAt<=end||q.returnAt!=null&&q.returnAt<=end)
-      issue('quest',q.id,q.nextStageAt,'quest-outcome-not-supplied');
-    return issues;
-  }
-  // Shared with native-decision window tests. Missing observations remain blocked;
-  // neither an unknown attribute nor missing progress can become a fresh course.
-  function trainingStep(view,assumptions) {
-    if(assumptions?.trainingOverflow!=='reset'||typeof assumptions.source!=='string'||!assumptions.source.trim())
-      throw Error('Explicit conditional training assumptions required');
-    const s=view.state,start=view.serverTime,perk=s.legacy?.perks?.training??0,updates=[],blocked=[];
-    for(const r of s.rooms.filter(r=>r.type==='training'&&active(r,start)))for(const p of s.residents
-      .filter(p=>p.roomId===r.id&&p.away===null&&p.deadAt===null&&p.adultAt<=start).slice(0,r.width*2)){
-      const base=p.stats[r.trainStat];
-      if(!stats.includes(r.trainStat)||!Number.isInteger(base)||base<0||base>10||
-        !Number.isInteger(perk)||perk<0||perk>10||base<10&&(!Number.isFinite(p.training)||p.training<0||p.training>=1)){
-        blocked.push({kind:'training',target:p.id,at:start,reason:'unknown-training-state'});continue;
-      }
-      if(base<10)updates.push({id:p.id,stat:r.trainStat,base,
-        progress:p.training+r.level*(1+.05*perk)/(base+1)/6});
-    }
-    return {updates,blocked};
-  }
-  function mergeCompleted(view,completed,events) {
-    const s=view.state,at=view.serverTime;
-    // Explicit conditional rule, matching the existing long-development fixture: only a
-    // finished compatible left neighbor. Stored products and resident identities survive.
-    const ordered=[...new Set(completed)].sort((a,b)=>{
-      const ra=s.rooms.find(r=>r.id===a),rb=s.rooms.find(r=>r.id===b);
-      return ra.floor-rb.floor||ra.col-rb.col||ra.id-rb.id;
-    });
-    for(const roomId of ordered){
-      const r=s.rooms.find(r=>r.id===roomId);if(!r||r.separate||['door','elevator'].includes(r.type)||!active(r,at))continue;
-      const left=s.rooms.find(l=>l.id!==r.id&&l.floor===r.floor&&l.col+l.width===r.col&&l.type===r.type&&
-        !l.separate&&l.level===r.level&&l.width+r.width<=3&&active(l,at)&&(r.type!=='training'||l.trainStat===r.trainStat));
-      if(!left)continue;
-      left.width+=r.width;left.stored+=r.stored;
-      for(const p of s.residents)if(p.roomId===r.id)p.roomId=left.id;
-      s.rooms=s.rooms.filter(x=>x.id!==r.id);
-      events.push({kind:'merge',at,roomId:r.id,into:left.id,width:left.width});
-    }
-  }
-  function advance(input,to,{assumptions,outcomes={births:[],digs:[]},familyPlans=[],familyRules=null,moodRules=null,xpRules=null,scrapFloor=0,collect=false,stopAtEvent=false}={}) {
-    validate(input,assumptions,outcomes);
-    family.validate(familyPlans,familyRules);
-    if(moodRules!==null)mood.validate(input,moodRules);
-    if(xpRules!==null)xp.validate(input,xpRules);
-    if(!time(to)||to<input.serverTime||to-input.serverTime>168*3600000||(to-input.serverTime)%tick!==0)
-      throw Error('Event horizon must use whole ticks, monotone time and at most 168 hours');
-    if(typeof collect!=='boolean'||typeof stopAtEvent!=='boolean'||!Number.isFinite(scrapFloor)||scrapFloor<0)
-      throw Error('Invalid event simulation options');
-    let view=structuredClone(input),plans=structuredClone(familyPlans),known=structuredClone(outcomes);
-    const events=[],segments=[],blocked=[],familyPauses=[];
-    let lastMood=null,lastXp=null;
-    const earnedXp={duty:0,collection:0};
-    const ledger={initial:{...view.state.resources},initialStored:resources.storedTotals(view),final:null,
-      produced:zero(),collected:zero(),consumed:zero(),feed:zero(),
-      unserved:zero(),roomOverflow:zero(),collections:[],minimumInventory:{...view.state.resources},feedBlockedParts:0,ticks:0};
-    function accumulate(l){
-      for(const k of keys){for(const field of ['produced','collected','consumed','feed','unserved','roomOverflow'])ledger[field][k]+=l[field][k];
-        ledger.minimumInventory[k]=Math.min(ledger.minimumInventory[k],l.minimumInventory[k]);}
-      ledger.feedBlockedParts+=l.feedBlockedParts;ledger.ticks+=l.ticks;
-      ledger.collections.push(...l.collections);
-    }
-    while(view.serverTime<to){
-      const start=view.serverTime,end=start+tick,s=view.state,issues=dueIssues(view,end,known,plans);
-      const familyStep=plans.length?family.prepare(view,plans,familyRules):null;
-      if(familyStep)issues.push(...familyStep.blocked);
-      const dutyStep=xpRules===null?null:xp.duty(view,xpRules);
-      if(dutyStep)issues.push(...dutyStep.blocked);
-      const training=trainingStep(view,assumptions);issues.push(...training.blocked);
-      if(issues.length){blocked.push(...issues);break;}
-      const beforeEvents=events.length;
-      const tickEvents=[],awards=dutyStep?[...dutyStep.awards]:[];
-      const step=resources.settleTick(view,{scrapFloor});
-      const moodStep=moodRules===null?null:mood.step(view,step.ledger.unserved,moodRules);
-      if(moodStep?.blocked.length){blocked.push(...moodStep.blocked);break;}
-      const autoXp=xpRules===null?null:xp.collection(step.view,step.ledger.collections,xpRules);
-      if(autoXp?.blocked.length){blocked.push(...autoXp.blocked);break;}
-      if(autoXp)awards.push(...autoXp.awards);
-      let nextView=step.view;
-      const next=nextView.state,completed=[],nextKnown=structuredClone(known);
-      let nextPlans=structuredClone(plans);
-      if(xpRules!==null)xp.apply(nextView,awards);
-      if(moodStep){
-        for(const update of moodStep.updates)next.residents.find(p=>p.id===update.id).happiness=update.after;
-        tickEvents.push(...moodStep.events);
-      }
-      if(familyStep){
-        for(const update of familyStep.updates){const {id,...changes}=update;Object.assign(next.residents.find(p=>p.id===id),changes);}
-        next.births.push(...familyStep.births);nextKnown.births.push(...familyStep.outcomes);nextPlans=familyStep.plans;
-        tickEvents.push(...familyStep.events);
-      }
-      for(const t of training.updates){
-        const p=next.residents.find(p=>p.id===t.id);
-        if(t.progress>=1-1e-9){p.stats[t.stat]++;p.training=0;tickEvents.push({kind:'training',at:end,id:p.id,stat:t.stat,from:t.base,to:p.stats[t.stat]});}
-        else p.training=t.progress;
-      }
-      for(const r of next.rooms){
-        if(r.upgradeAt!==null&&r.upgradeAt<=end){
-          const dueAt=r.upgradeAt;r.upgradeAt=null;r.level++;completed.push(r.id);
-          tickEvents.push({kind:'upgrade',at:end,dueAt,roomId:r.id,level:r.level});
-        }
-        if(r.builtAt>start&&r.builtAt<=end){completed.push(r.id);tickEvents.push({kind:'build',at:end,dueAt:r.builtAt,roomId:r.id});}
-      }
-      if(next.digging&&next.digging.doneAt<=end){
-        const d=next.digging,o=nextKnown.digs.find(o=>o.floor===d.floor&&o.doneAt===d.doneAt);
-        next.depth=d.floor;next.rooms.push(structuredClone(o.elevator));next.digging=null;
-        tickEvents.push({kind:'dig',at:end,dueAt:d.doneAt,floor:d.floor,roomId:o.elevator.id,source:o.source});
-      }
-      for(const b of [...next.births])if(b.dueAt<=end){
-        const o=nextKnown.births.find(o=>sameBirth(o,b));next.residents.push(structuredClone(o.resident));
-        next.births.splice(next.births.indexOf(b),1);
-        tickEvents.push({kind:'birth',at:end,dueAt:b.dueAt,id:o.resident.id,adultAt:o.resident.adultAt,parents:[...b.parents],source:o.source});
-        for(const p of nextPlans)if(p.stage==='pregnant'&&p.dueAt===b.dueAt&&sameParents(p.parents,b.parents)){
-          p.stage='born';p.bornAt=end;
-        }
-      }
-      for(const p of next.residents)if(p.deadAt===null&&p.adultAt>start&&p.adultAt<=end)
-        tickEvents.push({kind:'adult',at:end,dueAt:p.adultAt,id:p.id});
-      for(const e of view.env?.events??[])if(e.kind==='production'){
-        if(e.startsAt>start&&e.startsAt<=end)tickEvents.push({kind:'production-modifier-start',at:end,dueAt:e.startsAt,percent:e.percent});
-        if(e.endsAt>start&&e.endsAt<=end)tickEvents.push({kind:'production-modifier-end',at:end,dueAt:e.endsAt,percent:e.percent});
-      }
-      mergeCompleted(nextView,completed,tickEvents);
-      nextView.progress={...nextView.progress,...progress(nextView)};
-      resources.validate(nextView);
-      // Manual collection is a modeled action at the interval end, after natural transitions.
-      // It must be explicitly requested and carries no implication of real browser execution.
-      let manual=null;
-      if(collect){
-        manual=resources.collect(nextView);nextView=manual.view;
-        if(xpRules!==null){
-          const manualXp=xp.collection(nextView,manual.ledger.collections,xpRules);
-          if(manualXp.blocked.length){blocked.push(...manualXp.blocked);break;}
-          xp.apply(nextView,manualXp.awards);awards.push(...manualXp.awards);
-        }
-      }
-      const xpStep=xpRules===null?null:xp.changes(view,nextView,awards);
-      // Commit one whole tick only after all modeled transitions are known. In particular,
-      // partial-collection uncertainty cannot leak production, births, XP or ledger changes.
-      view=nextView;known=nextKnown;plans=nextPlans;accumulate(step.ledger);
-      if(manual)accumulate(manual.ledger);
-      if(moodStep)lastMood=moodStep;
-      if(xpStep){tickEvents.push(...xpStep.events);lastXp=xpStep;
-        earnedXp.duty+=xpStep.summary.duty;earnedXp.collection+=xpStep.summary.collection;}
-      events.push(...tickEvents);
-      if(familyStep)familyPauses.push(...familyStep.paused.map(p=>({...p,at:end})));
-      segments.push({from:start,to:end,events:events.slice(beforeEvents),progress:{...view.progress},
-        resources:{...view.state.resources},demand:resources.demand(view,end),...(moodStep?{mood:moodStep.summary}:{}),
-        ...(xpStep?{xp:xpStep.summary}:{})});
-      if(stopAtEvent&&events.length>beforeEvents)break;
-    }
-    ledger.final={...view.state.resources};ledger.finalStored=resources.storedTotals(view);
-    for(const k of keys){
-      if(Math.abs(ledger.initial[k]+ledger.collected[k]-ledger.consumed[k]-ledger.feed[k]-ledger.final[k])>1e-7)
-        throw Error('Event resource conservation failed: '+k);
-      if(Math.abs(ledger.initialStored[k]+ledger.produced[k]-ledger.collected[k]-ledger.finalStored[k])>1e-7)
-        throw Error('Event room storage conservation failed: '+k);
-    }
-    return {view,ledger,events,segments,blocked,outcomes:known,familyPlans:plans,familyPauses,
-      mood:{enabled:moodRules!==null,rules:structuredClone(moodRules),lastStep:lastMood},complete:view.serverTime===to,requestedTo:to,
-      xp:{enabled:xpRules!==null,rules:structuredClone(xpRules),earned:earnedXp,lastStep:lastXp},
-      model:{kind:'conditional-natural-events',assumptions:structuredClone(assumptions),
-        limits:[moodRules===null?'constant-mood':'conditional-dynamic-mood',
-          xpRules===null?'constant-xp-and-current-hp':'conditional-dynamic-xp-fixed-current-hp-no-healing',
-          'radio-recruitment-requires-explicit-outcomes-when-beds-available','no-random-rewards-or-incidents','no-action-or-reservation-planner',
-          'tick-start-roster-and-tick-end-events','birth-and-dig-outcomes-explicit','collection-only-if-requested',
-          'room-array-order-for-feed-and-automatic-collection','training-one-increment-then-reset',
-          'merge-completions-by-floor-column-into-left-neighbor',...(plans.length?['family-rules-and-child-templates-explicit']:[])]}};
-  }
-  return {advance,trainingStep};
-}
-
-return {createShelterEventSimulation};
-})();
-const {createShelterReservations}=(()=>{
-// Shared commitments for offline D.14 route states. No browser storage, requests or account
-// mutations. Money is held, not paid, until a caller supplies a bound simulated outcome.
-// The runtime adapter must retain its existing request/receipt proofs before using this model.
-function createShelterReservations() {
-  const resources=['power','food','water','scrap','parts','stimpak'];
-  const id=n=>Number.isSafeInteger(n)&&n>0;
-  const at=n=>Number.isSafeInteger(n)&&n>=0;
-  const amount=n=>Number.isFinite(n)&&n>=0;
-  const label=s=>typeof s==='string'&&s.length>0&&s.length<=160;
-  const zero=()=>Object.fromEntries(resources.map(k=>[k,0]));
-  const active=e=>!['cancelled','complete'].includes(e.status);
-  const familyKey=p=>[...p].sort((a,b)=>a-b).join('/');
-  const span=c=>at(c.from)&&at(c.until)&&c.until>c.from;
-  const overlaps=(a,b)=>a.from<b.until&&b.from<a.until;
-  const normalize=x=>Object.fromEntries(resources.map(k=>[k,x?.[k]??0]));
-  function validate(book,view) {
-    if(book?.version!==1||!id(book.vaultNo)||view.vaultNo!==book.vaultNo||!at(book.startedAt)||!at(book.windowEnd)||
-      book.windowEnd<=book.startedAt||book.windowEnd-book.startedAt>168*3600000||!Array.isArray(book.entries)||!Array.isArray(book.receipts)||!at(view.serverTime)||
-      !resources.every(k=>amount(book.safety?.[k])&&amount(view.state.resources?.[k])))throw Error('Invalid reservation account');
-    if(new Set(book.entries.map(e=>e.id)).size!==book.entries.length)throw Error('Duplicate reservation identity');
-    for(const e of book.entries){
-      if(!label(e.id)||!label(e.purpose)||!['held','submitted','cancelled','complete'].includes(e.status)||
-        !at(e.at)||!at(e.deadline)||e.deadline<=e.at||e.deadline>book.windowEnd||
-        !resources.every(k=>amount(e.resources?.[k])&&amount(e.paid?.[k]))||!amount(e.feedScrap)||!amount(e.feedSpent)||
-        !Array.isArray(e.people)||!Array.isArray(e.seats)||!Array.isArray(e.families))throw Error('Invalid reservation entry');
-      for(const c of [...e.people,...e.seats])if(!id(c.residentId)||!span(c)||c.from<book.startedAt||c.until>book.windowEnd||
-        e.seats.includes(c)&&!id(c.roomId))throw Error('Invalid reservation interval');
-      for(const f of e.families)if(!Array.isArray(f.parents)||f.parents.length!==2||!f.parents.every(id)||f.parents[0]===f.parents[1]||
-        !(f.dueAt===null||at(f.dueAt))||!(f.childId===null||id(f.childId)))throw Error('Invalid family reservation');
-      if(e.status==='submitted'&&(!e.pending||!label(e.pending.id)||!label(e.pending.fingerprint)||
-        !at(e.pending.at)||!resources.every(k=>amount(e.pending.cost?.[k]))))throw Error('Invalid pending reservation');
-      if(e.status!=='submitted'&&e.pending!==null)throw Error('Unexpected pending reservation');
-    }
-    if(new Set(book.receipts.map(r=>r.requestId)).size!==book.receipts.length||book.receipts.some(r=>!label(r.requestId)||
-      !label(r.intentId)||!label(r.fingerprint)||!at(r.at)||!['confirmed','rejected'].includes(r.result)))
-      throw Error('Invalid reservation receipts');
-  }
-  function create(view,{safety={},windowEnd}={}) {
-    const book={version:1,vaultNo:view.vaultNo,startedAt:view.serverTime,windowEnd,safety:normalize(safety),entries:[],receipts:[]};
-    validate(book,view);return book;
-  }
-  function inspect(view,book,{owner=null}={}) {
-    validate(book,view);const now=view.serverTime,held=book.entries.filter(active),blocked=[];
-    const direct=zero(),others=zero();let feed=0,otherFeed=0;
-    for(const e of held){
-      for(const k of resources){direct[k]+=e.resources[k];if(e.id!==owner)others[k]+=e.resources[k];}
-      feed+=e.feedScrap;if(e.id!==owner)otherFeed+=e.feedScrap;
-      if(e.deadline<=now)blocked.push({kind:'deadline',intentId:e.id,pending:e.status==='submitted'});
-    }
-    const free=zero(),ownSpendable=zero();
-    for(const k of resources){
-      free[k]=view.state.resources[k]-book.safety[k]-direct[k]-(k==='scrap'?feed:0);
-      // Own construction allocation is usable; its separately promised feed still is not.
-      ownSpendable[k]=view.state.resources[k]-book.safety[k]-others[k]-(k==='scrap'?feed:0);
-      if(free[k]<-1e-7)blocked.push({kind:'material-deficit',resource:k,amount:-free[k]});
-    }
-    const people=held.flatMap(e=>e.people.filter(c=>c.until>now||e.status==='submitted').map(c=>({...c,intentId:e.id,pending:e.status==='submitted'})));
-    // A pending intent keeps outsiders from taking its resident, but its own sequential
-    // stages are not simultaneous assignments. The route cannot advance while unresolved.
-    for(let i=0;i<people.length;i++)for(let j=0;j<i;j++)if(people[i].residentId===people[j].residentId&&
-      (overlaps(people[i],people[j])||people[i].intentId!==people[j].intentId&&(people[i].pending||people[j].pending)))
-      blocked.push({kind:'resident-conflict',residentId:people[i].residentId,intents:[people[j].intentId,people[i].intentId]});
-    for(const c of people){
-      const p=view.state.residents.find(p=>p.id===c.residentId);
-      if(!p||p.deadAt!==null||p.away!==null||p.adultAt>c.from)blocked.push({kind:'resident-unavailable',intentId:c.intentId,residentId:c.residentId});
-    }
-    const seats=held.flatMap(e=>e.seats.filter(c=>c.until>now||e.status==='submitted').map(c=>({...c,intentId:e.id,pending:e.status==='submitted'})));
-    for(let i=0;i<seats.length;i++)for(let j=0;j<i;j++)if(seats[i].residentId===seats[j].residentId&&
-      (overlaps(seats[i],seats[j])||seats[i].intentId!==seats[j].intentId&&(seats[i].pending||seats[j].pending)))
-      blocked.push({kind:'resident-seat-conflict',residentId:seats[i].residentId,intents:[seats[j].intentId,seats[i].intentId]});
-    for(const c of seats){
-      if(!people.some(p=>p.intentId===c.intentId&&p.residentId===c.residentId&&p.from<=c.from&&p.until>=c.until))
-        blocked.push({kind:'seat-without-resident',intentId:c.intentId,residentId:c.residentId});
-      const r=view.state.rooms.find(r=>r.id===c.roomId);
-      if(!r||r.builtAt>c.from||r.upgradeAt!==null&&r.upgradeAt>c.from||r.incident||r.unpowered)
-        blocked.push({kind:'seat-unavailable',intentId:c.intentId,roomId:c.roomId});
-    }
-    for(const roomId of new Set(seats.map(c=>c.roomId))){
-      const r=view.state.rooms.find(r=>r.id===roomId);if(!r)continue;
-      const claims=seats.filter(c=>c.roomId===roomId),boundaries=new Set([now,...claims.map(c=>Math.max(now,c.from)),
-        ...view.state.residents.filter(p=>p.roomId===roomId&&p.adultAt>now).map(p=>p.adultAt)]);
-      for(const t of boundaries){
-        const current=claims.filter(c=>c.pending||c.from<=t&&t<c.until);if(!current.length)continue;
-        // A planned departure never frees a real seat. Only an applied move updates roomId.
-        // Away residents retain recorded occupancy, and one's own return is counted once.
-        const occupants=new Set(view.state.residents.filter(p=>p.deadAt===null&&p.roomId===roomId&&p.adultAt<=t).map(p=>p.id));
-        for(const c of current)occupants.add(c.residentId);
-        if(occupants.size>r.width*2)blocked.push({kind:'seat-capacity',roomId,at:t,used:occupants.size,capacity:r.width*2});
-      }
-    }
-    const families=held.flatMap(e=>e.families.map(f=>({...f,intentId:e.id}))),births=view.state.births,extra=new Set();
-    const familyOwners=new Map(),parentOwners=new Map();
-    for(const f of families){
-      const key=familyKey(f.parents);
-      if(f.parents.some(id=>!view.state.residents.some(p=>p.id===id)))blocked.push({kind:'unknown-family-parents',intentId:f.intentId});
-      if(familyOwners.has(key))blocked.push({kind:'family-conflict',parents:f.parents,intents:[familyOwners.get(key),f.intentId]});
-      familyOwners.set(key,f.intentId);
-      if(f.childId===null)for(const id of f.parents){
-        if(parentOwners.has(id))blocked.push({kind:'family-parent-conflict',residentId:id,intents:[parentOwners.get(id),f.intentId]});
-        parentOwners.set(id,f.intentId);
-      }
-      if(f.childId!==null){
-        const p=view.state.residents.find(p=>p.id===f.childId);
-        if(!p||!Array.isArray(p.parents)||familyKey(p.parents)!==key)blocked.push({kind:'unknown-family-child',intentId:f.intentId});
-      }else if(f.dueAt!==null){
-        if(!births.some(b=>b.dueAt===f.dueAt&&familyKey(b.parents??[])===key))blocked.push({kind:'unknown-family-birth',intentId:f.intentId});
-      }else if(births.some(b=>familyKey(b.parents??[])===key))blocked.push({kind:'family-transition-unreconciled',intentId:f.intentId});
-      else extra.add(key);
-    }
-    // Existing romance and an explicit planned reservation for the same parents count once.
-    for(const p of view.state.residents)if(p.romance?.partnerId){
-      const pair=[p.id,p.romance.partnerId],key=familyKey(pair);
-      if(!births.some(b=>familyKey(b.parents??[])===key))extra.add(key);
-    }
-    const capacity=Math.min(200,view.state.rooms.filter(r=>r.type==='quarters'&&r.builtAt<=now)
-      .reduce((n,r)=>n+r.width*(2+2*r.level),0));
-    const population=view.state.residents.length+births.length+extra.size;
-    if(families.length&&population>capacity)blocked.push({kind:'beds',used:population,capacity});
-    return {free,ownSpendable,direct,feedScrap:feed,otherFeedScrap:otherFeed,people,seats,population,capacity,blocked,
-      expired:held.filter(e=>e.deadline<=now).map(e=>e.id)};
-  }
-  function reserve(view,input,intent) {
-    validate(input,view);const book=structuredClone(input);
-    if(book.entries.some(e=>e.id===intent.id))throw Error('Reservation identity already used');
-    if(view.serverTime>=book.windowEnd)throw Error('Reservation window expired');
-    const e={id:intent.id,purpose:intent.purpose,at:view.serverTime,deadline:intent.deadline??book.windowEnd,status:'held',
-      people:structuredClone(intent.people??[]),seats:structuredClone(intent.seats??[]),families:structuredClone(intent.families??[]),
-      resources:normalize(intent.resources),feedScrap:intent.feedScrap??0,paid:zero(),feedSpent:0,pending:null};
-    if([...e.people,...e.seats].some(c=>c.from<view.serverTime))throw Error('Reservation starts before snapshot');
-    book.entries.push(e);const report=inspect(view,book);
-    return report.blocked.length?{book:input,accepted:false,report}:{book,accepted:true,report};
-  }
-  function release(view,input,intentId,{complete=false,reason}={}) {
-    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId);
-    if(!e||!active(e)||!label(reason))throw Error('Unknown reservation or missing release reason');
-    if(e.status==='submitted')throw Error('Pending action must be reconciled before release');
-    e.status=complete?'complete':'cancelled';e.releasedAt=view.serverTime;e.releaseReason=reason;
-    return book;
-  }
-  function amend(view,input,intentId,changes) {
-    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId);
-    if(!e||e.status!=='held'||e.deadline<=view.serverTime||!changes||Object.keys(changes)
-      .some(k=>!['people','seats','families','resources','feedScrap'].includes(k)))throw Error('Invalid commitment amendment');
-    for(const [key,value] of Object.entries(changes))e[key]=key==='resources'?normalize(value):structuredClone(value);
-    const report=inspect(view,book);
-    return report.blocked.length?{book:input,accepted:false,report}:{book,accepted:true,report};
-  }
-  function submit(view,input,intentId,{requestId,fingerprint,cost={}}) {
-    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId),payment=normalize(cost);
-    if(!e||e.status!=='held'||book.entries.some(e=>e.status==='submitted')||!label(requestId)||!label(fingerprint)||
-      book.receipts.some(r=>r.requestId===requestId)||!resources.every(k=>amount(payment[k])&&payment[k]<=e.resources[k]))
-      throw Error('Invalid submission or unreserved cost');
-    const report=inspect(view,book,{owner:intentId});
-    if(report.blocked.length||resources.some(k=>payment[k]>report.ownSpendable[k]+1e-7))
-      return {book:input,accepted:false,report};
-    e.status='submitted';e.pending={id:requestId,fingerprint,at:view.serverTime,cost:payment};
-    return {book,accepted:true,report};
-  }
-  function resolve(view,input,intentId,receipt) {
-    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===intentId),p=e?.pending;
-    const prior=book.receipts.find(r=>r.requestId===receipt?.requestId);
-    if(prior){
-      if(JSON.stringify(prior)!==JSON.stringify(receipt)||prior.intentId!==intentId)throw Error('Conflicting duplicate receipt');
-      return {view,book:input,duplicate:true};
-    }
-    if(!p||receipt?.intentId!==intentId||receipt.requestId!==p.id||receipt.fingerprint!==p.fingerprint||
-      !['confirmed','rejected','unknown'].includes(receipt.result)||!at(receipt.at)||receipt.at<p.at||receipt.at>view.serverTime)
-      throw Error('Receipt does not bind pending action');
-    if(receipt.result==='unknown')return {view,book:input,duplicate:false};
-    const next=structuredClone(view);
-    if(receipt.result==='confirmed')for(const k of resources){
-      if(next.state.resources[k]+1e-7<p.cost[k])throw Error('Confirmed payment cannot be funded');
-      next.state.resources[k]-=p.cost[k];e.resources[k]-=p.cost[k];e.paid[k]+=p.cost[k];
-    }
-    e.status='held';e.pending=null;book.receipts.push(structuredClone(receipt));
-    return {view:next,book,duplicate:false};
-  }
-  function reconcileEvents(view,input,events) {
-    validate(input,view);const book=structuredClone(input);
-    for(const event of events){
-      if(event.kind==='merge')for(const e of book.entries.filter(active))for(const c of e.seats)if(c.roomId===event.roomId)c.roomId=event.into;
-      if(event.kind==='pregnancy'){
-        const claims=book.entries.filter(active).flatMap(e=>e.families).filter(f=>
-          f.childId===null&&familyKey(f.parents)===familyKey(event.parents));
-        if(claims.length!==1||!at(event.dueAt)||claims[0].dueAt!==null&&claims[0].dueAt!==event.dueAt)
-          throw Error('Pregnancy event needs one matching family reservation');
-        claims[0].dueAt=event.dueAt;
-      }
-      if(event.kind==='birth')for(const e of book.entries.filter(active))for(const f of e.families)
-        if(f.dueAt===event.dueAt&&familyKey(f.parents)===familyKey(event.parents))f.childId=event.id;
-    }
-    return book;
-  }
-  function feedAllowance(view,book,owner=null) {
-    const report=inspect(view,book),e=owner===null?null:book.entries.find(e=>e.id===owner&&active(e));
-    if(owner!==null&&(!e||e.status==='submitted'))throw Error('Invalid manufacturing owner');
-    const allowed=e?Math.min(e.feedScrap,Math.max(0,report.free.scrap+e.feedScrap)):Math.max(0,report.free.scrap);
-    return {floor:Math.max(0,view.state.resources.scrap-allowed),allowed,report};
-  }
-  function consumeFeed(view,input,owner,spent) {
-    validate(input,view);const book=structuredClone(input),e=book.entries.find(e=>e.id===owner&&active(e));
-    if(!e||!amount(spent)||spent>e.feedScrap+1e-7)throw Error('Manufacturing exceeds reserved feed');
-    e.feedScrap=Math.max(0,e.feedScrap-spent);e.feedSpent+=spent;return book;
-  }
-  return {create,inspect,reserve,amend,release,submit,resolve,reconcileEvents,feedAllowance,consumeFeed};
-}
-
-return {createShelterReservations};
-})();
-const {createShelterExistingState}=(()=>{
-
-// Imports actual schedule/role records into the shared offline route state. This is a
-// snapshot adapter, not a native receipt verifier. Unresolved native operations cannot
-// be completed by the route simulator's synthetic receipts.
-function createShelterExistingState() {
-  const holds=createShelterReservations(),stats=['str','per','end','cha','int','agi','lck'];
-  const id=n=>Number.isSafeInteger(n)&&n>0,time=n=>Number.isSafeInteger(n)&&n>=0;
-  const label=s=>typeof s==='string'&&s.trim().length>0;
-  const active=e=>!['complete','cancelled'].includes(e.status);
-  const pairKey=p=>[...p].sort((a,b)=>a-b).join('/');
-  const pair=p=>Array.isArray(p)&&p.length===2&&p.every(id)&&p[0]!==p[1];
-  const roomId=n=>n===null||id(n);
-  const zero=()=>Object.fromEntries(['power','food','water','scrap','parts','stimpak'].map(k=>[k,0]));
-  const pick=(o,keys)=>Object.fromEntries(keys.filter(k=>o[k]!==undefined).map(k=>[k,structuredClone(o[k])]));
-  const validRole=r=>r&&id(r.id)&&id(r.room)&&time(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
-    (r.upgradeUntil===undefined||r.role==='training'&&time(r.upgradeUntil)&&r.upgradeUntil>r.at&&r.until>r.upgradeUntil)&&
-    (r.existingTraining===undefined||r.existingTraining===true&&r.role==='training'&&r.purpose==='current'&&r.finishCurrent===true)&&
-    (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
-      Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining?(r.base+1)*60+10:130)*60000)&&
-    (r.role!=='training'||stats.includes(r.stat)&&Number.isFinite(r.base)&&r.base>=0&&r.base<=10&&
-      (r.purpose===undefined||['production','parent','current'].includes(r.purpose)&&time(r.until)&&r.until>r.at)&&
-      (r.purpose!=='current'||r.finishCurrent===true)&&
-      (r.purpose!=='production'||['str','per','end','agi','int'].includes(r.stat)&&time(r.windowEnd)&&r.windowEnd>r.at&&id(r.destination)));
-  const validMaterial=m=>m&&id(m.vaultNo)&&id(m.id)&&['power','diner','water','scrap','medbay','workshop','storage','quarters'].includes(m.type)&&
-    m.level===3&&id(m.targetLevel)&&id(m.finalTarget)&&m.targetLevel<=m.finalTarget;
-  function validateSwap(swap) {
-    if(!swap)return;
-    if(!label(swap.id)||!time(swap.at)||![undefined,'allocation'].includes(swap.kind)||
-      !Array.isArray(swap.people)||!swap.people.length||swap.people.some(p=>!id(p.id)||!roomId(p.room))||
-      new Set(swap.people.map(p=>p.id)).size!==swap.people.length||!Array.isArray(swap.moves)||!swap.moves.length||
-      swap.moves.some(p=>!swap.people.some(q=>q.id===p.id)||!roomId(p.room))||
-      !Number.isInteger(swap.step)||swap.step<0||swap.step>swap.moves.length||
-      swap.futureSupply!==undefined&&typeof swap.futureSupply!=='boolean'||
-      swap.prepareFamily!==undefined&&(!Array.isArray(swap.prepareFamily)||swap.prepareFamily.length!==3||
-        !swap.prepareFamily.every(id)||swap.prepareFamily[0]>=swap.prepareFamily[1]))throw Error('Invalid inherited swap');
-    if(swap.kind==='allocation'&&(!Array.isArray(swap.targets)||swap.targets.length!==swap.people.length||
-      new Set(swap.targets.map(p=>p.id)).size!==swap.people.length||swap.targets.some(p=>!roomId(p.room)||
-        !swap.people.some(q=>q.id===p.id)||[...swap.moves].reverse().find(q=>q.id===p.id)?.room!==p.room)||
-      !['power','food','water'].every(k=>Number.isFinite(swap.supplyFloor?.[k])&&swap.supplyFloor[k]>=0)))
-      throw Error('Invalid inherited allocation');
-  }
-  function swapMatches(view,swap,step) {
-    const expected=new Map(swap.people.map(p=>[p.id,p.room]));
-    for(const p of swap.moves.slice(0,step))expected.set(p.id,p.room);
-    return swap.people.every(p=>view.state.residents.some(q=>q.id===p.id&&q.roomId===expected.get(p.id)));
-  }
-  function syncSwap(view,state,book,{confirmed=false}={}) {
-    const s=state.swap;if(!s||['complete','cancelled','changed'].includes(s.status)||state.native.length)return;
-    if(s.step<s.moves.length&&swapMatches(view,s,s.step+1)){s.step++;s.observedAt=view.serverTime;}
-    else if(confirmed||!swapMatches(view,s,s.step)){s.status='changed';return;}
-    const e=book.entries.find(e=>e.id===s.intentId);
-    if(s.step===s.moves.length){s.status='complete';e.status='complete';e.releasedAt=view.serverTime;e.releaseReason='observed all inherited moves';return;}
-    s.status='active';const next=s.moves[s.step];
-    // Only the next destination is held: reserving every later full-room target would
-    // reject a valid sequence before its preceding departure has actually happened.
-    e.seats=next.room===null?[]:[{residentId:next.id,roomId:next.room,from:view.serverTime,until:book.windowEnd}];
-  }
-  function pendingRecord(p,vaultNo,parent=null) {
-    if(!p||!label(p.id)||!label(p.kind)||p.vaultNo!==vaultNo||!time(p.at)||!Array.isArray(p.targets)||
-      !p.targets.length||p.targets.some(x=>x!==null&&typeof x!=='string'&&!Number.isSafeInteger(x))||
-      parent!==null&&(p.blockedBy!==parent||p.emergency!==undefined))throw Error('Invalid inherited native request');
-    const project=p.before?.construction?.project,cost=project?.cost??p.before?.campaign?.choice?.cost;
-    if(cost&&(!['scrap','parts'].every(k=>Number.isSafeInteger(cost[k])&&cost[k]>=0)))throw Error('Invalid inherited pending cost');
-    const result={id:p.id,kind:p.kind,vaultNo,at:p.at,targets:structuredClone(p.targets),blockedBy:parent,
-      sourceServerTime:time(p.before?.serverTime)?p.before.serverTime:null,costBound:cost?{scrap:cost.scrap,parts:cost.parts}:null,
-      responseFinishedAt:time(p.result?.responseFinishedAt)?p.result.responseFinishedAt:null};
-    // No idempotency keys, request bodies, or purported success proof are copied.
-    return [result,...(p.emergency?[...pendingRecord(p.emergency,vaultNo,p.id)]:[])];
-  }
-  function capture(view,{schedule,pending,source,windowEnd,safety={},clock=null}={}) {
-    if(!id(view.vaultNo)||!time(view.serverTime)||!schedule||schedule.vaultNo!==view.vaultNo||
-      !Object.hasOwn(arguments[1]??{},'pending')||!label(source))throw Error('Explicit same-vault schedule, pending state and source required');
-    const now=view.serverTime,s=view.state,book=holds.create(view,{windowEnd,safety});
-    const c=schedule.campaign??{},list=(o,k)=>{
-      if(o[k]!==undefined&&!Array.isArray(o[k]))throw Error('Invalid inherited list: '+k);
-      return structuredClone(o[k]??[]);
-    };
-    const native=pending===null?[]:pendingRecord(pending,view.vaultNo);
-    if(new Set(native.map(p=>p.id)).size!==native.length)throw Error('Duplicate inherited request identity');
-    const state={version:1,vaultNo:view.vaultNo,at:now,source,native,nativeIds:native.map(p=>p.id),priorPayments:[],roles:[],families:[],defense:list(c,'defense'),
-      trips:list(c,'trips'),attempts:list(c,'attempts'),heals:list(c,'heals'),trainingRest:list(c,'trainingRest'),
-      historicalFamilies:list(schedule,'families'),defenseManual:list(c,'defenseManual'),
-      materialPurpose:c.materials===undefined?null:structuredClone(c.materials),
-      materialRecord:c.materials===undefined?null:structuredClone(c.materials),material:null,
-      swap:schedule.swap==null?null:{...pick(schedule.swap,['id','kind','people','targets','moves','step','at','prepareFamily','futureSupply','supplyFloor']),
-        record:pick(schedule.swap,['id','kind','people','targets','moves','step','at','prepareFamily','futureSupply','supplyFloor']),status:'active'},
-      constructionKnown:Array.isArray(schedule.constructionLedger),paymentBounds:[],notes:[]};
-    const add=(key,purpose,{people=[],seats=[],families=[]}={})=>{
-      if(book.entries.some(e=>e.id===key))throw Error('Duplicate imported intent');
-      book.entries.push({id:key,purpose,at:now,deadline:windowEnd,status:'held',people,seats,families,
-        resources:zero(),feedScrap:0,paid:zero(),feedSpent:0,pending:null});
-      return key;
-    };
-    const person=(residentId,from=now,until=windowEnd)=>({residentId,from,until});
-    const seat=(residentId,roomId,from=now,until=windowEnd)=>({...person(residentId,from,until),roomId});
-    const entries=list(c,'roles');
-    if(new Set(entries.map(r=>r.id)).size!==entries.length)throw Error('Duplicate inherited role');
-    for(const d of state.defense)if(!id(d.id)||!id(d.room)||!(d.from===null||id(d.from))||!time(d.at))throw Error('Invalid inherited defense');
-    if(new Set(state.defense.map(d=>d.id)).size!==state.defense.length)throw Error('Duplicate inherited defender');
-    if(state.defenseManual.some(x=>!id(x)))throw Error('Invalid manual defense identity');
-    for(const r of entries){
-      if(!validRole(r))throw Error('Invalid inherited role');
-      const p=s.residents.find(p=>p.id===r.id),d=state.defense.find(d=>d.id===r.id&&d.from===r.room&&p&&[d.room,null].includes(p.roomId));
-      const current=p&&p.deadAt===null&&p.away===null&&p.adultAt<=now&&(p.roomId===r.room||d);
-      const row={residentId:r.id,roomId:r.room,destination:r.destination??null,intentId:null,
-        status:current?(d?'preempted':'active'):'stale',record:pick(r,['id','room','role','at','stat','base','purpose','until','windowEnd','destination','finishCurrent','existingTraining','upgradeUntil'])};
-      if(current){
-        const due=r.role==='training'&&(p.stats[r.stat]>r.base||time(r.until)&&r.until<=now||time(r.windowEnd)&&r.windowEnd<=now);
-        const returnAt=due?now:Math.min(windowEnd,r.until??windowEnd);
-        const seats=[];
-        // The runtime already promises the return seat. Training may finish before its
-        // latest-return deadline, so reserving it only from \`until\` would strand a graduate.
-        // Current training occupancy remains in the real roster and is not a second future seat.
-        if(r.purpose==='production')seats.push(seat(p.id,r.destination));
-        else if(!d&&returnAt>now)seats.push(seat(p.id,r.room,now,returnAt));
-        row.intentId=add('existing:role:'+p.id,'inherited '+r.role,{people:[person(p.id)],seats});
-        if(due)row.status='return-due';
-      }
-      state.roles.push(row);
-    }
-    // No old automatic marker does not mean a permanent manual lock. Retain the actual
-    // special post for candidate review, without manufacturing a training purpose/deadline.
-    for(const p of s.residents){
-      const room=s.rooms.find(r=>r.id===p.roomId);
-      if(p.deadAt===null&&p.away===null&&p.adultAt<=now&&['training','medbay','workshop','radio','armory','tailor','door'].includes(room?.type)&&
-        !state.roles.some(r=>r.residentId===p.id&&r.status!=='stale'))
-        state.roles.push({residentId:p.id,roomId:room.id,destination:null,intentId:null,status:'historical',record:{role:room.type}});
-    }
-    const families=new Map();
-    const addFamily=(parents,roomId,kind)=>{
-      if(!pair(parents)||!id(roomId))throw Error('Invalid inherited family');
-      const key=pairKey(parents),old=families.get(key);
-      if(old&&old.roomId!==roomId)throw Error('Conflicting inherited family room');
-      if(!old||kind==='romance')families.set(key,{parents:[...parents],roomId,kind});
-    };
-    if(schedule.pair){const f=schedule.pair;addFamily([f.a,f.b],f.room,'pair');}
-    for(const p of s.residents)if(p.romance){
-      const other=s.residents.find(q=>q.id===p.romance.partnerId);
-      if(!other||other.romance?.partnerId!==p.id||
-        ![p,other].every(q=>Number.isFinite(q.romance.progress)&&q.romance.progress>=0&&q.romance.progress<=1)||
-        Math.abs(p.romance.progress-other.romance.progress)>1e-9)throw Error('Inconsistent inherited romance');
-      if(p.id>other.id||s.births.some(b=>pair(b.parents)&&pairKey(b.parents)===pairKey([p.id,other.id])))continue;
-      if(p.roomId!==other.roomId||p.roomId===null){
-        // Native partners may keep their relationship while working apart. Preserve
-        // their actual posts; neither a shared dorm nor renewed progress is implied.
-        const key=pairKey([p.id,other.id]),old=families.get(key);
-        families.set(key,{parents:[p.id,other.id],roomId:old?.roomId??null,kind:'romance',
-          positions:[p,other].map(q=>({id:q.id,room:q.roomId}))});
-      }else addFamily([p.id,other.id],p.roomId,'romance');
-    }
-    for(const f of families.values()){
-      const birth=s.births.find(b=>pair(b.parents)&&pairKey(b.parents)===pairKey(f.parents));
-      if(birth){state.families.push({...f,intentId:null,status:'pregnant',dueAt:birth.dueAt});continue;}
-      const intentId=add('existing:family:'+pairKey(f.parents),'inherited active family',{
-        people:f.parents.map(p=>person(p)),seats:f.positions?
-          f.positions.filter(p=>p.room!==null).map(p=>seat(p.id,p.room)):f.parents.map(p=>seat(p,f.roomId)),
-        families:[{parents:f.parents,dueAt:null,childId:null}]});
-      state.families.push({...f,intentId,status:f.positions?'paused':'needs-plan'});
-    }
-    for(const birth of s.births)if(!pair(birth.parents)){
-      const people=new Set(s.residents.filter(p=>p.roomId===birth.roomId&&p.adultAt<=now).map(p=>p.id));
-      for(const f of state.historicalFamilies)if(f.room===birth.roomId){people.add(f.a);people.add(f.b);}
-      if([...people].some(p=>!id(p)))throw Error('Invalid historical family identity');
-      state.families.push({roomId:birth.roomId,parents:[...people],intentId:null,status:'unknown-birth',dueAt:birth.dueAt});
-    }
-    for(const d of state.defense){
-      const p=s.residents.find(p=>p.id===d.id);
-      d.intentId=state.roles.find(r=>r.residentId===d.id&&r.status!=='stale')?.intentId??null;
-      if(!d.intentId&&p&&p.deadAt===null&&p.away===null&&[d.room,null].includes(p.roomId)&&!state.defenseManual.includes(p.id))
-        d.intentId=add('existing:defense:'+p.id,'inherited defense return',{people:[person(p.id)]});
-    }
-    if(state.swap){
-      validateSwap(state.swap);
-      state.swap.intentId=add('existing:swap','inherited unfinished swap',{people:state.swap.people.map(p=>person(p.id))});
-      syncSwap(view,state,book);
-    }
-    const payments=[];
-    if(schedule.constructionLedger!==undefined&&!Array.isArray(schedule.constructionLedger))throw Error('Invalid inherited construction ledger');
-    const ledger=schedule.constructionLedger??[];
-    if(ledger.length&&(!clock||!time(clock.localAt)||clock.serverAt!==now||!time(clock.uncertaintyMs)||!label(clock.source)))
-      throw Error('Explicit local/server clock bounds required for prior construction payments');
-    for(const e of ledger){
-      if(!label(e.id)||!time(e.at)||e.at>clock.localAt||!['scrap','parts'].every(k=>Number.isSafeInteger(e[k])&&e[k]>=0)||payments.some(p=>p.id===e.id))
-        throw Error('Invalid inherited construction payment');
-      const mapped=e.at+clock.serverAt-clock.localAt,earliest=Math.max(0,mapped-clock.uncertaintyMs),latest=Math.min(now,mapped+clock.uncertaintyMs);
-      if(latest<earliest)throw Error('Construction clock bounds do not intersect prior time');
-      payments.push({id:e.id,at:latest,cost:{scrap:e.scrap,parts:e.parts}});
-      state.paymentBounds.push({id:e.id,localAt:e.at,earliest,latest,source:clock.source});
-    }
-    state.priorPayments=structuredClone(payments);
-    if(state.materialPurpose&&(!validMaterial(state.materialPurpose)||state.materialPurpose.vaultNo!==view.vaultNo))throw Error('Invalid inherited material purpose');
-    const report=holds.inspect(view,book);validate(view,state,book);
-    return {book,state,payments,blocked:report.blocked};
-  }
-  function validate(view,state,book) {
-    if(state?.version!==1||state.vaultNo!==view.vaultNo||!time(state.at)||state.at>view.serverTime||!label(state.source)||
-      !['native','nativeIds','priorPayments','roles','families','defense','trips','attempts','heals','trainingRest','historicalFamilies','defenseManual','paymentBounds','notes']
-        .every(k=>Array.isArray(state[k]))||typeof state.constructionKnown!=='boolean')throw Error('Invalid inherited route state');
-    for(const row of [...state.roles,...state.families,...state.defense,...(state.swap?[state.swap]:[])])
-      if(row.intentId&&!book.entries.some(e=>e.id===row.intentId))throw Error('Inherited intent binding missing');
-    for(const row of state.roles){
-      if(!id(row.residentId)||!id(row.roomId)||!['active','preempted','return-due','stale','historical','completed'].includes(row.status)||
-        !row.record||row.status!=='historical'&&(!validRole(row.record)||row.record.id!==row.residentId))
-        throw Error('Invalid inherited role binding');
-      if(!['active','preempted','return-due'].includes(row.status))continue;
-      const e=book.entries.find(e=>e.id===row.intentId&&active(e));
-      if(!e||!e.people.some(p=>p.residentId===row.residentId&&p.from<=state.at&&p.until===book.windowEnd)||
-        row.record.purpose==='production'&&(!id(row.destination)||!e.seats.some(p=>p.residentId===row.residentId&&
-          p.roomId===row.destination&&p.from<=state.at&&p.until===book.windowEnd)))
-        throw Error('Inherited role lost its commitment');
-    }
-    for(const f of state.families)if(['needs-plan','paused'].includes(f.status)){
-      const e=book.entries.find(e=>e.id===f.intentId&&active(e));
-      const positions=f.status==='paused'?f.positions:f.parents.map(id=>({id,room:f.roomId}));
-      if(!pair(f.parents)||(f.status==='paused'?!roomId(f.roomId):!id(f.roomId))||
-        !Array.isArray(positions)||positions.length!==2||new Set(positions.map(p=>p.id)).size!==2||
-        positions.some(p=>!f.parents.includes(p.id)||!roomId(p.room)||f.status==='paused'&&
-          !view.state.residents.some(q=>q.id===p.id&&q.roomId===p.room))||
-        !e||!e.families.some(p=>pairKey(p.parents)===pairKey(f.parents))||
-        positions.some(q=>!e.people.some(p=>p.residentId===q.id)||q.room!==null&&
-          !e.seats.some(p=>p.residentId===q.id&&p.roomId===q.room)))
-        throw Error('Inherited family lost its commitment');
-    }
-    if(state.swap){
-      const s=state.swap;validateSwap(s);validateSwap(s.record);
-      if(!['active','changed','complete','cancelled'].includes(s.status))throw Error('Invalid inherited swap status');
-      const e=book.entries.find(e=>e.id===s.intentId);
-      if(!e||['active','changed'].includes(s.status)&&(!active(e)||s.people.some(p=>
-        !e.people.some(c=>c.residentId===p.id&&c.until===book.windowEnd))))throw Error('Inherited swap lost its commitment');
-      if(s.status==='active'&&!state.native.length&&!swapMatches(view,s,s.step))throw Error('Inherited swap position mismatch');
-    }
-    if(state.material){
-      const m=state.material,e=book.entries.find(e=>e.id===m.intentId);
-      if(!label(m.source)||!id(m.roomId)||m.roomId!==state.materialPurpose?.id||!id(m.fromLevel)||!id(m.targetLevel)||
-        !['preparing','ready','constructing','complete','cancelled'].includes(m.status)||!Array.isArray(m.workers)||
-        m.workers.some(p=>!id(p.id)||!label(p.intentId))||!Array.isArray(m.rooms)||!m.rooms.every(id)||
-        !e||m.status!=='cancelled'&&!active(e)||
-        !['scrap','parts'].every(k=>Number.isSafeInteger(m.cost?.[k])&&m.cost[k]>=0&&e.resources[k]===m.allocated?.[k])||
-        e.feedScrap!==m.allocated?.feedScrap)throw Error('Invalid inherited material allocation');
-      if(m.status!=='cancelled')for(const w of m.workers){
-        const p=view.state.residents.find(p=>p.id===w.id);
-        if(p&&m.rooms.includes(p.roomId)&&!book.entries.some(e=>e.id===w.intentId&&active(e)&&
-          e.people.some(c=>c.residentId===w.id&&c.until>view.serverTime)))throw Error('Inherited material worker lost its commitment');
-      }
-    }
-    if(state.materialPurpose&&(!validMaterial(state.materialPurpose)||!validMaterial(state.materialRecord)))throw Error('Invalid inherited material purpose');
-    if(new Set(state.native.map(p=>p.id)).size!==state.native.length||JSON.stringify(state.nativeIds)!==JSON.stringify(state.native.map(p=>p.id))||
-      state.native.some(p=>!label(p.id)||!label(p.kind)||p.vaultNo!==view.vaultNo||!time(p.at)||!Array.isArray(p.targets)||!p.targets.length||
-        p.costBound!==null&&!['scrap','parts'].every(k=>Number.isSafeInteger(p.costBound?.[k])&&p.costBound[k]>=0)||
-        p.blockedBy!==null&&!state.nativeIds.includes(p.blockedBy)))
-      throw Error('Invalid inherited request binding');
-    if(state.priorPayments.length!==state.paymentBounds.length||state.priorPayments.some(p=>!label(p.id)||!time(p.at)||
-      !['scrap','parts'].every(k=>Number.isSafeInteger(p.cost?.[k])&&p.cost[k]>=0)||
-      !state.paymentBounds.some(b=>b.id===p.id&&b.latest===p.at)))throw Error('Invalid inherited payment history');
-  }
-  function issues(view,state,book,{action=null,intentId=null,advancing=false,nextAt=null,familyPlans=[]}={}) {
-    if(!state)return [];
-    validate(view,state,book);const problems=[],s=view.state;
-    const held=id=>book.entries.some(e=>e.id===id&&active(e));
-    if(state.native.length)return state.native.map(p=>({kind:'inherited-native-pending',requestId:p.id,action:p.kind}));
-    if(state.swap&&held(state.swap.intentId)){
-      const swap=state.swap,move=swap.moves[swap.step];
-      if(swap.status==='changed')problems.push({kind:'inherited-swap-position-changed'});
-      if(swap.prepareFamily&&!familyPlans.some(p=>p.stage==='planned'&&pairKey(p.parents)===pairKey(swap.prepareFamily.slice(0,2))&&
-        p.roomId===swap.prepareFamily[2]))problems.push({kind:'inherited-swap-family-context-needed'});
-      if(action&&!(intentId===swap.intentId&&action.kind==='assign'&&action.residentId===move?.id&&action.roomId===move.room))
-        problems.push({kind:'inherited-swap-next-action-required',step:swap.step});
-    }
-    if(action&&['build','upgrade','dig'].includes(action.kind)&&!state.constructionKnown)problems.push({kind:'prior-construction-spending-unknown'});
-    if(state.materialPurpose&&!state.material&&(advancing&&s.residents.some(p=>p.deadAt===null&&p.away===null&&p.adultAt<=view.serverTime&&
-      s.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&r.builtAt<=view.serverTime&&r.upgradeAt===null&&!r.unpowered&&!r.incident))||
-      action&&['build','upgrade','dig'].includes(action.kind)))problems.push({kind:'inherited-material-allocation-needed',roomId:state.materialPurpose.id});
-    if(state.material&&action&&intentId===state.material.intentId&&['build','upgrade','dig'].includes(action.kind)&&
-      (action.kind!=='upgrade'||action.roomId!==state.material.roomId||action.fromLevel!==state.material.fromLevel||state.material.status!=='ready'))
-      problems.push({kind:'inherited-material-project-not-ready'});
-    for(const f of state.families){
-      if(f.status==='paused'&&held(f.intentId)&&(advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))
-        problems.push({kind:'inherited-romance-paused',intentId:f.intentId});
-      if(f.status==='unknown-birth'&&(advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))
-        problems.push({kind:'inherited-birth-ownership-unknown',roomId:f.roomId});
-      if(f.status==='needs-plan'&&held(f.intentId)&&!familyPlans.some(p=>p.intentId===f.intentId)&&
-        (advancing||action?.kind==='assign'&&f.parents.includes(action.residentId)))
-        problems.push({kind:'inherited-family-plan-needed',intentId:f.intentId});
-    }
-    if(advancing)for(const row of state.roles)if(row.intentId&&held(row.intentId)&&row.record.role==='training'){
-      const r=row.record,p=s.residents.find(p=>p.id===row.residentId);
-      if(p?.roomId===row.roomId&&(p.stats[r.stat]>r.base||time(r.until)&&view.serverTime>=r.until||time(r.windowEnd)&&view.serverTime>=r.windowEnd))
-        problems.push({kind:'inherited-training-return-due',residentId:row.residentId,intentId:row.intentId,until:r.until??null});
-      else if(p?.roomId===row.roomId&&time(nextAt)){
-        const until=Math.min(...[r.until,r.windowEnd].filter(time));
-        if(until>view.serverTime&&until<nextAt)problems.push({kind:'inherited-training-deadline-boundary',
-          residentId:row.residentId,intentId:row.intentId,until,nextAt});
-      }
-    }
-    return problems;
-  }
-  function remap(input,events) {
-    if(!input)return input;const state=structuredClone(input);
-    for(const e of events)if(e.kind==='merge'){
-      for(const r of state.roles){if(r.roomId===e.roomId)r.roomId=e.into;if(r.destination===e.roomId)r.destination=e.into;}
-      for(const f of state.families){
-        if(f.roomId===e.roomId)f.roomId=e.into;
-        for(const p of f.positions??[])if(p.room===e.roomId)p.room=e.into;
-      }
-      for(const d of state.defense){if(d.room===e.roomId)d.room=e.into;if(d.from===e.roomId)d.from=e.into;}
-      if(state.materialPurpose?.id===e.roomId)state.materialPurpose.id=e.into;
-      if(state.material){if(state.material.roomId===e.roomId)state.material.roomId=e.into;
-        state.material.rooms=[...new Set(state.material.rooms.map(id=>id===e.roomId?e.into:id))];}
-      if(state.swap){for(const p of [...state.swap.people,...state.swap.moves,...(state.swap.targets??[])])if(p.room===e.roomId)p.room=e.into;
-        if(state.swap.prepareFamily?.[2]===e.roomId)state.swap.prepareFamily[2]=e.into;}
-    }
-    for(const e of events)if(['pregnancy','birth'].includes(e.kind))for(const f of state.families)
-      if(pair(f.parents)&&pairKey(f.parents)===pairKey(e.parents??[])){
-        f.status=e.kind==='pregnancy'?'pregnant':'born';f.dueAt=e.dueAt;if(e.kind==='birth')f.childId=e.id;
-      }
-    return state;
-  }
-  return {capture,validate,issues,remap,syncSwap};
-}
-
-return {createShelterExistingState};
-})();
-const {createShelterRouteSimulation}=(()=>{
-
-// Offline D.14 state transitions, with an explicit one-action-per-tick execution assumption.
-// Does not generate/rank routes or send requests. Bound simulated receipts must never be
-// substituted for the userscript's native DOM/network proof when a runtime adapter is added.
-function createShelterRouteSimulation() {
-  const resource=createShelterResourceSimulation(),natural=createShelterEventSimulation(),holds=createShelterReservations(),
-    family=createShelterFamilySimulation(),mood=createShelterMoodSimulation(),xp=createShelterXpSimulation(),existing=createShelterExistingState();
-  const tick=600000,day=86400000,keys=['power','food','water','scrap','parts','stimpak'];
-  const production={power:'power',diner:'food',water:'water',scrap:'scrap',workshop:'parts',medbay:'stimpak'};
-  const builds={power:[100,1],diner:[100,1],water:[100,1],scrap:[80,1],quarters:[120,1],storage:[80,2],
-    medbay:[300,3],training:[400,4],workshop:[500,5],armory:[600,6],tailor:[600,6],radio:[800,8]};
-  const validId=n=>Number.isSafeInteger(n)&&n>0;
-  const evidence=s=>typeof s==='string'&&s.trim().length>0;
-  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));
-  const active=e=>!['cancelled','complete'].includes(e.status);
-  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;
-  const activeRoom=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-  const sameParents=(a,b)=>Array.isArray(a)&&Array.isArray(b)&&a.length===2&&b.length===2&&a.every(id=>b.includes(id));
-  const upgradeCost=r=>({scrap:Math.ceil(builds[r.type][0]*r.width*(r.level===1?2.5:6)),parts:r.level===1?0:15*r.width});
-  function create(view,{assumptions,outcomes={births:[],digs:[]},familyRules=null,moodRules=null,xpRules=null,safety={},windowEnd,
-    windowStart=view.serverTime,firstActionOnly=false,construction,constructionLedger}={}) {
-    if(typeof firstActionOnly!=='boolean'||!Number.isSafeInteger(windowStart)||windowStart<0||windowStart>view.serverTime||
-      windowEnd-windowStart>168*3600000||view.serverTime>=windowEnd)throw Error('Invalid original planning window');
-    // A native read between settlements supports current-action checks only. Never
-    // replace lastSettledAt or invent history to make it a full simulation snapshot.
-    if(firstActionOnly)resource.validate(view);
-    else natural.advance(view,view.serverTime,{assumptions,outcomes,moodRules,xpRules});
-    if(!construction||!['build','upgrade','dig'].every(k=>typeof construction[k]==='boolean')||
-      construction.budgetMode!==undefined&&!['stock','daily'].includes(construction.budgetMode)||
-      !['scrap','parts'].every(k=>Number.isSafeInteger(construction[k+'Limit'])&&construction[k+'Limit']>=0))
-      throw Error('Explicit construction switches, valid budget mode and limits required');
-    if(!Array.isArray(constructionLedger)||constructionLedger.some(e=>!e||!evidence(e.id)||
-      !Number.isSafeInteger(e.at)||e.at<0||e.at>view.serverTime||!['scrap','parts'].every(k=>Number.isSafeInteger(e.cost?.[k])&&e.cost[k]>=0))||
-      new Set(constructionLedger.map(e=>e.id)).size!==constructionLedger.length)
-      throw Error('Explicit prior construction payments required');
-    return {version:1,view:structuredClone(view),book:{...holds.create(view,{safety,windowEnd}),startedAt:windowStart},assumptions:structuredClone(assumptions),
-      outcomes:structuredClone(outcomes),familyRules:structuredClone(familyRules),familyPlans:[],familyPauses:[],
-      moodRules:structuredClone(moodRules),mood:null,xpRules:structuredClone(xpRules),xp:null,
-      construction:structuredClone(construction),spent:structuredClone(constructionLedger),pending:null,lastActionAt:null,
-      accounting:{initial:{...view.state.resources},produced:zero(),collected:zero(),consumed:zero(),feed:zero(),paid:zero()},events:[],
-      model:firstActionOnly?'native-snapshot-first-action-only':'offline-one-confirmed-action-per-ten-minute-tick'};
-  }
-  function validate(n) {
-    if(n?.version!==1||!Array.isArray(n.spent)||!Array.isArray(n.events)||!n.accounting||
-      !keys.every(k=>['initial','produced','collected','consumed','feed','paid'].every(f=>Number.isFinite(n.accounting[f][k])&&n.accounting[f][k]>=0)))
-      throw Error('Invalid route state');
-    resource.validate(n.view);holds.inspect(n.view,n.book);
-    if(n.existing)existing.validate(n.view,n.existing,n.book);
-    if(n.existing?.priorPayments.some(p=>!n.spent.some(s=>s.id===p.id&&s.at===p.at&&
-      s.cost.scrap===p.cost.scrap&&s.cost.parts===p.cost.parts)))throw Error('Inherited construction payments cannot be reset');
-    family.validate(n.familyPlans??[],n.familyRules);
-    if(n.moodRules!=null)mood.validate(n.view,n.moodRules);
-    if(n.mood&&['statBasis','matching','shortage','timing','rounding','source'].some(k=>n.mood.rules?.[k]!==n.moodRules?.[k]))
-      throw Error('Stored mood rules disagree with the route policy');
-    if(n.xpRules!=null)xp.validate(n.view,n.xpRules);
-    if(n.xp&&['duty','collection','health','activity','precision','source'].some(k=>n.xp.rules?.[k]!==n.xpRules?.[k]))
-      throw Error('Stored XP rules disagree with the route policy');
-    if((n.familyPlans??[]).some(p=>!evidence(p.intentId)||!n.book.entries.some(e=>e.id===p.intentId)))
-      throw Error('Family plan is not bound to its reservation');
-    if(n.book.entries.filter(e=>e.status==='submitted').length!==(n.pending?1:0))throw Error('Route pending mismatch');
-    if(n.pending){
-      const p=n.book.entries.find(e=>e.id===n.pending.intentId)?.pending;
-      if(!p||p.id!==n.pending.requestId||p.fingerprint!==n.pending.fingerprint||p.fingerprint!==JSON.stringify(n.pending.action))
-        throw Error('Route pending binding mismatch');
-    }
-  }
-  function checkConservation(n) {
-    for(const k of keys){const a=n.accounting;
-      if(Math.abs(a.initial[k]+a.collected[k]-a.consumed[k]-a.feed[k]-a.paid[k]-n.view.state.resources[k])>1e-6)
-        throw Error('Route inventory conservation failed: '+k);
-    }
-  }
-  function accumulate(n,ledger) {for(const field of ['produced','collected','consumed','feed'])for(const k of keys)n.accounting[field][k]+=ledger[field][k];}
-  function fromRuntime(view,options={}) {
-    if(!options.runtime||options.constructionLedger!==undefined)throw Error('Runtime import requires its own native construction history');
-    const imported=existing.capture(view,{...options.runtime,windowEnd:options.windowEnd,safety:options.safety});
-    const node=create(view,{...options,constructionLedger:imported.payments});
-    node.book={...imported.book,startedAt:node.book.startedAt};node.existing=imported.state;validate(node);
-    return {node,blocked:imported.blocked};
-  }
-  const inheritedIssues=(n,options={})=>existing.issues(n.view,n.existing,n.book,{familyPlans:n.familyPlans,...options});
-  function reserve(input,intent) {
-    validate(input);if(input.pending)throw Error('Reconcile pending before changing route commitments');
-    const blocked=inheritedIssues(input,{action:{kind:'reserve'}});if(blocked.length)return {node:input,accepted:false,blocked};
-    const result=holds.reserve(input.view,input.book,intent);
-    return {node:result.accepted?{...input,book:result.book}:input,accepted:result.accepted,blocked:result.report.blocked};
-  }
-  function release(input,id,options) {
-    validate(input);
-    if(input.existing?.native.length)throw Error('Native pending action must be reconciled outside the simulator');
-    if(input.existing?.roles.some(r=>r.intentId===id&&['active','preempted','return-due'].includes(r.status)))
-      throw Error('Inherited role must end with a confirmed assignment before release');
-    if(input.existing?.material?.intentId===id&&input.existing.material.workers.some(w=>
-      input.existing.material.rooms.includes(input.view.state.residents.find(p=>p.id===w.id)?.roomId)))
-      throw Error('Inherited material workers must leave or transfer their use before release');
-    if(input.existing?.families.some(f=>f.intentId===id&&f.kind==='romance'&&['needs-plan','paused'].includes(f.status)&&
-      input.book.entries.some(e=>e.id===id&&active(e))))throw Error('Inherited romance must retain its reservation');
-    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='romance'))throw Error('Active romance cannot lose its reservation');
-    if((input.familyPlans??[]).some(p=>p.intentId===id&&p.stage==='planned'&&p.parents.every(id=>
-      input.view.state.residents.some(r=>r.id===id&&r.roomId===p.roomId))))
-      throw Error('Co-located parents cannot be cancelled without resolving their next family transition');
-    const n={...input,book:holds.release(input.view,input.book,id,options),familyPlans:structuredClone(input.familyPlans??[])};
-    for(const p of n.familyPlans)if(p.intentId===id&&p.stage==='planned')p.stage='cancelled';
-    if(n.existing){n.existing=structuredClone(n.existing);for(const f of n.existing.families)if(f.intentId===id&&f.status==='needs-plan')f.status='cancelled';}
-    if(n.existing?.swap?.intentId===id)n.existing.swap.status='cancelled';
-    if(n.existing?.material?.intentId===id)n.existing.material.status='cancelled';
-    return n;
-  }
-  function amend(input,intentId,changes) {
-    validate(input);if(input.pending)throw Error('Reconcile pending before amending commitments');
-    const blocked=inheritedIssues(input,{action:{kind:'amend'}});if(blocked.length)return {node:input,accepted:false,blocked};
-    const result=holds.amend(input.view,input.book,intentId,changes);
-    if(result.accepted){
-      try{if(input.existing)existing.validate(input.view,input.existing,result.book);}
-      catch{return {node:input,accepted:false,blocked:[{kind:'inherited-commitment-amendment-invalid'}]};}
-      const blocked=familyCommitments({...input,book:result.book});
-      if(blocked.length)return {node:input,accepted:false,blocked};
-    }
-    return {node:result.accepted?{...input,book:result.book}:input,accepted:result.accepted,blocked:result.report.blocked};
-  }
-  function familyCommitments(n) {
-    const blocked=[],at=n.view.serverTime;
-    for(const p of n.familyPlans??[])if(['planned','romance'].includes(p.stage)){
-      const e=n.book.entries.find(e=>e.id===p.intentId&&active(e));
-      if(!e||!e.families.some(f=>sameParents(f.parents,p.parents)&&f.dueAt===null&&f.childId===null)||
-        p.parents.some(id=>!e.people.some(c=>c.residentId===id&&c.from<=at&&c.until>at)||
-          !e.seats.some(c=>c.residentId===id&&c.roomId===p.roomId&&c.from<=at&&c.until>at)))
-        blocked.push({kind:'family-commitment-missing',key:p.key,intentId:p.intentId});
-    }
-    return blocked;
-  }
-  function registerFamily(input,intentId,plan) {
-    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before registering family');
-    if(plan?.stage!=='planned')throw Error('New family must start as an explicit planned cycle');
-    const n=structuredClone(input);n.familyPlans??=[];
-    n.familyPlans.push({...structuredClone(plan),intentId});family.validate(n.familyPlans,n.familyRules);
-    const blocked=familyCommitments(n);
-    blocked.push(...family.eligibility(n.view,plan,{ignoreLocation:true}));
-    if(n.outcomes.births.some(o=>o.resident.id===plan.child.id))blocked.push({kind:'family-child-already-promised',key:plan.key});
-    return {node:blocked.length?input:n,accepted:!blocked.length,blocked};
-  }
-  function bindExistingFamily(input,intentId,plan) {
-    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before binding inherited family');
-    const f=input.existing?.families.find(f=>f.intentId===intentId&&f.status==='needs-plan');
-    if(!f||plan?.roomId!==f.roomId||!sameParents(plan.parents,f.parents)||
-      plan.stage!==(f.kind==='romance'?'romance':'planned'))throw Error('Family plan does not bind inherited family');
-    if(plan.stage==='planned')return registerFamily(input,intentId,plan);
-    const n=structuredClone(input);n.familyPlans.push({...structuredClone(plan),intentId});family.validate(n.familyPlans,n.familyRules);
-    const blocked=familyCommitments(n);
-    if(n.view.state.residents.some(p=>p.id===plan.child.id)||n.outcomes.births.some(o=>o.resident.id===plan.child.id))
-      blocked.push({kind:'family-child-already-promised',key:plan.key});
-    if(!f.parents.every(id=>n.view.state.residents.some(p=>p.id===id&&p.roomId===f.roomId&&
-      p.romance&&f.parents.includes(p.romance.partnerId))))blocked.push({kind:'inherited-romance-state-changed'});
-    return {node:blocked.length?input:n,accepted:!blocked.length,blocked};
-  }
-  function nextExistingSwap(input) {
-    validate(input);const s=input.existing?.swap;
-    if(!s||s.status==='complete'||s.status==='cancelled')return {action:null,intentId:null,blocked:[]};
-    const move=s.moves[s.step],p=input.view.state.residents.find(p=>p.id===move?.id);
-    if(!move||!p)return {action:null,intentId:s.intentId,blocked:[{kind:'inherited-swap-position-changed'}]};
-    const action={kind:'assign',residentId:p.id,fromRoomId:p.roomId,roomId:move.room};
-    const result=preview(input,s.intentId,action);
-    return {action:result.blocked.length?null:action,intentId:s.intentId,blocked:result.blocked};
-  }
-  function refreshMaterials(n) {
-    const m=n.existing?.material;if(!m||m.status==='cancelled')return;
-    const e=n.book.entries.find(e=>e.id===m.intentId),r=n.view.state.rooms.find(r=>r.id===m.roomId);
-    if(e.status==='submitted')return;
-    if(m.status==='constructing'&&r?.level>=m.targetLevel&&r.upgradeAt===null)m.status='complete';
-    const preparing=['preparing','ready'].includes(m.status);
-    if(preparing&&(!r||r.type!==n.existing.materialPurpose.type||r.level!==m.fromLevel||r.upgradeAt!==null))
-      throw Error('Inherited material target changed before payment');
-    if(preparing)m.cost=upgradeCost(r);
-    const report=holds.inspect(n.view,n.book,{owner:m.intentId});
-    // Existing allocations are replaceable by their own purpose, not extra inventory.
-    const availableScrap=Math.max(0,report.ownSpendable.scrap+e.feedScrap),availableParts=Math.max(0,report.ownSpendable.parts);
-    e.resources.scrap=preparing?Math.min(m.cost.scrap,availableScrap):0;
-    e.resources.parts=preparing?Math.min(m.cost.parts,availableParts):0;
-    let collected=structuredClone(n.view),ready=0;
-    for(const roomId of m.rooms){const result=resource.collect(collected,roomId);collected=result.view;ready+=result.ledger.collected.parts;}
-    m.shortage={scrap:preparing?m.cost.scrap-e.resources.scrap:0,parts:preparing?m.cost.parts-e.resources.parts:0};
-    m.collectableParts=ready;
-    // Grant at most the next actual tick's feed, then re-evaluate collected inventory.
-    // Capping at fractional remaining parts would strand an incomplete whole batch.
-    const feedNeed=preparing&&m.shortage.parts>ready+1e-7?n.view.state.rooms.filter(r=>m.rooms.includes(r.id))
-      .reduce((sum,r)=>sum+resource.rate(n.view,r,n.view.serverTime),0):0;
-    e.feedScrap=Math.min(Math.max(0,availableScrap-e.resources.scrap),feedNeed);
-    m.allocated={scrap:e.resources.scrap,parts:e.resources.parts,feedScrap:e.feedScrap};m.updatedAt=n.view.serverTime;
-    if(preparing)m.status=m.shortage.scrap<1e-7&&m.shortage.parts<1e-7?'ready':'preparing';
-  }
-  function bindExistingMaterials(input,{workers,source}={}) {
-    validate(input);if(input.pending||input.existing?.native.length)throw Error('Reconcile pending before binding inherited materials');
-    const purpose=input.existing?.materialPurpose;
-    if(!purpose||input.existing.material||!evidence(source)||!Array.isArray(workers)||workers.some(id=>!validId(id))||
-      new Set(workers).size!==workers.length)throw Error('Explicit inherited material workers and source required');
-    const n=structuredClone(input),r=n.view.state.rooms.find(r=>r.id===purpose.id),at=n.view.serverTime;
-    if(!r||r.type!==purpose.type||r.level+1!==purpose.level||!builds[r.type]||r.level>=3||!activeRoom(r,at))
-      return {node:input,accepted:false,blocked:[{kind:'inherited-material-target-changed'}]};
-    const report=holds.inspect(n.view,n.book),bindings=[],people=[],seats=[],rooms=new Set(),blocked=[];
-    for(const id of workers){
-      const p=n.view.state.residents.find(p=>p.id===id),room=n.view.state.rooms.find(r=>r.id===p?.roomId);
-      if(!p||!present(p,at)||p.romance||room?.type!=='workshop'||!activeRoom(room,at)){
-        blocked.push({kind:'inherited-material-worker-unavailable',residentId:id});continue;
-      }
-      const claims=report.people.filter(c=>c.residentId===id),role=n.existing.roles.find(r=>r.residentId===id&&
-        r.record.role==='workshop'&&['active','return-due'].includes(r.status));
-      if(claims.length&&(!role||claims.some(c=>c.intentId!==role.intentId))){
-        blocked.push({kind:'inherited-material-worker-already-promised',residentId:id});continue;
-      }
-      rooms.add(room.id);const intentId=claims.length?role.intentId:'existing:materials';
-      bindings.push({id,intentId});
-      if(!claims.length){people.push({residentId:id,from:at,until:n.book.windowEnd});
-        seats.push({residentId:id,roomId:room.id,from:at,until:n.book.windowEnd});}
-    }
-    for(const p of n.view.state.residents)if(present(p,at)&&n.view.state.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&activeRoom(r,at))&&!workers.includes(p.id))
-      blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});
-    if(blocked.length)return {node:input,accepted:false,blocked};
-    const held=holds.reserve(n.view,n.book,{id:'existing:materials',purpose:'inherited project material allocation',people,seats});
-    if(!held.accepted)return {node:input,accepted:false,blocked:held.report.blocked};n.book=held.book;
-    n.existing.material={intentId:'existing:materials',source,roomId:r.id,fromLevel:r.level,targetLevel:purpose.level,
-      cost:upgradeCost(r),workers:bindings,rooms:[...rooms],status:'preparing',allocated:{scrap:0,parts:0,feedScrap:0}};
-    refreshMaterials(n);validate(n);
-    return {node:n,accepted:true,blocked:holds.inspect(n.view,n.book).blocked};
-  }
-  function manufacturing(n,requestedOwner=null) {
-    const m=n.existing?.material,owner=m&&m.status!=='cancelled'?m.intentId:requestedOwner;
-    if(m&&m.status!=='cancelled'&&requestedOwner!==null&&requestedOwner!==owner)
-      return {blocked:[{kind:'manufacturing-owner-conflict'}]};
-    const allowance=holds.feedAllowance(n.view,n.book,owner),blocked=[];
-    if(owner!==null){
-      const owned=new Set(allowance.report.people.filter(p=>p.intentId===owner&&p.from<=n.view.serverTime&&p.until>n.view.serverTime).map(p=>p.residentId));
-      if(m?.intentId===owner)for(const p of m.workers)owned.add(p.id);
-      for(const p of n.view.state.residents)if(present(p,n.view.serverTime)&&n.view.state.rooms.some(r=>r.id===p.roomId&&
-        r.type==='workshop'&&activeRoom(r,n.view.serverTime))&&!owned.has(p.id))blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});
-    }
-    return {...allowance,owner,blocked};
-  }
-  function committedFamilySupply(n) {
-    const v=structuredClone(n.view);
-    // All prospective parents are removed together, including other reserved families.
-    // Checking only the parent moved by this action could strand the second supply worker.
-    for(const e of n.book.entries.filter(active))for(const f of e.families)if(f.dueAt===null&&f.childId===null)
-      for(const id of f.parents){const p=v.state.residents.find(p=>p.id===id);if(p)p.roomId=null;}
-    return supply(v,n.book);
-  }
-  function growthNeeds(view,book) {
-    const at=view.serverTime,s=view.state,report=holds.inspect(view,book);
-    const current=resource.demand(view,at),needs={...current,food:report.population,water:report.population};
-    // Reserve the electricity of already paid construction and upgrade increments.
-    for(const r of s.rooms){
-      const per=['power','door','elevator'].includes(r.type)?0:production[r.type]?1:.5;
-      if(r.builtAt>at)needs.power+=per*r.width*r.level;
-      else if(r.upgradeAt!==null)needs.power+=per*r.width;
-    }
-    return needs;
-  }
-  function supply(view,book) {
-    const need=growthNeeds(view,book),rates=zero();
-    for(const r of view.state.rooms)if(production[r.type])rates[production[r.type]]+=resource.rate(view,r,view.serverTime);
-    return Object.fromEntries(['power','food','water'].map(k=>[k,{need:need[k],rate:rates[k],
-      deficit:Math.max(0,need[k]*1.2-rates[k]),inventoryGap:Math.max(0,need[k]*2-view.state.resources[k])}]));
-  }
-  function constructionSupplyTrajectory(node,intentId,cost) {
-    // Use the same event/stock model as the route, including whole-batch collection. Completion
-    // itself gives no inventory. This assumes one collection opportunity per tick; the runtime
-    // must measure its real delay before these offline times can be used as an execution claim.
-    const projected=structuredClone(node),e=projected.book.entries.find(e=>e.id===intentId),begin=projected.view.serverTime;
-    for(const k of ['scrap','parts']){projected.view.state.resources[k]-=cost[k];e.resources[k]-=cost[k];}
-    if(projected.existing?.material?.intentId===intentId)projected.existing.material.status='constructing';
-    refreshMaterials(projected);
-    const first=supply(projected.view,projected.book),waiting=Object.keys(first).filter(k=>first[k].deficit>1e-7);
-    const minimum=Object.fromEntries(Object.entries(first).map(([k])=>[k,projected.view.state.resources[k]])),restored={};
-    const blocked=[];
-    for(const [k,v] of Object.entries(first))if(v.inventoryGap>1e-7)blocked.push({kind:'construction-stock-floor',resource:k});
-    const end=Math.min(begin+day,projected.book.windowEnd);
-    while(waiting.some(k=>restored[k]===undefined)&&projected.view.serverTime+tick<=end&&!blocked.length){
-      blocked.push(...inheritedIssues(projected,{advancing:true,nextAt:projected.view.serverTime+tick}));
-      if(blocked.length)break;
-      const feed=manufacturing(projected);blocked.push(...feed.blocked);if(blocked.length)break;
-      const floor=feed.floor;
-      const step=natural.advance(projected.view,projected.view.serverTime+tick,{assumptions:projected.assumptions,
-        outcomes:projected.outcomes,familyPlans:projected.familyPlans,familyRules:projected.familyRules,
-        moodRules:projected.moodRules??null,xpRules:projected.xpRules??null,scrapFloor:floor,collect:true});
-      if(!step.complete){blocked.push(...step.blocked);break;}
-      projected.view=step.view;projected.outcomes=step.outcomes;projected.familyPlans=step.familyPlans;
-      if(feed.owner!==null)projected.book=holds.consumeFeed(projected.view,projected.book,feed.owner,step.ledger.feed.scrap);
-      projected.book=holds.reconcileEvents(projected.view,projected.book,step.events);
-      if(projected.existing)projected.existing=existing.remap(projected.existing,step.events);
-      refreshMaterials(projected);
-      const after=supply(projected.view,projected.book);
-      for(const [k,v] of Object.entries(after)){
-        minimum[k]=Math.min(minimum[k],step.ledger.minimumInventory[k]);
-        if(step.ledger.unserved[k]>1e-7||step.ledger.minimumInventory[k]<2*v.need-1e-7)
-          blocked.push({kind:'construction-stock-floor',resource:k,at:projected.view.serverTime});
-        if(waiting.includes(k)&&v.deficit<=1e-7&&step.ledger.collected[k]>0)restored[k]??=projected.view.serverTime;
-      }
-    }
-    for(const k of waiting)if(restored[k]===undefined&&!blocked.length)blocked.push({kind:'construction-supply-unresolved',resource:k});
-    return {blocked,restored,minimum,assumption:'whole-batch collection at every ten-minute boundary',from:begin,checkedUntil:projected.view.serverTime};
-  }
-  function preview(input,intentId,action) {
-    validate(input);const n=structuredClone(input),at=n.view.serverTime,s=n.view.state,blocked=[];
-    const entry=n.book.entries.find(e=>e.id===intentId&&active(e));
-    if(!entry)return {blocked:[{kind:'unknown-intent'}]};
-    const cost={scrap:0,parts:0},beforeSupply=supply(n.view,n.book);let supplyRecovery=null;
-    const people=new Set(entry.people.filter(c=>c.from<=at&&at<c.until).map(c=>c.residentId));
-    const seats=entry.seats.filter(c=>c.from<=at&&at<c.until);
-    if(s.lastSettledAt!==at&&n.model!=='native-snapshot-first-action-only'||at>=n.book.windowEnd)blocked.push({kind:'invalid-action-time'});
-    if(n.view.switches?.frozen)blocked.push({kind:'frozen-shelter'});
-    if(n.model==='native-snapshot-first-action-only'&&action.kind!=='assign')blocked.push({kind:'native-current-assignment-only'});
-    blocked.push(...inheritedIssues(n,{intentId,action}));
-    blocked.push(...familyCommitments(n));
-    if(input.lastActionAt!==null&&at<input.lastActionAt+tick)blocked.push({kind:'action-cadence'});
-    const a=action,r=s.rooms.find(r=>r.id===a.roomId);
-    if(a.kind==='assign'){
-      const p=s.residents.find(p=>p.id===a.residentId);
-      const maxHp=p?Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end)):Infinity;
-      if(!p||!people.has(p.id)||!present(p,at)||p.romance||!Number.isFinite(p.hp)||p.hp<.6*maxHp||p.roomId!==a.fromRoomId||a.roomId===a.fromRoomId)
-        blocked.push({kind:'resident-action-invalid'});
-      const familyPlan=r?.type==='quarters'?(n.familyPlans??[]).find(f=>f.key===a.familyKey&&f.intentId===intentId&&
-        f.stage==='planned'&&f.roomId===a.roomId&&f.parents.includes(a.residentId)):null;
-      if(a.roomId!==null&&(!activeRoom(r,at)||!production[r?.type]&&!['training','radio'].includes(r?.type)&&!familyPlan||
-        !seats.some(c=>c.residentId===a.residentId&&c.roomId===a.roomId)))blocked.push({kind:'destination-not-reserved'});
-      if(r?.type==='radio'){
-        const capacity=Math.min(200,s.rooms.filter(q=>q.type==='quarters'&&q.builtAt<=at).reduce((n,q)=>n+q.width*(2+2*q.level),0));
-        if(s.residents.length+s.births.length<capacity||s.rooms.some(q=>q.type==='quarters'&&(q.builtAt>at||q.upgradeAt!==null)))
-          blocked.push({kind:'radio-recruitment-not-modeled'});
-      }
-      if(familyPlan){
-        blocked.push(...family.eligibility(n.view,familyPlan,{ignoreLocation:true}));
-        for(const [k,v] of Object.entries(committedFamilySupply(n)))if(v.deficit>1e-7||v.inventoryGap>1e-7)
-          blocked.push({kind:'family-supply-not-covered',resource:k,...v});
-      }
-      if(r&&s.residents.filter(q=>q.id!==p?.id&&q.deadAt===null&&q.adultAt<=at&&q.roomId===r.id).length>=r.width*2)
-        blocked.push({kind:'destination-full'});
-      if(r?.type==='training'&&(!['str','per','end','cha','int','agi','lck'].includes(r.trainStat)||p?.stats[r.trainStat]>=10))
-        blocked.push({kind:'invalid-training-destination'});
-      if(!blocked.length){p.roomId=a.roomId;if(a.fromRoomId!==a.roomId)p.training=0;}
-    }else if(['build','upgrade','dig'].includes(a.kind)){
-      if(!n.construction[a.kind])blocked.push({kind:'construction-disabled'});
-      if(!Number.isSafeInteger(a.finishAt)||a.finishAt<=at||a.finishAt>n.book.windowEnd||!evidence(a.source))
-        blocked.push({kind:'unknown-construction-time'});
-      if(a.kind!=='dig'&&s.rooms.filter(r=>r.builtAt>at||r.upgradeAt!==null).length>=2)blocked.push({kind:'construction-slots'});
-      if(a.kind==='upgrade'){
-        if(!activeRoom(r,at)||!builds[r?.type]||r.level!==a.fromLevel||r.level>=3)blocked.push({kind:'upgrade-state-changed'});
-        else{
-          Object.assign(cost,upgradeCost(r));
-          r.upgradeAt=a.finishAt;
-        }
-      }else if(a.kind==='build'){
-        if(!builds[a.type]||!validId(a.roomId)||r||!Number.isInteger(a.floor)||a.floor<1||a.floor>s.depth||
-          !Number.isInteger(a.col)||a.col<2||a.col>7||n.view.progress.level<(builds[a.type]?.[1]??Infinity))blocked.push({kind:'build-state-invalid'});
-        const floor=s.rooms.filter(r=>r.floor===a.floor).sort((a,b)=>a.col-b.col);let next=2;
-        for(const room of floor.filter(r=>!['door','elevator'].includes(r.type))){if(room.col!==next)blocked.push({kind:'layout-gap'});next=room.col+room.width;}
-        if(a.col!==next)blocked.push({kind:'build-not-at-free-edge'});
-        if(a.type==='training'&&!['str','per','end','cha','int','agi','lck'].includes(a.trainStat))blocked.push({kind:'unknown-training-stat'});
-        if(builds[a.type])cost.scrap=Math.ceil(builds[a.type][0]*(1+.2*s.rooms.filter(r=>r.type===a.type).reduce((n,r)=>n+r.width,0)));
-        if(!blocked.length)s.rooms.push({id:a.roomId,type:a.type,floor:a.floor,col:a.col,width:1,level:1,builtAt:a.finishAt,
-          upgradeAt:null,stored:0,incident:null,unpowered:false,...(a.type==='training'?{trainStat:a.trainStat}:{})});
-      }else{
-        if(s.digging||a.floor!==s.depth+1||a.floor>=20||!validId(a.elevatorId)||s.rooms.some(r=>r.id===a.elevatorId))
-          blocked.push({kind:'dig-state-or-unmodeled-defense'});
-        cost.scrap=Math.ceil(120*(s.depth+1)**1.4);
-        if(!blocked.length){
-          s.digging={floor:a.floor,doneAt:a.finishAt};
-          n.outcomes.digs.push({floor:a.floor,doneAt:a.finishAt,source:a.source,
-            elevator:{id:a.elevatorId,type:'elevator',floor:a.floor,col:1,width:1,level:1,builtAt:a.finishAt,
-              upgradeAt:null,stored:0,incident:null,unpowered:false}});
-        }
-      }
-      for(const k of ['scrap','parts']){
-        const spent=n.spent.filter(x=>x.at>at-day).reduce((sum,x)=>sum+x.cost[k],0);
-        if(n.construction.budgetMode!=='stock'&&cost[k]+spent>n.construction[k+'Limit'])blocked.push({kind:'rolling-construction-limit',resource:k});
-      }
-    }else blocked.push({kind:'unsupported-action'});
-    if(!blocked.length){
-      const after=supply(n.view,n.book);
-      if(a.kind==='assign'&&input.existing?.swap?.intentId===intentId)for(const k of ['power','food','water'])
-        if(after[k].rate<(input.existing.swap.supplyFloor?.[k]??0)-1e-7)
-          blocked.push({kind:'inherited-swap-supply-floor',resource:k});
-      for(const k of ['power','food','water'])if(a.kind==='assign'&&
-        (after[k].deficit>beforeSupply[k].deficit+1e-7||after[k].inventoryGap>1e-7))
-        blocked.push({kind:'supply-not-covered',resource:k,before:beforeSupply[k],after:after[k]});
-      // Existing deficits may be repaired incrementally but never worsened by a free move.
-      const report=holds.inspect(n.view,n.book,{owner:intentId});
-      blocked.push(...report.blocked);
-      for(const k of ['scrap','parts'])if(cost[k]>entry.resources[k]+1e-7||cost[k]>report.ownSpendable[k]+1e-7)
-        blocked.push({kind:'construction-cost-not-reserved',resource:k,cost:cost[k]});
-      if(!blocked.length&&['build','upgrade','dig'].includes(a.kind)){
-        supplyRecovery=constructionSupplyTrajectory(n,intentId,cost);blocked.push(...supplyRecovery.blocked);
-      }
-    }
-    return {node:n,cost,blocked,supplyRecovery};
-  }
-  function submit(input,intentId,action,requestId) {
-    validate(input);if(input.pending)throw Error('Route already has a pending action');
-    if(input.model==='native-snapshot-first-action-only')return {node:input,accepted:false,blocked:[{kind:'native-receipt-required'}]};
-    const proposal=preview(input,intentId,action);if(proposal.blocked.length)return {node:input,accepted:false,blocked:proposal.blocked};
-    const fingerprint=JSON.stringify(action),result=holds.submit(input.view,input.book,intentId,{requestId,fingerprint,cost:proposal.cost});
-    if(!result.accepted)return {node:input,accepted:false,blocked:result.report.blocked};
-    return {node:{...input,book:result.book,pending:{intentId,requestId,fingerprint,action:structuredClone(action),at:input.view.serverTime}},accepted:true,blocked:[]};
-  }
-  function resolve(input,receipt) {
-    validate(input);const pending=input.pending;
-    if(!pending){
-      const found=input.book.receipts.find(r=>r.requestId===receipt?.requestId);
-      if(!found)throw Error('No matching pending action');
-      holds.resolve(input.view,input.book,found.intentId,receipt);return {node:input,duplicate:true,blocked:[]};
-    }
-    // Check the exact request binding before previewing or applying any local state change.
-    const payment=holds.resolve(input.view,input.book,pending.intentId,receipt);
-    if(receipt.result==='unknown')return {node:input,duplicate:false,blocked:[{kind:'pending-outcome'}]};
-    const n=structuredClone(input);
-    if(receipt.result==='confirmed'){
-      // The bound receipt has resolved uncertainty. Validate the confirmed action against
-      // still-unpaid allocations without treating this same request as pending forever;
-      // otherwise valid later intents for the resident prevent confirming the first move.
-      const confirmedInput=structuredClone(input),confirmedEntry=confirmedInput.book.entries.find(e=>e.id===pending.intentId);
-      confirmedEntry.status='held';confirmedEntry.pending=null;confirmedInput.pending=null;
-      const proposal=preview(confirmedInput,pending.intentId,pending.action);
-      if(proposal.blocked.length)return {node:input,duplicate:false,blocked:proposal.blocked};
-      const reserved=input.book.entries.find(e=>e.id===pending.intentId).pending.cost;
-      if(['scrap','parts'].some(k=>reserved[k]!==proposal.cost[k]))
-        return {node:input,duplicate:false,blocked:[{kind:'submitted-cost-changed'}]};
-      n.view=proposal.node.view;n.outcomes=proposal.node.outcomes;n.familyPlans=proposal.node.familyPlans;
-      n.view.state.resources=payment.view.state.resources;
-      for(const k of keys)n.accounting.paid[k]+=input.book.entries.find(e=>e.id===pending.intentId).pending.cost[k];
-      if(['build','upgrade','dig'].includes(pending.action.kind))n.spent.push({id:pending.requestId,at:n.view.serverTime,cost:proposal.cost});
-    }
-    n.book=payment.book;n.pending=null;n.lastActionAt=n.view.serverTime;
-    if(receipt.result==='confirmed'&&pending.intentId===n.existing?.material?.intentId&&pending.action.kind==='upgrade')
-      n.existing.material.status='constructing';
-    if(receipt.result==='confirmed'&&pending.action.kind==='assign'&&n.existing){
-      const role=n.existing.roles.find(r=>r.intentId===pending.intentId&&r.residentId===pending.action.residentId);
-      if(role&&pending.action.roomId!==role.roomId){
-        role.status='completed';role.completedAt=n.view.serverTime;
-        n.book=holds.release(n.view,n.book,pending.intentId,{complete:true,reason:'inherited role ended by confirmed simulated assignment'});
-      }
-      if(n.existing.swap?.intentId===pending.intentId)existing.syncSwap(n.view,n.existing,n.book,{confirmed:true});
-    }
-    refreshMaterials(n);
-    n.events.push({kind:'action',at:n.view.serverTime,action:pending.action,result:receipt.result,requestId:pending.requestId});
-    checkConservation(n);return {node:n,duplicate:false,blocked:[]};
-  }
-  function advanceInternal(input,to,{feedOwner=null,collect=false,stopAtEvent=false}={},owned=false) {
-    if(input.model==='native-snapshot-first-action-only')throw Error('Unsettled native snapshot cannot be advanced as a simulated route');
-    validate(input);let n=owned?input:structuredClone(input);const blocked=[];
-    const metrics={ticks:0,minimumInventory:{...input.view.state.resources},unserved:zero(),roomOverflow:zero()};
-    if(!Number.isSafeInteger(to)||to<n.view.serverTime||to>n.book.windowEnd||(to-n.view.serverTime)%tick!==0)throw Error('Invalid route horizon');
-    if(n.pending)return {node:input,complete:false,blocked:[{kind:'pending-action-timing-unknown'}],metrics};
-    const inherited=inheritedIssues(n,{advancing:true});if(inherited.length)return {node:input,complete:false,blocked:inherited,metrics};
-    while(n.view.serverTime<to){
-      const inherited=inheritedIssues(n,{advancing:true,nextAt:n.view.serverTime+tick});if(inherited.length){blocked.push(...inherited);break;}
-      const report=holds.inspect(n.view,n.book);if(report.blocked.length){blocked.push(...report.blocked);break;}
-      const familyIssues=familyCommitments(n);if(familyIssues.length){blocked.push(...familyIssues);break;}
-      if((n.familyPlans??[]).some(p=>p.stage==='romance'||p.stage==='planned'&&p.parents.every(id=>
-        n.view.state.residents.some(r=>r.id===id&&r.roomId===p.roomId)))){
-        for(const [k,v] of Object.entries(committedFamilySupply(n)))if(v.deficit>1e-7||v.inventoryGap>1e-7)
-          blocked.push({kind:'family-supply-not-covered',resource:k,...v});
-        if(blocked.length)break;
-      }
-      const feed=manufacturing(n,feedOwner);if(feed.blocked.length){blocked.push(...feed.blocked);break;}
-      const {floor,allowed,owner}=feed;
-      const next=natural.advance(n.view,n.view.serverTime+tick,{assumptions:n.assumptions,outcomes:n.outcomes,
-        familyPlans:n.familyPlans,familyRules:n.familyRules,moodRules:n.moodRules??null,xpRules:n.xpRules??null,scrapFloor:floor,collect});
-      if(!next.complete){blocked.push(...next.blocked);break;}
-      if(next.ledger.feed.scrap>allowed+1e-7)throw Error('Feed allowance exceeded');
-      metrics.ticks++;
-      for(const k of keys){metrics.minimumInventory[k]=Math.min(metrics.minimumInventory[k],next.ledger.minimumInventory[k]);
-        metrics.unserved[k]+=next.ledger.unserved[k];metrics.roomOverflow[k]+=next.ledger.roomOverflow[k];}
-      n.view=next.view;n.outcomes=next.outcomes;n.familyPlans=next.familyPlans;n.mood=next.mood;n.xp=next.xp;
-      n.familyPauses??=[];n.familyPauses.push(...next.familyPauses);
-      accumulate(n,next.ledger);n.events.push(...next.events);
-      if(owner!==null)n.book=holds.consumeFeed(n.view,n.book,owner,next.ledger.feed.scrap);
-      n.book=holds.reconcileEvents(n.view,n.book,next.events);
-      if(n.existing)n.existing=existing.remap(n.existing,next.events);
-      refreshMaterials(n);
-      const after=holds.inspect(n.view,n.book);
-      // Depletion and new adulthood are real state transitions, not silently undone to make a
-      // route look feasible. Retain that state and its explicit failure for the route search.
-      for(const k of ['power','food','water'])if(next.ledger.unserved[k]>1e-7||
-        next.ledger.minimumInventory[k]+1e-7<2*resource.demand(n.view,n.view.serverTime)[k])
-        blocked.push({kind:'supply-inventory-floor',resource:k});
-      blocked.push(...after.blocked.filter(b=>b.kind!=='deadline'||n.view.serverTime<to));
-      if(blocked.length||stopAtEvent&&next.events.length)break;
-    }
-    checkConservation(n);return {node:n,complete:n.view.serverTime===to&&!blocked.length,blocked,metrics};
-  }
-  const advance=(input,to,options)=>advanceInternal(input,to,options,false);
-  // For the continuation interpreter's already private clone only. Avoid copying the
-  // growing immutable event prefix on every ten-minute tick of a full-week projection.
-  const advanceOwned=(input,to,options)=>advanceInternal(input,to,options,true);
-  return {create,fromRuntime,reserve,amend,release,registerFamily,bindExistingFamily,bindExistingMaterials,nextExistingSwap,preview,submit,resolve,advance,advanceOwned,
-    inspect:n=>({...holds.inspect(n.view,n.book),inherited:inheritedIssues(n)}),supply:n=>supply(n.view,n.book)};
-}
-
-return {createShelterRouteSimulation};
-})();
-const {createShelterExchangeCandidates}=(()=>{
-
-// Two-person exchanges for offline development routes. Every move is a separately
-// checked assignment, with a real settlement/collection between confirmations.
-// This is bounded candidate generation, not an allocation optimum or native executor.
-function createShelterExchangeCandidates() {
-  const routes=createShelterRouteSimulation(),resources=createShelterResourceSimulation();
-  const tick=600000,types={power:'power',diner:'food',water:'water',scrap:'scrap'};
-  const keys=['power','food','water','scrap','parts','stimpak'];
-  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-  const rates=v=>Object.fromEntries(keys.map(k=>[k,v.state.rooms.filter(r=>types[r.type]===k)
-    .reduce((sum,r)=>sum+resources.rate(v,r,v.serverTime),0)]));
-  function enumerate(n,{people,goal,maxCandidates}) {
-    if(!Array.isArray(people)||!goal||typeof goal.id!=='string'||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>2000)
-      throw Error('Explicit exchange roster, goal and bounded generation budget required');
-    const at=n.view.serverTime,s=n.view.state;
-    const jobs=s.rooms.filter(r=>types[r.type]&&usable(r,at)).sort((a,b)=>a.id-b.id);
-    const ids=new Set(people.filter(p=>p.eligible&&!p.intentId).map(p=>p.residentId));
-    const workers=s.residents.filter(p=>ids.has(p.id)&&jobs.some(r=>r.id===p.roomId)).sort((a,b)=>a.id-b.id);
-    const count=r=>s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=at).length;
-    const buffers=[null,...jobs.filter(r=>count(r)<r.width*2).map(r=>r.id)],pairs=[],seen=new Set();
-    const contributions=new Map(),before=rates(n.view);
-    function contribution(p,r){
-      const key=p.id+':'+r.id;if(contributions.has(key))return contributions.get(key);
-      const view={...n.view,state:{...s,residents:[{...p,roomId:r.id}]}};
-      const value=resources.rate(view,r,at);contributions.set(key,value);return value;
-    }
-    // Rotate through the full roster before increasing pair distance. A budget must
-    // not silently turn the roster into its first sixteen residents.
-    for(let distance=1;distance<workers.length;distance++)for(let i=0;i<workers.length;i++){
-      const a=workers[i],b=workers[(i+distance)%workers.length],key=[a.id,b.id].sort((a,b)=>a-b).join('/');
-      if(seen.has(key))continue;seen.add(key);
-      if(a.roomId===b.roomId)continue;
-      const ra=jobs.find(r=>r.id===a.roomId),rb=jobs.find(r=>r.id===b.roomId);
-      if(count(ra)>ra.width*2||count(rb)>rb.width*2||count(ra)<ra.width*2&&count(rb)<rb.width*2)continue;
-      const delta=Object.fromEntries(keys.map(k=>[k,0]));
-      delta[types[ra.type]]+=contribution(b,ra)-contribution(a,ra);
-      delta[types[rb.type]]+=contribution(a,rb)-contribution(b,rb);
-      // Keep cross-resource tradeoffs for the later full-window selector. A food gain
-      // may unlock a family even when the current stock goal names scrap.
-      if(!keys.some(k=>delta[k]>1e-7))continue;
-      pairs.push({a,b,delta});
-    }
-    const rows=[];let totalVariants=0;
-    for(const buffer of buffers)for(const reverse of [false,true])for(const pair of pairs){
-      const a=reverse?pair.b:pair.a,b=reverse?pair.a:pair.b;
-      if(buffer===a.roomId||buffer===b.roomId)continue;
-      totalVariants++;if(rows.length>=maxCandidates)continue;
-      const key='exchange:'+a.id+':'+b.id+':'+(buffer??'idle');
-      const moves=[{kind:'assign',residentId:a.id,fromRoomId:a.roomId,roomId:buffer},
-        {kind:'assign',residentId:b.id,fromRoomId:b.roomId,roomId:a.roomId},
-        {kind:'assign',residentId:a.id,fromRoomId:buffer,roomId:b.roomId}];
-      const people=[a,b].map(p=>({residentId:p.id,from:at,until:n.book.windowEnd}));
-      const seats=buffer===null?[]:[{...people[0],roomId:buffer}];
-      rows.push({id:key,kind:'assign',intentId:key,intent:{id:key,purpose:'exchange for '+goal.id,people,seats},action:moves[0],
-        blocked:at+2*tick>=n.book.windowEnd?[{kind:'exchange-cannot-finish-before-window'}]:[],
-        continuation:{kind:'exchange-sequence',moves,expectedRates:Object.fromEntries(keys.map(k=>[k,before[k]+pair.delta[k]])),
-          finalDelta:pair.delta,bufferRoomId:buffer,requiresWholePath:true}});
-    }
-    return {rows,coverage:{eligibleResidents:workers.map(p=>p.id),improvingPairs:pairs.length,totalVariants,
-      emitted:rows.length,unemitted:totalVariants-rows.length,generationTruncated:totalVariants>rows.length,
-      pairScope:'two workers in existing basic production rooms; at least one full room; any positive resource delta retains cross-resource tradeoffs',
-      bufferScope:'idle or currently free basic production room; both orders',maxCandidates}};
-  }
-  function stage(n,intentId,action) {
-    const entry=n.book.entries.find(e=>e.id===intentId);
-    if(!entry)return {node:n,accepted:false,blocked:[{kind:'exchange-reservation-missing'}]};
-    const p=n.view.state.residents.find(p=>p.id===action.residentId);
-    if(!p||p.roomId!==action.fromRoomId)return {node:n,accepted:false,blocked:[{kind:'exchange-position-changed',residentId:action.residentId}]};
-    // Reserve only the next legal destination. A future departure never frees an
-    // occupied seat. Continuation keeps the sequence exclusive until its last move.
-    const seats=action.roomId===null?[]:[{residentId:action.residentId,roomId:action.roomId,from:n.view.serverTime,until:n.book.windowEnd}];
-    return routes.amend(n,intentId,{seats});
-  }
-  function check(prepared,row,{inspectNode=()=>[]}={}) {
-    let n=prepared;const trace=[],minimum={...n.view.state.resources};
-    for(let i=0;i<row.continuation.moves.length;i++){
-      const action=row.continuation.moves[i];
-      if(i){const next=routes.advance(n,n.view.serverTime+tick,{collect:true});
-        for(const k of keys)minimum[k]=Math.min(minimum[k],next.metrics.minimumInventory[k]);
-        if(!next.complete)return {accepted:false,blocked:next.blocked,trace,checkedMoves:i,minimum};n=next.node;}
-      const ready=stage(n,row.intentId,action);
-      if(!ready.accepted)return {accepted:false,blocked:ready.blocked,trace,checkedMoves:i,minimum};n=ready.node;
-      const submitted=routes.submit(n,row.intentId,action,'exchange-admission:'+i+':'+n.view.serverTime);
-      if(!submitted.accepted)return {accepted:false,blocked:submitted.blocked,trace,checkedMoves:i+1,minimum};
-      const pending=submitted.node.pending,resolved=routes.resolve(submitted.node,{requestId:pending.requestId,intentId:row.intentId,
-        fingerprint:pending.fingerprint,at:n.view.serverTime,result:'confirmed'});
-      if(resolved.blocked.length)return {accepted:false,blocked:resolved.blocked,trace,checkedMoves:i+1,minimum};n=resolved.node;
-      const extra=inspectNode(n);if(extra.length)return {accepted:false,blocked:extra,trace,checkedMoves:i+1,minimum};
-      trace.push({at:n.view.serverTime,action,supply:routes.supply(n),inventory:{...n.view.state.resources}});
-    }
-    return {accepted:true,blocked:[],trace,checkedMoves:trace.length,minimum,finalRates:rates(n.view),
-      collected:structuredClone(n.accounting.collected),assumptions:'simulated immediate receipts; one action and collection per ten-minute tick'};
-  }
-  return {enumerate,stage,check};
-}
-
-return {createShelterExchangeCandidates};
-})();
-const {createShelterMaterialCandidates}=(()=>{
-
-// Explicit new upgrade purposes. No invented inherited role, future inventory or payment.
-function createShelterMaterialCandidates() {
-  const routes=createShelterRouteSimulation(),resources=createShelterResourceSimulation(),holds=createShelterReservations();
-  const basic=['power','diner','water','scrap'];
-  const active=e=>!['complete','cancelled'].includes(e.status);
-  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.incident&&!r.unpowered;
-  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;
-  const claim=(n,id)=>({residentId:id,from:n.view.serverTime,until:n.book.windowEnd});
-  function conflicts(n,intentId) {
-    const blocked=[];
-    if(n.existing?.materialPurpose&&!['complete','cancelled'].includes(n.existing.material?.status))
-      blocked.push({kind:'existing-material-purpose-active'});
-    if(n.book.entries.some(e=>active(e)&&e.id!==intentId&&e.purpose.startsWith('new upgrade materials for ')))
-      blocked.push({kind:'material-purpose-already-active'});
-    return blocked;
-  }
-  function refresh(n,intentId,spec) {
-    const blocked=conflicts(n,intentId),at=n.view.serverTime,s=n.view.state;
-    const e=n.book.entries.find(e=>e.id===intentId&&active(e)),r=s.rooms.find(r=>r.id===spec.project.roomId);
-    if(!e||e.status!=='held')return {node:n,accepted:false,blocked:[{kind:'material-reservation-unavailable'}]};
-    if(!usable(r,at)||r.level!==spec.project.fromLevel||r.width!==spec.width||r.type!==spec.type)
-      blocked.push({kind:'material-target-changed'});
-    const owned=new Set(e.people.filter(c=>c.from<=at&&at<c.until).map(c=>c.residentId));
-    for(const p of s.residents)if(present(p,at)&&s.rooms.some(r=>r.id===p.roomId&&r.type==='workshop'&&usable(r,at))&&
-      (!owned.has(p.id)||!spec.workers.some(w=>w.residentId===p.id&&w.workshopId===p.roomId)))
-      blocked.push({kind:'manufacturing-owner-conflict',residentId:p.id});
-    for(const id of spec.rooms)if(!s.rooms.some(r=>r.id===id&&r.type==='workshop'&&usable(r,at)))
-      blocked.push({kind:'material-workshop-unavailable',roomId:id});
-    if(blocked.length)return {node:n,accepted:false,blocked};
-    const view=holds.inspect(n.view,n.book,{owner:intentId});
-    const scrap=Math.max(0,view.ownSpendable.scrap+e.feedScrap),parts=Math.max(0,view.ownSpendable.parts);
-    const allocation={scrap:Math.min(spec.cost.scrap,scrap),parts:Math.min(spec.cost.parts,parts)};
-    let projected=n.view,collectable=0;
-    for(const roomId of spec.rooms){const got=resources.collect(projected,roomId);projected=got.view;collectable+=got.ledger.collected.parts;}
-    const missing=Math.max(0,spec.cost.parts-allocation.parts);
-    const need=missing>collectable+1e-7?spec.rooms.reduce((sum,id)=>sum+resources.rate(n.view,s.rooms.find(r=>r.id===id),at),0):0;
-    const feedScrap=Math.min(Math.max(0,scrap-allocation.scrap),need);
-    const updated=routes.amend(n,intentId,{resources:allocation,feedScrap});
-    return {...updated,material:{allocation,feedScrap,collectable,missing,
-      partsReady:missing<1e-7,ready:missing<1e-7&&allocation.scrap>=spec.cost.scrap-1e-7}};
-  }
-  function enumerate(n,{proof,goal,cost,people,maxCandidates=2000}) {
-    if(proof.action.kind!=='upgrade'||!Number.isInteger(maxCandidates)||maxCandidates<1||maxCandidates>2000)
-      throw Error('Bounded new upgrade material evidence required');
-    const at=n.view.serverTime,s=n.view.state,target=s.rooms.find(r=>r.id===proof.action.roomId);
-    const workshops=s.rooms.filter(r=>r.type==='workshop'&&usable(r,at)).sort((a,b)=>a.id-b.id);
-    const jobs=s.rooms.filter(r=>basic.includes(r.type)&&usable(r,at)).sort((a,b)=>a.id-b.id);
-    const occupants=s.residents.filter(p=>present(p,at)&&workshops.some(r=>r.id===p.roomId)).sort((a,b)=>a.id-b.id);
-    const book=holds.inspect(n.view,n.book),blocked=conflicts(n,null);
-    for(const p of occupants){
-      const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));
-      if(p.romance||!Number.isFinite(p.hp)||p.hp<.6*maxHp||book.people.some(c=>c.residentId===p.id)||
-        n.existing?.roles.some(r=>r.residentId===p.id&&['active','return-due','preempted'].includes(r.status))||
-        n.existing?.defense.some(d=>d.id===p.id))blocked.push({kind:'material-worker-unavailable',residentId:p.id});
-    }
-    const donors=people.filter(x=>x.eligible&&!x.intentId&&(!x.p.roomId||s.rooms.some(r=>r.id===x.p.roomId&&
-      [...basic,'quarters'].includes(r.type)))).map(x=>x.p);
-    const free=book.free,groups=[{workers:occupants.map(p=>({residentId:p.id,workshopId:p.roomId,fromRoomId:p.roomId})),arrival:null}];
-    if(cost.parts>free.parts+1e-7)for(const donor of donors)for(const room of workshops){
-      if(s.residents.filter(p=>p.roomId===room.id&&p.deadAt===null&&p.adultAt<=at).length>=room.width*2)continue;
-      groups.push({workers:[...groups[0].workers,{residentId:donor.id,workshopId:room.id,fromRoomId:donor.roomId}],
-        arrival:{kind:'assign',residentId:donor.id,fromRoomId:donor.roomId,roomId:room.id}});
-    }
-    const rows=[];let totalVariants=0;
-    // Existing workers, optionally one new donor. Rotate a deterministic return allocation
-    // across all basic jobs; report this limited family instead of claiming all permutations.
-    for(let rotation=0;rotation<Math.max(1,jobs.length);rotation++)for(const group of groups){
-      if(!group.workers.length&&rotation)continue;
-      totalVariants++;if(rows.length>=maxCandidates)continue;
-      const occupied=new Map(jobs.map(r=>[r.id,new Set(s.residents.filter(p=>p.roomId===r.id&&p.deadAt===null&&p.adultAt<=at).map(p=>p.id))]));
-      const workers=group.workers.map(w=>({...w})),reasons=[...blocked];
-      for(const w of workers){
-        const original=jobs.find(r=>r.id===w.fromRoomId),ordered=[...jobs.slice(rotation),...jobs.slice(0,rotation)];
-        const room=original??ordered.find(r=>occupied.get(r.id).size<r.width*2);
-        if(!room){reasons.push({kind:'material-return-seat-missing',residentId:w.residentId});continue;}
-        w.returnRoomId=room.id;occupied.get(room.id).add(w.residentId);
-      }
-      let projected=n.view,collectable=0;
-      for(const r of workshops){const got=resources.collect(projected,r.id);projected=got.view;collectable+=got.ledger.collected.parts;}
-      if(cost.parts>free.parts+collectable+1e-7&&!workers.length)reasons.push({kind:'material-manufacturing-worker-needed'});
-      if(cost.parts>free.parts+collectable+1e-7&&!workshops.length)reasons.push({kind:'material-workshop-needed'});
-      const key='material:'+proof.id+':'+(group.arrival?group.arrival.residentId+':'+group.arrival.roomId:'existing')+':'+rotation;
-      const project={...structuredClone(proof.action),source:proof.source};delete project.finishAt;
-      const spec={project,durationMs:proof.durationMs,
-        cost:{...cost},type:target.type,width:target.width,goalId:goal.id,source:proof.source,workers,rooms:workshops.map(r=>r.id)};
-      rows.push({id:key,kind:'project',intentId:key,intent:{id:key,purpose:'new upgrade materials for '+goal.id,
-        people:workers.map(w=>claim(n,w.residentId)),seats:workers.map(w=>({...claim(n,w.residentId),roomId:w.workshopId})),
-        resources:{scrap:Math.min(cost.scrap,Math.max(0,free.scrap)),parts:Math.min(cost.parts,Math.max(0,free.parts))}},
-        action:group.arrival,blocked:reasons,continuation:{kind:'material-upgrade',spec}});
-    }
-    return {rows,coverage:{totalVariants,emitted:rows.length,unemitted:totalVariants-rows.length,generationTruncated:totalVariants>rows.length,
-      scope:'all existing unreserved workshop workers, optionally one basic/idle donor; rotated greedy return seats; existing upgrades only'}};
-  }
-  function prepare(n,row) {
-    const result=refresh(n,row.intentId,row.continuation.spec);if(!result.accepted)return result;
-    const blocked=Object.entries(routes.supply(result.node)).filter(([,v])=>v.deficit>1e-7||v.inventoryGap>1e-7)
-      .map(([resource])=>({kind:'material-investment-supply-not-covered',resource}));
-    return blocked.length?{node:n,accepted:false,blocked}:result;
-  }
-  return {enumerate,prepare,refresh};
-}
-
-return {createShelterMaterialCandidates};
-})();
-const {createShelterDevelopmentCandidates}=(()=>{
-
-// D.14 common first-action input. This enumerates and checks proposals, not complete routes.
-// A ready first action is never a seven-day winner or permission for a native request.
-function createShelterDevelopmentCandidates() {
-  const routes=createShelterRouteSimulation(),resource=createShelterResourceSimulation(),family=createShelterFamilySimulation(),exchanges=createShelterExchangeCandidates(),
-    materials=createShelterMaterialCandidates();
-  const tick=600000,keys=['power','food','water','scrap','parts','stimpak'];
-  const production={power:['power','str',100],diner:['food','agi',100],water:['water','per',100],
-    scrap:['scrap','end',80],workshop:['parts','int',500],medbay:['stimpak','int',300]};
-  const base={...Object.fromEntries(Object.entries(production).map(([k,v])=>[k,v[2]])),quarters:120,storage:80,
-    training:400,armory:600,tailor:600,radio:800};
-  const active=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.unpowered&&!r.incident;
-  const present=(p,at)=>p.deadAt===null&&p.away===null&&p.adultAt<=at;
-  const text=s=>typeof s==='string'&&s.trim().length>0;
-  const status=blocked=>blocked.length?blocked.some(b=>/unknown|missing|needed|not-modeled|unmodeled/.test(b.kind+' '+(b.reason??'')))?'unknown':'blocked':'ready';
-  const person=(n,residentId,from=n.view.serverTime)=>({residentId,from,until:n.book.windowEnd});
-  const seat=(n,residentId,roomId,from=n.view.serverTime)=>({...person(n,residentId,from),roomId});
-  const move=(p,r)=>({kind:'assign',residentId:p.id,fromRoomId:p.roomId,roomId:r.id});
-  const signature=n=>JSON.stringify(n);
-  const rates=view=>Object.fromEntries(keys.map(k=>[k,view.state.rooms.filter(r=>production[r.type]?.[0]===k)
-    .reduce((sum,r)=>sum+resource.rate(view,r,view.serverTime),0)]));
-  function eligible(n,p) {
-    const why=[],at=n.view.serverTime,s=n.view.state;
-    if(!present(p,at))why.push('not-present-adult');
-    if(p.romance)why.push('active-romance');
-    const maxHp=Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end));
-    if(!Number.isFinite(p.hp))why.push('unknown-health');else if(p.hp<.6*maxHp)why.push('low-health');
-    const role=n.existing?.roles.find(r=>r.residentId===p.id&&['active','preempted','return-due'].includes(r.status));
-    const owners=n.book.entries.filter(e=>!['complete','cancelled'].includes(e.status)&&
-      e.people.some(c=>c.residentId===p.id&&c.until>at));
-    if(owners.some(e=>e.id!==role?.intentId))why.push('resident-reserved');
-    if(role&&role.record.role!=='training')why.push('special-role-value-not-modeled');
-    if(n.existing?.defense.some(d=>d.id===p.id))why.push('defense-recovery-not-modeled');
-    const room=s.rooms.find(r=>r.id===p.roomId);
-    if(room&&['medbay','workshop','radio','armory','tailor','door'].includes(room.type)&&!role)
-      why.push('special-role-value-not-modeled');
-    return {residentId:p.id,roomId:p.roomId,reasons:why,eligible:!why.length,intentId:role?.intentId??null};
-  }
-  function goals(n) {
-    routes.inspect(n);const s=n.view.state,at=n.view.serverTime,result=[];
-    const supply=routes.supply(n);
-    for(const [key,v] of Object.entries(supply))if(v.deficit>1e-7||v.inventoryGap>1e-7)
-      result.push({id:'supply:'+key,kind:'supply',resource:key,rate:v.need*1.2,inventory:v.need*2,
-        source:'current roster, paid construction and shared family commitments'});
-    const residents=s.residents.filter(p=>present(p,at)&&(!p.roomId||s.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'))&&!p.romance).map(p=>p.id);
-    if(residents.length)result.push({id:'employment:'+n.view.vaultNo+':'+at,kind:'employment',residentIds:residents,
-      source:'observed unemployed adults; no projected children counted as employed'});
-    return result;
-  }
-  function validateGoal(n,g) {
-    if(!g||!text(g.id)||g.id.length>120||!text(g.source)||!['employment','supply','stock','unlock'].includes(g.kind))throw Error('Explicit common development goal required');
-    if(g.kind==='employment'&&(!Array.isArray(g.residentIds)||!g.residentIds.length||
-      new Set(g.residentIds).size!==g.residentIds.length||g.residentIds.some(x=>!n.view.state.residents.some(p=>p.id===x))))
-      throw Error('Employment goal must bind observed residents');
-    if(['supply','stock'].includes(g.kind)&&(!keys.includes(g.resource)||g.kind==='stock'&&(!Number.isFinite(g.amount)||g.amount<0)||
-      g.kind==='supply'&&(!['power','food','water'].includes(g.resource)||![g.rate,g.inventory].every(x=>Number.isFinite(x)&&x>=0))))
-      throw Error('Invalid resource goal');
-    if(g.kind==='unlock'&&(!Number.isInteger(g.score)||g.score<0||!text(g.benefit)))throw Error('Unlock requires verified score and productive use');
-  }
-  function prepare(n,p) {
-    if(p.blocked?.length)return {node:n,accepted:false,blocked:p.blocked};
-    if(n.view.serverTime>=n.book.windowEnd)return {node:n,accepted:false,blocked:[{kind:'planning-window-ended'}]};
-    if(n.pending)return {node:n,accepted:false,blocked:[{kind:'pending-action-timing-unknown'}]};
-    if(n.existing?.native.length)return {node:n,accepted:false,blocked:[{kind:'inherited-native-pending',reason:'unknown original outcome'}]};
-    if(p.kind==='wait')return {node:n,accepted:true,blocked:[],action:null};
-    let next=n;
-    if(p.intent){const held=routes.reserve(next,p.intent);if(!held.accepted)return held;next=held.node;}
-    if(p.continuation?.kind==='material-upgrade'){
-      const prepared=materials.prepare(next,p);if(!prepared.accepted)return prepared;next=prepared.node;
-    }
-    let sequenceCheck=null;
-    if(p.continuation?.kind==='exchange-sequence'){
-      sequenceCheck=exchanges.check(next,p);
-      if(!sequenceCheck.accepted)return {node:n,accepted:false,blocked:sequenceCheck.blocked,sequenceCheck};
-    }
-    if(p.familyPlan){const linked=routes.registerFamily(next,p.intentId,p.familyPlan);if(!linked.accepted)return linked;next=linked.node;}
-    if(p.familyPlan){
-      const view=structuredClone(next.view),blocked=[];
-      for(const e of next.book.entries.filter(e=>!['cancelled','complete'].includes(e.status)))for(const f of e.families)
-        if(f.dueAt===null&&f.childId===null)for(const id of f.parents){const person=view.state.residents.find(p=>p.id===id);if(person)person.roomId=null;}
-      for(const [key,value] of Object.entries(routes.supply({...next,view})))if(value.deficit>1e-7||value.inventoryGap>1e-7)
-        blocked.push({kind:'family-supply-not-covered',resource:key,...value});
-      if(blocked.length)return {node:n,accepted:false,blocked};
-    }
-    if(!p.action)return {node:next,accepted:true,blocked:[],action:null};
-    const checked=routes.preview(next,p.intentId,p.action);
-    const before=rates(n.view),after=checked.blocked.length?null:rates(checked.node.view);
-    return {node:next,accepted:!checked.blocked.length,blocked:checked.blocked,action:p.action,sequenceCheck,
-      cost:checked.cost,supplyAfter:checked.blocked.length?null:routes.supply(checked.node),
-      productionDelta:after?Object.fromEntries(keys.map(k=>[k,after[k]-before[k]])):null};
-  }
-  function enumerate(n,{goal=goals(n)[0],familyOutcomes=[],constructionEvidence=[],maxChecks=2000}={}) {
-    const inputSignature=signature(n),report=routes.inspect(n),at=n.view.serverTime,s=n.view.state;
-    validateGoal(n,goal);
-    if(!Number.isInteger(maxChecks)||maxChecks<1||maxChecks>2000||!Array.isArray(familyOutcomes)||!Array.isArray(constructionEvidence))
-      throw Error('Invalid candidate evidence or bounded check budget');
-    if(new Set(constructionEvidence.map(p=>p?.id)).size!==constructionEvidence.length||
-      new Set(familyOutcomes.map(p=>[...(p?.parents??[])].sort((a,b)=>a-b).join('/'))).size!==familyOutcomes.length)
-      throw Error('Duplicate candidate evidence identity');
-    const groups=Object.fromEntries(['wait','assign','family','train','project'].map(k=>[k,[]]));
-    const people=[...s.residents].sort((a,b)=>a.id-b.id).map(p=>({...eligible(n,p),p}));
-    const workers=people.filter(x=>x.eligible),rooms=s.rooms.filter(r=>active(r,at)),jobs=rooms.filter(r=>production[r.type]);
-    let checks=0,familyPairsWithoutOutcome=0;const identities=new Set();
-    function add(p) {
-      if(identities.has(p.id))throw Error('Duplicate candidate identity');identities.add(p.id);
-      // A candidate label is reusable after a completed action; its reservation identity
-      // is not. Keep old payments/receipts and give this occurrence a fresh bound intent.
-      if(p.intent&&n.book.entries.some(e=>e.id===p.intent.id)){
-        const stem=p.intent.id+'@'+at;let next=stem,index=1;
-        while(n.book.entries.some(e=>e.id===next))next=stem+':'+index++;
-        p.intent.id=next;p.intentId=next;
-        if(p.familyPlan){p.familyPlan.key=next;if(p.action)p.action.familyKey=next;}
-      }
-      const row={...p,goalId:goal.id,routeComplete:false,blocked:p.blocked??[]};
-      row.status=row.blocked.length?status(row.blocked):'unchecked';
-      groups[row.kind].push(row);return row;
-    }
-    function intent(key,ids,seats=[],extra={}) {return {id:key,purpose:'common development goal '+goal.id,
-      people:ids.map(x=>person(n,x)),seats,...extra};}
-    const future=[...s.residents.map(p=>({kind:'adulthood',id:p.id,at:p.adultAt})),...s.births.map(b=>({kind:'birth',id:b.roomId,at:b.dueAt})),
-      ...s.rooms.flatMap(r=>[{kind:'construction',id:r.id,at:r.builtAt},{kind:'upgrade',id:r.id,at:r.upgradeAt}]),
-      ...(n.existing?.roles??[]).map(r=>({kind:'training-deadline',id:r.residentId,at:r.record.until}))]
-      .filter(e=>Number.isSafeInteger(e.at)&&e.at>at).sort((a,b)=>a.at-b.at||a.id-b.id);
-    add({id:'wait',kind:'wait',action:null,nextAt:Math.min(at+tick,future[0]?.at??Infinity,n.book.windowEnd),
-      nextEvent:future[0]??{kind:'next-settlement',at:at+tick},blocked:[...report.blocked,...report.inherited],
-      continuation:{kind:'observe-and-regenerate',originalWindowEnd:n.book.windowEnd}});
-    if(n.existing?.swap&&!['complete','cancelled'].includes(n.existing.swap.status)){
-      const next=routes.nextExistingSwap(n);
-      add({id:'existing-swap:'+n.existing.swap.step,kind:'assign',intentId:next.intentId,intent:null,action:next.action,
-        blocked:next.blocked,continuation:{kind:'inherited-swap',step:n.existing.swap.step,total:n.existing.swap.moves.length}});
-    }
-    // Interleave destinations across the entire roster so a check limit is never a hidden
-    // prefix-of-16 resident pool. Unchecked proposals remain explicit, not zero-benefit losers.
-    for(const r of jobs)for(const x of workers){const p=x.p;if(p.roomId===r.id)continue;
-      const key='assign:'+p.id+':'+r.id;
-      add({id:key,kind:'assign',intentId:x.intentId??key,intent:x.intentId?null:intent(key,[p.id],[seat(n,p.id,r.id)]),
-        action:move(p,r),continuation:{kind:'recompute-after-confirmed-employment'}});
-    }
-    // Current-snapshot selection cannot simulate receipts or later settlements,
-    // and only accepts independent assignments. Three-step exchange routes would
-    // all be rejected while consuming the checks needed by later direct moves.
-    const exchange=n.model==='native-snapshot-first-action-only'?
-      {rows:[],coverage:{evaluated:false,reason:'native-current-assignment-only',emitted:0}}:
-      exchanges.enumerate(n,{people,goal,maxCandidates:maxChecks});
-    for(const row of exchange.rows)add(row);
-    // Family evidence supplies uncertain offspring outcomes; the enumerator supplies pairs,
-    // location and first move. It never invents child IDs, attributes or native confirmations.
-    for(const r of rooms.filter(r=>r.type==='quarters'))for(let i=0;i<workers.length;i++)for(let j=i+1;j<workers.length;j++){
-      const pair=[workers[i].p,workers[j].p],ids=pair.map(p=>p.id),key='family:'+ids.join('/')+':'+r.id;
-      const proof=familyOutcomes.find(o=>Array.isArray(o.parents)&&o.parents.length===2&&ids.every(x=>o.parents.includes(x)));
-      if(!proof){familyPairsWithoutOutcome++;continue;}
-      const plan={key,parents:ids,roomId:r.id,stage:'planned',child:structuredClone(proof.child),source:proof.source};
-      if(plan.child?.roomId!==null&&plan.child?.roomId!==r.id){
-        add({id:key,kind:'family',blocked:[{kind:'child-room-outcome-mismatch',roomId:r.id}]});continue;}
-      try{family.validate([plan],n.familyRules);}catch(error){add({id:key,kind:'family',blocked:[{kind:'unknown-family-outcome',reason:error.message}]});continue;}
-      const blocked=family.eligibility(n.view,plan,{ignoreLocation:true});
-      const first=pair.find(p=>p.roomId!==r.id);
-      add({id:key,kind:'family',intentId:key,intent:intent(key,ids,ids.map(x=>seat(n,x,r.id)),
-        {families:[{parents:ids,dueAt:null,childId:null}]}),familyPlan:plan,
-        action:first?{...move(first,r),familyKey:key}:null,blocked,
-        continuation:{kind:'family-through-employed-child',parents:ids,originalRooms:pair.map(p=>p.roomId),childId:plan.child.id}});
-    }
-    if(familyPairsWithoutOutcome||!groups.family.length)add({id:'family:evidence',kind:'family',
-      blocked:[{kind:'missing-child-outcome-evidence',pairLocationsWithoutOutcome:familyPairsWithoutOutcome}]});
-    const perk=s.legacy?.perks?.training??0;
-    // Native local proposals have no future timing assumptions and only compare
-    // current assignments. Training payoff routes belong to explicit offline inputs.
-    for(const r of rooms.filter(r=>n.model!=='native-snapshot-first-action-only'&&r.type==='training'))for(const x of workers){const p=x.p;
-      if(!['str','per','end','cha','int','agi','lck'].includes(r.trainStat)||!Number.isInteger(p.stats[r.trainStat])||!Number.isInteger(perk)||perk<0||perk>10){
-        add({id:'train:'+p.id+':'+r.id,kind:'train',blocked:[{kind:'unknown-training-state'}]});continue;}
-      if(p.stats[r.trainStat]>=10)continue;
-      const progress=p.roomId===r.id?p.training:0;
-      if(!Number.isFinite(progress)||progress<0||progress>=1){add({id:'train:'+p.id+':'+r.id,kind:'train',blocked:[{kind:'unknown-training-progress'}]});continue;}
-      const duration=Math.max(1,Math.ceil((1-progress)/(r.level*(1+.05*perk)/(p.stats[r.trainStat]+1)/6)-1e-9))*tick;
-      const readyAt=at+duration,role=n.existing?.roles.find(q=>q.intentId===x.intentId),deadline=Math.min(n.book.windowEnd,role?.record.until??Infinity,role?.record.windowEnd??Infinity);
-      for(const dest of jobs.filter(q=>production[q.type][1]===r.trainStat)){
-        const key='train:'+p.id+':'+r.id+':'+dest.id,blocked=[];
-        if(readyAt>=deadline)blocked.push({kind:'training-cannot-return-before-deadline',readyAt,deadline});
-        const claims=readyAt<n.book.windowEnd?[{...seat(n,p.id,r.id),until:readyAt},seat(n,p.id,dest.id,readyAt)]:[];
-        if(x.intentId&&(!role||role.roomId!==r.id||role.record.destination!==dest.id))blocked.push({kind:'inherited-training-destination-mismatch'});
-        if(role&&(p.stats[role.record.stat]>role.record.base||at>=deadline))blocked.push({kind:'inherited-training-return-due'});
-        add({id:key,kind:'train',intentId:x.intentId??key,intent:x.intentId?null:intent(key,[p.id],claims),
-          action:p.roomId===r.id?null:move(p,r),blocked,
-          continuation:{kind:'one-stat-then-return',residentId:p.id,stat:r.trainStat,base:p.stats[r.trainStat],
-            roomId:dest.id,readyAt,deadline,source:n.assumptions.source,needsFullPaybackComparison:true}});
-      }
-    }
-    const materialCoverage=[];
-    for(const proof of constructionEvidence){
-      if(!proof||proof.goalId!==goal.id)continue;
-      const a=structuredClone(proof.action),r=s.rooms.find(r=>r.id===a?.roomId),key='project:'+String(proof.id),blocked=[];
-      if(!text(proof.id)||!a||!['build','upgrade','dig'].includes(a.kind)||!text(proof.source)||
-        !Number.isSafeInteger(proof.durationMs)||proof.durationMs<=0)throw Error('Explicit bound construction outcome and duration required');
-      a.source=proof.source;a.finishAt=at+proof.durationMs;
-      const type=a.kind==='build'?a.type:r?.type;
-      let useful=['stock','supply'].includes(goal.kind)&&production[type]?.[0]===goal.resource;
-      if(goal.kind==='stock'&&type==='storage')useful=resource.capacities(n.view)[goal.resource]<goal.amount;
-      if(goal.kind==='employment')useful=!!production[type]&&Array.isArray(proof.residentIds)&&proof.residentIds.length>0&&
-        proof.residentIds.every(id=>goal.residentIds.includes(id));
-      if(goal.kind==='unlock')useful=proof.benefit===goal.benefit;
-      if(!useful)blocked.push({kind:'project-not-linked-to-goal'});
-      let cost={scrap:0,parts:0};
-      if(a.kind==='upgrade'&&r&&base[r.type])cost={scrap:Math.ceil(base[r.type]*r.width*(r.level===1?2.5:6)),parts:r.level===1?0:15*r.width};
-      else if(a.kind==='build'&&base[a.type])cost.scrap=Math.ceil(base[a.type]*(1+.2*s.rooms.filter(q=>q.type===a.type).reduce((v,q)=>v+q.width,0)));
-      else if(a.kind==='dig')cost.scrap=Math.ceil(120*(s.depth+1)**1.4);
-      else blocked.push({kind:'invalid-project-target'});
-      const shortage=Object.fromEntries(['scrap','parts'].map(k=>[k,Math.max(0,cost[k]-report.free[k])]));
-      if(shortage.scrap>1e-7||shortage.parts>1e-7)blocked.push({kind:'project-needs-material-route',shortage});
-      add({id:key,kind:'project',intentId:key,intent:intent(key,[],[],{resources:cost}),action:a,blocked,
-        continuation:{kind:'completion-power-staff-then-use',goalId:goal.id,finishAt:a.finishAt,requiredCost:cost}});
-      if(a.kind==='upgrade'&&r&&blocked.length===1&&blocked[0].kind==='project-needs-material-route'){
-        const generated=materials.enumerate(n,{proof,goal,cost,people,maxCandidates:maxChecks});
-        materialCoverage.push({proofId:proof.id,...generated.coverage});for(const row of generated.rows)add(row);
-      }
-    }
-    if(!constructionEvidence.some(p=>p?.goalId===goal.id))add({id:'project:evidence',kind:'project',blocked:[{kind:'missing-goal-construction-evidence'}]});
-    if(!groups.train.length)add({id:'train:none',kind:'train',blocked:[{kind:rooms.some(r=>r.type==='training')?
-      'training-purpose-not-modeled':'no-existing-training-destination'}]});
-    // Share checking capacity across first-action types before allocating extra checks to a
-    // large assignment matrix. This is admission coverage, not beam-search ranking.
-    const assignments=groups.assign.filter(p=>p.status==='unchecked'),moves=assignments.filter(p=>p.continuation?.kind!=='exchange-sequence'),
-      swaps=assignments.filter(p=>p.continuation?.kind==='exchange-sequence'),interleaved=[];
-    for(let i=0;i<Math.max(moves.length,swaps.length);i++){if(moves[i])interleaved.push(moves[i]);if(swaps[i])interleaved.push(swaps[i]);}
-    const queues=Object.entries(groups).map(([kind,rows])=>kind==='assign'?interleaved:rows.filter(p=>p.status==='unchecked'));
-    for(let index=0;queues.some(q=>q[index]);index++)for(const queue of queues){const row=queue[index];if(!row)continue;
-      if(checks>=maxChecks){row.status='truncated';row.blocked=[{kind:'candidate-check-budget'}];continue;}
-      checks++;const trial=prepare(n,row);row.blocked=trial.blocked;row.status=status(row.blocked);
-      if(trial.sequenceCheck)row.sequenceCheck=trial.sequenceCheck;
-      row.cost=trial.cost??null;row.supplyAfter=trial.supplyAfter??null;row.productionDelta=trial.productionDelta??null;
-    }
-    return {version:1,goal:structuredClone(goal),basis:inputSignature,from:at,windowEnd:n.book.windowEnd,
-      people:people.map(({p,...x})=>x),groups,checks,maxChecks,selected:null,
-      summary:Object.entries(groups).map(([kind,rows])=>({kind,counts:Object.fromEntries(['ready','blocked','unknown','truncated']
-        .map(state=>[state,rows.filter(p=>p.status===state).length])),firstReady:rows.find(p=>p.status==='ready')?.id??null,
-        completeRoutes:0})),
-      coverage:{familyPairsWithoutOutcome,checkedByKind:Object.fromEntries(Object.entries(groups)
-        .map(([k,rows])=>[k,rows.filter(p=>p.cost!==undefined).length])),
-        completeRoutes:0,fullRoomExchangeGenerated:exchange.rows.length>0,exchange:exchange.coverage,materials:materialCoverage,
-        exchangeCheckedMoves:groups.assign.reduce((sum,p)=>sum+(p.sequenceCheck?.checkedMoves??0),0)},
-      limitations:['First-action admissibility only; no complete 168-hour comparison or optimal selection.',
-        'Two-person exchanges and new upgrade material candidates are bounded; larger cycles, other special roles and full route selection remain incomplete.',
-        'Family and construction outcomes are explicit conditional evidence, not invented server results.']};
-  }
-  function prepareFirst(n,report,candidateId) {
-    if(report?.version!==1||report.basis!==signature(n))throw Error('Candidate snapshot changed; regenerate before preparation');
-    const row=Object.values(report.groups).flat().find(p=>p.id===candidateId);
-    if(!row)throw Error('Unknown development candidate');
-    if(row.status==='truncated')return {node:n,accepted:false,blocked:row.blocked};
-    return prepare(n,row);
-  }
-  return {goals,enumerate,prepareFirst};
-}
-
-return {createShelterDevelopmentCandidates};
-})();
-const {createShelterDevelopmentContinuation}=(()=>{
-
-// Conditional continuation interpreter, not the D.14 bounded-search selector or a live executor.
-// Only its own modeled submissions receive simulated receipts. Native pending requests remain
-// unresolved. Subsequent investments can be appended at any observed state, across action types.
-function createShelterDevelopmentContinuation() {
-  const routes=createShelterRouteSimulation(),candidates=createShelterDevelopmentCandidates(),resources=createShelterResourceSimulation(),holds=createShelterReservations(),
-    exchanges=createShelterExchangeCandidates(),materials=createShelterMaterialCandidates();
-  const tick=600000,hour=3600000,keys=['power','food','water','scrap','parts','stimpak'];
-  const production={power:'power',diner:'food',water:'water',scrap:'scrap',workshop:'parts',medbay:'stimpak'};
-  const active=e=>!['complete','cancelled'].includes(e.status),id=n=>Number.isSafeInteger(n)&&n>0;
-  const text=s=>typeof s==='string'&&s.trim().length>0;
-  const usable=(r,at)=>r&&r.builtAt<=at&&r.upgradeAt===null&&!r.unpowered&&!r.incident;
-  const zero=()=>Object.fromEntries(keys.map(k=>[k,0]));
-  const signature=x=>JSON.stringify(x);
-  const owner=(n,intentId)=>n.book.entries.find(e=>e.id===intentId&&active(e));
-  const person=(n,residentId,from=n.view.serverTime)=>({residentId,from,until:n.book.windowEnd});
-  const seat=(n,residentId,roomId,from=n.view.serverTime)=>({...person(n,residentId,from),roomId});
-  const assignment=(n,residentId,roomId)=>({kind:'assign',residentId,fromRoomId:n.view.state.residents.find(p=>p.id===residentId)?.roomId,roomId});
-  const contract=w=>JSON.stringify({key:w.key,candidateId:w.candidateId,kind:w.kind,intentId:w.intentId,
-    createdAt:w.createdAt,deadline:w.deadline,residentId:w.residentId,stat:w.stat,base:w.base,
-    parents:w.parents,childId:w.childId,staff:w.staff,project:w.project,material:w.material,binding:w.binding});
-  const projectAction=w=>w.constructionAction??w.project;
-  function materialSpec(state,w) {
-    return {...w.material,project:{...w.material.project,roomId:w.projectRoomId},
-      rooms:[...new Set(w.material.rooms.map(id=>remappedRoom(state,id)))],
-      workers:w.material.workers.map(p=>({...p,workshopId:remappedRoom(state,p.workshopId),returnRoomId:remappedRoom(state,p.returnRoomId)}))};
-  }
-  const overlap=(a,b)=>a.from<b.until&&b.from<a.until;
-  // These are capacity guarantees, not invented future residents or usable construction.
-  // Family return seats are held conservatively until confirmed; child seats start no
-  // earlier than the known pregnancy + childhood durations. They never produce income.
-  function guarantees(state,node=state.node) {
-    const claims=[],n=node,at=n.view.serverTime;
-    for(const w of state.workflows)if(w.stage!=='done'){
-      if(w.kind==='family')for(const d of w.destinations){
-        if(w.returned.includes(d.residentId))continue;
-        const child=d.residentId===w.childId,p=n.view.state.residents.find(p=>p.id===d.residentId);
-        const from=child?Math.max(at,p?.adultAt??w.createdAt+n.familyRules.pregnancyMs+n.familyRules.childhoodMs):at;
-        if(from<n.book.windowEnd)claims.push({...d,intentId:w.intentId,from,until:n.book.windowEnd,child});
-      }
-      if(w.material&&w.paidAt===null)for(const p of materialSpec(state,w).workers)if(!w.materialReturned.includes(p.residentId))
-        claims.push({residentId:p.residentId,roomId:p.returnRoomId,intentId:w.intentId,from:at,until:n.book.windowEnd,child:false});
-      if(w.kind==='project')for(const residentId of w.staff)if(!w.staffed.includes(residentId)){
-        const from=Math.max(at,projectAction(w).finishAt??n.view.state.rooms.find(r=>r.id===w.projectRoomId)?.upgradeAt??at);
-        if(from<n.book.windowEnd)claims.push({residentId,roomId:w.projectRoomId,intentId:w.intentId,from,until:n.book.windowEnd,child:false});
-      }
-    }
-    return claims;
-  }
-  function futureIssues(state,node=state.node) {
-    // A preview has proposed positions but intentionally has not reconciled imported
-    // swap/role state yet. Check its capacity book here; validate actual nodes separately.
-    const claims=guarantees(state,node),view=node.view,blocked=[],book=holds.inspect(view,node.book);
-    for(const c of claims){
-      const w=state.workflows.find(w=>w.intentId===c.intentId),p=view.state.residents.find(p=>p.id===c.residentId);
-      let r=view.state.rooms.find(r=>r.id===c.roomId);
-      if(!r&&w.kind==='project'&&w.stage==='first'&&w.project.kind==='build')
-        r={...w.project,id:c.roomId,width:1,builtAt:w.project.finishAt,upgradeAt:null};
-      if(!r||!production[r.type]||r.builtAt>c.from||r.upgradeAt!==null&&r.upgradeAt>c.from||r.unpowered||r.incident)
-        blocked.push({kind:'future-seat-unavailable',...c});
-      const maxHp=p?Math.round(100+Math.min(49,Math.floor(Math.sqrt(p.xp/3)))*(2+.5*p.stats.end)):Infinity;
-      if(!c.child&&(!p||p.deadAt!==null||p.away!==null||p.adultAt>c.from||!Number.isFinite(p.hp)||p.hp<.6*maxHp))
-        blocked.push({kind:'future-worker-unavailable',...c});
-      if(book.people.some(q=>q.residentId===c.residentId&&q.intentId!==c.intentId&&overlap(c,q))||
-        claims.some(q=>q!==c&&q.residentId===c.residentId&&q.intentId!==c.intentId&&overlap(c,q)))
-        blocked.push({kind:'future-worker-conflict',...c});
-      if(!r)continue;
-      const others=[...claims,...book.seats].filter(q=>q.roomId===c.roomId&&overlap(c,q));
-      const boundaries=new Set([c.from,...others.map(q=>Math.max(c.from,q.from)),
-        ...view.state.residents.filter(p=>p.roomId===c.roomId&&p.adultAt>=c.from&&p.adultAt<c.until).map(p=>p.adultAt)]);
-      for(const at of boundaries){
-        const occupants=new Set(view.state.residents.filter(p=>p.roomId===c.roomId&&p.deadAt===null&&p.adultAt<=at).map(p=>p.id));
-        for(const q of others)if(q.from<=at&&at<q.until)occupants.add(q.residentId);
-        if(occupants.size>r.width*2){blocked.push({kind:'future-seat-capacity',roomId:r.id,at,used:occupants.size,capacity:r.width*2});break;}
-      }
-    }
-    return blocked;
-  }
-  function projectStaffIssues(node,w) {
-    if(w.kind!=='project'||!w.staff.length)return [];
-    // A static admission check only: actual event, staffing and collection times are
-    // still advanced below. No output from this hypothetical end state is booked.
-    const projected=structuredClone(node),s=projected.view.state,r=s.rooms.find(r=>r.id===w.projectRoomId);
-    if(!r)return [{kind:'future-project-room-missing'}];
-    projected.view.serverTime=projectAction(w).finishAt??node.view.serverTime+w.material.durationMs;r.upgradeAt=null;
-    if(w.project.kind==='upgrade')r.level=w.project.fromLevel+1;
-    if(w.material&&w.paidAt===null)for(const p of w.material.workers){
-      const worker=s.residents.find(q=>q.id===p.residentId);
-      if(worker)worker.roomId=remappedRoom({node},p.returnRoomId);
-    }
-    for(const id of w.staff)s.residents.find(p=>p.id===id).roomId=r.id;
-    return Object.entries(routes.supply(projected)).filter(([,v])=>v.deficit>1e-7)
-      .map(([resource,value])=>({kind:'future-project-supply',resource,...value}));
-  }
-  function remappedRoom(state,roomId) {
-    for(const e of state.node.events)if(e.kind==='merge'&&e.roomId===roomId)roomId=e.into;
-    return roomId;
-  }
-  function employed(view,p) {
-    const r=view.state.rooms.find(r=>r.id===p.roomId),at=view.serverTime;
-    return p.deadAt===null&&p.away===null&&p.adultAt<=at&&!!production[r?.type]&&usable(r,at)&&
-      view.state.residents.filter(q=>q.roomId===r.id&&q.deadAt===null&&q.away===null&&q.adultAt<=at)
-        .slice(0,r.width*2).some(q=>q.id===p.id)&&resources.rate(view,r,at)>0;
-  }
-  function snapshot(state) {
-    const n=state.node,v=n.view,s=v.state,supply=routes.supply(n),book=routes.inspect(n);
-    const employedIds=s.residents.filter(p=>employed(v,p)).map(p=>p.id);
-    const score=2*s.residents.filter(p=>p.deadAt===null).length+3*s.depth+s.rooms
-      .filter(r=>r.builtAt<=v.serverTime&&!['door','elevator'].includes(r.type)).reduce((n,r)=>n+r.width*r.level,0);
-    const rates=zero();for(const r of s.rooms)if(production[r.type])rates[production[r.type]]+=resources.rate(v,r,v.serverTime);
-    const g=state.goal,supplied=Object.values(supply).every(v=>v.deficit<1e-7&&v.inventoryGap<1e-7);
-    const achieved=supplied&&(g.kind==='employment'?g.residentIds.every(id=>employedIds.includes(id)):
-      g.kind==='stock'?book.free[g.resource]>=g.amount:g.kind==='supply'?rates[g.resource]>=g.rate&&s.resources[g.resource]>=g.inventory:null);
-    return {at:v.serverTime,score,employedIds,rates,supply,inventory:{...s.resources},stored:resources.storedTotals(v),
-      free:{...book.free},accounting:structuredClone(n.accounting),goalAchieved:g.kind==='unlock'?null:achieved,
-      goalUnknown:g.kind==='unlock'?'score alone does not verify the promised functional unlock':null};
-  }
-  function mark(state) {
-    for(const k of keys)state.metrics.minimumInventory[k]=Math.min(state.metrics.minimumInventory[k],state.node.view.state.resources[k]);
-    const value=snapshot(state);if(value.goalAchieved)state.goalFirstAt??=value.at;
-    for(const h of [24,72,168])if(value.at===state.origin.windowStart+h*hour)state.checkpoints[String(h)]=value;
-    state.latest=value;
-  }
-  function validate(state) {
-    if(state?.version!==1||!state.node||!state.origin||!Array.isArray(state.workflows)||!Array.isArray(state.history)||!Array.isArray(state.admissions)||
-      state.node.book.windowEnd!==state.origin.windowEnd||state.node.book.startedAt!==state.origin.windowStart||
-      !Number.isSafeInteger(state.sequence)||state.sequence<0||state.execution?.receipts!=='immediate-simulated'||
-      state.execution?.collection!=='each-tick'||!text(state.execution.source)||
-      new Set(state.workflows.map(w=>w.key)).size!==state.workflows.length||state.admissions.length!==state.workflows.length||
-      state.admissions.some((a,i)=>a!==contract(state.workflows[i]))||state.sequence!==state.history.length||
-      state.metrics?.ticks*tick!==state.node.view.serverTime-state.origin.from||
-      !keys.every(k=>Number.isFinite(state.metrics?.minimumInventory?.[k])&&state.metrics.minimumInventory[k]>=0))
-      throw Error('Invalid or reset continuation state');
-    routes.inspect(state.node);
-    if(state.origin.goal!==signature(state.goal))throw Error('Continuation changed its original goal');
-    for(const h of state.history)if(!state.workflows.some(w=>w.key===h.workflow)||!state.node.book.receipts.some(r=>
-      r.requestId===h.requestId&&r.result==='confirmed'&&r.at===h.at&&r.fingerprint===signature(h.action)))
-      throw Error('Continuation action lost its receipt');
-    for(const k of keys){const a=state.node.accounting;
-      if(Math.abs(a.initial[k]+a.collected[k]-a.consumed[k]-a.feed[k]-a.paid[k]-state.node.view.state.resources[k])>1e-6)
-        throw Error('Continuation inventory conservation failed');}
-    for(const w of state.workflows){
-      if(w.stage==='first'&&signature(w.first)!==signature(w.binding.firstAction)||
-        w.stage!=='first'&&w.binding.firstAction&&!state.history.some(h=>h.workflow===w.key&&signature(h.action)===signature(w.binding.firstAction)))
-        throw Error('Continuation first action was not confirmed');
-      for(const field of ['returnRoomId','trainingRoomId','projectRoomId'])if(w.binding[field]!==undefined&&
-        w[field]!==remappedRoom(state,w.binding[field]))throw Error('Continuation destination changed');
-      if(w.binding.destinations&&signature(w.destinations)!==signature(w.binding.destinations.map(d=>({...d,roomId:remappedRoom(state,d.roomId)}))))
-        throw Error('Continuation family destinations changed');
-      if(w.moves){
-        if(signature(w.moves)!==signature(w.binding.moves)||!Number.isInteger(w.exchangeStep)||w.exchangeStep<0||w.exchangeStep>w.moves.length)
-          throw Error('Continuation exchange lost its original moves');
-        const confirmed=state.history.filter(h=>h.workflow===w.key);
-        if(confirmed.length!==w.exchangeStep||confirmed.some((h,i)=>signature(h.action)!==signature(w.moves[i])))
-          throw Error('Continuation exchange progress disagrees with receipts');
-        if(w.stage==='done'&&w.exchangeStep!==w.moves.length)throw Error('Continuation exchange finished too early');
-      }
-      if(w.material){
-        const payments=state.history.filter(h=>h.workflow===w.key&&h.action.kind==='upgrade');
-        if(payments.length>1||payments.length!==(w.paidAt===null?0:1)||payments.length&&
-          (w.paidAt!==payments[0].at||signature(w.constructionAction)!==signature(payments[0].action)||
-            w.constructionAction.finishAt!==w.paidAt+w.material.durationMs))throw Error('Material construction clock lost its payment');
-        if(w.stage==='done'&&w.paidAt===null)throw Error('Material purpose finished without construction');
-        const spec=materialSpec(state,w),returned=spec.workers.filter(p=>state.history.some(h=>h.workflow===w.key&&
-          h.action.kind==='assign'&&h.action.residentId===p.residentId&&remappedRoom(state,h.action.fromRoomId)===p.workshopId&&
-          remappedRoom(state,h.action.roomId)===p.returnRoomId)).map(p=>p.residentId).sort((a,b)=>a-b);
-        if(signature([...w.materialReturned].sort((a,b)=>a-b))!==signature(returned))throw Error('Material return lost its receipt');
-      }
-      if(!text(w.key)||!['wait','assign','train','family','project'].includes(w.kind)||!text(w.stage)||
-        w.deadline>state.origin.windowEnd||w.kind!=='wait'&&!state.node.book.entries.some(e=>e.id===w.intentId))
-        throw Error('Continuation lost its commitment');
-      if(w.kind==='train'&&(!id(w.residentId)||!id(w.returnRoomId)||!Number.isSafeInteger(w.deadline)||
-        !state.node.view.state.residents.some(p=>p.id===w.residentId)||w.base<0||w.base>=10))
-        throw Error('Invalid training continuation');
-      if(w.stage==='done'&&(!Number.isSafeInteger(w.completedAt)||w.completedAt>w.deadline||w.ownsIntent&&owner(state.node,w.intentId)))
-        throw Error('Continuation was not fulfilled');
-      if(w.stage!=='done'&&w.kind!=='wait'&&!owner(state.node,w.intentId)&&
-        !(w.kind==='assign'&&state.node.existing?.swap?.status==='complete')&&
-        !(w.kind==='train'&&state.node.existing?.roles.some(r=>r.intentId===w.intentId&&r.status==='completed')))
-        throw Error('Unfinished continuation lost its active reservation');
-    }
-  }
-  function workflow(n,row,completion,key) {
-    const w={key,candidateId:row.id,kind:row.kind,intentId:row.intentId??null,stage:'first',
-      first:structuredClone(row.action??null),ownsIntent:!!row.intent,continuation:structuredClone(row.continuation),
-      createdAt:n.view.serverTime,deadline:n.book.windowEnd};
-    if(row.continuation?.kind==='exchange-sequence')Object.assign(w,{moves:structuredClone(row.continuation.moves),exchangeStep:0});
-    if(row.kind==='train')Object.assign(w,{residentId:row.continuation.residentId,stat:row.continuation.stat,base:row.continuation.base,
-      returnRoomId:row.continuation.roomId,trainingRoomId:row.action?.roomId??n.view.state.residents.find(p=>p.id===row.continuation.residentId).roomId,
-      deadline:row.continuation.deadline,expectedReadyAt:row.continuation.readyAt});
-    if(row.kind==='family'){
-      w.familyKey=row.familyPlan.key;w.parents=[...row.continuation.parents];w.childId=row.continuation.childId;
-      w.destinations=structuredClone(completion?.destinations??[]);w.returned=[];w.childReserved=false;
-      const ids=[...w.parents,w.childId];
-      if(w.destinations.length!==ids.length||new Set(w.destinations.map(x=>x.residentId)).size!==ids.length||
-        w.destinations.some(x=>!ids.includes(x.residentId)||!id(x.roomId)||!n.view.state.rooms.some(r=>r.id===x.roomId&&production[r.type])))
-        return {blocked:[{kind:'missing-family-employment-plan',residents:ids}]};
-    }
-    if(row.kind==='project'){
-      if(row.continuation?.kind==='material-upgrade'){
-        w.material=structuredClone(row.continuation.spec);w.materialReturned=[];w.materialChecks=[];w.paidAt=null;
-      }
-      w.project=structuredClone(w.material?.project??row.action);w.projectRoomId=w.project.roomId??w.project.elevatorId;
-      const r=n.view.state.rooms.find(r=>r.id===w.projectRoomId);
-      w.staff=structuredClone(completion?.staff??(w.project.kind==='upgrade'?n.view.state.residents
-        .filter(p=>p.roomId===r?.id&&p.deadAt===null&&p.away===null&&p.adultAt<=n.view.serverTime).map(p=>p.id):[]));
-      w.staffReserved=false;w.staffed=[];
-      if(!Array.isArray(w.staff)||new Set(w.staff).size!==w.staff.length||w.staff.some(id=>!n.view.state.residents.some(p=>p.id===id)))
-        throw Error('Project staff must bind observed residents');
-      if(production[w.project.type??r?.type]&&!w.staff.length)return {blocked:[{kind:'missing-project-staff-plan'}]};
-    }
-    w.binding=Object.fromEntries(Object.entries({firstAction:structuredClone(w.first),returnRoomId:w.returnRoomId,trainingRoomId:w.trainingRoomId,projectRoomId:w.projectRoomId,
-      destinations:w.destinations?structuredClone(w.destinations):undefined,moves:w.moves?structuredClone(w.moves):undefined}).filter(([,value])=>value!==undefined));
-    return {workflow:w,blocked:[]};
-  }
-  function append(input,report,candidateId,{completion={}}={}) {
-    validate(input);const state=structuredClone(input),n=state.node;
-    if(signature(report.goal)!==signature(state.goal))throw Error('Continuation cannot silently change the common goal');
-    if(state.workflows.some(w=>w.material&&w.stage!=='done'))return {state:input,accepted:false,blocked:[{kind:'material-purpose-in-progress'}]};
-    if(state.workflows.some(w=>w.moves&&w.stage!=='done'))return {state:input,accepted:false,blocked:[{kind:'exchange-sequence-in-progress'}]};
-    if(state.workflows.some(w=>w.stage==='first'&&w.first))return {state:input,accepted:false,blocked:[{kind:'unsubmitted-first-action'}]};
-    if(state.workflows.some(w=>w.stage!=='done'&&w.candidateId===candidateId))throw Error('Candidate continuation already active');
-    const row=Object.values(report.groups).flat().find(p=>p.id===candidateId);
-    if(!row)throw Error('Unknown first action');
-    const ready=candidates.prepareFirst(n,report,candidateId);
-    if(!ready.accepted)return {state:input,accepted:false,blocked:ready.blocked};
-    const compiled=workflow(n,row,completion,'workflow:'+state.workflows.length);
-    if(compiled.blocked.length)return {state:input,accepted:false,blocked:compiled.blocked};
-    state.node=ready.node;state.workflows.push(compiled.workflow);state.admissions.push(contract(compiled.workflow));state.blocked=[];
-    const proposal=row.action?routes.preview(state.node,row.intentId,row.action):{node:state.node,blocked:[]};
-    const blocked=[...proposal.blocked,...futureIssues(state,proposal.node??state.node),
-      ...projectStaffIssues(proposal.node??state.node,compiled.workflow)];
-    if(compiled.workflow.moves){
-      // Protect already admitted family/project guarantees throughout the exchange,
-      // rather than finding a future-seat collision after its first displacement.
-      const full=exchanges.check(state.node,row,{inspectNode:node=>futureIssues({...state,node})});
-      blocked.push(...full.blocked);
-    }
-    if(compiled.workflow.kind==='project'&&compiled.workflow.staff.length&&compiled.workflow.project.finishAt>=n.book.windowEnd)
-      blocked.push({kind:'project-staff-outside-window'});
-    if(blocked.length)return {state:input,accepted:false,blocked};
-    validate(state);mark(state);return {state,accepted:true,blocked:[]};
-  }
-  function start(n,report,candidateId,{execution,completion={}}={}) {
-    if(execution?.receipts!=='immediate-simulated'||execution?.collection!=='each-tick'||!text(execution.source))
-      throw Error('Explicit conditional receipt and collection assumptions required');
-    const state={version:1,node:structuredClone(n),goal:structuredClone(report.goal),execution:structuredClone(execution),
-      origin:{basis:signature(n),goal:signature(report.goal),from:n.view.serverTime,windowStart:n.book.startedAt,windowEnd:n.book.windowEnd},
-      workflows:[],admissions:[],history:[],sequence:0,blocked:[],goalFirstAt:null,checkpoints:{},
-      metrics:{ticks:0,minimumInventory:{...n.view.state.resources},unserved:zero(),roomOverflow:zero()}};
-    const result=append(state,report,candidateId,{completion});if(result.accepted)result.state.firstCandidate={id:candidateId,kind:result.state.workflows[0].kind};
-    return result;
-  }
-  function updateClaims(state,w,residentId,roomId,{from=state.node.view.serverTime,remove=false}={}) {
-    const n=state.node,e=owner(n,w.intentId);if(!e)return [{kind:'continuation-reservation-ended'}];
-    const people=e.people.filter(c=>c.residentId!==residentId),seats=e.seats.filter(c=>c.residentId!==residentId);
-    if(!remove){people.push(person(n,residentId,from));seats.push(seat(n,residentId,roomId,from));}
-    const amended=routes.amend(n,w.intentId,{people,seats});if(!amended.accepted)return amended.blocked;
-    state.node=amended.node;return [];
-  }
-  function finish(state,w) {
-    if(w.ownsIntent&&owner(state.node,w.intentId))state.node=routes.release(state.node,w.intentId,{complete:true,reason:'conditional continuation fulfilled'});
-    w.stage='done';w.completedAt=state.node.view.serverTime;
-  }
-  function next(state,w) {
-    const n=state.node,at=n.view.serverTime,s=n.view.state;
-    if(w.stage==='done')return {};
-    if(w.stage==='first'){
-      if(w.first)return {action:w.first,after:'first'};
-      if(w.kind==='wait'){finish(state,w);return {};}
-      w.stage=w.material?'materials':w.kind==='train'?'training':w.kind==='family'?'parents':w.kind==='project'?'construction':'running';
-    }
-    if(w.material&&w.paidAt===null){
-      const spec=materialSpec(state,w),updated=materials.refresh(state.node,w.intentId,spec);
-      if(!updated.accepted)return {blocked:updated.blocked};state.node=updated.node;w.materialStatus=updated.material;
-      const check={at,...structuredClone(updated.material),feedSpent:owner(state.node,w.intentId).feedSpent,
-        returned:[...w.materialReturned]};
-      if(signature(w.materialChecks.at(-1))!==signature(check))w.materialChecks.push(check);
-      if(!updated.material.partsReady)return {};
-      w.stage='material-return';
-      for(const p of spec.workers)if(!w.materialReturned.includes(p.residentId)){
-        const actual=state.node.view.state.residents.find(r=>r.id===p.residentId);
-        if(actual?.roomId!==p.workshopId)return {blocked:[{kind:'material-worker-position-changed',residentId:p.residentId}]};
-        const blocked=updateClaims(state,w,p.residentId,p.returnRoomId);if(blocked.length)return {blocked};
-        return {action:assignment(state.node,p.residentId,p.returnRoomId),after:'material-return'};
-      }
-      if(!updated.material.ready){w.stage='material-capital';return {};}
-      const action={...w.project,roomId:w.projectRoomId,finishAt:at+w.material.durationMs};
-      if(action.finishAt>=state.origin.windowEnd)return {blocked:[{kind:'material-construction-outside-window',finishAt:action.finishAt}]};
-      return {action,after:'material-payment'};
-    }
-    if(w.kind==='assign'){
-      if(w.moves){
-        if(w.exchangeStep===w.moves.length){finish(state,w);return {};}
-        const action=w.moves[w.exchangeStep],ready=exchanges.stage(n,w.intentId,action);
-        if(!ready.accepted)return {blocked:ready.blocked};state.node=ready.node;
-        return {action,after:'exchange-move'};
-      }
-      if(w.continuation.kind==='inherited-swap'){
-        if(n.existing.swap.status==='complete'){finish(state,w);return {};}
-        const r=routes.nextExistingSwap(n);return {action:r.action,blocked:r.blocked.filter(b=>b.kind!=='action-cadence'),after:'swap'};
-      }
-      finish(state,w);return {};
-    }
-    if(w.kind==='train'){
-      const p=s.residents.find(p=>p.id===w.residentId);
-      if(p.roomId!==w.trainingRoomId&&p.roomId!==w.returnRoomId)return {blocked:[{kind:'training-position-changed',residentId:p.id}]};
-      if(p.roomId===w.returnRoomId&&employed(n.view,p)){finish(state,w);return {};}
-      if(p.stats[w.stat]>w.base||at>=w.deadline){
-        w.returnReason=p.stats[w.stat]>w.base?'stat-complete':'deadline';
-        if(w.ownsIntent){const blocked=updateClaims(state,w,p.id,w.returnRoomId);if(blocked.length)return {blocked};}
-        return {action:assignment(state.node,p.id,w.returnRoomId),after:'training-return'};
-      }
-      return {};
-    }
-    if(w.kind==='family'){
-      const plan=n.familyPlans.find(p=>p.key===w.familyKey);
-      if(!plan)return {blocked:[{kind:'missing-family-continuation'}]};
-      if(['planned','romance'].includes(plan.stage)){
-        const p=w.parents.map(id=>s.residents.find(p=>p.id===id)).find(p=>p.roomId!==plan.roomId);
-        return p?{action:{...assignment(n,p.id,plan.roomId),familyKey:plan.key},after:'parent-arrive'}:{};
-      }
-      if(!['pregnant','born'].includes(plan.stage))return {blocked:[{kind:'family-continuation-state-changed'}]};
-      for(const id of w.parents)if(!w.returned.includes(id)){
-        const dest=w.destinations.find(d=>d.residentId===id).roomId,p=s.residents.find(p=>p.id===id);
-        if(p.roomId===dest){w.returned.push(id);const blocked=updateClaims(state,w,id,dest,{remove:true});if(blocked.length)return {blocked};continue;}
-        const blocked=updateClaims(state,w,id,dest);if(blocked.length)return {blocked};
-        return {action:assignment(state.node,id,dest),after:'parent-return'};
-      }
-      const child=s.residents.find(p=>p.id===w.childId);if(!child)return {};
-      if(child.adultAt>=state.origin.windowEnd){w.outsideWindow='child-employment';return {};}
-      const dest=w.destinations.find(d=>d.residentId===child.id).roomId;
-      if(!w.childReserved){const blocked=updateClaims(state,w,child.id,dest,{from:Math.max(at,child.adultAt)});
-        if(blocked.length)return {blocked};w.childReserved=true;}
-      if(at<child.adultAt)return {};
-      if(child.roomId===dest&&employed(n.view,child)){finish(state,w);return {};}
-      return {action:assignment(state.node,child.id,dest),after:'child-job'};
-    }
-    if(w.kind==='project'){
-      const r=s.rooms.find(r=>r.id===w.projectRoomId);
-      if(w.project.kind==='dig'&&s.depth<w.project.floor)return {};
-      if(w.project.kind!=='dig'&&(!r||r.builtAt>at||r.upgradeAt!==null))return {};
-      if(r&&(!usable(r,at)||w.project.kind==='upgrade'&&r.level<w.project.fromLevel+1))return {blocked:[{kind:'project-not-operational'}]};
-      for(const id of w.staff)if(!w.staffed.includes(id)){
-        const p=s.residents.find(p=>p.id===id);
-        if(p.roomId===w.projectRoomId&&employed(n.view,p)){w.staffed.push(id);continue;}
-        const blocked=updateClaims(state,w,id,w.projectRoomId);if(blocked.length)return {blocked};
-        return {action:assignment(state.node,id,w.projectRoomId),after:'project-staff'};
-      }
-      finish(state,w);return {};
-    }
-    return {};
-  }
-  function afterAction(state,w,task) {
-    const at=state.node.view.serverTime;
-    if(task.after==='first'){
-      w.first=null;w.stage=w.material?'materials':w.kind==='train'?'training':w.kind==='family'?'parents':w.kind==='project'?'construction':'running';
-      if(w.moves)w.exchangeStep=1;
-      if(w.kind==='assign'&&w.continuation.kind!=='inherited-swap'&&!w.moves)finish(state,w);
-      if(w.kind==='project'&&!w.material&&w.staff.length){
-        const e=owner(state.node,w.intentId),from=w.project.finishAt;
-        if(from>=state.origin.windowEnd)return [{kind:'project-staff-outside-window'}];
-        const result=routes.amend(state.node,w.intentId,{people:[...e.people,...w.staff.map(id=>person(state.node,id,from))],
-          seats:[...e.seats,...w.staff.map(id=>seat(state.node,id,w.projectRoomId,from))]});
-        if(!result.accepted)return result.blocked;state.node=result.node;w.staffReserved=true;
-      }
-    }
-    if(task.after==='material-return'){
-      w.materialReturned.push(task.action.residentId);
-      if(!w.staff.includes(task.action.residentId)){
-        const blocked=updateClaims(state,w,task.action.residentId,task.action.roomId,{remove:true});if(blocked.length)return blocked;
-      }
-    }
-    if(task.after==='material-payment'){
-      w.paidAt=at;w.constructionAction=structuredClone(task.action);w.stage='construction';
-      const from=task.action.finishAt;
-      const result=routes.amend(state.node,w.intentId,{resources:{},feedScrap:0,
-        people:w.staff.map(id=>person(state.node,id,from)),seats:w.staff.map(id=>seat(state.node,id,w.projectRoomId,from))});
-      if(!result.accepted)return result.blocked;state.node=result.node;w.staffReserved=true;
-    }
-    if(task.after==='training-return'){w.returnedAt=at;finish(state,w);}
-    if(task.after==='parent-return'){
-      w.returned.push(task.action.residentId);
-      const blocked=updateClaims(state,w,task.action.residentId,task.action.roomId,{remove:true});if(blocked.length)return blocked;
-    }
-    if(task.after==='child-job'){w.childEmployedAt=at;finish(state,w);}
-    if(task.after==='project-staff')w.staffed.push(task.action.residentId);
-    if(task.after==='exchange-move'){w.exchangeStep++;if(w.exchangeStep===w.moves.length)finish(state,w);}
-    return [];
-  }
-  function remap(state,events) {
-    for(const e of events)if(e.kind==='merge')for(const w of state.workflows){
-      for(const field of ['returnRoomId','trainingRoomId','projectRoomId'])if(w[field]===e.roomId)w[field]=e.into;
-      for(const d of w.destinations??[])if(d.roomId===e.roomId)d.roomId=e.into;
-    }
-  }
-  function advance(input,to,{maxTicks=1008,stopAtDecision=false,collectTrajectory=false}={}) {
-    validate(input);
-    if(!Number.isSafeInteger(to)||to<input.node.view.serverTime||to>input.origin.windowEnd||
-      (to-input.node.view.serverTime)%tick!==0||!Number.isInteger(maxTicks)||maxTicks<1||maxTicks>1008||typeof stopAtDecision!=='boolean'||typeof collectTrajectory!=='boolean')
-      throw Error('Invalid continuation horizon or tick budget');
-    const state=structuredClone(input);state.blocked=[];let ticks=0,decision=false;
-    const trajectory=[];
-    const record=(minimum=null)=>{if(collectTrajectory){const value=structuredClone(state.latest);
-      value.minimumInventory=minimum?structuredClone(minimum):{...value.inventory};
-      value.recoveringSupply=state.node.view.state.rooms.filter(r=>r.upgradeAt!==null)
-        .map(r=>({power:'power',diner:'food',water:'water'})[r.type]).filter(Boolean);
-      if(trajectory.at(-1)?.at===value.at)for(const k of keys)
-        value.minimumInventory[k]=Math.min(value.minimumInventory[k],trajectory.at(-1).minimumInventory[k]);
-      if(trajectory.at(-1)?.at===value.at)trajectory[trajectory.length-1]=value;else trajectory.push(value);}};
-    record();
-    while(true){
-      const n=state.node,at=n.view.serverTime;
-      if(n.pending||n.existing?.native.length){state.blocked=[{kind:'original-request-outcome-unknown'}];break;}
-      state.blocked=futureIssues(state);if(state.blocked.length)break;
-      if(at<state.origin.windowEnd){
-        let acted=false;
-        for(const w of state.workflows){
-          const exchange=state.workflows.find(w=>w.moves&&w.stage!=='done');
-          if(exchange&&w!==exchange)continue;
-          const task=next(state,w);
-          if(task.blocked?.length){state.blocked=task.blocked;break;}
-          if(!task.action)continue;
-          // Pure completion may run at the same timestamp; a second action may not.
-          if(state.node.lastActionAt!==null&&at<state.node.lastActionAt+tick)continue;
-          const proposal=routes.preview(state.node,w.intentId,task.action);
-          state.blocked=[...proposal.blocked,...futureIssues(state,proposal.node??state.node),
-            ...(task.after==='material-payment'?projectStaffIssues(proposal.node??state.node,w):[])];
-          if(state.blocked.length)break;
-          const requestId='continuation:'+state.sequence+':'+at;
-          const submitted=routes.submit(state.node,w.intentId,task.action,requestId);
-          if(!submitted.accepted){state.blocked=submitted.blocked;break;}
-          const p=submitted.node.pending,confirmation=routes.resolve(submitted.node,
-            {requestId,intentId:w.intentId,fingerprint:p.fingerprint,at,result:'confirmed'});
-          if(confirmation.blocked.length){state.node=submitted.node;state.blocked=confirmation.blocked;break;}
-          state.node=confirmation.node;state.sequence++;state.history.push({at,workflow:w.key,action:task.action,requestId});
-          state.blocked=afterAction(state,w,task);acted=true;mark(state);record();break;
-        }
-        if(state.blocked.length)break;
-        if(acted)continue;
-      }
-      mark(state);record();
-      if(at===to)break;
-      if(ticks>=maxTicks){state.blocked=[{kind:'continuation-tick-budget'}];break;}
-      for(const w of state.workflows)if(w.kind==='train'&&w.stage!=='done'&&w.deadline>at&&w.deadline<at+tick)
-        state.blocked.push({kind:'training-deadline-boundary',deadline:w.deadline,nextAt:at+tick});
-      if(state.blocked.length)break;
-      const material=state.workflows.find(w=>w.material&&w.stage!=='done');
-      const eventCount=state.node.events.length,step=routes.advanceOwned(state.node,at+tick,{collect:true,feedOwner:material?.intentId??null});
-      state.node=step.node;ticks+=step.metrics.ticks;state.metrics.ticks+=step.metrics.ticks;
-      for(const k of keys){state.metrics.minimumInventory[k]=Math.min(state.metrics.minimumInventory[k],step.metrics.minimumInventory[k]);
-        state.metrics.unserved[k]+=step.metrics.unserved[k];state.metrics.roomOverflow[k]+=step.metrics.roomOverflow[k];}
-      const events=state.node.events.slice(eventCount);remap(state,events);mark(state);record(step.metrics.minimumInventory);
-      if(!step.complete){state.blocked=step.blocked;break;}
-      if(stopAtDecision&&events.some(e=>['adult','birth','build','upgrade','training','production-modifier-end'].includes(e.kind))){decision=true;break;}
-    }
-    validate(state);
-    return {state,complete:state.node.view.serverTime===to&&!state.blocked.length,decisionRequired:decision,
-      blocked:state.blocked,requestedTo:to,ticks,...(collectTrajectory?{trajectory}:{})};
-  }
-  function report(state) {
-    validate(state);const current=snapshot(state),finished=state.node.view.serverTime===state.origin.windowEnd&&!state.blocked.length;
-    const workflowIntents=new Set(state.workflows.map(w=>w.intentId));
-    const unfinished=state.workflows.filter(w=>w.stage!=='done').map(w=>
-      ({kind:w.kind,intentId:w.intentId,stage:w.stage,deadline:w.deadline,outsideWindow:w.outsideWindow??null}));
-    unfinished.push(...state.node.book.entries.filter(e=>active(e)&&!workflowIntents.has(e.id)).map(e=>
-      ({kind:'existing-commitment',intentId:e.id,stage:e.status,deadline:e.deadline,purpose:e.purpose})));
-    if(state.node.existing?.native.length)unfinished.push({kind:'original-native-request',stage:'unknown',count:state.node.existing.native.length});
-    const obligationsFulfilled=unfinished.length===0&&!state.node.pending;
-    return {kind:'conditional-development-continuation',firstCandidate:state.firstCandidate,goal:state.goal,
-      from:state.origin.from,windowStart:state.origin.windowStart,windowEnd:state.origin.windowEnd,evaluatedUntil:current.at,
-      complete:finished&&obligationsFulfilled&&current.goalAchieved===true,
-      simulationComplete:finished,obligationsFulfilled,
-      firstAdmitted:!!state.firstCandidate,blocked:structuredClone(state.blocked),goalFirstAt:state.goalFirstAt,goalAtEnd:current.goalAchieved,
-      checkpoints:structuredClone(state.checkpoints),ending:current,metrics:structuredClone(state.metrics),
-      futureSeats:guarantees(state),actions:structuredClone(state.history),unfinished,
-      materials:state.workflows.filter(w=>w.material).map(w=>({intentId:w.intentId,purpose:structuredClone(w.material),
-        stage:w.stage,paidAt:w.paidAt,finishAt:w.constructionAction?.finishAt??null,returned:[...w.materialReturned],
-        checks:structuredClone(w.materialChecks)})),
-      selected:null,limitations:['Explicit chosen continuations, not bounded search or a winning complete strategy.',
-        'Immediate simulated receipts and one action per ten-minute tick; no native account evidence.',
-        'Future family seats are conservatively protected until confirmed; admission staffing is rechecked at execution.',
-        'Subsequent investment choices are explicit appends; an unmodeled event stops the actual prefix.']};
-  }
-  return {start,append,advance,report};
-}
-
-return {createShelterDevelopmentContinuation};
-})();
-const {createShelterDevelopmentSelection}=(()=>{
-
-const tick=600000,hour=3600000,keys=['power','food','water','scrap','parts','stimpak'];
-const kinds=['wait','assign','family','train','project'],copy=structuredClone,eps=1e-6;
-const hash=createShelterSelectionDigest();
-const text=x=>typeof x==='string'&&x.trim().length>0;
-const merge=(a,b)=>{const values=new Map(a.map(x=>[x.at,x]));for(const x of b){const old=values.get(x.at);
-  values.set(x.at,old?{...x,minimumInventory:Object.fromEntries(keys.map(k=>[k,Math.min(old.minimumInventory[k],x.minimumInventory[k])]))}:x);
-}return [...values.values()].sort((a,b)=>a.at-b.at);};
-
-// Reuses actual conditional continuations. No invented offspring, construction times,
-// simultaneous swaps, market conversion, or native receipts are introduced here.
-function createShelterDevelopmentSelection(){
-  const candidates=createShelterDevelopmentCandidates(),continuation=createShelterDevelopmentContinuation(),routes=createShelterRouteSimulation();
-  let localReport=null;
-  function options(n,o,local=false){
-    if(!o||!o.goal||!o.execution)throw Error('A common goal and explicit execution assumptions are required');
-    if(n.book.windowEnd-n.book.startedAt!==168*hour||n.view.serverTime<n.book.startedAt||
-      n.view.serverTime>=n.book.windowEnd||!local&&(n.book.windowEnd-n.view.serverTime)%tick!==0)
-      throw Error('Selection requires a remaining tick-aligned horizon in the original fixed 168-hour window');
-    const p={familyOutcomes:[],constructionEvidence:[],completions:{},surplus:[],goalDeadline:null,
-      beamWidth:8,maxProjects:8,maxExpansions:2000,maxChecks:2000,checksPerNode:64,...copy(o)};
-    for(const [key,limit] of Object.entries({beamWidth:8,maxProjects:8,maxExpansions:2000,maxChecks:2000,checksPerNode:2000}))
-      if(!Number.isInteger(p[key])||p[key]<1||p[key]>limit)throw Error('Invalid bounded selection budget: '+key);
-    if(p.beamWidth<kinds.length)throw Error('Beam width must preserve all five first-action classes');
-    if(!Array.isArray(p.surplus)||new Set(p.surplus.map(x=>x.resource)).size!==p.surplus.length||
-      p.surplus.some(x=>!['power','food','water'].includes(x.resource)||x.resource===p.goal.resource||!text(x.source)||
-        !Number.isSafeInteger(x.through)||x.through<n.book.windowEnd||x.knownLaterCommitmentsCovered!==true))
-      throw Error('Surplus needs explicit purpose evidence through the window and known later commitments');
-    if(p.goalDeadline!==null&&(!Number.isSafeInteger(p.goalDeadline)||p.goalDeadline<n.view.serverTime||p.goalDeadline>n.book.windowEnd))
-      throw Error('Invalid common goal deadline');
-    if(!p.completions||typeof p.completions!=='object'||Array.isArray(p.completions))throw Error('Completion plans must be bound by candidate ID');
-    return p;
-  }
-  function compact(s){return {at:s.at,employed:s.employedIds.length,free:s.free,stored:s.stored,rates:s.rates,
-    supply:s.supply,minimumInventory:s.minimumInventory,recoveringSupply:s.recoveringSupply,goal:s.goalAchieved};}
-  function evaluate(branch,p){
-    const run=continuation.advance(branch.state,branch.state.origin.windowEnd,{collectTrajectory:true});
-    const report=continuation.report(run.state),trajectory=merge(branch.trace,run.trajectory.map(compact));
-    const supplySafe=Object.fromEntries(['power','food','water'].map(k=>[k,trajectory.every(t=>
-      t.supply[k].deficit<=eps&&t.supply[k].inventoryGap<=eps)]));
-    const unserved=Object.values(report.metrics.unserved).some(x=>x>eps);
-    const supplyViolation=trajectory.some(t=>Object.entries(t.supply).some(([k,v])=>
-      t.minimumInventory[k]+eps<2*v.need||v.deficit>eps&&!t.recoveringSupply.includes(k)));
-    const complete=report.simulationComplete&&report.obligationsFulfilled&&report.goalAtEnd!==null&&!unserved&&!supplyViolation;
-    const deadlineOk=p.goalDeadline===null||report.goalFirstAt!==null&&report.goalFirstAt<=p.goalDeadline;
-    return {report,trajectory,supplySafe,status:!report.simulationComplete?
-      report.blocked.some(b=>/unknown|missing|not.modeled|boundary/.test(b.kind))?'unknown':'blocked':
-      !report.obligationsFulfilled?'unfinished':unserved||supplyViolation||!deadlineOk?'blocked':report.goalAtEnd===null?'unknown':'comparable',
-      comparable:complete&&deadlineOk,deadlineOk,supplyViolation,
-      trajectoryMinimum:Object.fromEntries(keys.map(k=>[k,Math.min(...trajectory.map(t=>t.minimumInventory[k]))]))};
-  }
-  function relevant(a,b,p){return keys.filter(k=>!p.surplus.some(x=>x.resource===k&&a.supplySafe[k]&&b.supplySafe[k]));}
-  function vector(s,resources){return [s.employed,s.goal===true?1:0,...resources.flatMap(k=>[s.free[k],s.stored[k],s.rates[k]])];}
-  function relation(av,bv){return {ge:av.every((x,i)=>x+eps>=bv[i]),strict:av.some((x,i)=>x>bv[i]+eps),equal:av.every((x,i)=>Math.abs(x-bv[i])<=eps)};}
-  function compare(a,b,p){
-    if(!a.comparable||!b.comparable)return {better:false,reason:'incomplete-or-unknown'};
-    const resources=relevant(a,b,p),end=relation(vector(a.trajectory.at(-1),resources),vector(b.trajectory.at(-1),resources));
-    if(!end.ge)return {better:false,reason:'useful-resource-or-production-tradeoff'};
-    const ta=a.report.goalFirstAt??Infinity,tb=b.report.goalFirstAt??Infinity;
-    if(end.equal){
-      if(ta<tb)return {better:true,reason:'same-effective-end-earlier-goal',advanceMs:tb-ta};
-      if(ta!==tb)return {better:false,reason:'later-goal-without-end-benefit'};
-      const cost=r=>keys.map(k=>r.report.ending.accounting.paid[k]+r.report.ending.accounting.feed[k]);
-      const costs=relation(cost(b),cost(a));
-      if(!costs.equal)return {better:costs.ge&&costs.strict,reason:'equivalent-outcome-resource-cost-tie'};
-      return {better:a.report.actions.length<b.report.actions.length,reason:'equivalent-outcome-action-tie',equivalent:a.report.actions.length===b.report.actions.length};
-    }
-    if(ta<=tb)return {better:true,reason:'earlier-or-equal-goal-and-better-effective-end',advanceMs:tb-ta};
-    const other=new Map(b.trajectory.map(t=>[t.at,t]));let catchup=null;
-    for(let i=a.trajectory.length-1;i>=0;i--){const x=a.trajectory[i],y=other.get(x.at);
-      if(!y||!relation(vector(x,resources),vector(y,resources)).ge)break;catchup=x.at;}
-    return {better:catchup!==null,reason:catchup===null?'unproved-payback':'later-goal-with-realized-window-payback',catchupAt:catchup};
-  }
-  function ordered(report){
-    const queues=kinds.map(k=>report.groups[k]),result=[];
-    for(let i=0;queues.some(q=>q[i]);i++)for(const q of queues)if(q[i])result.push(q[i]);
-    return result;
-  }
-  function frontier(rows,p){return rows.filter(a=>!rows.some(b=>a!==b&&compare(b.evaluation,a.evaluation,p).better));}
-  function choose(rows,p){
-    const valid=rows.filter(x=>x.evaluation.comparable);if(!valid.length)return null;
-    const best=frontier(valid,p).sort((a,b)=>a.id.localeCompare(b.id,'en'));
-    if(best.length===1)return best[0];
-    const first=best[0];return best.every(x=>x===first||compare(first.evaluation,x.evaluation,p).equivalent)?first:null;
-  }
-  function independentAssignment(n,report,p){
-    const before=routes.supply(n),local=report.groups.assign.filter(row=>row.status==='ready'&&row.action?.kind==='assign'&&
-      row.continuation?.kind==='recompute-after-confirmed-employment'&&row.productionDelta&&
-      keys.every(k=>row.productionDelta[k]>=-eps)&&keys.some(k=>row.productionDelta[k]>eps)&&
-      Object.entries(row.supplyAfter).every(([k,v])=>v.deficit<=before[k].deficit+eps&&v.inventoryGap<=before[k].inventoryGap+eps));
-    local.sort((a,b)=>(b.productionDelta[p.goal.resource]??0)-(a.productionDelta[p.goal.resource]??0)||a.id.localeCompare(b.id,'en'));
-    const row=local[0];return row?{routeId:null,firstCandidate:{at:n.view.serverTime,id:row.id,kind:row.kind},
-      firstAction:{at:n.view.serverTime,action:copy(row.action)},report:null,choices:[]}:null;
-  }
-  function selectLocal(n,o){
-    localReport=null;
-    routes.inspect(n);const p=options(n,o,true),report=candidates.enumerate(n,{goal:p.goal,familyOutcomes:p.familyOutcomes,
-      constructionEvidence:p.constructionEvidence,maxChecks:Math.min(p.checksPerNode,p.maxChecks)});
-    const selected=independentAssignment(n,report,p);
-    const body={kind:'bounded-development-selection',basis:hash(n),options:p,from:n.view.serverTime,
-      windowStart:n.book.startedAt,windowEnd:n.book.windowEnd,selected,
-      outcome:selected?'independent-local-improvement':'no-independent-local-improvement',
-      budget:{checks:report.checks,expansions:0,terminalEvaluations:0},coverage:report.coverage,
-      comparisons:[],qualifiedForNativeExecution:false,
-      limitations:['Current non-worsening assignment only; no future simulation, seven-day winner or native receipt.']};
-    const result={body,integrity:hash(body)};
-    // The Worker immediately prepares this same result. Keep only its private
-    // report; preparation still verifies both hashes and rechecks the one action.
-    localReport={result,integrity:result.integrity,report};
-    return result;
-  }
-  function select(input,o,resume=null){
-    localReport=null;
-    if(resume){
-      continuation.report(resume);
-      if(JSON.stringify(resume.node)!==JSON.stringify(input)||JSON.stringify(resume.goal)!==JSON.stringify(o?.goal)||
-        JSON.stringify(resume.execution)!==JSON.stringify(o?.execution))throw Error('Replanning must preserve its continuation, goal and execution assumptions');
-    }
-    routes.inspect(input);const n=copy(input),p=options(n,o),basis=hash(n),all=[],rejected=[],coverage=[];
-    const budget={expansions:0,checks:0,admissions:0,terminalEvaluations:0,beamPruned:0,projectPruned:0,unexpanded:0};
-    let queue=[{id:'root',state:resume?copy(resume):null,node:n,trace:[],choices:[],projects:0,firstKind:null}],rootReport=null,depth=0;
-    const makeReport=node=>{
-      const allowed=Math.min(p.checksPerNode,p.maxChecks-budget.checks);
-      if(allowed<1)return null;
-      const report=candidates.enumerate(node,{goal:p.goal,familyOutcomes:p.familyOutcomes,
-        constructionEvidence:p.constructionEvidence,maxChecks:allowed});budget.checks+=report.checks;
-      coverage.push({at:node.view.serverTime,checks:report.checks,summary:report.summary,coverage:report.coverage});return report;
-    };
-    while(queue.length&&budget.expansions<p.maxExpansions&&budget.checks<p.maxChecks){
-      const next=[];
-      for(const parent of queue){
-        if(budget.expansions>=p.maxExpansions||budget.checks>=p.maxChecks){budget.unexpanded++;continue;}
-        const report=makeReport(parent.node);if(!report){budget.unexpanded++;continue;}
-        rootReport??=report;
-        for(const row of ordered(report)){
-          if(budget.expansions>=p.maxExpansions){budget.unexpanded++;break;}
-          budget.expansions++;
-          const id=parent.id+'/'+row.id,firstKind=parent.firstKind??row.kind;
-          if(row.status!=='ready') {rejected.push({id,firstKind,kind:row.kind,status:row.status,blocked:row.blocked});continue;}
-          if(row.kind==='project'&&parent.projects>=p.maxProjects){budget.projectPruned++;rejected.push({id,firstKind,status:'truncated',blocked:[{kind:'route-project-budget'}]});continue;}
-          if(parent.state?.workflows.some(w=>w.stage!=='done'&&w.candidateId===row.id))continue;
-          const opt={execution:p.execution,completion:p.completions[row.id]??{}};
-          budget.admissions++;
-          const admitted=parent.state?continuation.append(parent.state,report,row.id,opt):continuation.start(n,report,row.id,opt);
-          if(!admitted.accepted){rejected.push({id,firstKind,status:admitted.blocked.some(b=>/unknown|missing/.test(b.kind))?'unknown':'blocked',blocked:admitted.blocked});continue;}
-          const immediate=continuation.advance(admitted.state,parent.node.view.serverTime,{collectTrajectory:true});
-          const branch={id,state:immediate.state,node:immediate.state.node,firstKind,
-            projects:parent.projects+(row.kind==='project'?1:0),choices:[...parent.choices,{at:parent.node.view.serverTime,id:row.id,kind:row.kind}],
-            trace:merge(parent.trace,immediate.trajectory.map(compact))};
-          branch.evaluation=evaluate(branch,p);budget.terminalEvaluations++;all.push(branch);
-          if(branch.node.view.serverTime<n.book.windowEnd&&!immediate.blocked.length){
-            const step=continuation.advance(branch.state,Math.min(n.book.windowEnd,branch.node.view.serverTime+tick),{collectTrajectory:true});
-            if(!step.blocked.length&&step.state.node.view.serverTime<n.book.windowEnd)
-              next.push({...branch,state:step.state,node:step.state.node,trace:merge(branch.trace,step.trajectory.map(compact))});
-          }
-        }
-      }
-      // Keep a representative of every first-action class before filling the remaining beam.
-      // Unknown and short-prefix branches are retained as search candidates, never scored as zero.
-      const kept=[];
-      for(const kind of kinds){const group=next.filter(x=>x.firstKind===kind);if(!group.length)continue;
-        kept.push(choose(group,p)??frontier(group,p).sort((a,b)=>a.id.localeCompare(b.id,'en'))[0]);}
-      for(const row of frontier(next,p).sort((a,b)=>a.id.localeCompare(b.id,'en')))
-        if(kept.length<p.beamWidth&&!kept.includes(row))kept.push(row);
-      budget.beamPruned+=Math.max(0,next.length-Math.min(kept.length,p.beamWidth));
-      queue=kept.slice(0,p.beamWidth);depth++;
-    }
-    budget.unexpanded+=queue.length;
-    const baseline=all.find(x=>x.id==='root/wait'),winner=choose(all,p);
-    let selected=winner?{routeId:winner.id,firstCandidate:winner.choices[0],
-      firstAction:null,comparisonToWait:baseline?compare(winner.evaluation,baseline.evaluation,p):null,
-      report:winner.evaluation.report,choices:winner.choices}:null;
-    let outcome=selected?(selected.firstCandidate.kind==='wait'?'wait':'complete-route-selected'):'no-comparable-winner';
-    if(!selected&&baseline?.evaluation.comparable){selected={routeId:baseline.id,firstCandidate:baseline.choices[0],firstAction:null,
-      report:baseline.evaluation.report,choices:baseline.choices};outcome='retain-feasible-wait';}
-    if(!selected&&rootReport){
-      selected=independentAssignment(n,rootReport,p);if(selected)outcome='independent-local-improvement';
-    }
-    // Earlier confirmations and a future move after a wait are not the current first action.
-    if(selected){const first=Object.values(rootReport.groups).flat().find(r=>r.id===selected.firstCandidate.id);
-      selected.firstAction=first?.action?{at:n.view.serverTime,action:copy(first.action)}:null;}
-    const body={kind:'bounded-development-selection',basis,options:p,from:n.view.serverTime,windowStart:n.book.startedAt,windowEnd:n.book.windowEnd,
-      outcome,selected,budget,depth,coverage,rejected,comparisons:kinds.map(kind=>{
-        const group=all.filter(x=>x.firstKind===kind),best=choose(group,p);
-        return {kind,completeRoutes:group.filter(x=>x.evaluation.comparable).length,
-          routes:group.map(x=>({id:x.id,status:x.evaluation.status,choices:x.choices,report:x.evaluation.report,trajectoryMinimum:x.evaluation.trajectoryMinimum,
-            selectedOverThisRoute:winner?compare(winner.evaluation,x.evaluation,p):null})),
-          representative:best?.id??null,rejections:rejected.filter(x=>x.firstKind===kind)};
-      }),nextCheckAt:rootReport?.groups.wait[0]?.nextAt??null,
-      qualifiedForNativeExecution:false,limitations:['Bounded conditional search; not a global optimum or real seven-day efficiency proof.',
-        'Surplus is excluded only with explicit purpose evidence and safe supply throughout both compared trajectories.',
-        'Unknown, unfinished and truncated routes remain visible; a selected route is best only among comparable evaluated routes.',
-        'Original snapshot, requests and receipts must be checked by the native executor; simulated confirmations are not native receipts.']};
-    return {body,integrity:hash(body)};
-  }
-  function prepareSelected(n,result){
-    if(result?.integrity!==hash(result.body)||result.body.kind!=='bounded-development-selection')throw Error('Selection integrity changed');
-    if(hash(n)!==result.body.basis)throw Error('Selection snapshot changed; replan before execution');
-    const chosen=result.body.selected;if(!chosen)return {node:n,accepted:false,blocked:[{kind:'no-selected-development-action'}]};
-    const p=result.body.options,report=localReport?.result===result&&localReport.integrity===result.integrity?localReport.report:
-      candidates.enumerate(n,{goal:p.goal,familyOutcomes:p.familyOutcomes,
-        constructionEvidence:p.constructionEvidence,maxChecks:Math.min(p.checksPerNode,p.maxChecks)});
-    return candidates.prepareFirst(n,report,chosen.firstCandidate.id);
-  }
-  return {select,selectLocal,prepareSelected,continueSelection:(state,o)=>select(state.node,o,state)};
-}
-
-return {createShelterDevelopmentSelection};
-})();
-const {installShelterPlanningWorker}=(()=>{
-
-// This endpoint only proposes. It cannot access storage, DOM controls or native requests.
-function installShelterPlanningWorker(endpoint) {
-  const selection=createShelterDevelopmentSelection();
-  endpoint.onmessage=({data})=>{
-    const {id,options,resume}=data;
-    try {
-      const node=data.runtime?createShelterRouteSimulation().fromRuntime(data.runtime.view,data.runtime.options).node:data.node;
-      const result=data.mode==='local'?selection.selectLocal(node,options):
-        resume?selection.continueSelection(resume,options):selection.select(node,options);
-      const prepared=selection.prepareSelected(resume?.node??node,result);
-      endpoint.postMessage({id,result,prepared:{accepted:prepared.accepted,action:prepared.action??null,blocked:prepared.blocked}});
-    } catch(error) {endpoint.postMessage({id,error:String(error?.message??error)});}
-  };
-}
-
-return {installShelterPlanningWorker};
-})();
-installShelterPlanningWorker(self);
-`;
-  const createShelterPlanningClient=function createShelterPlanningClient({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{}}) {
-  if(!(typeof source==='function'||typeof source==='string'&&source)||!Number.isFinite(timeoutMs)||timeoutMs<=0)throw Error('Invalid planning worker configuration');
-  const factory=makeWorker??(()=>{
-    const url=URL.createObjectURL(new Blob([typeof source==='function'?source():source],{type:'text/javascript'}));
-    try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
-  });
-  let sequence=0,job=null;
-  const close=j=>{clearTimeout(j.timer);j.worker?.terminate();j.worker=null;};
-  const finish=(j,status,extra={})=>{
-    if(job!==j||j.status!=='running')return;
-    const finishedAt=now();
-    if(finishedAt-j.startedAt>=timeoutMs){status='timeout';extra={error:'Planning time budget exhausted'};}
-    close(j);Object.assign(j,{status,finishedAt},extra);onUpdate(read(j.key));
-  };
-  function read(key){if(!job||job.key!==key)return null;
-    // Background tabs may delay timers. Reads and replies still obey the original deadline.
-    if(job.status==='running'&&now()-job.startedAt>=timeoutMs)finish(job,'timeout',{error:'Planning time budget exhausted'});
-    return {id:job.id,key:job.key,status:job.status,startedAt:job.startedAt,finishedAt:job.finishedAt,
-      result:job.result??null,prepared:job.prepared??null,error:job.error??null};}
-  function invalidate(){if(job)close(job);job=null;sequence++;}
-  function request(key,payload){
-    if(typeof key!=='string'||!key)throw Error('A planning snapshot identity is required');
-    if(job?.key===key)return read(key);
-    invalidate();const j=job={id:++sequence,key,status:'running',startedAt:now(),finishedAt:null,worker:null,timer:null};
-    try{
-      j.worker=factory();
-      j.worker.onmessage=({data})=>{
-        if(job!==j||j.status!=='running'||data?.id!==j.id)return;
-        if(data.error)finish(j,'failed',{error:data.error});
-        else if(data.result?.body?.kind!=='bounded-development-selection'||typeof data.prepared?.accepted!=='boolean')
-          finish(j,'failed',{error:'Invalid planning response'});
-        else finish(j,'ready',{result:data.result,prepared:data.prepared});
-      };
-      j.worker.onerror=event=>finish(j,'failed',{error:String(event?.message??'Planning worker failed')});
-      j.worker.onmessageerror=()=>finish(j,'failed',{error:'Planning response could not be decoded'});
-      j.timer=setTimeout(()=>finish(j,'timeout',{error:'Planning time budget exhausted'}),timeoutMs);
-      j.worker.postMessage({...payload,id:j.id});
-    }catch(error){finish(j,'failed',{error:String(error?.message??error)});}
-    return read(key);
-  }
-  return {request,read,invalidate};
-};
-  const createShelterNativePlanning=function createShelterNativePlanning({client,now=Date.now}) {
-  let latest=null;
-  const keyOf=value=>JSON.stringify(value,(_key,v)=>v&&typeof v==='object'&&!Array.isArray(v)?
-    Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
-  function observation(view,context){
-    const {serverTime,revision,...facts}=view,bounds={serverTime},state={...facts.state},resources={...state.resources};
-    const take=(copy,key,path,marker=null)=>{if(Number.isFinite(copy[key])){bounds[path]=copy[key];copy[key]=marker;}};
-    for(const key of ['power','food','water','scrap','parts','stimpak'])take(resources,key,'resources.'+key);
-    state.resources=resources;
-    state.rooms=state.rooms.map(r=>{const copy={...r};take(copy,'stored','rooms.'+r.id);return copy;});
-    state.residents=state.residents.map(p=>{
-      const copy={...p};
-      take(copy,'xp','residents.'+p.id+'.xp',Math.min(50,1+Math.floor(Math.sqrt(Math.max(0,p.xp)/3))));
-      take(copy,'training','residents.'+p.id+'.training',p.training>=1);
-      if(p.romance){copy.romance={...p.romance};take(copy.romance,'progress','residents.'+p.id+'.romance',p.romance.progress>=1);}
-      return copy;
-    });
-    // Clock-only transitions can change admissible work even when the API has
-    // not settled the state yet. Keep all other and unknown facts exact.
-    const boundaries=[];
-    const deadlines=new Set(['adultAt','familyCooldownUntil','builtAt','upgradeAt','startsAt','endsAt','dueAt','returnAt','until','windowEnd']);
-    function clocks(value,path=''){
-      if(!value||typeof value!=='object')return;
-      for(const [key,v] of Object.entries(value)){
-        if(deadlines.has(key)&&Number.isFinite(v))boundaries.push([path+'.'+key,v<=serverTime]);
-        else if(v&&typeof v==='object')clocks(v,path+'.'+key);
-      }
-    }
-    clocks([facts,context.schedule]);
-    return {key:keyOf([{...facts,state},context.schedule,context.construction,context.safety,context.window,context.settings,
-      boundaries.sort(([a],[b])=>a.localeCompare(b))]),bounds};
-  }
-  function update(view,context){
-    if(!context.enabled||context.pending||!context.window||context.window.end<=view.serverTime){
-      client.invalidate();latest=null;return null;
-    }
-    const {serverTime}=view,{key,bounds}=observation(view,context);
-    const regressed=latest&&Object.entries(latest.bounds).some(([k,v])=>!Number.isFinite(bounds[k])||bounds[k]<v);
-    if(latest?.key!==key||regressed||now()-latest.at>60000){
-      client.invalidate();latest={key,at:now(),vaultNo:view.vaultNo,bounds};
-    }else latest.bounds=bounds;
-    const payload={mode:'local',runtime:{view,options:{firstActionOnly:true,
-      windowStart:context.window.start,windowEnd:context.window.end,safety:context.safety,construction:context.construction,
-      runtime:{schedule:context.schedule,pending:context.pending,source:'observed native read and persisted original obligations',
-        clock:{localAt:context.readAt,serverAt:serverTime,uncertaintyMs:Math.max(0,context.readAt-context.readStartedAt),source:'native request/response clock interval'}}}},
-      options:{goal:{id:'current-scrap-production',kind:'stock',resource:'scrap',amount:view.state.resources.scrap+1,
-        source:'current non-worsening scrap production; not a future stock forecast'},
-        execution:{receipts:'immediate-simulated',collection:'each-tick',source:'unused in local-only selection; never native evidence'},
-        maxChecks:2000,checksPerNode:2000,maxExpansions:1}};
-    const status=client.request(key,payload);return status;
-  }
-  function choose(view,context,allowed){
-    const status=update(view,context);
-    if(!status||status.status!=='ready'||now()-latest.at>60000||latest.vaultNo!==view.vaultNo)return null;
-    const body=status.result?.body,prepared=status.prepared,first=body?.selected?.firstCandidate,action=prepared?.action;
-    if(body?.outcome!=='independent-local-improvement'||!prepared?.accepted||first?.kind!=='assign'||action?.kind!=='assign'||
-      body.windowStart!==context.window.start||body.windowEnd!==context.window.end||
-      JSON.stringify(body.selected.firstAction?.action)!==JSON.stringify(action))return null;
-    const current=allowed.find(c=>c.id===action.residentId&&c.room===action.roomId&&c.from===action.fromRoomId);
-    if(!current)return null;
-    return {...current,reason:'后台已比较独立增产调岗，本轮重新核对供应、用途和空位后执行',
-      developmentProposal:{jobId:status.id,from:body.from,windowStart:body.windowStart,windowEnd:body.windowEnd,
-        candidateId:first.id,kind:body.outcome}};
-  }
-  return {update,choose,status:()=>latest?client.read(latest.key):null,invalidate(){client.invalidate();latest=null;}};
-};
-  const createShelterLevelPlanning=function createShelterLevelPlanning({source,makeWorker=null,now=Date.now,timeoutMs=45000,onUpdate=()=>{},retainLevelProgress=false,retainFamilyProgress=false}) {
-  const factory=makeWorker??(()=>{
-    const url=URL.createObjectURL(new Blob([typeof source==='function'?source():source],{type:'text/javascript'}));
-    try{return new Worker(url);}finally{URL.revokeObjectURL(url);}
-  });
-  let epoch=null,sequence=0,active=null,progress=null;
-  const jobs=new Map();
-  // Inputs are JSON data. Object insertion order is not a business fact;
-  // array order and every non-metadata field still participate in identity.
-  const keyOf=value=>JSON.stringify(value,(_key,v)=>v&&typeof v==='object'&&!Array.isArray(v)?
-    Object.fromEntries(Object.keys(v).sort().map(k=>[k,v[k]])):v);
-  function observation(view,retain){
-    const {serverTime,revision,...facts}=view,bounds={};
-    if(!retain)return {facts,bounds};
-    bounds.serverTime=serverTime;
-    // Only monotone accumulation may retain work. Level routes require replay;
-    // family searches additionally compare every recorded family's stock eligibility.
-    // Keep unknown fields and actual worker/room/health changes exact.
-    const state={...facts.state},resources={...state.resources};
-    const take=(copy,key,path,marker=null)=>{if(Number.isFinite(copy[key])){bounds[path]=copy[key];copy[key]=marker;}};
-    for(const key of ['power','food','water','scrap','parts','stimpak'])take(resources,key,'resources.'+key);
-    state.resources=resources;
-    state.rooms=state.rooms.map(r=>{const next={...r};take(next,'stored','rooms.'+r.id+'.stored');return next;});
-    state.residents=state.residents.map(p=>{
-      const next={...p};
-      take(next,'xp','residents.'+p.id+'.xp',Math.min(50,1+Math.floor(Math.sqrt(Math.max(0,p.xp)/3))));
-      take(next,'training','residents.'+p.id+'.training',p.training>=1);
-      if(p.romance){next.romance={...p.romance};take(next.romance,'progress','residents.'+p.id+'.romance',p.romance.progress>=1);}
-      return next;
-    });
-    return {facts:{...facts,state},bounds};
-  }
-  const close=j=>{clearTimeout(j.timer);j.worker?.terminate();j.worker=null;if(active===j)active=null;};
-  const read=j=>({id:j.id,status:j.status,routes:j.routes??[],supply:j.supply??null,snapshotAt:j.payload.view.serverTime,
-    queuedAt:j.queuedAt,finishedAt:j.finishedAt??null,error:j.error??null});
-  function invalidate(){for(const j of jobs.values())close(j);jobs.clear();epoch=null;progress=null;}
-  function finish(j,status,extra={}){
-    if(jobs.get(j.key)!==j||!['running','queued'].includes(j.status))return;
-    const finishedAt=now();
-    if(finishedAt-j.queuedAt>=timeoutMs){status='timeout';extra={error:'Planning request time budget exhausted'};}
-    close(j);Object.assign(j,{status,finishedAt},extra);onUpdate(read(j));pump();
-  }
-  function pump(){
-    if(active){
-      // A delayed timer must not let expired work keep the queue occupied on the next read.
-      if(now()-active.queuedAt>=timeoutMs)finish(active,'timeout',{error:'Planning request time budget exhausted'});
-      return;
-    }
-    const j=[...jobs.values()].find(j=>j.status==='queued');if(!j)return;
-    if(now()-j.queuedAt>=timeoutMs){finish(j,'timeout',{error:'Planning request time budget exhausted'});return;}
-    active=j;j.status='running';
-    try{
-      j.worker=factory();
-      j.worker.onmessage=({data})=>{
-        if(active!==j||data?.id!==j.id)return;
-        if(data.error)finish(j,'failed',{error:String(data.error)});
-        else if(j.payload.kind==='native-family-supply'){
-          if(data.kind!=='native-family-supply'||!(data.supply===null||data.supply&&
-              Array.isArray(data.supply.family)&&data.supply.family.length===3&&
-              data.supply.family.every(Number.isSafeInteger)&&data.supply.resources&&typeof data.supply.resources==='object'))
-            finish(j,'failed',{error:'Invalid native family-supply response'});
-          else finish(j,'ready',{supply:data.supply});
-        }
-        else if(data.kind!=='native-level-routes'||!Array.isArray(data.routes)||
-          !data.routes.every(r=>r.kind==='projects'&&Array.isArray(r.steps)&&Number.isFinite(r.hours)))
-          finish(j,'failed',{error:'Invalid native level-route response'});
-        else finish(j,'ready',{routes:data.routes});
-      };
-      j.worker.onerror=e=>finish(j,'failed',{error:String(e?.message??'Level worker failed')});
-      j.worker.onmessageerror=()=>finish(j,'failed',{error:'Level response could not be decoded'});
-      j.worker.postMessage({id:j.id,...j.payload});
-    }catch(e){finish(j,'failed',{error:String(e?.message??e)});}
-  }
-  function request(payload,context){
-    // A changed clock alone may retain the search, but its route must be replayed
-    // against the new clock by the native caller before any proposal is consumed.
-    const {serverTime}=payload.view,family=payload.kind==='native-family-supply';
-    const retain=family?retainFamilyProgress&&Array.isArray(payload.stockEligibility)&&payload.stockEligibility.length>0:retainLevelProgress;
-    const replay=retain&&!family;
-    const {facts,bounds}=observation(payload.view,retain);
-    // Family previews depend on clock predicates, not elapsed stock projections.
-    // Preserve a completed search across the mandatory fresh pre-submit read, but
-    // invalidate at adulthood, cooldown, room completion or production-event boundaries.
-    // Stock-only growth is equivalent only while every housing allowance stays the same.
-    // Actual settlement, all other facts and unknown fields still belong to the epoch.
-    const familyClock=family?[
-      facts.state.residents.map(p=>[p.adultAt<=serverTime,p.familyCooldownUntil>serverTime]),
-      facts.state.rooms.map(r=>[r.builtAt<=serverTime,r.upgradeAt!==null&&r.upgradeAt<=serverTime]),
-      (facts.env?.events||[]).map(e=>[e.startsAt<=serverTime,e.endsAt<=serverTime])]:null;
-    const newEpoch=keyOf([facts,context,familyClock,family?payload.stockEligibility:null]);
-    const regressed=progress&&Object.entries(progress).some(([key,value])=>!Number.isFinite(bounds[key])||bounds[key]<value);
-    if(epoch!==newEpoch||regressed){invalidate();epoch=newEpoch;}
-    progress=bounds;
-    // The job owns an immutable clone. Canonicalize its original view once,
-    // while every current read is still checked in full, including metadata/time.
-    const viewKey=replay?keyOf([payload.view,payload.planning?.campaign?.constructionPolicy?.budgetReleases]):null;
-    // The local ledger timestamp is the payment identity. Mapping it into a
-    // fresh server clock must not restart a search for millisecond read jitter;
-    // the caller replays the proposal with the new mapping before consumption.
-    const planning=structuredClone(payload.planning);
-    if(replay&&planning?.campaign?.constructionPolicy?.budgetReleases)
-      planning.campaign.constructionPolicy.budgetReleases=planning.campaign.constructionPolicy.budgetReleases.map(e=>{
-        if(!Number.isFinite(e.localReleaseAt))return e;
-        const {at,...payment}=e;return payment;
-      });
-    const key=keyOf([payload.kind,payload.options,payload.targetScore,payload.first,planning,payload.campaign]);
-    let j=jobs.get(key);
-    if(j?.status==='ready'&&now()-j.finishedAt>60000){close(j);jobs.delete(key);j=null;}
-    if(!j){
-      if(jobs.size>=4){const oldest=jobs.values().next().value;close(oldest);jobs.delete(oldest.key);}
-      j={id:++sequence,key,viewKey,payload:structuredClone(payload),status:'queued',queuedAt:now(),worker:null,timer:null};jobs.set(key,j);
-      // The deadline includes time in the queue; expired work must not acquire a Worker.
-      j.timer=setTimeout(()=>finish(j,'timeout',{error:'Planning request time budget exhausted'}),timeoutMs);
-    }
-    pump();
-    return {...read(j),recheck:replay&&viewKey!==j.viewKey};
-  }
-  return {request,invalidate};
-};
-  const shelterLevelWorkerSource=(()=>{let text;return ()=>{if(text)return text;
-    const fragments=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob("WyIndXNlIHN0cmljdCc7XG5jb25zdCBvYmplY3RTdGF0ZT14PT54IT09bnVsbCYmdHlwZW9mIHg9PT0nb2JqZWN0JyYmIUFycmF5LmlzQXJyYXkoeCk7XG4gIGNvbnN0IHNoZWx0ZXJSb29tcyA9IHsgcG93ZXI6IFsnc3RyJywncG93ZXInLDEyLDMwXSwgZGluZXI6IFsnYWdpJywnZm9vZCcsOCwyNV0sIHdhdGVyOiBbJ3BlcicsJ3dhdGVyJyw4LDI1XSxcbiAgICBzY3JhcDogWydlbmQnLCdzY3JhcCcsOCwzMF0sIG1lZGJheTogWydpbnQnLCdzdGltcGFrJywuNSwyXSwgd29ya3Nob3A6IFsnaW50JywncGFydHMnLC42LDNdLFxuICAgIGRvb3I6IFtdLCBlbGV2YXRvcjogW10sIHF1YXJ0ZXJzOiBbXSwgc3RvcmFnZTogW10sIHRyYWluaW5nOiBbXSwgYXJtb3J5OiBbXSwgdGFpbG9yOiBbXSwgcmFkaW86IFtdIH07XG4gIGNvbnN0IHNoZWx0ZXJCdWlsZFJ1bGVzID0ge3Bvd2VyOlsn5Y+R55S156uZJywxMDAsMV0sZGluZXI6WyfppJDljoUnLDEwMCwxXSx3YXRlcjpbJ+WHgOawtOermScsMTAwLDFdLHNjcmFwOlsn5bqf5paZ5Zue5pS256uZJyw4MCwxXSxcbiAgICBxdWFydGVyczpbJ+Wuv+iIjScsMTIwLDFdLHN0b3JhZ2U6Wyfku5PlupMnLDgwLDJdLG1lZGJheTpbJ+WMu+WKoeWupCcsMzAwLDNdLHRyYWluaW5nOlsn6K6t57uD5a6kJyw0MDAsNF0sXG4gICAgd29ya3Nob3A6Wyflt6XlnYonLDUwMCw1XSxhcm1vcnk6Wyfmrablmajlt6XlnYonLDYwMCw2XSx0YWlsb3I6WyfmnI3oo4Xlt6XlnYonLDYwMCw2XSxyYWRpbzpbJ+eUteWPsCcsODAwLDhdfTtcbiAgY29uc3QgY2FtcGFpZ25EZWZhdWx0cz17ZXhwbG9yZTpmYWxzZSxxdWVzdHM6ZmFsc2UsdHJhaW5pbmc6ZmFsc2UsbWVkaWNhbDpmYWxzZSxyYWRpbzpmYWxzZSxjb21iYXRHZWFyOmZhbHNlLHBhcmVudFByZXBhcmF0aW9uOnRydWUsXG4gICAgdGllcjowLGhvdXJzOjYsc3RpbXBha3M6MixyZXNlcnZlOjIsY2hhbmNlOjcwLGF0dGVtcHRzOjEsdHJhaW5UYXJnZXQ6NixndWFyZFJlc2lkZW50czoyLGd1YXJkUG93ZXJQZXJjZW50OjUwfTtcbiAgY29uc3Qgc2hlbHRlclJlc291cmNlcyA9IHsgcG93ZXI6ICfnlLXlipsnLCBmb29kOiAn6aOf54mpJywgd2F0ZXI6ICflh4DmsLQnLCBzY3JhcDogJ+W6n+aWmScsIHBhcnRzOiAn6Zu25Lu2Jywgc3RpbXBhazogJ+ayu+eWl+mSiCcgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgLy8g5YCS5LiL6K6w5b2V5LuN5Zyo5pe25L+d55WZ5oGi5aSN5ZCN6aKd77yb5LiN5Yet5pys5Zyw5pyf6ZmQ5o6o5pat5bey57uP5a6J6JGs77yM5Lmf5LiN6K6h5YWl5b2T5YmN5Lqn5Ye6L+a2iOiAl+OAglxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDlhazlvIDmiJjlipvlhazlvI/vvJvmjonokL3lkozph47lpJbkvKTlrrPnmoTlkI7lj7DlhazlvI/mnKrnn6XvvIzkuI3nlKjlubjov5Dmjqjmlq3msb3msLTmlLbnm4rjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuXG4gIGNvbnN0IHN0YWZmUm9vbVR5cGVzID0gWydwb3dlcicsJ2RpbmVyJywnd2F0ZXInLCdzY3JhcCddO1xuICBjb25zdCBzdGFmZlJvb21OYW1lcyA9IHsgcG93ZXI6J+WPkeeUteermScsZGluZXI6J+mkkOWOhScsd2F0ZXI6J+WHgOawtOermScsc2NyYXA6J+W6n+aWmeWbnuaUtuermScscXVhcnRlcnM6J+Wuv+iIjScgfTtcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAvLyDmqKHmi5/mr4/kuIDmraXnmoTmiL/pl7Tlrrnph4/kuI7kvpvlupTvvJvkuI3og73lronlhajohb7kvY3nmoTmu6HlkZjmiL/pl7Tkv53nlZnljp/lronmjpLjgIJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gIGNvbnN0IGZhbWlseUtleSA9IChhLGIpID0+IFthLGJdLnNvcnQoKHgseSk9PngteSkuam9pbignOicpO1xuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcbiAgIiwiXG4gICIsIlxuICAiLCJcblxuICAiLCJcbmxldCBzaGVsdGVyU3RhZmZNb2RlLHNoZWx0ZXJTdGFmZkhvbGQsc2hlbHRlclBvcHVsYXRpb25UYXJnZXQsc2hlbHRlck9wdGltaXplLHNoZWx0ZXJTdGF0ZTtcbmNvbnN0IHNhdmVTaGVsdGVyPSgpPT57dGhyb3cgRXJyb3IoXCJSZWFkLW9ubHkgZmFtaWx5IHByZXZpZXcgY2Fubm90IHNhdmUgc3RhdGVcIik7fTtcbmZ1bmN0aW9uIGluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoZW5kcG9pbnQsbW9kZWwscm91dGVzLGZhbWlseVN1cHBseT1udWxsKSB7XG4gIGVuZHBvaW50Lm9ubWVzc2FnZT0oe2RhdGF9KT0+e1xuICAgIHRyeXtcbiAgICAgIGlmKGRhdGEua2luZD09PSduYXRpdmUtZmFtaWx5LXN1cHBseScpe1xuICAgICAgICBpZighZmFtaWx5U3VwcGx5KXRocm93IEVycm9yKCdGYW1pbHktc3VwcGx5IGtlcm5lbCB1bmF2YWlsYWJsZScpO1xuICAgICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOmRhdGEua2luZCxzdXBwbHk6ZmFtaWx5U3VwcGx5KGRhdGEpfSk7cmV0dXJuO1xuICAgICAgfVxuICAgICAgY29uc3QgcmVzdWx0PXJvdXRlcyhtb2RlbChkYXRhLnZpZXcpLGRhdGEub3B0aW9ucyxkYXRhLnRhcmdldFNjb3JlLGRhdGEuZmlyc3QsZGF0YS5wbGFubmluZyk7XG4gICAgICBlbmRwb2ludC5wb3N0TWVzc2FnZSh7aWQ6ZGF0YS5pZCxraW5kOiduYXRpdmUtbGV2ZWwtcm91dGVzJyxyb3V0ZXM6cmVzdWx0fSk7XG4gICAgfWNhdGNoKGUpe2VuZHBvaW50LnBvc3RNZXNzYWdlKHtpZDpkYXRhLmlkLGVycm9yOlN0cmluZyhlPy5tZXNzYWdlPz9lKX0pO31cbiAgfTtcbn1cbmluc3RhbGxTaGVsdGVyTGV2ZWxXb3JrZXIoc2VsZixzaGVsdGVyTW9kZWwsc2hlbHRlckxldmVsUm91dGVzLGRhdGE9Pntcbih7c2hlbHRlclN0YWZmTW9kZSxzaGVsdGVyU3RhZmZIb2xkLHNoZWx0ZXJQb3B1bGF0aW9uVGFyZ2V0LHNoZWx0ZXJPcHRpbWl6ZSxzaGVsdGVyU3RhdGV9PWRhdGEucG9saWN5KTtcbnJldHVybiBzaGVsdGVyUG9wdWxhdGlvbkZhbWlseVN1cHBseShzaGVsdGVyTW9kZWwoZGF0YS52aWV3KSxkYXRhLmNhbXBhaWduKTtcbn0pO1xuIl0="),char=>char.charCodeAt(0))));
-    const functions=[
-      shelterWorkerRate,
-      shelterStoredItems,
-      shelterResidentIdentity,
-      shelterStoredProjection,
-      shelterSharedProjection,
-      shelterFutureCollection,
-      shelterCapacity,
-      shelterModel,
-      shelterProductionWithout,
-      shelterProductionEvaluator,
-      shelterDepartureSafe,
-      shelterConstructionSupply,
-      shelterRecoveringPopulation,
-      shelterFamilyExpecting,
-      shelterBirthParents,
-      shelterGrowthNeeds,
-      shelterSupplyShortages,
-      shelterFutureEmployment,
-      shelterGrowthEmployment,
-      shelterPopulationStage,
-      advanceShelterPopulation,
-      shelterCombat,
-      shelterQuestChance,
-      shelterQuestGrowth,
-      shelterQuestValue,
-      shelterQuestBetter,
-      shelterUtilityOutfit,
-      shelterHomeGear,
-      shelterCombatLoadout,
-      shelterDepartureLoadout,
-      shelterWeaponTransferAllowed,
-      validShelterSodaReceipts,
-      shelterSodaQuota,
-      shelterSodaQuotaText,
-      shelterExploreEfficiency,
-      shelterTripEvidence,
-      shelterExistingTrip,
-      shelterAdoptTrip,
-      shelterDefenseEnabled,
-      shelterLocalIncident,
-      shelterDefensePower,
-      shelterGuardPlan,
-      shelterGuardEvaluator,
-      shelterDefenseReturn,
-      shelterDefensePlan,
-      shelterParentKinship,
-      validShelterParentPreparation,
-      shelterParentPrepared,
-      shelterRankFamilies,
-      shelterParentPairAllowed,
-      shelterUpdateParentPreparation,
-      shelterParentAssessment,
-      shelterParentDevelopmentProjection,
-      shelterParentDevelopmentChoice,
-      shelterParentTrainingProjection,
-      shelterParentTrainingChoice,
-      shelterParentTrainingEstimate,
-      shelterStaffCapacity,
-      shelterTrainingDestinations,
-      shelterTrainingUpgrade,
-      shelterTrainingFinish,
-      shelterTrainingPurpose,
-      shelterTrainingValue,
-      shelterTrainingProgress,
-      shelterTrainingReturn,
-      shelterWorkshopFeeding,
-      shelterExploreSlots,
-      shelterCampaignPlan,
-      validShelterMaterials,
-      shelterAssignmentHeld,
-      shelterEquipmentHeld,
-      shelterOperationHeld,
-      shelterEquipmentObserved,
-      validShelterEquipmentHolds,
-      shelterAssignmentObservation,
-      validShelterAssignmentHolds,
-      validCampaignRecord,
-      validCampaignPending,
-      shelterCampaignProof,
-      shelterCampaignConfirmed,
-      shelterLevelProgress,
-      shelterResolvedLevelTarget,
-      shelterLevelEvents,
-      shelterPlanningStock,
-      shelterAdvancePlanningStock,
-      shelterMaterialForecast,
-      shelterMaterialTimeText,
-      shelterConstructionStockTarget,
-      shelterLevelProjectAllowed,
-      shelterLevelRouteFunding,
-      shelterPlanningBudget,
-      shelterPlanningBudgetReady,
-      shelterDevelopmentFundingProjection,
-      shelterDevelopmentTrainingOpportunity,
-      shelterDevelopmentRouteProjection,
-      shelterRankDevelopmentRoutes,
-      shelterLevelSearchBudget,
-      shelterLevelRoutes,
-      shelterPopulationAdvice,
-      shelterDailyGoals,
-      shelterDailyCraft,
-      shelterUpgradePowerStaffing,
-      shelterLaborInvestmentContext,
-      shelterLaborInvestment,
-      shelterDevelopmentPlan,
-      validShelterDevelopmentTrace,
-      shelterDevelopmentSnapshot,
-      shelterDevelopmentTrace,
-      shelterDevelopmentTraceText,
-      shelterDevelopmentText,
-      shelterConstructionSpent,
-      shelterUsesStockBudget,
-      shelterConstructionCommitments,
-      shelterConstructionAvailable,
-      shelterConstructionPolicy,
-      shelterConstructionBudgetCalendar,
-      shelterCaravanPlan,
-      shelterConstructionAllowance,
-      shelterConstructionPowerReserve,
-      shelterConstructionTargets,
-      shelterConstructionMaterials,
-      shelterConstructionSignature,
-      shelterNameUnique,
-      shelterTrainingComplete,
-      shelterGearPlan,
-      shelterFindGear,
-      shelterSwapSequences,
-      shelterSwapProjection,
-      shelterSwapEvaluator,
-      shelterAllocationScore,
-      shelterAllocationCompare,
-      shelterAllocationFutureSupply,
-      shelterAllocationImproves,
-      shelterAllocationWorthMoves,
-      shelterAllocationOutput,
-      shelterAllocationMoves,
-      shelterGreedyAllocation,
-      shelterFindAllocation,
-      planShelterAllocation,
-      shelterSwapStep,
-      shelterFamilySupplyPreserved,
-      planShelterSwap,
-      rememberShelterFamilies,
-      populationBudget,
-      populationHousingSupply,
-      populationPairingContext,
-      populationPairingChoice,
-      shelterPopulationPreparation,
-      populationCanHouse,
-      populationGrowthEmployment,
-      shelterPopulationDiagnostics,
-      shelterDormWorkers,
-      shelterRestingWorkers,
-      shelterIdleEmploymentAllocation,
-      shelterStaffInputError,
-      shelterIdleEmploymentChoice,
-      shelterEmploymentReservations,
-      shelterWorkshopPreparation,
-      shelterWorkshopBuildPreparation,
-      shelterConstructionPowerPreparation,
-      shelterPopulationFamilySupplyContext,
-      shelterPopulationFamilySupply,
-      shelterHealth
-    ];
-    return text=fragments.map((fragment,index)=>fragment+(functions[index]??'')).join('');
-  };})();
-  // END GENERATED SHELTER PLANNING WORKER
-  let shelterBackgroundPlanner = null;
-  function shelterPlanningContext(m) {
-    const held=shelterConstructionCommitments(shelterState,shelterPending);
-    return {enabled:shelterEnabled&&shelterOptimize&&shelterStaffMode!=='off'&&!shelterStaffHold&&
-        !shelterState.swap&&!shelterState.pair&&!m.state.rooms.some(r=>r.incident),
-      window:shelterState.developmentWindow,pending:shelterPending,
-      schedule:{vaultNo:m.view.vaultNo,campaign:shelterState.campaign,families:shelterState.families,
-        pair:shelterState.pair,swap:shelterState.swap,constructionLedger:shelterState.constructionLedger},
-      construction:{build:shelterConstruction.build,upgrade:shelterConstruction.upgrade,dig:shelterConstruction.dig,
-        budgetMode:shelterUsesStockBudget(shelterConstruction)?'stock':'daily',
-        scrapLimit:shelterConstruction.scrapLimit,partsLimit:shelterConstruction.partsLimit},
-      safety:{scrap:shelterConstruction.scrapReserve+held.scrap,parts:shelterConstruction.partsReserve+held.parts},
-      settings:[shelterStaffMode,shelterPopulationTarget,shelterLevelTarget,shelterCampaign,shelterGear,shelterOptimize],
-      readAt:shelterRead?.at??Date.now(),readStartedAt:shelterRead?.startedAt??Date.now()};
-  }
-  let shelterLevelPlanner=null;
-  const shelterLevelReplays=new Map();
   function shelterBackgroundLevelRoutes(m,options,targetScore,first,planning) {
-    if(!shelterEnabled||shelterPending||accountStopReason()){
-      shelterLevelPlanner?.invalidate();shelterLevelReplays.clear();return {routes:[],status:'disabled'};
-    }
-    // Pass the route kernel's actual constraints, not the whole mutable campaign
-    // output. Notes, selected actions and other Worker IDs are not search inputs
-    // and must not evict the same completed route as multiple plan variants.
-    const campaign=planning.campaign;
-    planning={...planning,campaign:campaign?{
-      reserved:campaign.reserved,dailyReserved:campaign.dailyReserved,
-      constructionPolicy:campaign.constructionPolicy,populationPreparation:campaign.populationPreparation
-    }:campaign};
-    shelterLevelPlanner??=createShelterLevelPlanning({source:shelterLevelWorkerSource,retainLevelProgress:true,onUpdate:status=>{
-      shelterLevelReplays.clear();
-      shelterCampaignSchedule.cache=null;
-      log.add('shelter-level-planning','后台等级路线比较完成，开工仍核对当前条件',
-        {status:status.status,jobId:status.id,snapshotAt:status.snapshotAt,routes:status.routes.length,error:status.error});schedule();
-    }});
-    const context=[shelterConstruction,shelterStaffMode,shelterPopulationTarget,shelterLevelTarget,
-      shelterCampaign,shelterGear,shelterOptimize,shelterStaffHold,shelterState.pair,shelterState.swap,
-      shelterState.constructionLedger];
-    const status=shelterLevelPlanner.request({view:m.view,options,targetScore,first,planning},context);
-    if(status.status!=='ready')return {routes:[],status:status.status};
-    const recheck=status.snapshotAt!==m.now||status.recheck;
-    // Several consumers inspect the same read while the native dialog is opening.
-    // Reuse only an exact replay input, including the current derived model/time.
-    // request() above still checks expiry, worker generation and all policy facts.
-    const key=recheck?JSON.stringify([status.id,m,options,targetScore,first,planning]):null;
-    let routes=key===null?status.routes:shelterLevelReplays.get(key);
-    if(!routes){routes=status.routes.flatMap(route=>{
-      // Replay only the proposed sequence at the current clock. This checks all
-      // costs, batches, pauses and staffing again, without another branching search.
-      const checked=shelterLevelRoutes(m,options,targetScore,first,{...planning,routeSteps:route.steps.map(s=>s.project)});
-      const end=checked.find(r=>r.steps.length===route.steps.length&&r.complete===route.complete);
-      return end?[end]:[];
-      });
-      if(shelterLevelReplays.size>=4)shelterLevelReplays.delete(shelterLevelReplays.keys().next().value);
-      routes=structuredClone(routes);shelterLevelReplays.set(key,routes);
-    }
-    // A consumer may annotate its proposal; never expose stored Worker/replay data.
-    return {routes:structuredClone(routes),status:'ready',jobId:status.id,snapshotAt:status.snapshotAt};
+    // Online decisions only replay one concrete project. Branching multi-day
+    // comparisons remain in the offline modules and their fixture tools.
+    const chosen=first||options.find(c=>!c.blocks.length);
+    return {routes:chosen?shelterLevelRoutes(m,options,targetScore,first,
+      {...planning,deep:false,comparisonHours:undefined,routeSteps:[chosen]}):[],status:'ready'};
   }
-  let shelterFamilyPlanner=null;
   function shelterBackgroundFamilySupply(m,campaign) {
-    if(!shelterEnabled||shelterPending||accountStopReason()||shelterStaffMode!=='population'||shelterStaffHold||
-        shelterState.pair||shelterState.swap||campaign.defense?.busy||!shelterState.families?.length||
-        Object.entries(shelterGrowthNeeds(m).demand).some(([k,need])=>m.production[k]<need*1.2-1e-9)){
-      shelterFamilyPlanner?.invalidate();return {status:'ready',supply:null};
-    }
-    const policy={shelterStaffMode,shelterStaffHold,shelterPopulationTarget,shelterOptimize,
-      shelterState:{families:shelterState.families,pair:shelterState.pair,swap:shelterState.swap}};
-    // Reuse the native eligibility check before paying serialization/Worker startup.
-    // No expensive swap search runs here; a full target or no ready family needs none.
-    const familyContext=shelterPopulationFamilySupplyContext(m,campaign,policy);
-    if(!familyContext){
-      // A different reservation variant may still need its in-flight/completed result.
-      // request() rechecks facts, policy and time boundaries before reusing that result.
-      return {status:'ready',supply:null};
-    }
-    // The family kernel uses stock only through this housing allowance. Preserve
-    // ordinary accumulation within the same allowance, never across its threshold.
-    // Include all recorded families so reservation variants share an observation
-    // and cannot repeatedly cancel each other's still-valid search.
-    const stockEligibility=policy.shelterState.families.flatMap(f=>{
-      const pair=[f.a,f.b].map(id=>m.state.residents.find(p=>p.id===id));
-      return pair.every(Boolean)?[[f.a,f.b,f.room,populationHousingSupply(m,policy.shelterState.families,pair).allowed]]:[];
-    });
-    shelterFamilyPlanner??=createShelterLevelPlanning({source:shelterLevelWorkerSource,retainFamilyProgress:true,onUpdate:status=>{
-      shelterCampaignSchedule.cache=null;
-      log.add('shelter-family-planning','后台家庭供给比较完成，调岗和建设仍核对当前快照',
-        {status:status.status,jobId:status.id,family:status.supply?.family??null,error:status.error,
-          requestedAt:status.queuedAt,finishedAt:status.finishedAt,timingScope:'queue-to-result-wall-clock'});schedule();
-    }});
-    const context=[policy,shelterConstruction,shelterCampaign,shelterGear,shelterLevelTarget];
-    return shelterFamilyPlanner.request({kind:'native-family-supply',view:m.view,policy,stockEligibility,
-      campaign:{reserved:campaign.reserved,dailyReserved:campaign.dailyReserved,trainingDestinations:campaign.trainingDestinations||[],
-        defense:{busy:Boolean(campaign.defense?.busy)}}},context);
-  }
-  function shelterStartBackgroundPlanning(m) {
-    const context=shelterPlanningContext(m);
-    if(!context.enabled||context.pending){shelterBackgroundPlanner?.invalidate();return;}
-    if(!context.window||context.window.end<=m.now){
-      context.window={start:m.now,end:m.now+168*3600000};
-      saveShelter({...shelterState,developmentWindow:context.window});
-    }
-    if(!shelterBackgroundPlanner)shelterBackgroundPlanner=createShelterNativePlanning({
-      client:createShelterPlanningClient({source:shelterPlanningWorkerSource,onUpdate:status=>{
-        log.add('shelter-planning','后台调岗比较完成，实际提交仍按当前状态核对',{
-          status:status.status,outcome:status.result?.body.outcome??null,
-          selected:status.result?.body.selected?.firstCandidate??null,budget:status.result?.body.budget??null,
-          error:status.error,jobId:status.id,requestedAt:status.startedAt,finishedAt:status.finishedAt,
-          timingScope:'request-to-result-wall-clock'});schedule();
-      }})});
-    shelterBackgroundPlanner.update(m.view,context);
-  }
-  function shelterBackgroundAssignment(m,allowed) {
-    const chosen=shelterBackgroundPlanner?.choose(m.view,shelterPlanningContext(m),allowed)??null;
-    if(chosen||shelterWork||!allowed.length)return chosen;
-    const status=shelterBackgroundPlanner?.status();
-    // Yield only the ordinary production decision, for at most 1.5 seconds. Urgent
-    // supply/family/defense and already opened native windows have earlier priority.
-    return status?.status==='running'&&Date.now()-status.startedAt<1500?
-      {kind:'development-wait',reason:'后台正在比较普通增产岗位'}:null;
+    return {status:'ready',supply:shelterPopulationFamilySupply(m,campaign,true)};
   }
   let shelterReadFailures = 0;
   let shelterWatchController = null, shelterWatchAt = 0, shelterWatchRaid = null, shelterWatchFailures = 0;
   let shelterRaidTrace = null;
   let shelterEntryAt = 0, shelterStage = 0, shelterActions = 0, shelterConfirmedActions = 0, shelterLeave = false, shelterVisitPeriod = null;
   let shelterUiWait = null, shelterCollection = null, shelterCollectionChecked = false;
+  const shelterUiSkipped=new Set();
   const shelterDailyDeferred = new Set();
   let shelterBatchReloading = false;
   const shelterFields=Object.fromEntries([...shadow.querySelectorAll('[id^="shelter-"]')].map(element=>[element.id.slice(8),element]));
@@ -8861,6 +5399,7 @@ installShelterPlanningWorker(self);
     shelterPending=loadState(storage,SHELTER_PENDING,null,'shelter',validShelterPending);
     shelterConstruction=loadState(storage,SHELTER_CONSTRUCTION,shelterConstruction,'shelter',validConstructionConfig);
     shelterCampaign=loadState(storage,SHELTER_CAMPAIGN,shelterCampaign,'shelter',validCampaignConfig);
+    shelterCampaign={...shelterCampaign,radio:false,parentPreparation:true};
     if(stateFault('shelter')||shelterStopFault)shelterEnabled=false;
     const staff=storage.getItem(SHELTER_STAFF);
     shelterStaffMode=staffModes.includes(staff)?staff:'off';
@@ -8920,6 +5459,18 @@ installShelterPlanningWorker(self);
     cancelQueued();cancelShelterRead();
     log.add('shelter-preparation-recovered','旧页面准备尚未绑定原请求，撤销准备并重新规划',
       {operation:p.id,kind:p.kind,targets:p.targets,phase:p.lifecycle.phase,independent:Boolean(parent.emergency)});
+    return true;
+  }
+  function shelterMigratePlanPolicy(m) {
+    if(shelterState.planPolicy===1||shelterPending||nativePending().length||captureShelterAction||continueShelterAction||
+        shelterWorkConfirm||shelterWork||shelterBuildWork||shelterRecallWork||shelterRescueWork||shelterCampaignWork)return false;
+    const old=shelterState,swap=old.swap,pair=old.pair,unchanged=(id,room)=>m.state.residents.some(p=>
+      p.id===id&&p.roomId===room&&p.away===null&&p.deadAt===null&&!p.romance);
+    const dropSwap=swap?.step===0&&Array.isArray(swap.people)&&swap.people.length>0&&swap.people.every(p=>p&&unchanged(p.id,p.room));
+    const dropPair=pair?.step===0&&unchanged(pair.a,pair.fromA)&&unchanged(pair.b,pair.fromB)&&
+      !shelterFamilyExpecting(m.state,pair.a,pair.b);
+    saveShelter({...old,planPolicy:1,developmentWindow:undefined,...(dropSwap?{swap:null}:{}),...(dropPair?{pair:null}:{}),
+      ...(dropSwap||dropPair?{policyMigration:{at:m.now,swap:dropSwap?swap:null,pair:dropPair?pair:null}}:{})});
     return true;
   }
   function cancelShelterRead() {
@@ -9022,13 +5573,13 @@ installShelterPlanningWorker(self);
     });
     return true;
   }
-  const shelterPresetPopulation=()=>Math.max(30,shelterPopulationTarget??30);
+  const shelterPresetPopulation=()=>200;
   const shelterPresetBudget=()=>localStorage.getItem(SHELTER_CONSTRUCTION)===null?
       {budgetMode:'stock',scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0}:shelterConstruction;
   function shelterRecommended() {
     const construction=shelterPresetBudget(),stock=shelterUsesStockBudget(construction),allow=stock||construction.scrapLimit>0;
     return {population:shelterPresetPopulation(),
-      campaign:{...shelterCampaign,sodaEfficiency:true,...Object.fromEntries(campaignFlags.map(k=>[k,k!=='caravanDaily']))},
+      campaign:{...shelterCampaign,sodaEfficiency:true,...Object.fromEntries(campaignFlags.map(k=>[k,!['caravanDaily','radio'].includes(k)]))},
       construction:{...construction,budgetMode:stock?'stock':'daily',build:allow,upgrade:allow,dig:allow}};
   }
   let shelterBudgetView,shelterShownTrace;
@@ -9064,7 +5615,7 @@ installShelterPlanningWorker(self);
     setPanelProperty(shelterFields['cancel-old-assignment'],'hidden',!recoverable||!blocked);
     setPanelText(shelterFields.toggle,shelterEnabled ? '暂停避难所' : '开启避难所');
     const budget=shelterPresetBudget();
-    setPanelText(shelterFields['preset-summary'],`应用后：人口阶段目标 ${shelterPresetPopulation()} 人，开启持续分阶段增长；按床位、成年口粮和岗位逐批准备，最多200人。${shelterUsesStockBudget(budget)?'建设按实际库存扣除未决原单预留':'保留自定义建设24小时上限 '+budget.scrapLimit+' 废料 / '+budget.partsLimit+' 零件'}，另保留 ${budget.scrapReserve} 废料 / ${budget.partsReserve} 零件。\n汽水优先：按网页资格时长召回，默认跟随网页最高已解锁区域。不清账本、不花汽水。`);
+    setPanelText(shelterFields['preset-summary'],`应用后：人口目标固定200人；两对父母七项基础属性均达10后生育，按床位和实际供给逐批准备，关闭主动广播和持续追级。${shelterUsesStockBudget(budget)?'建设按实际库存扣除未决原单预留':'保留自定义建设24小时上限 '+budget.scrapLimit+' 废料 / '+budget.partsLimit+' 零件'}，另保留 ${budget.scrapReserve} 废料 / ${budget.partsReserve} 零件。\n汽水优先：按网页资格时长召回，默认跟随网页最高已解锁区域。不清账本、不花汽水。`);
     setPanelText(shelterFields['config-summary'],`当前：${({off:'仅领取',production:'生产',family:'生产与已有家庭',population:'生产与人口发展'})[shelterStaffMode]}；探险${shelterCampaign.explore?'开':'关'}、周任务${shelterCampaign.quests?'开':'关'}、训练${shelterCampaign.training?'开':'关'}、医疗${shelterCampaign.medical?'开':'关'}、电台${shelterCampaign.radio?'开':'关'}。${!enabled?'总开关已暂停，开启本模块后仍需启动总开关。':''}${!shelterUsesStockBudget(budget)&&budget.scrapLimit===0?'已保留零建设额度，不会开工。':''}`);
     setPanelText(shelterFields.advice,shelterState.advice || '首次检查后显示生产和生育建议；人员由你安排。');
     setPanelText(shelterFields.development,shelterState.development || '检查避难所后比较建造、升级和扩容。建议不会自动花费资源。');
@@ -9098,6 +5649,7 @@ installShelterPlanningWorker(self);
     setPanelText(shelterFields['explore-status'],shelterExploreClaim||shelterCampaign.explore?
       shelterExploreNote||shelterState.exploreNote||'库存足够时领取已归来的探险；出发、召回和周任务按养成模块开关执行。':'探险自动领取未开启。');
     const target = shelterFields.population;
+    setPanelProperty(target,'disabled',true);
     if (shadow.activeElement !== target) setPanelProperty(target,'value',String(shelterPopulationTarget ?? ''));
     setPanelProperty(shelterFields['population-continuous'],'checked',shelterPopulationContinuous);
     const levelInput=shelterFields['level-target'];
@@ -9152,7 +5704,7 @@ installShelterPlanningWorker(self);
     cancelQueued();cancelShelterRead();cancelShelterAuxReads();
     if(shelterBuildWork)shelterBuildWork.cancelled=true;
     if(shelterRecallWork)shelterRecallWork.cancelled=true;
-    for(const [key,value] of [[SHELTER_STAFF,'population'],[SHELTER_POPULATION,String(next.population)],[SHELTER_POPULATION_CONTINUOUS,'true'],[SHELTER_LEVEL_TARGET,'auto'],
+    for(const [key,value] of [[SHELTER_STAFF,'population'],[SHELTER_POPULATION,String(next.population)],[SHELTER_POPULATION_CONTINUOUS,'false'],[SHELTER_LEVEL_TARGET,'off'],
       [SHELTER_GEAR,'true'],[SHELTER_OPTIMIZE,'true'],[SHELTER_EXPLORE_CLAIM,'true'],
       [SHELTER_CAMPAIGN,JSON.stringify(next.campaign)],[SHELTER_CONSTRUCTION,JSON.stringify(next.construction)]])write(key,value);
     shelterReload();
@@ -9250,6 +5802,7 @@ installShelterPlanningWorker(self);
   });
   shelterControl('campaign-save','click',()=>{
     const next={};for(const k of campaignFlags)next[k]=shelterFields[`campaign-${k}`].checked;
+    next.radio=false;next.parentPreparation=true;
     next.sodaEfficiency=shelterFields['campaign-sodaEfficiency'].checked;
     for(const k of Object.keys(campaignNumbers)){const value=shelterFields[`campaign-${k}`].value.trim();next[k]=value===''?NaN:Number(value);}
     if(!validCampaignConfig(next)){say('探险与养成数值须为输入框范围内的整数');return;}
@@ -9276,6 +5829,8 @@ installShelterPlanningWorker(self);
   });
   function shelterUserInteraction(event) {
     if(!event.isTrusted||!inShelter()||event.composedPath().includes(host))return false;
+    const control=event.target?.closest?.('button,input,select,textarea,a[href],[role="button"],[role="tab"],[contenteditable="true"]');
+    if(!control||control.matches?.(':disabled,[aria-disabled="true"]'))return false;
     if(event.type!=='keydown')return true;
     // A modifier alone or the OS screenshot chord does not operate the game.
     // Navigation/activation keys and actual input still transfer ownership.
@@ -9317,10 +5872,7 @@ installShelterPlanningWorker(self);
     saveShelter({ ...shelterState,swap:null,nextAt:0,note:'人员管理设置已更新' }); schedule();
   });
   shelterControl('population','change',event => {
-    const value = Number(event.target.value);
-    if (!Number.isInteger(value) || value < 2 || value > 200) {
-      say('人口目标请输入 2～200 的整数'); event.target.value = shelterPopulationTarget ?? ''; return;
-    }
+    const value = 200;event.target.value='200';
     localStorage.setItem(SHELTER_POPULATION_CONTINUOUS,String(shelterPopulationContinuous));
     localStorage.setItem(SHELTER_POPULATION,String(value)); shelterPopulationTarget = value;
     shelterPopulationNote = ''; shelterStaffHold = false; shelterStaffNote = '';
@@ -9328,22 +5880,23 @@ installShelterPlanningWorker(self);
     saveShelter({...shelterState,nextAt:0,note:'人口目标已更新'}); schedule();
   });
   shelterControl('population-continuous','change',event=>{
-    shelterPopulationContinuous=event.target.checked;
+    shelterPopulationContinuous=false;event.target.checked=false;
     localStorage.setItem(SHELTER_POPULATION_CONTINUOUS,String(shelterPopulationContinuous));
     shelterPopulationNote='';cancelShelterRead();cancelQueued();
     saveShelter({...shelterState,nextAt:0,note:shelterPopulationContinuous?
       '已启用持续分阶段增长：人数、成年子女就业和成年口粮落实后规划下一批，儿童继续成长':'已改为固定人口上限，不再自动提高目标'});schedule();
   });
   function setShelterLevelTarget(value){
-    localStorage.setItem(SHELTER_LEVEL_TARGET,String(value));shelterLevelTarget=value;
+    value=Number.isInteger(value)&&value>=1&&value<=20?value:null;
+    localStorage.setItem(SHELTER_LEVEL_TARGET,value===null?'off':String(value));shelterLevelTarget=value;
     cancelShelterRead();cancelQueued();
-    saveShelter({...shelterState,nextAt:0,note:value==='auto'?'已启用持续升级，每达一级继续规划下一级':`等级目标已更新为${value}级，按最新状态重新规划`});schedule();
+    saveShelter({...shelterState,nextAt:0,note:value===null?'已关闭额外追级，按实际人口、供给及岗位需求建设':`等级目标已更新为${value}级，按最新状态重新规划`});schedule();
   }
   shelterControl('level-continuous','change',event=>{
-    const fixed=Number(shelterFields['level-target'].value);
-    setShelterLevelTarget(event.target.checked?'auto':Number.isInteger(fixed)&&fixed>=1&&fixed<=20?fixed:10);
+    event.target.checked=false;setShelterLevelTarget(null);
   });
   shelterControl('level-target','change',event=>{
+    if(event.target.value.trim()===''){setShelterLevelTarget(null);return;}
     const value=Number(event.target.value);
     if(!Number.isInteger(value)||value<1||value>20){say('等级目标请输入1～20的整数');event.target.value=shelterLevelTarget??'';return;}
     setShelterLevelTarget(value);
@@ -9794,7 +6347,7 @@ installShelterPlanningWorker(self);
     const future=shelterFutureEmployment(m,record);
     return {allowed:!missing.length&&future.allowed,unemployed:unemployed.map(p=>p.id),missing,waiting,future,
       protectedResidents:[...protectedIds],committedPairs:[...committedPairs],
-      message:missing.length?`${missing.length}名成年居民尚未落实有效岗位，先就业或完成岗位建设后自动恢复增长`:future.message};
+      message:missing.length?`${missing.length}名成年居民尚未落实有效岗位，继续安排就业；不单独否决符合床位和供给条件的配对`:future.message};
   }
   function shelterPopulationStage(m,target,continuous,state={},pending=null) {
     const s=m.state,living=s.residents.filter(p=>p.deadAt===null),growth=shelterGrowthNeeds(m);
@@ -10205,8 +6758,7 @@ installShelterPlanningWorker(self);
       Number.isFinite(role.until)&&now>=role.until||Number.isFinite(role.windowEnd)&&now>=role.windowEnd||!cfg.training);
     const specialHeld=original?.type==='training'&&!trainingFinished||
       original?.type==='workshop'&&cfg.workshop&&(cfg.partsTarget===undefined||s.resources.parts<cfg.partsTarget)||
-      original?.type==='medbay'&&(s.resources.stimpak<(cfg.reserve??0)+1||s.residents.some(q=>{
-        const h=shelterHealth(q);return q.deadAt===null&&q.away===null&&h&&h.hp<.9*h.max;}))||
+      original?.type==='medbay'&&s.resources.stimpak<(cfg.reserve??0)+1||
       original?.type==='radio'&&cfg.radio;
     if(familyHeld||specialHeld)return null;
     const supplyKeys=['power','food','water'],demand=shelterGrowthNeeds(m).demand;
@@ -10265,7 +6817,8 @@ installShelterPlanningWorker(self);
       for(const room of rooms){
         const present=adults.filter(p=>p.roomId===room.id);
         for(const person of present)reserved.add(person.id);
-        if(!record.pending&&!assignmentHeld.size&&present.length<101&&available)actions.push({kind:'rescue',room:room.id,targets:[room.id],
+        if(!record.pending&&!assignmentHeld.size&&present.length<101&&available&&
+            !record.rescueSkipped?.includes(`${room.id}:${room.incident.kind}`))actions.push({kind:'rescue',room:room.id,targets:[room.id],
           incidentKind:room.incident.kind,present:present.length,reason:`房间${room.id}一键救援：在场${present.length}/101，原生每批最多3人`});
       }
       return {active,busy:true,actions,notes,settled,reserved:[...reserved]};
@@ -10314,6 +6867,26 @@ installShelterPlanningWorker(self);
     return ['a','b'].every(k=>{const p=m.state.residents.find(p=>p.id===f[k]);
       return p&&['str','per','end','cha','int','agi','lck'].every(stat=>Number.isFinite(p.stats[stat])&&p.stats[stat]>=10);});
   }
+  function shelterReadyParentPair(m,record,target) {
+    const s=m.state,growth=shelterGrowthNeeds(m);
+    if(growth.futureMouths>=Math.min(200,target,m.populationCap))return null;
+    for(const f of record.parentPreparation?.pairs||[]){
+      if(!shelterParentPrepared(m,f))continue;
+      const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id));
+      if(!pair.every(p=>p&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&p.happiness>=50&&
+          shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&!p.romance&&!(p.familyCooldownUntil>m.now)&&
+          shelterResidentIdentity(s,p))||!shelterParentKinship(s)(...pair)||
+          s.births.some(b=>shelterBirthParents(s,b)?.some(id=>[f.a,f.b].includes(id))))continue;
+      const room=s.rooms.find(r=>r.type==='quarters'&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
+        !s.births.some(b=>b.roomId===r.id)&&!s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&
+          p.roomId===r.id&&![f.a,f.b].includes(p.id)));
+      const demand={...growth.demand,food:Math.max(growth.demand.food,growth.futureMouths+1),
+        water:Math.max(growth.demand.water,growth.futureMouths+1)};
+      const production=shelterProductionWithout(m,[f.a,f.b]);
+      if(room&&Object.keys(demand).every(k=>s.resources[k]>=demand[k]*2&&production[k]>=demand[k]*1.2-1e-9))return {pair:f,room:room.id};
+    }
+    return null;
+  }
   function shelterRankFamilies(m,families) {
     const scores=new Map(families.map(f=>{const pair=[f.a,f.b].map(id=>m.state.residents.find(p=>p.id===id));
       const valid=pair.every(p=>p&&['str','per','end','cha','int','agi','lck'].every(k=>Number.isFinite(p.stats[k])));
@@ -10321,8 +6894,7 @@ installShelterPlanningWorker(self);
     return [...families].sort((a,b)=>scores.get(b).total-scores.get(a).total||scores.get(b).charm-scores.get(a).charm||a.a-b.a||a.b-b.b);
   }
   function shelterParentPairAllowed(m,pair,preparation,existing=false) {
-    if(!preparation)return true;
-    if(!preparation.pairs?.length)return pair.length===2&&shelterParentPrepared(m,{a:pair[0]?.id,b:pair[1]?.id});
+    if(!preparation?.pairs?.length)return pair.length===2&&shelterParentPrepared(m,{a:pair[0]?.id,b:pair[1]?.id});
     const ids=pair.map(p=>p?.id),cohort=preparation.pairs.find(f=>[f.a,f.b].some(id=>ids.includes(id)));
     if(cohort)return ids.includes(cohort.a)&&ids.includes(cohort.b)&&shelterParentPrepared(m,cohort);
     return existing&&pair.length===2&&shelterParentPrepared(m,{a:ids[0],b:ids[1]});
@@ -10334,6 +6906,7 @@ installShelterPlanningWorker(self);
       return;
     }
     const s=m.state,previous=shelterState.parentPreparation,unrelated=shelterParentKinship(s);
+    if(shelterGrowthNeeds(m).futureMouths>=Math.min(200,shelterPopulationTarget))return;
     if(previous?.pairs.some(f=>f.target!==10)){
       saveShelter({...shelterState,parentPreparation:{...previous,pairs:previous.pairs.map(f=>({...f,target:10}))}});
     }
@@ -10360,20 +6933,41 @@ installShelterPlanningWorker(self);
     const demand=shelterGrowthNeeds(m).demand,evaluate=shelterProductionEvaluator(m);
     const candidates=s.residents.filter(p=>{
       const room=s.rooms.find(r=>r.id===p.roomId),health=shelterHealth(p);
-      return !protectedIds.has(p.id)&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&p.happiness>=50&&
-        health?.hp>=.9*health?.max&&shelterResidentIdentity(s,p)&&!roles.some(r=>r.id===p.id)&&
+      return !protectedIds.has(p.id)&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
+        health?.hp>=.6*health?.max&&shelterResidentIdentity(s,p)&&!roles.some(r=>r.id===p.id)&&
         (p.roomId===null||active(room)&&['power','diner','water','scrap'].includes(room.type))&&
         ['str','per','end','cha','int','agi','lck'].every(k=>Number.isInteger(p.stats[k])&&p.stats[k]>=0&&p.stats[k]<=10)&&
         shelterConstructionSupply(m,[p.id],demand,shelterProductionWithout(m,[p.id],evaluate)).safe;
     });
-    const options=[];
-    for(let i=0;i<candidates.length;i++)for(let j=i+1;j<candidates.length;j++)if(unrelated(candidates[i],candidates[j])){
-      const [a,b]=[candidates[i].id,candidates[j].id].sort((a,b)=>a-b);options.push({a,b,target:10,at:m.now});
-    }
-    for(const f of shelterRankFamilies(m,options)){
-      if(pairs.length>=2)break;
-      if(pairs.some(old=>[old.a,old.b].some(id=>[f.a,f.b].includes(id))))continue;
-      pairs.push(f);
+    const fastest=new Map();
+    for(const room of s.rooms.filter(room=>room.type==='training'&&active(room)).sort((a,b)=>b.level-a.level||a.id-b.id))
+      if(!fastest.has(room.trainStat))fastest.set(room.trainStat,room);
+    const remaining=new Map(candidates.map(p=>[p.id,['str','per','end','cha','int','agi','lck'].reduce((total,stat)=>{
+      if(p.stats[stat]>=10)return total;
+      const room=fastest.get(stat);if(!room||!Number.isFinite(total))return Infinity;
+      for(let base=p.stats[stat];base<10;base++){
+        const estimate=shelterParentTrainingEstimate(m,{...p,trainingStat:base===p.stats[stat]?p.trainingStat:null,stats:{...p.stats,[stat]:base}},room,demand);
+        total+=estimate?.hours??Infinity;
+      }
+      return total;
+    },0)]));
+    const totals=new Map(candidates.map(person=>[person.id,Object.values(person.stats).reduce((sum,value)=>sum+value,0)]));
+    const held=new Set(pairs.flatMap(pair=>[pair.a,pair.b]));
+    const compare=(left,right)=>left.finish-right.finish||left.hours-right.hours||right.total-left.total||right.charm-left.charm||left.a-right.a||left.b-right.b;
+    while(pairs.length<2){
+      let best=null;
+      for(let index=0;index<candidates.length;index++){
+        const left=candidates[index];if(held.has(left.id))continue;
+        for(let other=index+1;other<candidates.length;other++){
+          const right=candidates[other];if(held.has(right.id))continue;
+          const leftHours=remaining.get(left.id),rightHours=remaining.get(right.id);
+          const option={a:Math.min(left.id,right.id),b:Math.max(left.id,right.id),finish:Math.max(leftHours,rightHours),hours:leftHours+rightHours,
+            total:totals.get(left.id)+totals.get(right.id),charm:left.stats.cha+right.stats.cha};
+          if((!best||compare(option,best)<0)&&unrelated(left,right))best=option;
+        }
+      }
+      if(!best)break;
+      held.add(best.a);held.add(best.b);pairs.push({a:best.a,b:best.b,target:10,at:m.now});
     }
     const next={version:1,pairs};
     if(JSON.stringify(previous)!==JSON.stringify(next)){
@@ -10675,7 +7269,8 @@ installShelterPlanningWorker(self);
     return Math.max(0,room.width*2-held.size);
   }
   function shelterTrainingDestinations(m,roles=[],exclude=null) {
-    return roles.filter(r=>r.role==='training'&&['parent','production'].includes(r.purpose)&&r.id!==exclude&&
+    // A former job is a preference on return, never a long-lived seat reservation.
+    return roles.filter(r=>r.returning===true&&r.role==='training'&&['parent','production'].includes(r.purpose)&&r.id!==exclude&&
       Number.isSafeInteger(r.destination)&&r.destination>0&&m.state.residents.some(p=>p.id===r.id&&p.deadAt===null&&
         (p.roomId===r.room||r.purpose==='parent'&&!m.state.rooms.some(room=>room.id===r.room)&&
           m.state.rooms.some(room=>room.id===p.roomId&&room.type==='training'&&room.trainStat===r.stat)&&
@@ -10687,7 +7282,7 @@ installShelterPlanningWorker(self);
       progress=shelterTrainingValue(p,stat);
     const existing=!role||role.existingTraining===true;
     if(!cfg.training||!cfg.development||record.pending||!p||p.deadAt!==null||p.away!==null||p.adultAt>m.now||
-        !health||health.hp<.9*health.max||room?.type!=='training'||p.roomId!==room.id||room.builtAt>m.now||
+        !health||health.hp<(role?.purpose==='parent'?.6:.9)*health.max||room?.type!=='training'||p.roomId!==room.id||room.builtAt>m.now||
         !Number.isFinite(room.upgradeAt)||room.upgradeAt<=m.now||room.incident||room.unpowered||
         !Number.isInteger(room.level)||room.level<1||room.level>=3||!Number.isInteger(perk)||perk<0||perk>10||
         !Number.isInteger(base)||base<0||base>=10||!Number.isFinite(progress)||progress<0||progress===0&&!existing||progress>=1||
@@ -10706,7 +7301,7 @@ installShelterPlanningWorker(self);
     const health=p&&shelterHealth(p),fixed=role?.finishCurrent||role?.preparation||role?.purpose==='production';
     const current=fixed&&role.stat===room?.trainStat&&p?.stats?.[role.stat]===role.base&&m.now<role.until;
     const existing=!role||role.existingTraining===true,value=shelterTrainingValue(p,room?.trainStat);
-    if(!health||health.hp<.9*health.max||!cfg.training||!cfg.development||record.pending||
+    if(!health||health.hp<(role?.purpose==='parent'?.6:.9)*health.max||!cfg.training||!cfg.development||record.pending||
       role?.preparation&&(!cfg.parentTraining||!cfg.parentPreparation)||
       fixed&&!current&&!(role.stat===room?.trainStat&&p.stats?.[role.stat]>role.base)||room?.type!=='training'||
       p.roomId!==room.id||!Number.isFinite(value)||value<0||value===0&&!existing||value>=1||
@@ -10748,6 +7343,21 @@ installShelterPlanningWorker(self);
     // unknown/nonproductive origin remains a possible competitor; temporary
     // supply, funding or occupancy limits cannot rule out later competition.
     return {resource,oldResource,compatible:Boolean(resource&&(!oldResource||oldResource===resource))};
+  }
+  function shelterParentContinuation(m,p,room,role,continueTraining) {
+    if(!role?.preparation||role.purpose!=='parent'||room?.type!=='training'||room.trainStat!==role.stat||
+        p.roomId!==room.id||p.stats[role.stat]<role.base||p.stats[role.stat]>=10)return null;
+    const progress=shelterTrainingProgress(m,p,room);
+    if(!Number.isFinite(progress.finishAt))return null;
+    if(!continueTraining&&(role.finishCurrent?p.stats[role.stat]!==role.base:
+        !(shelterTrainingValue(p,role.stat)>0)))return null;
+    // The native progress remains authoritative while training this attribute.
+    // Keep the original deadline for observation; crossing it is not a reason
+    // to leave an otherwise safe, progressing cell and start over.
+    const {destination,...next}=role;
+    const changed=p.stats[role.stat]!==role.base||!continueTraining&&!role.finishCurrent;
+    return {...next,base:p.stats[role.stat],at:changed?m.now:role.at,until:changed?progress.finishAt+600000:role.until,
+      ...(!continueTraining?{finishCurrent:true}:{})};
   }
   function shelterTrainingValue(person,stat,incumbent=true) {
     if(!person?.trainingStat)return incumbent?person?.training:0;
@@ -10897,15 +7507,16 @@ installShelterPlanningWorker(self);
   function shelterCampaignPlan(m,cfg={},record={},target=14) {
     const assignmentHeld=new Set(shelterOperationHeld(record,m.state));
     const s=m.state,now=m.now,notes=[],reserved=new Set(assignmentHeld),actions=[],projects=[],roles=[...(record.roles||[])];
-    const preparationPairs=record.parentPreparation?.pairs||[],preparingPairs=preparationPairs.filter(f=>!shelterParentPrepared(m,f));
+    const cultivating=shelterGrowthNeeds(m).futureMouths<Math.min(200,target);
+    const preparationPairs=cultivating?record.parentPreparation?.pairs||[]:[],preparingPairs=preparationPairs.filter(f=>!shelterParentPrepared(m,f));
     const preparationOf=p=>preparingPairs.find(f=>[f.a,f.b].includes(p.id));
     const enabled=cfg.development||['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>['parent','production','current'].includes(r.purpose));
     const workshopWorkers=roles.filter(r=>r.role==='workshop'&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>r.id);
-    const result={enabled,notes,reserved:[...assignmentHeld],dailyReserved:[],dailyProduction:[],actions,projects,events:[],partsReserve:cfg.partsReserve||0,workshopWorkers,
+    const result={enabled,runtimeSimple:Boolean(cfg.runtimeSimple),notes,reserved:[...assignmentHeld],dailyReserved:[],dailyProduction:[],actions,projects,events:[],partsReserve:cfg.partsReserve||0,workshopWorkers,
       materials:record.materials,populationPreparation:record.populationPreparation??null,constructionPolicy:record.constructionPolicy,trainingDestinations:[],adoptions:[],
       laborInvestmentEnabled:Boolean(cfg.development&&cfg.optimize),futureEmployment:shelterFutureEmployment(m,record),
       populationDefense:{enabled:shelterDefenseEnabled(cfg),guard:null,supply:{...m.production}},
-      parentResidents:[...new Set([...(record.families||[]),...preparationPairs].flatMap(f=>[f.a,f.b]))],
+      parentResidents:[...new Set([...(cultivating?record.families||[]:[]),...preparationPairs].flatMap(f=>[f.a,f.b]))],
       parentPreparation:preparationPairs.map(f=>({...f,ready:shelterParentPrepared(m,f)}))};
     const daily=cfg.dailyGoals?shelterDailyGoals(m):null;result.dailyGoals=daily;
     if(daily)notes.push(...daily.notes);
@@ -10930,7 +7541,7 @@ installShelterPlanningWorker(self);
       return homeChecks.get(p);
     };
     const expecting=new Set(s.births.flatMap(b=>shelterBirthParents(s,b)||[]));
-    const parentIds=new Set([...(record.families||[]),...preparationPairs].flatMap(f=>[f.a,f.b]));
+    const parentIds=new Set([...(cultivating?record.families||[]:[]),...preparationPairs].flatMap(f=>[f.a,f.b]));
     if(preparationPairs.length)notes.push(`父母预培养 ${preparationPairs.length}/2 对，${preparationPairs.filter(f=>shelterParentPrepared(m,f)).length} 对七项基础属性已达10；未达标组合暂停生育，按空位分批训练，等待时继续生产。`);
     const protectedIds=new Set([...assignmentHeld,...s.residents.filter(p=>p.romance&&!shelterFamilyExpecting(s,p.id,p.romance.partnerId)).flatMap(p=>[p.id,p.romance.partnerId])]);
     for(const b of s.births)if(!shelterBirthParents(s,b)){
@@ -10956,7 +7567,7 @@ installShelterPlanningWorker(self);
         for(const {p,rate} of workers){
           const before=removed.get(p.roomId)||0;removed.set(p.roomId,before+rate);
           if(collectable()>=goal.remaining)continue;
-          removed.set(p.roomId,before);protectedIds.add(p.id);kept.push(p.id);
+          removed.set(p.roomId,before);if(!preparationOf(p)){protectedIds.add(p.id);kept.push(p.id);}
         }
         result.dailyReserved.push(...kept);
         if(kept.length)notes.push(`今日${goal.label}尚差 ${goal.remaining}，按各房间整批领取保留 ${kept.length} 名现有产出人员；各房零头不合并，预留十分钟领取时间。`);
@@ -11079,15 +7690,16 @@ installShelterPlanningWorker(self);
     }
     const defense=shelterDefensePlan(m,cfg,record);
     const wounded=s.residents.filter(p=>home(p)&&shelterHealth(p).hp<.9*shelterHealth(p).max).sort((a,b)=>a.hp/shelterHealth(a).max-b.hp/shelterHealth(b).max||a.id-b.id);
-    const canHeal=p=>cfg.medical&&s.resources.stimpak>cfg.reserve&&
-      !(record.heals||[]).some(h=>h.id===p.id&&now-h.at<1800000)&&
+    const canHeal=p=>cfg.medical&&s.resources.stimpak>cfg.reserve&&!record.skippedHealing?.includes(p.id)&&
+      (!(record.heals||[]).some(h=>h.id===p.id&&now-h.at<1800000)||defense.active&&shelterHealth(p).critical&&
+        s.rooms.some(r=>r.id===p.roomId&&r.incident?.kind==='raiders'))&&
       (!record.pending||shelterIndependentDefense(record.pending,{kind:'stimpak',role:'medical',id:p.id},m,cfg,record.readStartedAt));
     const combatHealing=defense.active&&defense.busy;
-    const critical=combatHealing?wounded.find(p=>canHeal(p)&&shelterHealth(p).critical&&
-      s.rooms.some(r=>r.id===p.roomId&&r.incident?.kind==='raiders')):null;
+    const critical=wounded.find(p=>canHeal(p)&&shelterHealth(p).critical&&
+      (!combatHealing||s.rooms.some(r=>r.id===p.roomId&&r.incident?.kind==='raiders')));
     const patient=critical||wounded.find(canHeal);
-    const healing=patient?{kind:'stimpak',targets:[patient.id],id:patient.id,name:normalized(patient.name),role:'medical',
-      reason:critical?'先救治受袭房内血量不足一半的居民；每人半小时最多自动用一针':
+    const healing=patient?{kind:'stimpak',targets:[patient.id],id:patient.id,name:normalized(patient.name),role:'medical',urgent:Boolean(critical),
+      reason:critical?'先救治血量不足一半的居民；受袭房内确认前针已结束后可再次急救':
         combatHealing?'现有健康人手增援后治疗在家伤员，再评估追击；每人半小时最多自动用一针':'恢复在家伤员；每人半小时最多自动用一针'}:null;
     for(const id of defense.reserved)reserved.add(id);
     notes.push(...defense.notes);actions.push(...defense.actions);result.defense=defense;
@@ -11108,9 +7720,9 @@ installShelterPlanningWorker(self);
     if(defense.busy){
       const upkeep=actions.filter(c=>['explore-recall','quest-claim'].includes(c.kind));
       actions.splice(0,actions.length,...defense.actions);
-      if(defense.active&&healing){if(critical)actions.unshift(healing);else actions.push(healing);}
+      if(healing&&(defense.active||critical)){if(critical)actions.unshift(healing);else actions.push(healing);}
       actions.push(...upkeep);
-      result.events.push(5000);result.reserved=[...reserved];result.choice=actions[0]||null;return result;
+      result.healing=healing;result.events.push(5000);result.reserved=[...reserved];result.choice=actions[0]||null;return result;
     }
     // Current historical training needs its return seat before fast employment
     // can consume it. Trips/healing still leave here without that assessment.
@@ -11123,7 +7735,6 @@ installShelterPlanningWorker(self);
       scrapReserve:Math.max(cfg.workshopScrapReserve||0,record.constructionPolicy?.scrapReserve||0),
       scrapReserved:trainingScrapReserved,partsReserved:trainingPartsReserved,...extra});
     const reserveTraining=(id,destination,assessment)=>{
-      if(!result.trainingDestinations.some(d=>d.id===id&&d.room===destination))result.trainingDestinations.push({id,room:destination});
       trainingScrapReserved+=assessment?.best?.scrapFeed||0;trainingPartsReserved+=assessment?.best?.partsCommitment||0;
     };
     const finishTraining=(p,room,role,assessment)=>{
@@ -11179,6 +7790,22 @@ installShelterPlanningWorker(self);
       const p=s.residents.find(p=>p.id===role.id),r=p&&s.rooms.find(r=>r.id===p.roomId);
       if(!p||!home(p)||purposeProtectedIds.has(p.id)||role.room!==p.roomId)continue;
       if(role.role==='training'&&(cfg.training||['parent','production','current'].includes(role.purpose))){
+        if(role.preparation&&cfg.training&&cfg.parentTraining&&active(r)&&home(p).hp>=.6*home(p).max&&
+            trainingSafe([...projectedIds(),p.id])){
+          const continued=shelterParentContinuation(m,p,r,role,Boolean(preparationOf(p)));
+          if(continued){
+            if(JSON.stringify(continued)!==JSON.stringify(role))result.adoptions.push(continued);
+            reserve(p);result.events.push(continued.until-now);continue;
+          }
+          if(preparationOf(p)&&p.stats[role.stat]>=10){
+            const next=s.rooms.filter(room=>room.type==='training'&&active(room)&&p.stats[room.trainStat]<10&&
+              occupied(room)+actions.filter(a=>a.role==='training'&&a.room===room.id).length<room.width*2)
+              .map(room=>({room,estimate:shelterParentTrainingEstimate(m,p,room)})).filter(row=>row.estimate)
+              .sort((a,b)=>a.estimate.base-b.estimate.base||a.estimate.hours-b.estimate.hours||a.room.id-b.room.id)[0];
+            if(next){reserve(p);actions.push({...assign(p,next.room,'training','当前属性已达10，直接转入下一项父母培养'),
+              purpose:'parent',preparation:true,until:now+next.estimate.hours*3600000+600000});continue;}
+          }
+        }
         const upgrading=shelterTrainingUpgrade(m,p,r,cfg,record,role);
         if(upgrading){
           if(upgrading!==role)result.adoptions.push(upgrading);
@@ -11214,16 +7841,16 @@ installShelterPlanningWorker(self);
           }else{
             reserve(p);reserveTraining(p.id,role.destination,assessment);
             result.events.push(Math.max(1,Math.min(role.until,upgradingDestination?destination.upgradeAt:Infinity)-now));
-            if(upgradingDestination)notes.push(`${normalized(p.name)}原返岗房正在升级，保留当前训练与返岗席位，仍按原期限检查完成情况。`);
+            if(upgradingDestination)notes.push(`${normalized(p.name)}原岗位房正在升级，保留当前训练和原期限；结束后重新核对实际空岗。`);
           }
           continue;
         }
         const parent=role.purpose==='parent',preparing=parent&&role.preparation===true;
         const current=role.purpose==='current';
-        const due=current&&(!cfg.training||!cfg.development||now>=role.until)||parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||now>=role.until||
+        const due=current&&(!cfg.training||!cfg.development||now>=role.until)||parent&&(!cfg.training||!cfg.parentTraining||!parentIds.has(p.id)||home(p).hp<.6*home(p).max||now>=role.until||
           (preparing?!preparationOf(p):!role.finishCurrent&&!(p.familyCooldownUntil>now)));
         if(due||p.stats[role.stat]>role.base||r?.trainStat!==role.stat||!role.finishCurrent&&p.stats[role.stat]>=(preparing?10:parent?cfg.trainTarget:daily?.goals.some(g=>g.key==='train'&&!g.claimed&&g.remaining)?10:cfg.trainTarget)||!active(r)||!trainingSafe([p.id])){
-          if((current||parent&&(!preparing||preparationOf(p))&&cfg.parentTraining&&parentIds.has(p.id))&&active(r)&&r.trainStat===role.stat&&
+          if(!preparing&&(current||parent&&cfg.parentTraining&&parentIds.has(p.id))&&active(r)&&r.trainStat===role.stat&&
               finishTraining(p,r,role))continue;
           const destination=parent&&s.rooms.find(d=>d.id===role.destination),hp=shelterHealth(p);
           // Only a recorded real job may be promised. Near family readiness,
@@ -11231,7 +7858,7 @@ installShelterPlanningWorker(self);
           const returnJob=active(destination)&&['power','diner','water','scrap'].includes(destination.type)&&
             hp?.hp>=.6*hp.max&&(preparing||p.familyCooldownUntil>now+600000)&&!p.romance&&!expecting.has(p.id)&&
             occupied(destination)<shelterStaffCapacity({...m,trainingDestinations:result.trainingDestinations},destination,p.id);
-          actions.push(assign(p,returnJob?destination:null,'training-release',returnJob?(preparing?'候选父母本格训练结束，回预留生产岗后继续核对全项10目标':'父母本格训练结束，直接回到预留生产岗，保留原家庭和冷却期限'):!trainingSafe([p.id])?'训练期间真实供应或两小时储备不足，返岗补供给':role.finishCurrent?'当前训练格已完成、到达固定期限或供应变化，结束收尾并返岗':
+          actions.push(assign(p,returnJob?destination:null,'training-release',returnJob?(preparing?'候选父母本格训练结束，回当前可用生产岗后继续核对全项10目标':'父母本格训练结束，直接回到当前可用生产岗，保留原家庭和冷却期限'):!trainingSafe([p.id])?'训练期间真实供应或两小时储备不足，返岗补供给':role.finishCurrent?'当前训练格已完成、到达固定期限或供应变化，结束收尾并返岗':
             parent?'父母本轮训练完成、冷却到期或供应变化，交回人口与生产调度':'训练轮次结束，释放人选回到探险和生产候选池'));
         }
         else {reserve(p);if(parent||current)result.events.push(role.until-now);}
@@ -11245,7 +7872,7 @@ installShelterPlanningWorker(self);
           actions.push(assign(p,null,'craftDaily-release','每日制作已完成、关闭或供给变化，结束临时制作值班并返岗'));
       }
       else if(cfg.development&&!cfg[role.role]&&['medical','workshop','radio'].includes(role.role)){
-        if(role.role==='medical'&&(wounded.length||s.resources.stimpak<cfg.reserve+1))reserve(p);
+        if(role.role==='medical'&&s.resources.stimpak<cfg.reserve+1)reserve(p);
         else actions.push(assign(p,null,`${role.role}-release`,'当前未启用此岗位用途，释放历史值班并重新分配'));
       }
       else if(cfg[role.role]&&!safe([]))actions.push(assign(p,null,`${role.role}-release`,'基础供应失去余量，释放自动值班人选供生产接替'));
@@ -11274,10 +7901,9 @@ installShelterPlanningWorker(self);
       if(!newStaffing)return;
       const room=choices.find(supportVacancy);
       // Development manufacturing uses the ordinary staffing health threshold; leaving home still requires 90%.
-      const p=specialCandidate(stat,p=>!extraSafe||extraSafe(p,room),cfg.development&&role==='workshop'?.6:.9);if(!p){notes.push(`${shelterBuildRules[type][0]}暂缺可安全离岗的值班人选。`);return;}
-      reserve(p);
-      if(room)actions.push(assign(p,room,role,`安排${shelterBuildRules[type][0]}值班，补足综合发展缺口`));
-      else if(!rooms.length)projects.push({type,priority,person:p.id,stat,role,benefit:`已为${shelterBuildRules[type][0]}预留可安全离岗人选，建成后自动安排`});
+      const p=specialCandidate(stat,p=>!extraSafe||extraSafe(p,room),role==='medical'||cfg.development&&role==='workshop'?.6:.9);if(!p){notes.push(`${shelterBuildRules[type][0]}暂缺可安全离岗的值班人选。`);return;}
+      if(room){reserve(p);actions.push(assign(p,room,role,`安排${shelterBuildRules[type][0]}值班，补足综合发展缺口`));}
+      else if(!rooms.length)projects.push({type,priority,person:p.id,stat,role,benefit:`需要${shelterBuildRules[type][0]}，建成后重新核对人手，施工期间不预留居民`});
     };
     // 先为汽水普通探险留人，再评估整支周任务队的离岗成本。
     const slots=shelterExploreSlots(m,record);
@@ -11292,8 +7918,9 @@ installShelterPlanningWorker(self);
     const requestedMedicalTarget=cfg.reserve+Math.max(1,supplyTrips?2*cfg.stimpaks:0);
     const medicalTarget=Math.min(m.caps.stimpak,requestedMedicalTarget);
     result.stimpakTarget=cfg.medical||supplyTrips?requestedMedicalTarget:0;
-    const medicalNeededNow=cfg.medical&&(wounded.length>0||s.resources.stimpak<medicalTarget);
-    if(medicalNeededNow)support('medbay','int',true,'medical',12);
+    const medicalNeededNow=cfg.medical&&s.resources.stimpak-(healing?1:0)<medicalTarget;
+    if(medicalNeededNow)support('medbay','int',true,'medical',12,
+      p=>s.resources.stimpak<=cfg.reserve&&wounded.length>0||!cfg.workshopFamilyReady?.includes(p.id),wounded.length>0&&s.resources.stimpak<=cfg.reserve);
     if(cfg.workshop){
       // 只差一个零件也要把所在房间凑满一批；同一轮保留的工坊均需有完批供料。
       const {shortage,working,feeding,roomFeed,feed,nextTickStock}=shelterWorkshopFeeding(m,cfg.partsTarget);
@@ -11332,7 +7959,7 @@ installShelterPlanningWorker(self);
     const trainingTarget=dailyTrain?10:cfg.trainTarget;
     const trainingSeats=new Map(),trainingAt=p=>Math.max(0,...(record.trainingRest||[]).filter(r=>r.id===p.id).map(r=>r.at));
     const parentOccupied=r=>s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).length;
-    const trainParents=()=>{if(newStaffing&&cfg.training&&cfg.parentTraining){
+    const trainParents=()=>{if(cultivating&&newStaffing&&cfg.training&&cfg.parentTraining){
       const estimates=new Map();let trainingDemand=null;
       const estimate=(person,room)=>{
         const key=`${room.trainStat}:${person.stats[room.trainStat]}:${room.level}`;
@@ -11345,9 +7972,8 @@ installShelterPlanningWorker(self);
       const trainingRooms=new Set(s.rooms.filter(r=>r.type==='training').map(r=>r.id));
       const inTraining=new Set(s.residents.filter(p=>parentIds.has(p.id)&&p.deadAt===null&&p.adultAt<=now&&trainingRooms.has(p.roomId)).map(p=>p.id));
       const trainingFamilies=[...(record.families||[]),...preparationPairs].filter(f=>inTraining.has(f.a)||inTraining.has(f.b));
-      const familyBusy=new Set(trainingFamilies.flatMap(f=>[f.a,f.b]));
-      if(trainingFamilies.length)notes.push(`父母训练：${trainingFamilies.length} 个家庭已有成员在训或等待返岗；同一家庭暂不新增，其他家庭继续按空位、剩余冷却和共同供给评估。`);
-      const parents=pool.filter(p=>parentIds.has(p.id)&&!familyBusy.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&healthy(p)&&p.happiness>=50&&
+      const familyBusy=new Set(trainingFamilies.filter(f=>!preparationPairs.some(pair=>pair.a===f.a&&pair.b===f.b)).flatMap(f=>[f.a,f.b]));
+      const parents=pool.filter(p=>parentIds.has(p.id)&&!familyBusy.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&home(p).hp>=.6*home(p).max&&
         (preparationOf(p)?trainingAt(p)===0||s.lastSettledAt>trainingAt(p):
           p.familyCooldownUntil>now&&trainingAt(p)<p.familyCooldownUntil-6*3600000)&&safe([...projectedIds(),p.id]));
       const trainees=preparationPairs.flatMap(f=>[f.a,f.b]).map(id=>s.residents.find(p=>p.id===id)).filter(p=>p&&home(p));
@@ -11380,10 +8006,12 @@ installShelterPlanningWorker(self);
         return e&&e.base<(preparing?10:cfg.trainTarget)&&(preparing||now+e.hours*3600000<=p.familyCooldownUntil)&&
           shelterDevelopmentTrainingOpportunity(m,{id:p.id,hours:e.hours,stat:r.trainStat,destination:p.roomId,purpose:'parent'},
              cfg.developmentProject,record.constructionPolicy).allowed?[{p,r,...e,preparing}]:[];
-      })).sort((a,b)=>Number(b.preparing)-Number(a.preparing)||(a.preparing&&b.preparing?a.base-b.base:0)||b.value-a.value||loss([a.p.id])-loss([b.p.id])||a.p.id-b.p.id||a.r.id-b.r.id);
+      })).sort((a,b)=>Number(b.preparing)-Number(a.preparing)||
+        (a.preparing&&b.preparing?preparationPairs.indexOf(preparationOf(a.p))-preparationPairs.indexOf(preparationOf(b.p))||a.base-b.base:0)||
+        b.value-a.value||loss([a.p.id])-loss([b.p.id])||a.p.id-b.p.id||a.r.id-b.r.id);
       if(options.length){
-        const selected=options[0].preparing?{choice:options[0],comparison:{reason:'prepare-all-base-stats-10'}}:
-          shelterParentTrainingChoice(m,options,record,target,trainingTarget);
+        const selected=cfg.offlineComparison&&!options[0].preparing?shelterParentTrainingChoice(m,options,record,target,trainingTarget):
+          {choice:options[0],comparison:{reason:options[0].preparing?'prepare-all-base-stats-10':'cooldown-next-cell'}};
         result.parentTrainingComparison=selected.comparison;
         const {p,r,hours,preparing}=selected.choice;reserve(p);trainingSeats.set(r.id,1);
         const origin=s.rooms.find(room=>room.id===p.roomId);
@@ -11392,21 +8020,35 @@ installShelterPlanningWorker(self);
         if(destination)reserveTraining(p.id,destination);
         if(['better-in-each-explicit-inheritance-scenario','paired-route-beats-control-continuations'].includes(selected.comparison?.reason))
           notes.push('父母训练：按现有岗位对照原家庭多轮生育、单格训练和继续生产；三个明确遗传情景均不减少三天材料，不将条件结果当实际收益。');
-        actions.push({...assign(p,r,'training',preparing?`候选父母先培养：${r.trainStat} ${p.stats[r.trainStat]}→${p.stats[r.trainStat]+1}，预计 ${hours.toFixed(2)} 小时；七项基础属性均达10后生育`:
+        actions.push({...assign(p,r,'training',preparing?`候选父母连续培养${r.trainStat}至10，下一格预计 ${hours.toFixed(2)} 小时；七项基础属性均达10后生育`:
           `父母冷却期训练：预计 ${hours.toFixed(2)} 小时内提升一格（含结算余量），到期交回人口调度`),
-          purpose:'parent',until:preparing?now+hours*3600000+600000:p.familyCooldownUntil,...(preparing?{preparation:true}:{}),...(destination?{destination}:{})});
+          purpose:'parent',until:preparing?now+hours*3600000+600000:p.familyCooldownUntil,...(preparing?{preparation:true}:{}),...(!preparing&&destination?{destination}:{})});
       }else if(parents.length&&!upgrade){
         // 不为建房预留居民；施工期间继续生产。只提出一项可在当前冷却窗口内完成的需求。
         const requests=parents.flatMap(p=>['cha','end','str','per','agi','int','lck'].flatMap(stat=>{
           const preparing=Boolean(preparationOf(p));
           if(p.stats[stat]>=(preparing?10:cfg.trainTarget))return [];
           const same=s.rooms.filter(r=>r.type==='training'&&r.trainStat===stat);
-          if(same.some(r=>!active(r)||parentOccupied(r)>0))return [];
-          const room=same.filter(r=>r.level<3).sort((a,b)=>b.level-a.level||a.width-b.width||a.id-b.id)[0];
-          if(same.length&&!room)return [];
+          if(same.some(r=>!active(r)))return [];
+          if(same.some(r=>parentOccupied(r)>0)&&(!preparing||preparationOf(p)!==preparingPairs[0]))return [];
+          const room=same.filter(r=>r.level<3&&parentOccupied(r)===0).sort((a,b)=>b.level-a.level||a.width-b.width||a.id-b.id)[0];
+          if(same.length&&!room&&!same.every(r=>parentOccupied(r)>=r.width*2))return [];
           const proposed={trainStat:stat,level:room?room.level+1:1},e=estimate(p,proposed);
           const buildHours=room?room.width*(room.level===1?1:3):1/6;
           if(!e||!preparing&&now+(e.hours+buildHours)*3600000>p.familyCooldownUntil)return [];
+          if(preparing&&same.length&&!room){
+            const total=(person,r)=>Array.from({length:10-person.stats[stat]},(_,i)=>
+              estimate({...person,stats:{...person.stats,[stat]:person.stats[stat]+i}},r)?.hours??Infinity).reduce((a,b)=>a+b,0);
+            const existing=Math.min(...same.map(r=>{
+              const occupants=s.residents.filter(q=>q.roomId===r.id&&q.deadAt===null&&q.adultAt<=now);
+              const wait=Math.min(...occupants.map(q=>{
+                const role=roles.find(role=>role.id===q.id&&role.room===r.id&&role.role==='training');
+                return role?.preparation?total(q,r):role?.until>now?(role.until-now)/3600000:Infinity;
+              }));
+              return wait+total(p,r);
+            }));
+            if(buildHours+total(p,proposed)>=existing-1/6)return [];
+          }
           const cost=room?Math.ceil(400*room.width*(room.level===1?2.5:6))+6*(room.level===2?15*room.width:0):
             Math.ceil(400*(1+.2*s.rooms.filter(r=>r.type==='training').reduce((n,r)=>n+r.width,0)));
           return [{p,stat,room,value:e.value/cost,trainingHours:e.hours,preparing}];
@@ -11485,8 +8127,8 @@ installShelterPlanningWorker(self);
         }
       }
     };
-    // Existing training was protected above. Reserve safe ordinary expeditions
-    // before starting any new cell, using the same resident/supply reservations.
+    // Commit main cultivation seats and shared supply before new ordinary trips.
+    trainParents();
     if(cfg.explore&&newStaffing){
       if(!dropsOK||tripHours>24)notes.push('汽水掉落条件暂不可核对或超过24小时，暂停新的普通出发。');
       else if(quotaBlocked){/* 保留原行程处理，仅停止按汽水目标追加人员和补给。 */}
@@ -11517,11 +8159,12 @@ installShelterPlanningWorker(self);
     // A returned trip's needles may be carried straight back out on the next trip.
     if(cfg.medical){
       const needleSpend=actions.reduce((n,a)=>n+(a.kind==='explore-start'?a.targets[2]:a.kind==='stimpak'?1:0),0);
-      const medNeed=wounded.length>0||s.resources.stimpak-needleSpend<medicalTarget;
-      if(!medicalNeededNow)support('medbay','int',medNeed,'medical',12);
-      notes.push(`医疗补给目标 ${medicalTarget} 支（保留 ${cfg.reserve}）；本轮已安排携针及治疗 ${needleSpend} 支，先扣除再判断值班。${wounded.length?'仍有伤员，保留医疗值班。':''}`);
+      const medNeed=s.resources.stimpak-needleSpend<medicalTarget||cfg.digMedical;
+      if(!medicalNeededNow)support('medbay','int',medNeed,'medical',12,
+        p=>cfg.digMedical||s.resources.stimpak<=cfg.reserve&&wounded.length>0||!cfg.workshopFamilyReady?.includes(p.id),
+        wounded.length>0&&s.resources.stimpak<=cfg.reserve);
+      notes.push(`医疗补给目标 ${medicalTarget} 支（保留 ${cfg.reserve}）；扣除本轮携针及治疗 ${needleSpend} 支后安排值班，库存充足即释放。`);
     }
-    trainParents();
     if(!roles.some(r=>r.role==='training'&&reserved.has(r.id)))train(1,true);
     const week=m.view.env?.week,quests=m.view.env?.quests;
     if(cfg.quests&&newStaffing){
@@ -11714,10 +8357,10 @@ installShelterPlanningWorker(self);
       (v.defenseManual===undefined||Array.isArray(v.defenseManual)&&v.defenseManual.length<=200&&v.defenseManual.every(positive))&&
       v.roles.every(r=>positive(r.id)&&positive(r.room)&&at(r.at)&&['training','radio','medical','workshop','craftDaily'].includes(r.role)&&
         (r.upgradeUntil===undefined||r.role==='training'&&at(r.upgradeUntil)&&r.upgradeUntil>r.at&&r.until>r.upgradeUntil)&&
-        (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&!r.finishCurrent&&r.base<10)&&
+        (r.preparation===undefined||r.preparation===true&&r.role==='training'&&r.purpose==='parent'&&r.base<10)&&
         (r.existingTraining===undefined||r.existingTraining===true&&r.role==='training'&&r.purpose==='current'&&r.finishCurrent===true)&&
         (r.finishCurrent===undefined||r.finishCurrent===true&&r.role==='training'&&['parent','production','current'].includes(r.purpose)&&
-          Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining?(r.base+1)*60+10:130)*60000)&&
+          Number.isInteger(r.base)&&r.base<10&&r.until-Math.max(r.at,r.upgradeUntil||0)<=(r.existingTraining||r.preparation?(r.base+1)*60+20:130)*60000)&&
         (r.role!=='training'||(r.purpose==='production'?['str','per','end','agi','int'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
           at(r.windowEnd)&&r.windowEnd>r.at&&positive(r.destination):r.purpose==='parent'?['str','per','end','cha','int','agi','lck'].includes(r.stat)&&at(r.until)&&r.until>r.at&&
             (r.destination===undefined||positive(r.destination)):
@@ -11881,6 +8524,23 @@ installShelterPlanningWorker(self);
   function shelterConstructionStockTarget(cost,policy) {
     return Object.fromEntries(['scrap','parts'].map(k=>[k,cost[k]+
       (Number.isFinite(policy?.[k+'Reserve'])?Math.max(0,policy[k+'Reserve']):0)]));
+  }
+  function shelterIndependentProject(m,preferred,candidates,policy,busyRooms) {
+    const kinds=['build','upgrade','dig'];
+    if(!preferred||!kinds.includes(preferred.kind)||!policy||policy.pending)return preferred;
+    const ledger=shelterPlanningBudget(m,policy);
+    const affordable=cost=>['scrap','parts'].every(key=>Number.isSafeInteger(cost[key])&&cost[key]>=0&&
+      Number.isFinite(policy[key+'Reserve'])&&m.state.resources[key]>=cost[key]+policy[key+'Reserve'])&&
+      shelterPlanningBudgetReady(policy,ledger,cost)===0;
+    if(policy[preferred.kind]&&!preferred.blocks.length&&affordable(preferred.cost))return preferred;
+    return candidates.find(candidate=>{
+      if(candidate===preferred||candidate.priority>=70||!kinds.includes(candidate.kind)||!policy[candidate.kind]||candidate.blocks.length)return false;
+      if(candidate.kind==='dig'&&preferred.kind==='dig'||candidate.kind!=='dig'&&preferred.kind!=='dig'&&busyRooms>=1)return false;
+      if(candidate.kind==='build'&&preferred.kind==='build'&&candidate.floor===preferred.floor&&candidate.col===preferred.col)return false;
+      const target=project=>project.id??project.layout?.mergeInto;
+      if(target(candidate)!=null&&target(candidate)===target(preferred))return false;
+      return affordable(Object.fromEntries(['scrap','parts'].map(key=>[key,candidate.cost[key]+preferred.cost[key]])));
+    })||preferred;
   }
   function shelterLevelProjectAllowed(c,policy) {
     // A forecast may wait for inventory or rolling spending to recover, but
@@ -12149,8 +8809,8 @@ installShelterPlanningWorker(self);
     };
     const stillNeeded=(p,c)=>c.levelInvestment||!c.storageDemand||
       c.storageDemand.equipment&&shelterStoredItems(m.state)>=.9*p.itemCap||
-      c.storageDemand.resources.some(k=>p.resources[k]>=.9*p.caps[k]&&
-        !(Object.hasOwn(c.storageDemand.reserves,k)&&p.resources[k]>=c.storageDemand.reserves[k]));
+      (c.storageDemand.required?Object.entries(c.storageDemand.required).some(([key,amount])=>amount>p.caps[key]):c.storageDemand.resources.some(k=>p.resources[k]>=.9*p.caps[k]&&
+        !(Object.hasOwn(c.storageDemand.reserves,k)&&p.resources[k]>=c.storageDemand.reserves[k])));
     const score=p=>progress.score+p.gain+due.filter(e=>e.at<=m.now+p.hours*3600000).reduce((n,e)=>n+e.gain,0);
     const rank=(a,b)=>Number(score(b)>=targetScore)-Number(score(a)>=targetScore)||
       (score(a)>=targetScore?a.hours-b.hours:a.hours/Math.max(1,score(a)-progress.score)-b.hours/Math.max(1,score(b)-progress.score))||a.cost-b.cost;
@@ -12607,7 +9267,8 @@ installShelterPlanningWorker(self);
       c.blocks??=[];c.cost??={scrap:0,parts:0};
       if(c.kind==='dig'&&c.floor>=20){
         const healthy=p=>p.deadAt===null&&p.away===null&&p.adultAt<=now&&shelterHealth(p)?.hp>=.9*shelterHealth(p)?.max;
-        const medbay=built.some(r=>r.type==='medbay'&&active(r)&&living.some(p=>healthy(p)&&p.roomId===r.id));
+        const medbay=built.some(r=>r.type==='medbay'&&active(r)&&living.some(p=>p.away===null&&p.adultAt<=now&&
+          shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&p.roomId===r.id));
         const defender=living.some(p=>healthy(p)&&!campaign?.reserved?.includes(p.id)&&
           s.items.some(i=>i.id===p.weaponId&&i.slot==='weapon'&&Array.isArray(i.damage)&&i.damage.length===2&&i.damage.every(n=>Number.isFinite(n)&&n>=0)&&i.damage[0]+i.damage[1]>0));
         if(!medbay||s.resources.stimpak<1||!defender)c.blocks.push('第20层起有深层野兽风险：先准备有健康值班者的医务室、至少1支治疗针和留守的健康持武器成人（不代表能保证打退）');
@@ -12836,38 +9497,44 @@ installShelterPlanningWorker(self);
     }
     const full=Object.keys(m.caps).filter(k=>s.resources[k]>=.9*m.caps[k]&&m.production[k]>0);
     const equipmentFull=shelterStoredItems(s)>=.9*m.itemCap;
-    if(full.length||equipmentFull) {
+    const required={...Object.fromEntries(Object.entries(demand).map(([key,rate])=>[key,2*rate])),stimpak:campaign?.stimpakTarget||0};
+    const until=Math.max(now,...construction.map(room=>room.builtAt>now?room.builtAt:room.upgradeAt));
+    for(const key of Object.keys(demand))required[key]+=Math.max(0,demand[key]-m.production[key])*(until-now)/3600000;
+    for(const project of candidates.filter(project=>project.priority<70&&campaign?.constructionPolicy?.[project.kind]!==false)){
+      if(project.kind==='upgrade'&&campaign?.constructionPolicy?.build!==false&&buildRequests.some(request=>request.type===project.type&&
+          request.priority<=project.priority&&!request.blocks.length&&['scrap','parts'].every(key=>
+            request.cost[key]+(campaign?.constructionPolicy?.[key+'Reserve']||0)<=committed.caps[key])))continue;
+      for(const key of ['scrap','parts'])required[key]=Math.max(required[key]||0,(project.cost?.[key]||0)+(campaign?.constructionPolicy?.[key+'Reserve']||0));
+      if(project.kind==='upgrade'&&Number.isFinite(project.hours)){
+        const room=m.rooms.find(row=>row.id===project.id);
+        for(const key of Object.keys(demand))required[key]=Math.max(required[key],2*demand[key]+project.hours*
+          Math.max(0,demand[key]-m.production[key]+(room?.resource===key?room.rate:0)));
+      }
+    }
+    const missingCapacity=Object.keys(required).filter(key=>required[key]>committed.caps[key]);
+    if(full.length||equipmentFull||missingCapacity.length) {
       const afterFull=full.filter(k=>s.resources[k]>=.9*committed.caps[k]),afterEquipmentFull=equipmentFull&&shelterStoredItems(s)>=.9*committed.itemCap;
       const pending=full.filter(k=>committed.caps[k]>m.caps[k]).map(k=>`${shelterResources[k]} ${m.caps[k]}→${committed.caps[k]}`);
       if(equipmentFull&&committed.itemCap>m.itemCap)pending.push(`装备 ${m.itemCap}→${committed.itemCap}`);
-      notes.push(`${[...full.map(k=>shelterResources[k]),...(equipmentFull?['装备']:[])].join('、')}当前接近满仓。`);
+      if(full.length||equipmentFull)notes.push(`${[...full.map(k=>shelterResources[k]),...(equipmentFull?['装备']:[])].join('、')}当前接近满仓。`);
       if(pending.length)notes.push(`已开工工程完工后的容量：${pending.join('、')}（当前→完工后）；尚未生效，领取仍按当前容量。`);
-      if(!afterFull.length&&!afterEquipmentFull)notes.push('先等现有工程完工，可缓解当前满仓压力，暂不建议重复扩仓；期间留意库存变化。');
+      if(!afterFull.length&&!afterEquipmentFull&&!missingCapacity.length)notes.push('先等现有工程完工，可缓解当前满仓压力，暂不建议重复扩仓；期间留意库存变化。');
       else {
-        notes.push(`${construction.length?'完工后仍有':''}${[...afterFull.map(k=>shelterResources[k]),...(afterEquipmentFull?['装备']:[])].join('、')}接近满仓，可比较先消费库存与继续扩仓。`);
+        if(afterFull.length||afterEquipmentFull)notes.push(`${construction.length?'完工后仍有':''}${[...afterFull.map(k=>shelterResources[k]),...(afterEquipmentFull?['装备']:[])].join('、')}接近满仓，可比较先消费库存与继续扩仓。`);
+        if(missingCapacity.length)notes.push('现有及在建仓容不足：'+missingCapacity.map(key=>`${shelterResources[key]}需 ${Math.ceil(required[key])}，完工后容量 ${committed.caps[key]}`).join('、')+'。');
         const storageGain=cells=>{
           const next=shelterCapacity(committedRooms,storagePerk,cells);
           return `${capacityPending?'在已开工工程完工后的基础上，':''}容量增加：${Object.keys(m.caps).map(k=>`${shelterResources[k]} ${next.caps[k]-committed.caps[k]}`).join('、')}、装备 ${next.itemCap-committed.itemCap}；增加容量不会直接产生资源`;
         };
-        // 追级时，已有充分储备的消耗品不应靠反复扩仓继续囤积。材料、装备或真实停产/医疗需求仍保留扩容。
-        const pursuing=Number.isInteger(finalLevel)&&shelterLevelProgress(m)?.level<finalLevel;
-        const storageNeed={...Object.fromEntries(Object.entries(demand).map(([k,n])=>[k,2*n])),stimpak:campaign?.stimpakTarget||0};
-        const until=Math.max(now,...construction.map(r=>r.builtAt>now?r.builtAt:r.upgradeAt));
-        for(const k of Object.keys(demand))storageNeed[k]+=Math.max(0,demand[k]-m.production[k])*(until-now)/3600000;
-        for(const r of built.filter(r=>active(r)&&r.level<3&&shelterRooms[r.type][1])){
-          const {hours,rate}=upgradeEstimate(r),resource=shelterRooms[r.type][1];
-          for(const k of Object.keys(demand))storageNeed[k]=Math.max(storageNeed[k],
-            Math.max(0,demand[k]-(m.production[k]-(resource===k?rate:0)))*hours+2*demand[k]);
-        }
-        const surplusOnly=pursuing&&!afterEquipmentFull&&afterFull.length>0&&afterFull.every(k=>
-          Object.hasOwn(storageNeed,k)&&s.resources[k]>=storageNeed[k]);
+        const concreteNeed=afterEquipmentFull||missingCapacity.length>0;
+        const surplusOnly=!concreteNeed;
         const priority=surplusOnly?70:20;
         if(surplusOnly)notes.push('当前接近满仓的消耗品储备已充足，覆盖已知施工、候选升级停产和医疗预留；扩仓列为后续，先推进发展，不为继续囤积占用建设资金。未能整批收下的产出仍留在房间。');
-        const storageDemand={resources:afterFull,equipment:afterEquipmentFull,reserves:pursuing?storageNeed:{}};
+        const storageDemand={resources:missingCapacity,equipment:afterEquipmentFull,required};
         const start=candidates.length;
-        build('storage',priority,storageGain(1));
+        if(concreteNeed)build('storage',priority,storageGain(1));
         const room=built.filter(r=>r.type==='storage'&&active(r)&&r.level<3).sort((a,b)=>a.level-b.level||a.width-b.width)[0];
-        if(room)candidates.push(upgrade(room,priority+1,storageGain(room.width)));
+        if(room&&concreteNeed)candidates.push(upgrade(room,priority+1,storageGain(room.width)));
         for(const c of candidates.slice(start))c.storageDemand=storageDemand;
       }
     }
@@ -13142,6 +9809,11 @@ installShelterPlanningWorker(self);
           if(pursuing&&deepRoutes&&!options.some(c=>c.storageDemand)&&searchBudget.scoreUpperBound<targetScore){
             levelSearch={...searchBudget,targetScore,expanded:0,truncated:true,reason:'project-limit'};
             notes.push(`当前最多搜索 ${searchBudget.maxProjects} 项工程，即使每项增加 ${searchBudget.maxGain} 分、全部在途兑现，也至多 ${searchBudget.scoreUpperBound}/${targetScore} 分；此搜索范围不足以组成完整路线，跳过必定无解的推演，继续核对独立用途。`);
+          }else if(pursuing&&campaign?.runtimeSimple){
+            const chosen=retained||options.find(c=>!c.blocks.length&&canFund(c));
+            if(chosen)routes.push(...shelterLevelRoutes(m,options,targetScore,retained,
+              {deep:false,routeSteps:[chosen],campaign,populationTarget:requestedTarget}));
+            levelSearch={expanded:0,truncated:true,reason:'single-current-project'};
           }else if(pursuing){
             const planning={deep:deepRoutes,allowLevelInvestment:deepRoutes,funded:growthInvestmentReady,campaign,populationTarget:requestedTarget,
               ...(investmentReady&&!retained?{comparisonHours:72}:{})};
@@ -13157,7 +9829,7 @@ installShelterPlanningWorker(self);
               }
             }else routes.push(...shelterLevelRoutes(m,options,targetScore,retained,planning));
           }
-          if(investmentReady&&!retained&&routes.length)
+          if(!campaign?.runtimeSimple&&investmentReady&&!retained&&routes.length)
             routes.splice(0,routes.length,...shelterRankDevelopmentRoutes(m,routes,policy));
           options.sort((a,b)=>Number(Boolean(a.blocks.length))-Number(Boolean(b.blocks.length))||
             (a.cost.scrap+6*a.cost.parts)/Math.min(gap,a.levelGain)-(b.cost.scrap+6*b.cost.parts)/Math.min(gap,b.levelGain)||
@@ -13300,7 +9972,7 @@ installShelterPlanningWorker(self);
       c.priority=Math.min(c.priority,laborPriority); // Both alternatives buy actual scrap production, not surplus food.
     candidates.sort(compareProjects);
     const objective=candidates.find(c=>c.priority<70);
-    if(objective&&!objective.blocks.length&&objective.kind!=='staff'&&objective.priority>=24&&
+    if(!campaign?.runtimeSimple&&objective&&!objective.blocks.length&&objective.kind!=='staff'&&objective.priority>=24&&
         !objective.levelDecision&&!objective.employment&&!objective.storageDemand&&
         !retainedFunding&&!retainedMaterials&&!shortages.length&&!campaign?.defense?.busy&&!policy?.pending){
       const baseline=shelterDevelopmentFundingProjection(m,objective,policy,{checkpoints:[]});
@@ -13334,7 +10006,10 @@ installShelterPlanningWorker(self);
     for(const c of candidates.slice(0,8))if(c.kind!=='staff'&&Object.values(c.shortage).some(v=>v>0)){
       const estimate=funding(shelterConstructionStockTarget(c.cost,policy));c.saveHours=estimate.hours;c.saveReason=estimate.reason;
     }
-    const first=candidates.find(c=>c.priority<70),missing=first?Object.entries(first.shortage).filter(([,v])=>v>0).map(([k,v])=>`${v} ${shelterResources[k]}`):[];
+    const preferred=candidates.find(c=>c.priority<70);
+    const first=shelterIndependentProject(m,preferred,candidates,policy,construction.length),
+      missing=first?Object.entries(first.shortage).filter(([,v])=>v>0).map(([k,v])=>`${v} ${shelterResources[k]}`):[];
+    if(first&&first!==preferred)notes.push(`「${preferred.title}」当前不可执行，保留需求，先核对可执行的「${first.title}」。`);
     const budgetReady=first&&first.kind!=='staff'?shelterPlanningBudgetReady(policy,shelterPlanningBudget(m,policy),first.cost):0;
     if(first)first.budgetWaitHours=budgetReady;
     const waiting=construction.length>0||s.digging&&Number.isFinite(s.digging.doneAt);
@@ -13981,7 +10656,7 @@ installShelterPlanningWorker(self);
     if(pending||m.view.switches?.frozen||m.view.nameRequired||!Array.isArray(m.state.explorers)||
       m.state.explorers.some(e=>!objectState(e)||!Number.isSafeInteger(e.id)||e.id<=0||
         !Number.isSafeInteger(e.residentId)||e.residentId<=0))return null;
-    const available=shelterConstructionAvailable(m,config,state,null,now).scrap;
+    const available=m.state.resources.scrap-(config.scrapReserve||0);
     if(!Number.isFinite(available))return null;
     const candidates=m.state.residents.filter(p=>id===null||p.id===id).flatMap(p=>{
       if(!Number.isFinite(p.deadAt)||p.deadAt<0||p.deadAt>m.now||m.now>=p.deadAt+86400000||p.hp!==0||
@@ -13992,7 +10667,8 @@ installShelterPlanningWorker(self);
       const c={kind:'revive',id:p.id,name:p.name,targets:[p.id],from:p.roomId,room:p.roomId,level,cost,
         deadAt:p.deadAt,deadline:p.deadAt+86400000,explorer:e?{id:e.id,startedAt:e.startedAt}:null,
         reason:`在24小时期限内花 ${cost.scrap} 废料救回${p.name}${e?'，返程状态另行核对':''}`};
-      return validShelterRevival(c)&&available>=cost.scrap?[c]:[];
+      return validShelterRevival(c)&&available>=cost.scrap&&
+        (id!==null||typeof shelterExecutionDeferred!=='function'||!shelterExecutionDeferred(c))?[c]:[];
     });
     return candidates.sort((a,b)=>a.deadline-b.deadline||a.id-b.id)[0]||null;
   }
@@ -14149,17 +10825,12 @@ installShelterPlanningWorker(self);
         if(shelterDefenseEnabled(shelterCampaign))shelterObserveRaid(model,'shelter');
         shelterReadFailures=0;
         if (!shelterState.vaultNo) saveShelter({ ...shelterState, vaultNo:view.vaultNo });
-        try{if(!shelterWork?.execution&&!shelterBuildWork?.execution&&!shelterCampaignWork&&!shelterRecallWork)shelterStartBackgroundPlanning(model);}catch(error){
-          if(error?.code==='shelter-state-changed')throw error;
-          shelterBackgroundPlanner?.invalidate();
-          log.add('shelter-planning','后台比较未启动，继续当前人员管理',{error:String(error?.message??error)});
-        }
       }).catch(error => {
         if (!current()) return;
         if(shelterRetryChange(error))return;
         try{
           if (['TypeError','TimeoutError','AbortError'].includes(error.name)) shelterReadRetry('避难所读取中断');
-          else pauseShelter('避难所状态无法核对，已暂停并保留原记录');
+          else shelterReadRetry('避难所数据暂不能通过校验，保留原记录并等待新读取');
         }catch(error){if(!shelterRetryChange(error))pauseShelter('避难所记录无法保存，已暂停并保留原记录');}
       })
       .finally(() => { controller.close();if (generation === shelterGeneration) { shelterController = null; schedule(true); } });
@@ -14210,10 +10881,7 @@ installShelterPlanningWorker(self);
       }
     }
     choices.sort((a,b) => b.priority-a.priority || (Math.abs(b.gain-a.gain) > 1e-6 ? b.gain-a.gain : 0) || a.id-b.id || a.item-b.item);
-    const result=shelterFindGear(m,choices),choice=result.choices[0];
-    return choice?{...choice,reason:`${result.complete?'整批比较闲置服装':'有界比较闲置服装'}，增加${shelterResources[choice.resource]}产出`,
-      gearComparison:{complete:result.complete,nodes:result.nodes,count:result.choices.length,
-        before:m.production,after:result.production}}:null;
+    return choices[0]||null;
   }
   function shelterFindGear(m,choices,maxNodes=20000) {
     // 同时比较所有闲置衣服，避免多属性服先被有替代衣服的岗位占用。
@@ -14361,7 +11029,7 @@ installShelterPlanningWorker(self);
     }
     return production;
   }
-  function shelterAllocationMoves(m,targets) {
+  function shelterAllocationMoves(m,targets,deadline=Infinity) {
     const people=targets.filter(t=>m.state.residents.some(p=>p.id===t.id&&p.roomId!==t.room));
     const assigned=new Map(m.state.residents.map(p=>[p.id,p.roomId])),visited=new Set();
     const residents=m.state.residents.map(p=>({...p})),byId=new Map(residents.map(p=>[p.id,p]));
@@ -14369,7 +11037,7 @@ installShelterPlanningWorker(self);
     const futureSupply=shelterAllocationFutureSupply(m);
     let attempts=0;
     function visit(moves,production) {
-      if(++attempts>2000)return null;
+      if(++attempts>2000||deadline!==Infinity&&Date.now()>=deadline)return null;
       if(people.every(p=>assigned.get(p.id)===p.room))return moves;
       if(moves.length>=people.length*2)return null;
       const key=people.map(p=>`${p.id}:${assigned.get(p.id)}`).join(',');
@@ -14391,7 +11059,7 @@ installShelterPlanningWorker(self);
     }
     return visit([],{...(m.actualProduction||m.production)});
   }
-  function shelterGreedyAllocation(m,rooms,workers,slots,base,floors,before,maxChecks=5000) {
+  function shelterGreedyAllocation(m,rooms,workers,slots,base,floors,before,maxChecks=5000,deadline=Infinity) {
     const keys=Object.keys(m.demand),resources=rooms.map(r=>shelterRooms[r.type][1]),resourceOf=j=>resources[j];
     const left=slots.slice(),production={...base},assigned=workers.map(()=>undefined);
     // Only the moved worker changes this tie-break count. Recounting the entire
@@ -14403,6 +11071,7 @@ installShelterPlanningWorker(self);
     const scrapRate=i=>Math.max(0,...rooms.map((r,j)=>left[j]>0&&resourceOf(j)==='scrap'?workers[i].rates[j]:0));
     // 基础供给逐项补到需求1.2倍；每次补最缺的一项，选对该项产率相对回收产率最高的人，少占回收能手。
     for(;;){
+      if(deadline!==Infinity&&Date.now()>=deadline)return null;
       const need=keys.filter(k=>production[k]<m.demand[k]*1.2-1e-9)
         .sort((a,b)=>production[a]/Math.max(1e-9,m.demand[a])-production[b]/Math.max(1e-9,m.demand[b]));
       let best=null;
@@ -14425,6 +11094,7 @@ installShelterPlanningWorker(self);
     const restRates=workers.map((w,i)=>assigned[i]===undefined?scrapRate(i):0);
     const rest=workers.map((w,i)=>i).filter(i=>assigned[i]===undefined).sort((a,b)=>restRates[b]-restRates[a]||workers[a].p.id-workers[b].p.id);
     for(const i of rest){
+      if(deadline!==Infinity&&Date.now()>=deadline)return null;
       const open=rooms.map((r,j)=>j).filter(j=>left[j]>0&&workers[i].rates[j]>0);
       const scrap=open.filter(j=>resourceOf(j)==='scrap'),pool=scrap.length?scrap:open;
       place(i,pool.length?pool.reduce((a,b)=>workers[i].rates[b]>workers[i].rates[a]?b:a):null);
@@ -14436,6 +11106,7 @@ installShelterPlanningWorker(self);
     for(let pass=0;pass<workers.length*rooms.length&&checks<maxChecks;pass++){
       let improved=false;
       for(let i=0;i<workers.length&&!improved&&checks<maxChecks;i++){
+        if(deadline!==Infinity&&Date.now()>=deadline)return null;
         const from=assigned[i];
         for(const j of [...rooms.map((r,j)=>j),null]){
           if(checks>=maxChecks)break;
@@ -14461,9 +11132,12 @@ installShelterPlanningWorker(self);
     if(!valid()||!shelterAllocationImproves(before.score,current.score))return null;
     return {...current,localChecks:checks,production:{...production},targets:workers.map((w,i)=>({id:w.p.id,room:assigned[i]===null?null:rooms[assigned[i]].id}))};
   }
-  function shelterFindAllocation(m,pool,maxNodes=50000,minimumStepGain=0) {
+  function shelterFindAllocation(m,pool,maxNodes=50000,minimumStepGain=0,deadline=Infinity) {
     // 大阵容仍运行有界贪心与交换；16人仅限制指数搜索，不能跳过全部可调人员。
     if(!pool.length)return {plan:null,complete:false,reason:'no-candidates',nodes:0};
+    const expired=()=>deadline!==Infinity&&Date.now()>=deadline;
+    const deferred={plan:null,complete:false,reason:'search-limit',nodes:0};
+    if(expired()||deadline!==Infinity&&m.state.residents.length*m.state.rooms.length>4096)return deferred;
     // A failed search is reusable while its actual inputs are unchanged. Inventory
     // collection and wall-clock passage do not enter this production-only search.
     // Use current rates/availability so adulthood, completion and event boundaries
@@ -14508,7 +11182,7 @@ installShelterPlanningWorker(self);
     const candidates=[],assignments=[],workerChoices=[];
     let nodes=0,limited=workers.length>16,rejectedReturn=false;
     function visit(index,changes) {
-      if(++nodes>maxNodes){limited=true;return;}
+      if(++nodes>maxNodes||expired()){limited=true;return;}
       if(keys.some(k=>production[k]+suffix[index][k]<floors[k]-1e-9))return;
       const optimistic=Object.fromEntries(resources.map(k=>[k,production[k]+suffix[index][k]]));
       const bound=candidates.length===8?candidates.at(-1):before;
@@ -14542,16 +11216,19 @@ installShelterPlanningWorker(self);
     if(!limited)visit(0,0);
     // 搜索可能在找到可执行方案前达到计算上限。另以贪心加局部交换补一个候选：先按机会成本补足基础供给，
     // 其余人优先回收，再逐人改岗或两两互换直到不再改善；仍须满足相同供应底线、改善条件和安全调岗顺序。
-    const greedy=shelterGreedyAllocation(m,rooms,workers,slots,production,floors,before);
+    if(expired())return deferred;
+    const greedy=shelterGreedyAllocation(m,rooms,workers,slots,production,floors,before,5000,deadline);
     if(greedy&&!candidates.some(c=>c.targets.every((t,i)=>t.room===greedy.targets[i].room)))
       candidates.push(greedy),candidates.sort((a,b)=>shelterAllocationCompare(b,a));
     for(const candidate of candidates) {
+      if(expired())return deferred;
       const targets=candidate.targets.filter(t=>pool.some(p=>p.id===t.id&&p.roomId!==t.room)).sort((a,b)=>a.id-b.id);
       if(minimumStepGain>0&&!shelterAllocationWorthMoves(before.score,candidate.score,targets.length,minimumStepGain)){
         rejectedReturn=true;continue;
       }
       if(m.familySupplies?.length&&!shelterFamilySupplyPreserved(m,targets))continue;
-      const moves=shelterAllocationMoves(m,targets);
+      const moves=shelterAllocationMoves(m,targets,deadline);
+      if(expired())return deferred;
       if(moves&&minimumStepGain>0&&!shelterAllocationWorthMoves(before.score,candidate.score,moves.length,minimumStepGain)){
         rejectedReturn=true;continue;
       }
@@ -14559,10 +11236,14 @@ installShelterPlanningWorker(self);
         localChecks:greedy?.localChecks??0,before:m.production,reason:'plan'};
     }
     const result={plan:null,complete:!limited,nodes:Math.min(nodes,maxNodes),reason:rejectedReturn?'insufficient-return':candidates.length?'no-safe-sequence':limited?'search-limit':'no-improvement'};
+    if(expired())return deferred;
     shelterFindAllocation.lastNoPlan={key:searchKey,result:{...result}};return result;
   }
   function planShelterAllocation(m,pool) {
-    const result=shelterFindAllocation(m,pool,50000,1);
+    // Ordinary production uses direct assignments or a short two-person swap.
+    // Exhaustive allocation remains available to the offline comparison tools.
+    if(!m.prepareFamily&&!Object.keys(m.demand).some(k=>m.production[k]<m.demand[k]*1.2-1e-9))return null;
+    const result=shelterFindAllocation(m,pool,2000,1,Date.now()+25);
     if(!result.plan)return {plan:null,note:result.reason==='insufficient-return'?'已比较方案的增产收益不足以覆盖调岗步数，保留现岗；人员或供给条件变化后重新评估。':
       result.reason==='no-safe-sequence'?'找到的增产方案尚无可安全执行的调岗顺序，本轮保留原岗位。':
       result.reason==='search-limit'?'本轮有界比较未找到可执行的更优分配；未穷尽全部排列，不代表已经最优。':
@@ -14700,7 +11381,9 @@ installShelterPlanningWorker(self);
       if(row[index]===undefined)row[index]=readRate(entry.p,room);
       return row[index];
     };
-    for (const ae of entries) for (const be of targets) {
+    const searchAt=Date.now();let comparisons=0;
+    compare: for (const ae of entries) for (const be of targets) {
+      if(++comparisons>2000||Date.now()-searchAt>25)break compare;
       const a=ae.p,b=be.p;
       if (a.id === b.id || b.roomId === null || a.roomId === b.roomId) continue;
       const target=be.room,source=ae.room;
@@ -14733,6 +11416,7 @@ installShelterPlanningWorker(self);
       if(!shelterFamilySupplyPreserved(m,[{id:a.id,room:b.roomId},{id:b.id,room:a.roomId}],readRate))continue;
       const people = [a,b].map(p => ({id:p.id,room:p.roomId}));
       for (const moves of shelterSwapSequences(...people)) {
+        if(!futureSupply&&!m.prepareFamily&&(moves.length>3||scrap<Math.max(1,m.production.scrap*.05)))continue;
         if(!preview&&supplyGain<=1e-6&&!(scrap>moves.length||Math.abs(scrap)<1e-6&&basic>moves.length))continue;
         if (!shelterSwapProjection(m,moves,futureSupply,false,evaluate)) continue;
         // Family preparation only asks whether a safe transition exists.
@@ -14793,6 +11477,21 @@ installShelterPlanningWorker(self);
     if (JSON.stringify(families) !== JSON.stringify(stored)) saveShelter({...shelterState,families});
     return families;
   }
+  function shelterRelocatePassiveFamilies(m) {
+    if(shelterPending||shelterState.pair||shelterState.swap||shelterStaffHold)return false;
+    const s=m.state,claimed=new Set(),families=(shelterState.families||[]).map(f=>{
+      const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id));
+      const ready=r=>r?.type==='quarters'&&r.builtAt<=m.now&&r.upgradeAt===null&&!r.incident&&!r.unpowered&&
+        !claimed.has(r.id)&&!s.births.some(b=>b.roomId===r.id)&&
+        !s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id&&![f.a,f.b].includes(p.id));
+      if(pair.some(p=>!p||p.romance||p.away!==null||p.deadAt!==null)||shelterFamilyExpecting(s,f.a,f.b)||
+          pair.some(p=>p.roomId===f.room)||ready(s.rooms.find(r=>r.id===f.room))){claimed.add(f.room);return f;}
+      const room=s.rooms.find(r=>ready(r)&&!s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id));
+      if(!room)return f;claimed.add(room.id);return {...f,room:room.id};
+    });
+    if(JSON.stringify(families)===JSON.stringify(shelterState.families||[]))return false;
+    saveShelter({...shelterState,families});return true;
+  }
   const familyKey = (a,b) => [a,b].sort((x,y)=>x-y).join(':');
   function populationBudget(m,families,exclude = '') {
     const s = m.state, reserved = new Map();
@@ -14816,7 +11515,7 @@ installShelterPlanningWorker(self);
     const needs = shelterGrowthNeeds(m),growth=needs.demand;
     const demand = {...growth,food:Math.max(growth.food,future+needs.radioMouths),water:Math.max(growth.water,future+needs.radioMouths)};
     const employment=populationGrowthEmployment(m,families);
-    const growthAllowed=employment.allowed||employment.committedPairs.includes(familyKey(pair[0].id,pair[1].id));
+    const growthAllowed=true;
     return {production:projected,demand,reservedResidents:[...absent],employment,growthAllowed,
       allowed:future <= budget.limit && Object.keys(demand).every(k => m.state.resources[k] >= demand[k]*2)};
   }
@@ -14851,7 +11550,6 @@ installShelterPlanningWorker(self);
   function shelterPopulationPreparation(m,families,campaign=null) {
     const budget=populationBudget(m,families);
     if(budget.future>=budget.limit)return budget.future;
-    if(!populationGrowthEmployment(m,families).allowed)return budget.future;
     if(budget.future===budget.living+budget.recovering)return budget.future+1;
     if(shelterStaffHold||shelterPending||shelterState.pair||campaign?.defense?.busy)return budget.future;
     // 一位家长已回宿舍或两人正在等网站确认时，先完成该预约。
@@ -14973,7 +11671,8 @@ installShelterPlanningWorker(self);
     // Reuse the bounded assignment heuristic for idle people only. Compare its
     // whole roster with keeping the original first choice and optimizing the rest.
     // No existing producer is borrowed, and no multi-step plan is saved or replayed.
-    if(!shelterOptimize||pool.length<2||new Set(rooms.map(r=>shelterRooms[r.type][1])).size<2)return first;
+    if(!shelterOptimize||pool.length<2||pool.length*rooms.length>512||new Set(rooms.map(r=>shelterRooms[r.type][1])).size<2)return first;
+    const deadline=Date.now()+25;
     const s=m.state,resource=shelterRooms[first.r.type][1],gap=demand[resource]*1.2-m.production[resource];
     if(!(gap>0))return first;
     const slots=rooms.map(r=>Math.max(0,shelterStaffCapacity(m,r)-s.residents.filter(p=>
@@ -14981,12 +11680,13 @@ installShelterPlanningWorker(self);
     const workers=pool.map(p=>({p,rates:rooms.map(r=>shelterWorkerRate(s,m.now,m.view.env,p,r))}));
     if(workers.some(w=>w.rates.some(rate=>!Number.isFinite(rate)||rate<0)))return first;
     const model={...m,demand},floors={...m.production},before={score:shelterAllocationScore(m.production,demand)};
-    const proposal=shelterGreedyAllocation(model,rooms,workers,slots,m.production,floors,before,1000);
+    const proposal=shelterGreedyAllocation(model,rooms,workers,slots,m.production,floors,before,1000,deadline);
     if(!proposal)return first;
     const forced={...m.production,[resource]:m.production[resource]+first.gain},remaining=slots.slice();
     remaining[rooms.findIndex(r=>r.id===first.r.id)]--;
     const continuation=shelterGreedyAllocation(model,rooms,workers.filter(w=>w.p.id!==first.p.id),remaining,
-      forced,floors,before,1000);
+      forced,floors,before,1000,deadline);
+    if(Date.now()>=deadline)return first;
     const baseline=continuation||{production:forced,score:shelterAllocationScore(forced,demand)};
     if(!Object.keys(demand).every(k=>proposal.production[k]>=Math.min(baseline.production[k],demand[k]*1.2)-1e-9)||
         !shelterAllocationImproves(baseline.score,proposal.score))return first;
@@ -15273,7 +11973,7 @@ installShelterPlanningWorker(self);
     });
     return ready.length?{s,families,home,active,available,ready}:null;
   }
-  function shelterPopulationFamilySupply(m,campaign) {
+  function shelterPopulationFamilySupply(m,campaign,lightweight=false) {
     const context=shelterPopulationFamilySupplyContext(m,campaign);
     if(!context)return null;
     const {s,families,home,active,available,ready}=context;
@@ -15317,7 +12017,7 @@ installShelterPlanningWorker(self);
             // 填回收空岗本身不补口粮；只有此步确实打开后续安全接替时，才暂缓家庭扩产。
             // 例如宿舍成年子女先就业后可参与满员换位。预览不调岗、不保存计划。
             // 已在生产/休息的人本来就可参与下面的直接换位，无需逐人再预演一次就业。
-            if(!s.rooms.some(room=>room.id===p.roomId&&room.type==='quarters'))continue;
+            if(lightweight||!s.rooms.some(room=>room.id===p.roomId&&room.type==='quarters'))continue;
             const next=shelterModel({...m.view,state:{...s,residents:s.residents.map(other=>other.id===p.id?{...other,roomId:r.id}:other)}});
             const nextSupply=populationHousingSupply(next,families,pair);
             const nextFamilies=ready.map(f=>populationHousingSupply(next,families,[f.a,f.b].map(id=>next.state.residents.find(p=>p.id===id)))).filter(supply=>supply.allowed);
@@ -15325,7 +12025,7 @@ installShelterPlanningWorker(self);
                 next.state.residents.filter(available),true,true,readRate))return preparationPossible=true;
           }
         }
-        return preparationPossible=Boolean(planShelterSwap(model,s.residents.filter(available),true,true,readRate));
+        return preparationPossible=Boolean(!lightweight&&planShelterSwap(model,s.residents.filter(available),true,true,readRate));
       };
       const resources={};
       for(const [resource,need] of Object.entries(supply.demand)){
@@ -15438,12 +12138,12 @@ installShelterPlanningWorker(self);
           return {id:p.id,room:available ? old.id : null,from:p.roomId,name:p.name,reason:'结束未确认的新配对，恢复生产安排'};
         }
         if (plan.failed) {
-          const next = activeBlocks.filter(b => familyKey(b.a,b.b) !== key).concat({a:plan.a,b:plan.b,until:Date.now()+86400000}).slice(-200);
+          const next = activeBlocks.filter(b => familyKey(b.a,b.b) !== key).concat({a:plan.a,b:plan.b,until:Date.now()+1800000}).slice(-200);
           saveShelter({...shelterState,pairBlocks:next});
         }
         // Both residents have left the attempted dorm and their positions were checked.
         // Ordinary cleanup must not hold unrelated jobs or the next eligible family.
-        stopPopulationPlan(plan.failed ? '未观察到网站确认感情，已结束尝试；此组合 24 小时内不重试' : '心情、人口或供应条件已变化，已结束本次配对安排',false);
+        stopPopulationPlan(plan.failed ? '未观察到网站确认感情，已结束尝试；此组合30分钟内不重试' : '心情、人口或供应条件已变化，已结束本次配对安排',false);
         return null;
       }
       const ordered=plan.first===plan.b?[pair[1],pair[0]]:pair;
@@ -15454,6 +12154,16 @@ installShelterPlanningWorker(self);
         stopPopulationPlan('安排新配对期间岗位已被改变，取消剩余步骤'); return null;
       }
       if (!roomReady(room,[plan.a,plan.b])) {
+        const alternative=!shelterPending&&pair.every(p=>home(p)&&healthy(p)&&!p.romance)&&
+          s.rooms.find(r=>r.id!==plan.room&&roomReady(r,[plan.a,plan.b])&&
+            !s.residents.some(p=>p.deadAt===null&&p.adultAt<=m.now&&p.roomId===r.id)&&
+            !families.some(f=>f.room===r.id&&[f.a,f.b].some(id=>s.residents.some(p=>p.id===id&&p.roomId===r.id))));
+        if(alternative&&!room?.incident&&!s.births.some(b=>b.roomId===plan.room)){
+          const changed={...plan,room:alternative.id,relocatedRoom:plan.room,fromA:pair[0].roomId,fromB:pair[1].roomId,
+            step:0,at:Date.now(),waitAt:null,roomWaitAt:null};
+          saveShelter({...shelterState,pair:changed});
+          return shelterPopulationPlan(m,families,{eligible,home,healthy});
+        }
         if (roomUnchanged(room,[plan.a,plan.b])) {
           const reasons=[room.unpowered&&'停电',room.incident&&'事件尚未处理',room.upgradeAt!==null&&'升级尚未完成'].filter(Boolean);
           if (plan.roomWaitAt == null) {
@@ -15471,7 +12181,8 @@ installShelterPlanningWorker(self);
         log.add('shelter-population','新配对宿舍已恢复，重新核对原安排',{phase:'room-resumed',room:plan.room,step:plan.step});
       }
       const canContinue = shelterParentPairAllowed(m,pair,shelterState.parentPreparation)&&pair.every(p => home(p) && healthy(p) && p.happiness >= 50 && shelterNameUnique(s,p) && !(p.familyCooldownUntil > m.now) &&
-        (p.roomId === plan.room || eligible(p))) && populationCanHouse(m,families,pair) && populationKinship(s)(...pair);
+        (p.roomId === plan.room || p.roomId===plan.relocatedRoom&&s.rooms.some(r=>r.id===p.roomId&&r.type==='quarters'&&!r.incident)&&
+          !s.births.some(b=>b.roomId===p.roomId)||eligible(p))) && populationCanHouse(m,families,pair) && populationKinship(s)(...pair);
       // 只有两人均已入住才开始等感情；挂起期间尚未入住或条件失效不能算配对失败。
       const failed = plan.step === 2 && canContinue && Date.now()-(plan.waitAt ?? plan.at) >= 30*60000;
       if (failed || !canContinue) {
@@ -15492,7 +12203,7 @@ installShelterPlanningWorker(self);
     shelterPopulationNote = `人口 ${budget.living}；待产及已预约名额 ${budget.future-budget.living-budget.recovering}；${budget.recovering ? `倒下居民预留 ${budget.recovering}；` : ''}设置目标 ${shelterPopulationTarget}；按已建床位本轮最多 ${budget.limit} 人。`;
     if (budget.future >= budget.limit) { shelterPopulationNote+='已有名额达到当前目标或已建床位上限，暂缓新增生育。'; return null; }
     const employment=populationGrowthEmployment(m,families);
-    if(!employment.allowed){shelterPopulationNote+=employment.message+'。';return null;}
+    if(!employment.allowed)shelterPopulationNote+=employment.message+'；仍按真实床位、离岗供给和储备决定生育。';
     // 历史亲缘仍由 residents.parents 保留；家庭记录只表示本轮生育安排，不永久占用空宿舍。
     // 已有成人入住、感情、待产（含父母不明）时不换人，也不挪走人工放入宿舍的居民。
     const pairing=populationPairingContext(m,families,eligible),{rooms,candidates,unrelated}=pairing;
@@ -15522,14 +12233,14 @@ installShelterPlanningWorker(self);
           (score.scrap < best.score.scrap-1e-6 || Math.abs(score.scrap-best.score.scrap) < 1e-6 && score.total < best.score.total-1e-6)))) best = proposal;
     }
     if (!best) { shelterPopulationNote+='当前没有双方心情均达50、亲缘资料完整且离岗后供应仍充足的新组合。'; return null; }
-    best=shelterParentDevelopmentChoice(m,choices,best);
+    // The stable all-10 cohort decides online pairing; scenario projections are offline tools.
     const [a,b] = best.pair;
     plan = {a:a.id,b:b.id,room:best.room.id,fromA:a.roomId,fromB:b.roomId,step:0,at:Date.now(),waitAt:null,release:false,failed:false,
       childrenBefore:s.residents.filter(p=>p.parents.includes(a.id)&&p.parents.includes(b.id)).map(p=>p.id),
       ...(best.first!==a.id?{first:best.first}:{})};
     const nextFamilies=families.filter(f=>!best.replacedFamilies.includes(f));
     saveShelter({...shelterState,families:nextFamilies,pair:plan});
-    log.add('shelter-population',best.replacedFamilies.length?'空宿舍重新选择父母，释放旧家庭占位':'核对父母遗传范围、周期和三天材料，再选择新组合',
+    log.add('shelter-population',best.replacedFamilies.length?'空宿舍重新选择父母，释放旧家庭占位':'按基础属性和当前供给选择新组合',
       {phase:'placing',residents:[a.id,b.id],firstResident:plan.first??plan.a,room:plan.room,target:shelterPopulationTarget,assessment:best.assessment,
         replacedFamilies:best.replacedFamilies.map(f=>({...f,assessment:shelterParentAssessment(m,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)))})),
         ranking:best.developmentComparison?.reason==='lower-bound-beats-control-upper-bound'?'development72-genetic-bounds':'base-attributes-fallback',
@@ -15616,7 +12327,6 @@ installShelterPlanningWorker(self);
     const readyFamilies = families.filter(f => {
       const pair = [f.a,f.b].map(id => s.residents.find(p => p.id === id)), room = byRoom(f.room);
       return (interruptedFamilies.includes(f)||shelterParentPairAllowed(m,pair,shelterState.parentPreparation,true))&&room?.type === 'quarters' && room.builtAt <= m.now && room.upgradeAt === null && !room.incident && !room.unpowered &&
-        (populationGrowthEmployment(m,families).allowed||populationGrowthEmployment(m,families).committedPairs.includes(familyKey(f.a,f.b)))&&
         !birthRooms.has(room.id) && pair.every(p => home(p) && healthy(p) && p.happiness >= 50 && (!p.romance||interruptedFamilies.includes(f)) && !(p.familyCooldownUntil > m.now) &&
           (p.roomId === room.id || eligible(p)||interruptedFamilies.includes(f))) &&
         !s.residents.some(p => p.deadAt === null && p.adultAt <= m.now && p.roomId === room.id && ![f.a,f.b].includes(p.id));
@@ -15805,16 +12515,10 @@ installShelterPlanningWorker(self);
     if(!preparation&&campaign.powerPreparation?.extra>0&&constructionProject?.kind==='upgrade'&&
         constructionProject.type==='power'&&
         !shelterConstructionAllowance(constructionProject,m,shelterConstruction,shelterState,shelterPending,Date.now()))return null;
-    // Only a freshly admitted ordinary assignment can use a background proposal.
-    // Existing returns, defense, family preparation and construction handoffs keep their checks above.
-    if(!preparation&&typeof shelterBackgroundAssignment==='function'){
-      const proposed=shelterBackgroundAssignment(m,scrapChoices);
-      if(proposed)return proposed;
-    }
     const allocation=!preparation&&shelterOptimize?planShelterAllocation(staffModel,growthPool):null;
     if(allocation?.plan)return shelterSwapStep(staffModel,eligible);
     const scrap=!preparation&&populationMode? scrapChoices.find(c=>c.gain===bestScrap?.gain&&campaign.unemployedResidents.includes(c.id))||bestScrap:bestScrap;
-    if (scrap) return scrap;
+    if (scrap&&(preparation||scrap.gain>=Math.max(1,m.production.scrap*.05))) return scrap;
     if (!preparation && planShelterSwap(staffModel,growthPool)) return shelterSwapStep(staffModel,eligible);
     const lowMoodFamilies=families.filter(f=>[f.a,f.b].some(id=>s.residents.find(p=>p.id===id)?.happiness<50)).length;
     shelterStaffNote = (familyMode ? `已记住 ${families.length} 对原配对。${lowMoodFamilies?`${lowMoodFamilies} 对心情不足50，需恢复后才能继续生育。`:''}` : '')+
@@ -15851,6 +12555,7 @@ installShelterPlanningWorker(self);
     return buttonIn(tabs,new RegExp(`^${label}(?:\\s*\\d+)?$`));
   }
   function shelterReadyTab(m,label) {
+    if(shelterUiSkipped.has(label))return null;
     const tab=shelterTab(label);
     if(usable(tab)) {
       if(shelterUiWait?.label===label) {
@@ -15866,7 +12571,12 @@ installShelterPlanningWorker(self);
       log.add('shelter-ui-wait','避难所数据已读取，等待页面页签就绪',
         {tab:label,found:Boolean(tab),visible:visible(tab),usable:usable(tab)});
     }
-    if(Date.now()-shelterUiWait.at>=15000)finishShelter(m,`避难所“${label}”页签持续15秒未就绪，保留任务，稍后再检查`);
+    if(Date.now()-shelterUiWait.at>=15000){
+      if(['目标','图鉴','排行','商队'].includes(label)){
+        shelterUiSkipped.add(label);shelterUiWait=null;
+        log.add('shelter-ui-deferred',`“${label}”页签不可用，本轮继续其他任务，下次访问重查`,{tab:label});
+      }else finishShelter(m,`避难所“${label}”页签持续15秒未就绪，保留任务，稍后再检查`);
+    }
     else say(`等待避难所“${label}”页签加载，出现后继续本轮检查`);
     return null;
   }
@@ -15963,10 +12673,10 @@ installShelterPlanningWorker(self);
   }
   function shelterCloseWindow(w,button,key,label,perform=()=>button.click()) {
     if(w.manual){say('本轮窗口已由你接手，等待处理');return true;}
-    if(w.closeFailed){say(w===shelterRecallWork&&w.waitControl==='cancel'?'前台持续未能核对召回取消按钮，等待手动处理':'本轮窗口关闭失败，等待手动处理');return true;}
+    if(w.closeFailed)return shelterRecoverOwnedWindow(w);
     if(w.closeAt&&Date.now()-w.closeAt<5000){say('等待本轮窗口关闭');return true;}
     if((w.closeAttempts||0)>=2){
-      w.closeFailed=true;pauseShelter('本轮窗口两次关闭均未生效，已停止自动点击；请手动关闭窗口后开启避难所');return true;
+      w.closeFailed=true;return shelterRecoverOwnedWindow(w);
     }
     if(!usable(button)){
       if(w===shelterRecallWork||w===shelterWorkConfirm||w===shelterWork){
@@ -15975,13 +12685,39 @@ installShelterPlanningWorker(self);
         w.closeUnavailableAt??=Date.now();
         if(Date.now()-w.closeUnavailableAt<15000){say('本轮窗口的取消或关闭按钮不可核对，等待处理');return true;}
       }
-      w.closeFailed=true;pauseShelter('本轮窗口15秒未能核对取消或关闭按钮，请手动关闭窗口后开启避难所');return true;
+      w.closeFailed=true;return shelterRecoverOwnedWindow(w);
     }
     w.waitControl=null;
     offer(key,label,()=>{
       if(w.manual||!w.dialog?.isConnected||!visible(w.dialog)||!usable(button))return;
       w.closeAt=Date.now();w.closeAttempts=(w.closeAttempts||0)+1;perform();
     });return true;
+  }
+  function shelterRecoverOwnedWindow(w) {
+    if(w.recovering)return true;
+    const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog[open]')].filter(visible);
+    const owned=[w.dialog,w.work?.dialog].filter(Boolean);
+    const prepared=w===shelterWorkConfirm&&!w.clicked&&!w.sent()&&!w.work?.dialogAmbiguous&&
+      w.dialog?.isConnected&&textOf(w.dialog.querySelector('h2'))===w.title&&
+      awaitingShelterConfirmation===w.capture&&shelterPending?.id===w.id&&!shelterPending.emergency&&
+      shelterPending.lifecycle?.phase==='prepared'&&shelterPending.lifecycle.page===claimPageId;
+    if(w.manual||w.work?.manual||w.dialogAmbiguous||!owned.length||dialogs.some(d=>!owned.includes(d))||
+        ((shelterPending||awaitingShelterConfirmation)&&!prepared)||continueShelterAction||nativePending().length||accountStopReason()){
+      say('窗口关闭暂未完成，保留人工或原请求状态，等待安全恢复');return true;
+    }
+    const prior=shelterState.windowRecovery,now=Date.now();
+    const count=prior&&now-prior.at<3600000?Math.min(5,prior.count+1):1;
+    const nextAt=now+Math.min(900000,60000*2**(count-1));
+    if(prepared){
+      // This live closure proves no confirmation or native send occurred. Keep
+      // the journal for the existing fresh-page handoff protocol.
+      w.capture.cancelled=true;
+      saveShelterPending({...shelterPending,lifecycle:{...shelterPending.lifecycle,hiddenExitAt:now}});
+    }
+    saveShelter({...shelterState,nextAt,windowRecovery:{at:now,count},note:'脚本窗口关闭失败，返回远征后退避重查'});
+    w.recovering=true;cancelQueued();cancelShelterRead();cancelShelterAuxReads();
+    log.add('shelter-window-recovery','脚本窗口无未决请求，返回远征清理窗口；退避后按新状态重建',{count,nextAt});
+    location.replace('/activities/expedition');return true;
   }
   function shelterRecoverDialogs(dialogs) {
     const own=w=>w?.dialog&&dialogs.length===1&&dialogs[0]===w.dialog&&!w.manual;
@@ -16305,7 +13041,7 @@ installShelterPlanningWorker(self);
       // An awaited native callback still resolves through the page's fetch.
       // Do not replace its cancelled capture with a new intent on this page.
       if(captureShelterHelp?.cancelled){shelterSocialNote='等待旧互助准备结束；其他玩法继续，刷新页面也可重新核对';return false;}
-      const tab=shelterReadyTab(m,'排行');if(!tab)return true;
+      const tab=shelterReadyTab(m,'排行');if(!tab)return !shelterUiSkipped.has('排行');
       if(tab.getAttribute('aria-selected')!=='true'){offer('shelter:help-tab','查看每日互助候选',()=>tab.click());return true;}
       const levelButton=currentElement([...document.querySelectorAll('[role="group"][aria-label="排行方式"] button')].filter(b=>textOf(b)==='等级'));
       if(usable(levelButton)&&levelButton.getAttribute('aria-pressed')!=='true'){offer('shelter:help-level','查看等级榜互助对象',()=>levelButton.click());return true;}
@@ -16453,7 +13189,7 @@ installShelterPlanningWorker(self);
     const project=shelterDevelopmentPlan(m,shelterPopulationTarget,shelterCampaignSchedule(m),shelterLevelTarget).next.project;
     const plan=shelterCaravanPlan(m,goal,shelterCaravanRead.data.offers,shelterConstruction,shelterState,shelterPending,Date.now(),project);
     if(!plan.choice){shelterCaravanNote=plan.reason;return false;}
-    const chosen=plan.choice,tab=shelterReadyTab(m,'商队');if(!tab)return true;
+    const chosen=plan.choice,tab=shelterReadyTab(m,'商队');if(!tab)return !shelterUiSkipped.has('商队');
     if(tab.getAttribute('aria-selected')!=='true'){offer('shelter:caravan-tab','核对今日商队交付',()=>tab.click());return true;}
     const rows=[...document.querySelectorAll('li')].filter(li=>visible(li)&&textOf(li).replace(/,/g,'').includes(`交付 ${chosen.scrap} 废料`));
     const row=locator.pick(rows.filter(li=>chosen.parts?textOf(li).replace(/,/g,'').includes(`+ ${chosen.parts} 零件`):!textOf(li).includes('零件')));
@@ -16494,6 +13230,7 @@ installShelterPlanningWorker(self);
     if(shelterStaffMode==='population'&&!shelterStaffHold&&!shelterPending&&
         (shelterCampaign.parentPreparation!==false||shelterState.parentPreparation)){
       rememberShelterFamilies(m);
+      shelterRelocatePassiveFamilies(m);
       if(!m.state.rooms.some(r=>r.incident)&&!(shelterState.campaign?.defense||[]).length)shelterUpdateParentPreparation(m);
     }
     const cache=shelterCampaignSchedule.cache,inputs=[m,shelterState,shelterCampaign,shelterConstruction,shelterPending,
@@ -16515,7 +13252,7 @@ installShelterPlanningWorker(self);
   function shelterCampaignScheduleFresh(m) {
     const familyReserved=[...(shelterState.pair?[shelterState.pair.a,shelterState.pair.b]:[]),...(shelterState.swap?.people||[]).map(p=>p.id)];
     const budgetNow=Date.now();
-    const record={...shelterState.campaign,parentPreparation:shelterState.parentPreparation,pair:shelterState.pair,assignmentInProgress:Boolean(shelterState.swap),familyReserved,families:shelterState.families||[],sodaReceipts:shelterState.sodaReceipts,pending:shelterPending,readStartedAt:shelterRead?.startedAt,
+    const record={...shelterState.campaign,...shelterCampaignDeferrals(m),parentPreparation:shelterState.parentPreparation,pair:shelterState.pair,assignmentInProgress:Boolean(shelterState.swap),familyReserved,families:shelterState.families||[],sodaReceipts:shelterState.sodaReceipts,pending:shelterPending,readStartedAt:shelterRead?.startedAt,
       constructionPolicy:{...shelterConstructionPolicy(shelterConstruction,shelterState,shelterPending,budgetNow,m.now),
         pending:Boolean(shelterPending||shelterStaffHold||shelterStaffMode==='off'||shelterState.pair||shelterState.swap)},
       populationPreparation:shelterStaffMode==='population'?shelterPopulationPreparation(m,shelterState.families||[]):null,
@@ -16532,8 +13269,10 @@ installShelterPlanningWorker(self);
             p.happiness>=50&&!p.romance&&!(p.familyCooldownUntil>m.now)&&shelterNameUnique(s,p))&&
           populationHousingSupply(m,shelterState.families,pair).growthAllowed&&populationCanHouse(m,shelterState.families,pair);
       }).flatMap(f=>[f.a,f.b]):[];
-    const cfg={...shelterCampaign,workshop:workshopAutomatic(),partsReserve:record.constructionPolicy.partsReserve,workshopFamilyReady,
-      partsTarget:m.state.rooms.some(room=>room.type==='workshop')?Math.min(m.caps.parts,Math.max(100,record.constructionPolicy.partsReserve)):undefined,
+    const readyParent=shelterReadyParentPair(m,record,shelterPopulationTarget);
+    if(readyParent)workshopFamilyReady.push(readyParent.pair.a,readyParent.pair.b);
+    const cfg={...shelterCampaign,offlineComparison:false,runtimeSimple:true,radio:false,workshop:workshopAutomatic(),partsReserve:record.constructionPolicy.partsReserve,workshopFamilyReady,
+      partsTarget:m.state.rooms.some(room=>room.type==='workshop')?Math.min(m.caps.parts,record.constructionPolicy.partsReserve):undefined,
       workshopScrapReserve:record.constructionPolicy.scrapReserve,
       development:shelterStaffMode!=='off'&&!shelterStaffHold,optimize:shelterOptimize,
       populationGrowth:shelterStaffMode==='population'&&!shelterStaffHold,
@@ -16554,7 +13293,7 @@ installShelterPlanningWorker(self);
       p.populationFamilySupply=null;
       // 原行程的召回与归来领奖不借用家庭人手；保留供提交前重读再次核对，
       // 否则新快照启动 Worker 就会取消原倒计时。未知请求仍不允许穿插收尾。
-      p.actions=p.actions.filter(c=>!shelterPending&&['explore-recall','quest-claim'].includes(c.kind));
+      p.actions=p.actions.filter(c=>!shelterPending&&['explore-recall','quest-claim','stimpak'].includes(c.kind));
       p.choice=p.actions[0]||null;
       p.notes.push('家庭供给正在后台核对，依赖该结果的调岗和建设暂缓。');return false;
     };
@@ -16577,8 +13316,10 @@ installShelterPlanningWorker(self);
     if(plan.defense?.busy)return describe(plan);
     const development=shelterDevelopmentPlan(m,shelterPopulationTarget,plan,shelterLevelTarget);
     const next=development.next.project,materialStep=next?.type==='workshop'||next?.purpose?.type==='workshop';
+    cfg.digMedical=Boolean(shelterCampaign.medical&&(m.state.digging?.floor>=20||
+      development.candidates.some(c=>c.kind==='dig'&&c.floor>=20&&c.priority<70)));
     if(!workshopAutomatic()){
-      if(!cfg.training||!next)return describe(plan);
+      if((!cfg.training||!next)&&!cfg.digMedical)return describe(plan);
       const scheduled=shelterCampaignPlan(m,{...cfg,developmentProject:next},record,shelterPopulationTarget);
       scheduled.unemployedResidents=shelterDormWorkers(m,scheduled);
       scheduled.restingResidents=shelterRestingWorkers(m,scheduled);
@@ -16637,6 +13378,17 @@ installShelterPlanningWorker(self);
     }
     return describe(scheduled);
   }
+  function shelterCampaignDeferrals(m) {
+    const skippedHealing=[];
+    if(typeof shelterExecutionDeferrals!=='undefined')for(const [key,entry] of shelterExecutionDeferrals){
+      if(entry.released)continue;
+      try {const [kind,targets]=JSON.parse(key);if(kind==='stimpak')skippedHealing.push(targets[0]);}catch{}
+    }
+    const rescueSkipped=typeof shelterRescueSkipped==='undefined'?[]:[...shelterRescueSkipped];
+    for(const stop of shelterState.rescueStops||[])if(stop.rejected||
+        typeof shelterRescueRoster==='function'&&stop.roster===shelterRescueRoster(m))rescueSkipped.push(`${stop.room}:${stop.kind}`);
+    return {skippedHealing,rescueSkipped};
+  }
   function shelterDailyCraftStaffing(m,plan) {
     if(plan.defense?.busy||shelterPending||shelterStaffHold||shelterStaffMode==='off'||shelterState.pair||shelterState.swap)return;
     const s=m.state;
@@ -16661,6 +13413,7 @@ installShelterPlanningWorker(self);
     if(s.residents.some(p=>p.roomId===room.id&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now))return;
     if(s.residents.filter(p=>p.roomId===room.id&&p.deadAt===null&&p.adultAt<=m.now).length>=room.width*2)return;
     const protectedIds=new Set([...plan.reserved,...plan.dailyReserved,...plan.actions.map(a=>a.id),
+      ...(shelterGrowthNeeds(m).futureMouths<Math.min(200,shelterPopulationTarget)?shelterState.parentPreparation?.pairs||[]:[]).flatMap(f=>[f.a,f.b]),
       ...(shelterState.families||[]).flatMap(f=>[f.a,f.b]),...s.births.flatMap(b=>shelterBirthParents(s,b)||[]),
       ...s.residents.filter(p=>p.romance).flatMap(p=>[p.id,p.romance.partnerId])]);
     const demand=shelterGrowthNeeds(m,plan.populationPreparation,shelterPopulationTarget).demand;
@@ -16770,8 +13523,9 @@ installShelterPlanningWorker(self);
       '工坊备料结束，直接补足原工程所需供电，随后重新核对开工条件':'工坊备料结束，直接接续废料生产'};
     plan.actions.splice(plan.actions.indexOf(best.action),1);plan.actions.unshift(direct);plan.choice=direct;
   }
-  function shelterProductionClaimStep(m) {
-    const ready=m.rooms.filter(r=>r.batch&&r.stored>=r.batch),reward={};
+  function shelterProductionClaimStep(m,medicalOnly=false) {
+    const ready=m.rooms.filter(r=>r.batch&&r.stored>=r.batch&&(!medicalOnly||r.resource==='stimpak'&&
+      m.state.rooms.some(room=>room.id===r.id&&!room.incident&&!room.unpowered&&room.upgradeAt===null&&room.builtAt<=m.now))),reward={};
     // 保留原十秒在途余量，包括当前未满、提交时可能满批的房间。
     const projected=shelterFutureCollection(m,Date.now()-shelterRead.at+10000);
     const amount=r=>projected.amounts[r.id]||0;
@@ -16783,7 +13537,7 @@ installShelterPlanningWorker(self);
       }
     }
     const all=ready.length?locator.pick([...document.querySelectorAll('button')].filter(b=>textOf(b)==='全部收取')):null;
-    const bulkReady=Boolean(ready.length&&usable(all)&&shelterFits(m,reward));
+    const bulkReady=Boolean(!medicalOnly&&ready.length&&usable(all)&&shelterFits(m,reward));
     shelterCollection=shelterCollectionInfo(m,{projected,bulkReady});
     if(bulkReady){shelterSubmit(all,'collect',['all'],m,'收取避难所已满批产出');return true;}
     // 满仓或原生按钮缺失不能拖住其他房间，也不能无限阻塞后续人员安排。
@@ -16799,7 +13553,7 @@ installShelterPlanningWorker(self);
     if(!shelterCampaign.dailyGoals)return false;
     const daily=shelterDailyGoals(m),ready=daily.goals.filter(g=>!g.claimed&&!g.remaining&&!shelterDailyDeferred.has(`claim:${g.index}`));
     if(!ready.some(g=>shelterFits(m,{scrap:g.reward.scrap,parts:g.reward.parts})))return false;
-    const tab=shelterReadyTab(m,'目标');if(!tab)return true;
+    const tab=shelterReadyTab(m,'目标');if(!tab)return !shelterUiSkipped.has('目标');
     if(tab.getAttribute('aria-selected')!=='true'){offer('shelter:daily-priority','优先领取已完成的今日目标',()=>tab.click());return true;}
     const root=currentElement([...document.querySelectorAll('section')].filter(n=>textOf(n.querySelector('h2'))==='今日目标'));
     const rows=[...(root?.querySelectorAll('li')||[])].filter(visible);
@@ -16847,7 +13601,7 @@ installShelterPlanningWorker(self);
   function shelterInspectionStep(m) {
     if(!shelterCampaign.dailyGoals||shelterDailyDeferred.has('inspection'))return false;
     const due=shelterInspectionDue(m);if(due===null||due>m.now)return false;
-    const tab=shelterReadyTab(m,'目标');if(!tab)return true;
+    const tab=shelterReadyTab(m,'目标');if(!tab)return !shelterUiSkipped.has('目标');
     if(tab.getAttribute('aria-selected')!=='true'){offer('shelter:inspection-tab','打开今日目标，执行无消耗安全巡检',()=>tab.click());return true;}
     const root=currentElement([...document.querySelectorAll('section')].filter(n=>textOf(n.querySelector('h2'))==='今日目标'));
     const button=buttonIn(root,'安全巡检');
@@ -16934,11 +13688,13 @@ installShelterPlanningWorker(self);
   }
   function reconcileShelterAssignment(model,dialogs) {
     const pending=shelterPending,result=pending?.result;
+    const targetObserved=pending?.kind==='assign'&&model.state.residents.some(p=>p.id===pending.targets[0]&&p.roomId===pending.targets[1]);
     if(pending?.kind!=='assign'||pending.emergency||pending.blockedBy||pending.lifecycle?.phase!=='request-bound'||
       !/^[A-Za-z0-9-]{8,64}$/.test(pending.lifecycle.requestKey||'')||
       !Number.isFinite(pending.lifecycle.boundAt)||pending.lifecycle.boundAt<pending.at||
       pending.lifecycle.boundAt>result?.responseFinishedAt||!Number.isFinite(pending.before.serverTime)||
-      !Number.isInteger(result?.status)||result.status<500||result.status>599||result.outcome!=='http-error'||
+      !Number.isInteger(result?.status)||!(targetObserved&&result.status>=200&&result.status<600&&['ok','http-error'].includes(result.outcome)||
+        result.status>=500&&result.status<=599&&result.outcome==='http-error')||
       result.campaignProof||pending.before.campaign&&(!validCampaignPending(pending)||pending.campaignKey!==pending.lifecycle.requestKey)||
       continueShelterAction||awaitingShelterConfirmation||shelterWorkConfirm||accountStopReason()||
       !shelterRead||!shelterCanIsolateDefense(pending,model,shelterRead.startedAt))return false;
@@ -16950,12 +13706,21 @@ installShelterPlanningWorker(self);
       resident.roomId!==null&&!model.state.rooms.some(room=>room.id===resident.roomId)||
       pending.before.campaign?.choice.name&&String(resident.name).normalize('NFKC').replace(/\s+/g,' ').trim()!==pending.before.campaign.choice.name)return false;
     const campaign=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
-    const observation=shelterAssignmentObservation(model,resident),resolved=(!observation.stat||observation.base>=10)&&
-      resident.roomId===pending.targets[1];
+    const observation=shelterAssignmentObservation(model,resident),resolved=resident.roomId===pending.targets[1];
     const pair=shelterState.pair,swap=shelterState.swap;
     const interruptedPair=pair&&[pair.a,pair.b].includes(resident.id);
     const interruptedSwap=swap&&swap.people?.some(person=>person.id===resident.id);
     const entries=(campaign.assignmentHolds||[]).filter(entry=>entry.resolvedAt===undefined||model.now-entry.resolvedAt<7*86400000);
+    // A completed free assignment with its target observed needs no inferred
+    // success receipt. Archive the original response and adopt from fresh state.
+    if(resolved){
+      shelterWriteGuard();if(shelterPending?.id!==pending.id)return false;
+      saveShelter({...shelterState,assignmentRecovery:{original:pending,snapshotAt:model.now,outcome:'target-observed'},
+        nextAt:0,pendingReadOnly:undefined,note:'免费调岗请求已结束且目标岗位已满足，原单归档，按新状态继续'});
+      saveShelterPending(null);cancelQueued();cancelShelterRead();schedule();
+      log.add('shelter-assignment-reconciled','原请求结束后观察到目标岗位，归档原单；不伪造成功回执',
+        {operation:pending.id,residentId:resident.id,targetRoom:resident.roomId,snapshotAt:model.now});return true;
+    }
     if(!entries.some(entry=>entry.original.id===pending.id))entries.push({id:resident.id,at:Date.now(),snapshotAt:model.now,
       ...observation,original:pending,...(resolved?{resolvedAt:model.now}:{}),
       ...(interruptedPair?{pair}:{}),...(interruptedSwap?{swap}:{})});
@@ -17079,7 +13844,6 @@ installShelterPlanningWorker(self);
     if(work?.manual){shelterRescueSkipped.add(`${work.room}:${work.incidentKind}`);if(shelterDialogGone(work.dialog))shelterRescueWork=null;else say('事件房间已由你接手，等待关闭');return true;}
     if(!choice||shelterStaffHold||shelterCampaignHeld||!shelterDefenseEnabled(shelterCampaign)){
       if(closeShelterRescue())return true;
-      if(actions.some(action=>action.kind==='rescue')){finishShelter(m,'本轮无可继续核对的房间救援，不改走居民调岗',60000);return true;}
       return false;
     }
     if(work&&(work.room!==choice.room||work.incidentKind!==choice.incidentKind)){closeShelterRescue();return true;}
@@ -17110,7 +13874,7 @@ installShelterPlanningWorker(self);
     const plan=shelterCampaignPlan(m,{...shelterCampaign,maintenanceOnly:true,
       development:shelterStaffMode!=='off'&&!shelterStaffHold,
       parentTraining:Boolean(shelterCampaign.training&&['family','population'].includes(shelterStaffMode)&&!shelterStaffHold)},
-      {...shelterState.campaign,parentPreparation:shelterState.parentPreparation,families:shelterState.families||[],pending:shelterPending,
+      {...shelterState.campaign,...shelterCampaignDeferrals(m),parentPreparation:shelterState.parentPreparation,families:shelterState.families||[],pending:shelterPending,
         familyReserved:[...(shelterState.pair?[shelterState.pair.a,shelterState.pair.b]:[]),...(shelterState.swap?.people||[]).map(p=>p.id)],
         readStartedAt:shelterRead?.startedAt},shelterPopulationTarget);
     if(cache)cache.maintenance={inputs,plan};
@@ -17131,6 +13895,12 @@ installShelterPlanningWorker(self);
   function shelterCampaignChoice(m,maintenanceOnly=false) {
     const plan=maintenanceOnly?shelterMaintenanceSchedule(m):shelterCampaignSchedule(m);
     let choice=plan.choice,note='';
+    if(!maintenanceOnly&&!plan.defense?.busy&&!shelterPending&&!shelterState.pair&&!shelterState.swap&&
+        choice?.kind==='assign'&&['training','workshop','craftDaily','radio','medical'].includes(choice.role)&&
+        !(choice.role==='medical'&&m.state.resources.stimpak<=shelterCampaign.reserve)&&
+        shelterReadyParentPair(m,shelterState,shelterPopulationTarget)){
+      choice=null;note='全项10主配对先完成可行的生育交接，再安排普通值班和次要培养。';
+    }
     // A checked swap may temporarily use the 20% supply margin. Finish its
     // remaining move before releasing unrelated support workers; otherwise the
     // temporary gap empties the workshop and immediately recruits it again.
@@ -17171,27 +13941,36 @@ installShelterPlanningWorker(self);
     if(!missing.length)return false;
     const key=JSON.stringify([m.view.vaultNo,missing.map(e=>[e.id,e.residentId,e.startedAt]),
       shelterCampaign.sodaEfficiency,shelterCampaign.hours,m.view.drops,shelterStaffMode,shelterStaffHold]);
-    if(shelterTripLookup?.key===key)return shelterTripLookup.pending&&Date.now()-shelterTripLookup.at<5000;
-    const lookup=shelterTripLookup={key,pending:true,at:Date.now()};
-    const days=[...new Set(missing.flatMap(e=>[logDay(e.startedAt),logDay(e.startedAt+60000)]))];
-    Promise.all(days.map(day=>logStore.read('expedition',day,Infinity))).then(buckets=>{
-      const events=buckets.flatMap(b=>b?.events||[]);
-      if(shelterReload()){cancelShelterRead();cancelQueued();return;}
+    if(shelterTripLookup?.key!==key){
+      const lookup=shelterTripLookup={key,pending:true,at:Date.now(),events:[]};
+      const days=[...new Set(missing.flatMap(e=>[logDay(e.startedAt),logDay(e.startedAt+60000)]))];
+      const timer=setTimeout(()=>schedule(),1500);
+      if(typeof armWakeup==='function')armWakeup(lookup.at+1500);
+      Promise.all(days.map(day=>Promise.resolve().then(()=>logStore.read('expedition',day,Infinity)))).catch(()=>[]).then(buckets=>{
+        lookup.events=buckets.flatMap(b=>b?.events||[]);
+      }).finally(()=>{clearTimeout(timer);lookup.pending=false;schedule();});
+      say('核对外出人物的本地成功记录，恢复原召回计划');return true;
+    }
+    const lookup=shelterTripLookup;
+    if(lookup.applied)return false;
+    if(lookup.pending&&Date.now()-lookup.at<1500)return true;
+    try {
+      if(shelterReload()){cancelShelterRead();cancelQueued();return false;}
       if(!enabled||!shelterEnabled||!shelterCampaign.explore||shelterPending||accountStopReason()||
-        shelterState.vaultNo!==m.view.vaultNo||shelterRead?.model!==m||Date.now()-lookup.at>=5000)return;
+        shelterState.vaultNo!==m.view.vaultNo||shelterRead?.model!==m||Date.now()-shelterRead.at>=5000)return false;
       const previous=shelterState.campaign||{roles:[],trips:[],attempts:[],heals:[],trainingRest:[]};
-      const restored=missing.map(e=>shelterTripEvidence(m,e,events)||
+      const restored=missing.map(e=>shelterTripEvidence(m,e,lookup.events)||
         (shelterStaffMode!=='off'&&!shelterStaffHold?shelterAdoptTrip(m,e,shelterCampaign,
           previous.trips.find(t=>t.id===e.id&&t.resident===e.residentId)):null)).filter(Boolean);
-      if(!restored.length)return;
+      if(!restored.length){lookup.applied=true;return false;}
       const replaced=t=>restored.some(r=>r.id===t.id&&r.resident===t.resident);
       const corrected=previous.trips.filter(replaced).map(t=>({id:t.id,previousHours:t.hours,hours:restored.find(r=>r.id===t.id).hours,startedAt:t.startedAt}));
       saveShelter({...shelterState,campaign:{...previous,trips:[...previous.trips.filter(t=>!replaced(t)),...restored]}});
+      lookup.applied=true;
       log.add('shelter-trips-recovered','优先恢复原行程；缺少旧凭据的普通探险按派遣规则接管，旧接管时长只修正一次，保留出发时间',
         {vaultNo:m.view.vaultNo,trips:restored,adopted:restored.filter(t=>t.source==='existing-state').map(t=>t.id),corrected});
-    }).catch(()=>{ /* 日志不完整时明确提示未管理，不猜测行程或重发。 */ })
-      .finally(()=>{lookup.pending=false;schedule();});
-    say('核对外出人物的本地成功记录，恢复原召回计划');return true;
+    }catch{ /* 保存或身份复核失败时保留旧行程，不重发。 */ }
+    return false;
   }
   function holdShelterCampaign(note) {
     shelterCampaignHeld=note;shelterCampaignNote=note;cancelQueued();
@@ -17517,6 +14296,13 @@ installShelterPlanningWorker(self);
     log.add('shelter-execution-deferred',recheck?'原动作已撤销；以新读取重新规划一次，不重发旧动作':'本轮已撤销的未发送动作先让路，下次访问重新核对',
       {kind:work.execution.kind,targets:work.execution.targets,...work.executionFailure});
   }
+  function shelterDeferMedical(work) {
+    if(!work||!['stimpak','revive'].includes(work.kind)||work.submitted||shelterPending||work.manual)return false;
+    work.executionFailure={reason:'medical-control'};
+    if(work.execution)shelterExecutionDefer(work,'原生医疗控件不可用，本轮先检查其他居民');
+    else shelterExecutionDeferrals.set(shelterExecutionKey(work),{residents:[work.id],note:'原生治疗控件不可用，本轮先检查其他居民'});
+    work.closing=true;return true;
+  }
   function shelterRecheckExpiredWork(m){
     if(shelterPending||shelterStaffHold||shelterCampaignHeld||Date.now()<shelterExploreManualUntil)return false;
     for(const entry of shelterExecutionDeferrals.values()){
@@ -17628,13 +14414,18 @@ installShelterPlanningWorker(self);
     // Evidence expires at a business boundary, not after time spent navigating
     // native controls. Every send still requires a fresh read and the same facts.
     // The visit budget and unavailable-control/read recovery bound UI waiting.
+    const involved=new Set(shelterExecutionResidents(choice)),constructionDeadline=['build','upgrade','dig'].includes(kind);
+    const people=m.state.residents.filter(p=>involved.has(p.id));
+    const rooms=m.state.rooms.filter(r=>[choice.room,choice.from,...(constructionDeadline?[choice.id]:[])].includes(r.id));
+    const relevant=[m.view.env?.events,choice,people,rooms,
+      ...(constructionDeadline?[m.state.births,m.state.digging,m.state.rooms.filter(r=>r.builtAt>m.now||r.upgradeAt!==null)]:[])];
     const now=Date.now(),
-      serverDeadline=shelterExecutionDeadline(returning?[m.view.env?.events,choice]:[m.view,choice,shelterState.campaign],m.now),
-      localDeadline=returning?Number.MAX_SAFE_INTEGER:Math.min(Number.MAX_SAFE_INTEGER,...(shelterState.constructionLedger||[])
+      serverDeadline=shelterExecutionDeadline(returning?[m.view.env?.events,choice]:relevant,m.now),
+      localDeadline=!constructionDeadline?Number.MAX_SAFE_INTEGER:Math.min(Number.MAX_SAFE_INTEGER,...(shelterState.constructionLedger||[])
         .map(e=>e.at+86400000).filter(at=>at>now));
-    const nextTick=m.state.lastSettledAt+(Math.floor(Math.max(0,m.now-m.state.lastSettledAt)/600000)+1)*600000;
     const midnight=(Math.floor((m.now+8*3600000)/86400000)+1)*86400000-8*3600000;
-    let deadline=returning?serverDeadline:Math.min(serverDeadline,nextTick,midnight);
+    let deadline=serverDeadline;
+    if(['craft','quest-start'].includes(kind))deadline=Math.min(deadline,midnight);
     // These existing gates derive deadlines from durations rather than storing
     // an absolute timestamp. Keep server time and local spending time separate.
     const consider=at=>{if(Number.isFinite(at)&&at>m.now)deadline=Math.min(deadline,at);};
@@ -17644,20 +14435,16 @@ installShelterPlanningWorker(self);
       // Normal parent returns still yield to their own family readiness window.
       if(completedTraining.purpose==='parent'&&!completedTraining.preparation)consider(person.familyCooldownUntil-600000);
     }else{
-    for(const p of m.state.residents)consider(p.familyCooldownUntil-600000);
+    for(const p of people)consider(p.familyCooldownUntil-600000);
     for(const e of m.view.env?.events||[])consider(e.startsAt-86400000);
-    for(const h of shelterState.campaign?.heals||[])consider(h.at+1800000);
-    for(const a of shelterState.campaign?.attempts||[])consider(a.at+21600000);
-    for(const r of shelterState.campaign?.roles||[])consider(r.until-600000);
-    for(const trip of shelterState.campaign?.trips||[]){
-      const e=m.state.explorers.find(e=>e.id===trip.id),due=e&&e.startedAt+trip.hours*3600000;
-      if(due>m.now)deadline=Math.min(deadline,due);
-    }
+    for(const h of shelterState.campaign?.heals||[])if(involved.has(h.id))consider(h.at+1800000);
+    if(kind==='quest-start')for(const a of shelterState.campaign?.attempts||[])consider(a.at+21600000);
+    for(const r of shelterState.campaign?.roles||[])if(involved.has(r.id))consider(r.until-600000);
     }
     if(choice.purpose==='parent'&&kind==='assign'){
       const p=m.state.residents.find(p=>p.id===choice.id),room=m.state.rooms.find(r=>r.id===choice.room),e=shelterParentTrainingEstimate(m,p,room);
       if(!e)return null;
-      deadline=Math.min(deadline,(choice.preparation?choice.until:p.familyCooldownUntil)-e.hours*3600000);
+      if(!choice.preparation)deadline=Math.min(deadline,p.familyCooldownUntil-e.hours*3600000);
     }
     // More basic supply preserves a selected action's shortage/stock safety
     // checks. Never extend its deadline or restart its click wait for that alone.
@@ -17716,8 +14503,17 @@ installShelterPlanningWorker(self);
       const basis=shelterConstructionExecutionBasis(m),fields=shelterExecutionChangedPaths(e.construction.basis,basis);
       if(fields.length)return shelterExecutionReject(work,'construction-basis',fields);
       const current=shelterConstructionExecutionBounds(m),lower=Object.entries(e.construction.bounds).filter(([k,before])=>
-        !Number.isFinite(before)||!Number.isFinite(current[k])||current[k]<before).map(([k])=>k);
+        !Number.isFinite(before)||!Number.isFinite(current[k])||!k.startsWith('resources.')&&current[k]<before).map(([k])=>k);
       if(lower.length)return shelterExecutionReject(work,'construction-safety-bound',lower.slice(0,8));
+      const decreased=Object.keys(e.construction.bounds).some(k=>k.startsWith('resources.')&&current[k]<e.construction.bounds[k]);
+      if(decreased){
+        const campaign=shelterCampaignSchedule(m),plan=shelterDevelopmentPlan(m,shelterPopulationTarget,campaign,shelterLevelTarget);
+        const checked=plan.candidates.find(c=>c.kind===e.kind&&
+          JSON.stringify(shelterConstructionTargets(c))===JSON.stringify(e.targets)&&
+          JSON.stringify(c.cost)===JSON.stringify(e.choice.cost));
+        if(!checked||checked.blocks.length||Object.values(checked.shortage).some(v=>v>0))
+          return shelterExecutionReject(work,'construction-stock-recheck');
+      }
     }else{
       if(e.returning&&(!Number.isFinite(m.state.lastSettledAt)||m.state.lastSettledAt<e.settledAt))
         return shelterExecutionReject(work,'settlement-regressed');
@@ -17734,7 +14530,7 @@ installShelterPlanningWorker(self);
         if(!hp||hp.hp>=.9*hp.max)return shelterExecutionReject(work,'healing-no-longer-needed');
       }
     }
-    if(e.supply&&Object.entries(e.supply).some(([k,before])=>
+    if(!e.construction&&e.supply&&Object.entries(e.supply).some(([k,before])=>
       !Number.isFinite(before)||!Number.isFinite(m.state.resources[k])||m.state.resources[k]<before))
       return shelterExecutionReject(work,'supply',Object.keys(e.supply).filter(k=>m.state.resources[k]<e.supply[k]).map(k=>`resources.${k}`));
     if(e.kind==='assign'&&e.choice.role==='training-release'){
@@ -17762,7 +14558,7 @@ installShelterPlanningWorker(self);
       else {const campaign=idleJob?null:shelterCampaignChoice(m);choice=idleJob||(campaign&&['assign','equip','stimpak'].includes(campaign.kind)?campaign:
         shelterPending||plan.defense?.busy?null:shelterStaffPlan(m));if(choice===campaign)selectedCampaign=campaign;} }
     catch(error) { if(error?.code==='shelter-state-changed')throw error;holdShelterStaff('人员或配对记录无法核对，本轮只收取奖励'); }
-    if(!execution&&!plan?.defense?.busy&&shelterExecutionDeferred(choice))choice=null;
+    if(!execution&&shelterExecutionDeferred(choice))choice=null;
     if(choice?.kind==='development-wait'){say(choice.reason);return true;}
     if (shelterWork?.submitted || shelterLeave || !shelterEnabled || !choice) return closeShelterWork();
     if (shelterWork && (shelterWork.id !== choice.id || shelterWork.room !== choice.room || shelterWork.from !== choice.from ||
@@ -17815,7 +14611,7 @@ installShelterPlanningWorker(self);
       if(work.kind==='stimpak'){
         if(!shelterWorkTitle(work.dialog,work)){holdShelterStaff('治疗窗口身份变化');return closeShelterWork();}
         const button=buttonIn(work.dialog,/^用治疗针\((?:恢复最大血量 40%,)?剩 \d+\)$/);
-        if(!usable(button)){holdShelterStaff('原生治疗按钮不可核对');return closeShelterWork();}
+        if(!usable(button)){shelterDeferMedical(work);return closeShelterWork();}
         shelterSubmit(button,'stimpak',work.targets,m,work.reason,()=>{work.submitted=true;button.click();});return true;
       }
       const equip = work.kind === 'equip', value = equip ? String(work.item) : work.room === null ? 'rest' : String(work.room);
@@ -18096,6 +14892,10 @@ installShelterPlanningWorker(self);
     return diagnosticId;
   }
   function shelterCheckLog(note,data) {
+    if(typeof localStorage!=='undefined'&&localStorage.getItem('arkengine:auto-shelter:diagnostics:v1')!=='true'){
+      const keys=['nextAt','actions','confirmedActions','staffMode','staffHeld','pendingPair','pendingSwap','pendingReadOnly','population','populationTarget','recovering','births'];
+      log.add('shelter-check',note,Object.fromEntries(keys.filter(k=>data[k]!==undefined).map(k=>[k,data[k]])));return;
+    }
     if(logBytes(data)<=28000){log.add('shelter-check',note,data);return;}
     // 保留原汇总字段的完整JSON，避免多家庭原因使整条检查被日志32KB上限丢弃。
     const diagnosticId=data.diagnosticId||crypto.randomUUID(),json=JSON.stringify(data),chunks=[];
@@ -18252,7 +15052,7 @@ installShelterPlanningWorker(self);
       ...(m&&shelterPopulationNote?{populationEvaluation:{at:m.now,mode:shelterStaffMode,target:shelterPopulationTarget,note:shelterPopulationNote}}:{}),
       pendingReadOnly:shelterPending?.id===pendingReadOnly?pendingReadOnly:undefined,
       ...(m ? { advice:shelterAdvice(m),development,operations,populationAdvice,developmentTrace } : {}) });
-    if(m)try { diagnosticId=shelterDecisionLog(m,diagnosticPlan,diagnosticCampaign,populationDiagnostics,collection,note); }
+    if(m&&localStorage.getItem('arkengine:auto-shelter:diagnostics:v1')==='true')try { diagnosticId=shelterDecisionLog(m,diagnosticPlan,diagnosticCampaign,populationDiagnostics,collection,note); }
     catch { log.add('shelter-diagnostic-error','详细诊断生成失败；本轮原操作及预约保留'); }
     shelterCheckLog(note, { diagnosticId,nextAt:shelterState.nextAt, actions:shelterActions,confirmedActions:shelterConfirmedActions,
       actionCountMeaning:'actions为原生操作尝试（包含未发送准备）；confirmedActions为本次访问核对成功的操作',pendingReadOnly:shelterReadOnlyWait(),
@@ -18775,12 +15575,9 @@ installShelterPlanningWorker(self);
     }
     if (!shelterEntryAt&&shelterState.nextAt>Date.now()&&!shelterPending) { leaveShelter(); return; }
     if (!shelterEntryAt) { shelterEntryAt = Date.now(); shelterStage = 0; shelterActions = 0;shelterConfirmedActions=0; shelterLeave = false;shelterVisitPeriod=null;
-      // Worker proposals belong to one visit. A transient failure is terminal
-      // within that visit, but must not poison every later visit at the same facts.
-      // Clearing these read-only jobs never clears the pending action journal.
-      shelterLevelPlanner?.invalidate();shelterLevelReplays.clear();shelterFamilyPlanner?.invalidate();shelterBackgroundPlanner?.invalidate();
       shelterExecutionDeferrals.clear();shelterRescueSkipped.clear();
       shelterDailyDeferred.clear();
+      shelterUiSkipped.clear();
       shelterCampaignHeld='';shelterPopulationNote='';
       shelterQuestSelection=null;
       shelterCampaignWork=null;
@@ -18905,6 +15702,7 @@ installShelterPlanningWorker(self);
       }
       return;
     }
+    if(shelterMigratePlanPolicy(m)){schedule();return;}
     if(reconcileShelterAssignmentHolds(m)){schedule();return;}
     if(reconcileShelterEquipmentHolds(m)){schedule();return;}
     if(shelterVisitPeriod.day!==m.state.daily.day||shelterVisitPeriod.month!==m.state.season.month) {
@@ -18952,6 +15750,24 @@ installShelterPlanningWorker(self);
       schedule();return;
     }
     if(!defending&&!visitBudget.handoffOnly&&!dialogs.length&&!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&shelterRecheckExpiredWork(m))return;
+    if(!visitBudget.handoffOnly&&!shelterStaffHold&&!shelterCampaignHeld&&shelterCampaign.medical){
+      const urgent=maintenance.healing?.urgent?maintenance.healing:null;
+      const revival=!defending?shelterRevivalChoice(m,shelterConstruction,shelterState,null,Date.now()):null;
+      if(urgent||revival){
+        if(closeShelterBuild()||closeShelterRecall()||closeShelterRescue())return;
+        const choice=urgent||revival;
+        // Combat medical work is reselected from fresh defense observations on
+        // every step; an ordinary execution would be cancelled by defense above.
+        const medicalPlan=defending?{...maintenance,choice:{...choice,maintenanceMedical:true}}:null;
+        if(shelterWorkStep(m,dialogs,medicalPlan,defending?null:shelterExecutionCapture(m,choice,urgent)))return;
+      }
+      const needNeedles=defending&&m.state.resources.stimpak<=shelterCampaign.reserve&&
+        m.state.residents.some(p=>p.deadAt===null&&p.away===null&&shelterHealth(p)?.hp<.9*shelterHealth(p)?.max);
+      if(needNeedles){
+        if(closeShelterRescue())return;
+        if(!shelterWork&&!shelterBuildWork&&!shelterRecallWork&&!dialogs.length&&shelterProductionClaimStep(m,true))return;
+      }
+    }
     if(shelterRescueWork&&(visitBudget.handoffOnly||maintenance.choice?.kind==='stimpak')&&closeShelterRescue())return;
     if((shelterRescueWork||maintenance.defense?.actions.some(choice=>choice.kind==='rescue'))&&!visitBudget.handoffOnly&&maintenance.choice?.kind!=='stimpak'){
       if(closeShelterBuild()||closeShelterRecall()||closeShelterWork())return;
@@ -19052,7 +15868,7 @@ installShelterPlanningWorker(self);
     let tab;
     while(shelterStage<names.length) {
       tab=shelterReadyTab(m,names[shelterStage]);
-      if(!tab)return true;
+      if(!tab){if(shelterUiSkipped.has(names[shelterStage])){shelterStage++;continue;}return true;}
       if(shelterStage===0 || shelterRewardTabDue(shelterStage,m,tab))break;
       shelterStage++;
     }
@@ -20291,6 +17107,7 @@ installShelterPlanningWorker(self);
         id:pending.id,round:pending.round,openedAt:pending.at,...result});
       auctionSave({...auctionState,pending:null,rounds,receipts,rejected:outcome==='rejected'?pending.signature:''});
       auctionWindow=null;auctionRecord();
+      if(outcome==='success')auctionRelease();
     }
     schedule();
   }
@@ -20488,6 +17305,7 @@ installShelterPlanningWorker(self);
     const now=Date.now(),today=auctionCore.day(now),current=auctionView?.model;
     const visit=auctionCore.visit(current,now);
     const requested=auctionToggle.checked&&visit.active&&auctionState.doneDay!==today&&
+      !(current&&auctionState.rounds.includes(auctionCore.round(current,visit.releaseAt)))&&
       !(auctionState.pending?.phase==='submitted'&&auctionRetryClosed(auctionState.pending,now)&&!auctionWindow?.sent);
     if(!requested&&!auctionWindow){auctionRelease();return false;}
     const dialogs=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"]')].filter(visible);
@@ -20506,7 +17324,6 @@ installShelterPlanningWorker(self);
     }
     if(!auctionExclusive){
       auctionExclusive=true;cancelQueued();cultivation.cancel();cancelFarmRead();cancelShelterRead();cancelShelterAuxReads();cancelShelterWatch();cancelStockRead();
-      shelterLevelPlanner?.invalidate();shelterLevelReplays.clear();shelterFamilyPlanner?.invalidate();shelterBackgroundPlanner?.invalidate();
       auctionSummary={releaseAt:visit.releaseAt,enteredAt:now,bought:false,submitted:false,reason:'等待账号与行情'};
       if(captureShelterCaravan&&!captureShelterCaravan.sent)captureShelterCaravan.cancelled=true;
       if(captureShelterHelp&&!captureShelterHelp.sent)captureShelterHelp.cancelled=true;
@@ -20601,6 +17418,7 @@ installShelterPlanningWorker(self);
 
   function step() {
     if (enabled && sharedGroupPaused(PREF)) setEnabled(false);
+    if(!enabled||pageFrozen){releaseLock?.();return;}
     syncDialogAnimations();
     if(enabled&&active&&onPage()&&!pageFrozen&&!accountStopReason()&&!stateFault('expedition')){
       try{if(auctionStep()){
@@ -20611,7 +17429,9 @@ installShelterPlanningWorker(self);
     pollReadSessions();
     const handingOff=enabled&&active&&inShelter()&&shelterWorkConfirm&&!shelterWorkConfirm.manual&&
       !shelterWorkConfirm.clicked&&shelterRead&&shelterRead.startedAt>=shelterWorkConfirm.at&&Date.now()-shelterRead.at<=1500;
-    if(!handingOff){farmHint();shelterHint();stockHint();cultivation.update();}
+    if(!handingOff)for(const update of [farmHint,shelterHint,stockHint,()=>cultivation.update()]){
+      try{update();}catch{/* A display fault cannot stop action reconciliation. */}
+    }
     if (!cultivation.onPage()) cultivation.cancel();
     if (!inStock() && (stockEntryAt || stockController || stockRead)) {
       cancelStockRead();stockEntryAt=0;stockLeave=false;stockActions=0;
@@ -20624,8 +17444,8 @@ installShelterPlanningWorker(self);
     }
     if (host.hidden === onPage()) host.hidden = !onPage();
     if(!handingOff){
-      if(logSummaryDay!==Math.floor((Date.now()+8*3600000)/86400000))renderLogIncome();
-      if(onPage())log.receipts();
+      if(logSummaryDay!==Math.floor((Date.now()+8*3600000)/86400000))try{renderLogIncome();}catch{}
+      if(onPage())try{log.receipts();}catch{/* Display failures must not pause native actions. */}
     }
     if (accountStopReason()) {
       if (enabled) setEnabled(false, accountStopReason()); else say(accountStopReason());
@@ -20920,12 +17740,26 @@ installShelterPlanningWorker(self);
         if (!offered) cancelQueued();
         if (idleChecked && !idleBlocked) clearIdleWait(true);
         if (enabled && active && !auctionExclusive && farmEnabled && inFarm()) farmWait.finish();
+        scheduleNextEvent();
       }
     },()=>Boolean(auctionWindow&&!auctionWindow.sent)||enabled&&auctionToggle.checked&&
       auctionState.pending?.phase!=='submitted'&&auctionState.doneDay!==auctionCore.day(Date.now())&&auctionCore.visit(auctionView?.model,Date.now()).active);
     schedule.run(immediate===true||Boolean(shelterWorkConfirm&&shelterRead&&
       queued?.key===`shelter:work-confirm:${shelterWorkConfirm.id}`&&queued.dueAt<=Date.now()&&
       shelterRead.startedAt>=shelterWorkConfirm.at&&Date.now()-shelterRead.at<=1500));
+  }
+  function scheduleNextEvent() {
+    clearTimeout(schedule.nextTimer);schedule.nextTimer=null;
+    if(!enabled||pageFrozen||!onPage()){armWakeup(null);return;}
+    const now=Date.now(),auctionVisit=auctionToggle.checked?auctionCore.visit(auctionView?.model,now):null;
+    const dates=[queued?.dueAt,nextStepAt,cultivation.nextWakeAt(),shelterReadAt,shelterWatchAt,farmState.nextAt,shelterState.nextAt,stockLedger.nextAt,
+      ...(auctionVisit?[auctionReadAt,auctionRecoveryReadAt,auctionVisit.opensAt,auctionVisit.releaseAt,auctionVisit.closesAt]:[]),
+      shelterUiWait? shelterUiWait.at+15000:null,
+      ...[shelterWork,shelterBuildWork,shelterRecallWork,shelterRescueWork].flatMap(w=>w?
+        [w.openedAt?w.openedAt+5000:null,w.closeAt?w.closeAt+5000:null,w.closeUnavailableAt?w.closeUnavailableAt+15000:null]:[])];
+    const next=Math.min(now+idleWakeCadence(),...dates.filter(at=>Number.isFinite(at)&&at>now));
+    schedule.nextTimer=setTimeout(()=>schedule(),Math.max(50,next-now));
+    armWakeup(next);
   }
   log.observeLifecycle(() => onPage() ? { enabled, ownsLock: active, state: status.textContent,
     auctionEnabled:auctionToggle.checked,auctionExclusive,pendingAuction:Boolean(auctionState.pending),
@@ -20935,7 +17769,10 @@ installShelterPlanningWorker(self);
     stockEnabled:stockEnabled(),stockDueAt:stockLedger.nextAt,pendingStock:Boolean(stockLedger.pending),stockHeld:stockLedger.hold,
     shelterStaffMode,shelterGear,shelterOptimize,populationTarget:shelterPopulationTarget,
     pendingStaff:Boolean(shelterWork),pendingSwap:Boolean(shelterState.swap),pendingPair:Boolean(shelterState.pair),diagnostic } : null);
-  subscribeWakeup(schedule, onPage, () => enabled, () => {if(!auctionExclusive)cultivation.observe();});
+  function idleWakeCadence() {
+    return auctionExclusive||shelterEnabled&&shelterDefenseEnabled(shelterCampaign)?30000:60000;
+  }
+  subscribeWakeup(schedule,onPage,()=>enabled,()=>{if(!auctionExclusive)cultivation.observe();},idleWakeCadence);
   document.addEventListener('freeze', () => {
     pageFrozen = true;
     auctionRecovery?.controller.abort();
@@ -20998,7 +17835,7 @@ installShelterPlanningWorker(self);
             next.construction={build:true,upgrade:true,dig:true,budgetMode:'stock',scrapLimit:10000,partsLimit:100,scrapReserve:100,partsReserve:0};
           write(SHELTER_PREF,'false');shelterEnabled=false;
           for(const [key,value] of [[SHELTER_STAFF,'population'],[SHELTER_POPULATION,String(next.population)],
-            [SHELTER_POPULATION_CONTINUOUS,'true'],[SHELTER_LEVEL_TARGET,'auto'],[SHELTER_GEAR,'true'],
+            [SHELTER_POPULATION_CONTINUOUS,'false'],[SHELTER_LEVEL_TARGET,'off'],[SHELTER_GEAR,'true'],
             [SHELTER_OPTIMIZE,'true'],[SHELTER_EXPLORE_CLAIM,'true'],
             [SHELTER_CAMPAIGN,JSON.stringify(next.campaign)],[SHELTER_CONSTRUCTION,JSON.stringify(next.construction)]])write(key,value);
           write(SHELTER_PREF,'true');shelterReload();

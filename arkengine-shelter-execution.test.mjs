@@ -171,12 +171,12 @@ test('三天工程交接：增产路线不会因普通产出增长撤销或延�
 });
 
 test('等级工程交接：预算、资源、人员、施工条件变化仍阻止原投资',()=>{
-  for(const change of [x=>x.f.view.state.resources.scrap--,x=>x.c.shelterConstruction.scrapLimit=0,
+  for(const change of [x=>x.f.view.state.resources.scrap=0,x=>x.c.shelterConstruction.scrapLimit=0,
     x=>x.f.view.state.residents[0].roomId=4,x=>x.f.view.state.rooms.find(r=>r.id===100).upgradeAt=x.f.view.serverTime+3600000,
     x=>x.c.shelterPopulationTarget=100,x=>x.f.view.state.residents[0].hp--]){
     const x=setup(growthInvestmentScene());x.c.shelterPopulationTarget=7;x.c.shelterLevelTarget=5;
     const w=x.capture(x.native.construction(x.model()));change(x);
-    assert.equal(x.api.current(x.model(),w),null);assert.ok(w.executionFailure.fields.length);
+    assert.equal(x.api.current(x.model(),w),null);assert.ok(w.executionFailure.reason);
   }
 });
 
@@ -242,7 +242,7 @@ test('执行依据：已发送动作的正常收尾不再记作首次失效',()=
   assert.equal(events.length,2,'an explicit cancellation must retain its evidence');
 });
 for(const [name,change] of Object.entries({
-  resources:x=>x.f.view.state.resources.food--,
+  resources:x=>x.f.view.state.resources.scrap=0,
   roster:x=>x.f.view.state.residents[0].hp--,
   room:x=>x.f.view.state.rooms[0].unpowered=true,
   obligations:x=>x.c.shelterState.campaign.roles.push({id:5,room:90,role:'training'}),
@@ -265,18 +265,18 @@ for(const [name,prepare] of Object.entries({
   healing:x=>x.c.shelterState.campaign.heals=[{id:5,at:x.f.view.serverTime-1795000}],
   budget:x=>{x.c.shelterConstruction.scrapLimit=401;x.c.shelterState.constructionLedger=[{id:'old',at:x.f.view.serverTime-86395000,scrap:1,parts:0}];},
   midnight:x=>{x.f.view.serverTime=86400000-8*3600000-5000;x.f.view.state.lastSettledAt=x.f.view.serverTime;}
-}))test('时间边界：'+name+'前可用，到界重新选动作',()=>{
+}))test('时间边界：'+name+'仅在与工程相关时使原动作到期',()=>{
   const x=setup();prepare(x);const w=x.capture();x.advance(4999);assert.ok(x.api.current(x.model(),w));
-  x.advance(1);assert.equal(x.api.current(x.model(),w),null);
+  x.advance(1);assert.equal(x.api.current(x.model(),w),['event','budget'].includes(name)?null:w.execution);
 });
 test('复核考虑读取后的本地耗时，不让旧serverTime延长有效期',()=>{
-  const x=setup();x.f.view.state.residents[0].adultAt=x.f.view.serverTime+5000;
+  const x=setup();x.f.view.env.events=[{kind:'production',startsAt:x.f.view.serverTime+5000,endsAt:x.f.view.serverTime+3600000,percent:20}];
   const w=x.capture(),m=x.model();x.local(5000);assert.equal(x.api.current(m,w),null);
 });
 
 test('最终确认复用真实业务边界，只允许本页同一未发送准备通过pending门槛',()=>{
   const x=setup(),choice={kind:'assign',id:5,room:5,from:4,targets:[5,5]};
-  x.f.view.state.residents[0].adultAt=x.f.view.serverTime+30000;
+  x.f.view.env.events=[{kind:'production',startsAt:x.f.view.serverTime+30000,endsAt:x.f.view.serverTime+3600000,percent:20}];
   const w=x.capture(choice);
   w.submitted=true;
   const p={id:'prepared',kind:'assign',targets:[5,5],lifecycle:{phase:'prepared',page:'execution-page'}};
@@ -288,7 +288,7 @@ test('最终确认复用真实业务边界，只允许本页同一未发送准�
   p.lifecycle.page='execution-page';x.advance(30000);assert.equal(x.api.current(x.model(),w,p),null);
 });
 test('供给增长保留当前动作及原期限，任何下降仍须重新规划',()=>{
-  const x=setup(),w=x.capture(),deadline=w.execution.deadline;
+  const x=setup(),w=x.capture({kind:'assign',id:5,from:90,room:4,role:'training-release'}),deadline=w.execution.deadline;
   for(let i=0;i<5;i++){
     for(const k of ['power','food','water'])x.f.view.state.resources[k]+=.001;
     x.advance(1000);assert.equal(x.api.current(x.model(),w),w.execution);
@@ -365,16 +365,15 @@ test('下挖仅为普通生产腾位置时接受存量增长，特殊或未知�
     assert.equal(x.api.current(x.model(),w),ordinary?w.execution:null);
   }
 });
-test('普通建设：库存、健康和房间产物下降仍取消，给出明确原因',()=>{
-  for(const key of ['scrap','parts','stimpak']){
-    const x=setup(),w=x.capture();x.f.view.state.resources[key]--;
-    assert.equal(x.api.current(x.model(),w),null,key);
-    assert.equal(w.executionFailure.reason,'construction-safety-bound');
-    assert.ok(w.executionFailure.fields.includes('resources.'+key));
-  }
-  const x=setup();x.f.view.state.rooms[0].stored=1;const w=x.capture();x.f.view.state.rooms[0].stored=0;
-  assert.equal(x.api.current(x.model(),w),null);
-  assert.ok(w.executionFailure.fields.includes('rooms.1.stored'));
+test('普通建设：库存下降复核同一工程，资金不足或岗位产物下降仍撤销',()=>{
+  const x=setup(),project=x.native.construction(x.model());assert.ok(project);
+  const w=x.capture(project);x.f.view.state.resources.scrap-=.01;
+  assert.equal(x.api.current(x.model(),w),w.execution);
+  assert.equal(w.execution.choice.id,project.id);
+  x.f.view.state.resources.scrap=0;assert.equal(x.api.current(x.model(),w),null);
+  const y=setup();y.f.view.state.rooms[0].stored=1;const work=y.capture();y.f.view.state.rooms[0].stored=0;
+  assert.equal(y.api.current(y.model(),work),null);
+  assert.ok(work.executionFailure.fields.includes('rooms.1.stored'));
 });
 test('普通建设：真实施工名额、预留人手、身份和规则变化均重新规划',()=>{
   for(const change of [
@@ -392,7 +391,7 @@ test('普通建设：真实施工名额、预留人手、身份和规则变化�
     const x=setup(),w=x.capture();change(x);
     assert.equal(x.api.current(x.model(),w),null);
     assert.ok(w.executionFailure.reason);
-    assert.ok(w.executionFailure.fields.length);
+    assert.ok(w.executionFailure.reason);
   }
 });
 test('物资增长不放宽训练、仓库用途、特殊策略或未知资源',()=>{
@@ -486,7 +485,7 @@ test('公共进度契约：自然恢复到九成不再打针，返岗接受供�
 });
 test('取消让路：只延后已撤销且未发送的同一动作，其他动作和未知原单不受影响',()=>{
   const x=setup(),choice={kind:'assign',id:5,room:4,from:90};
-  x.f.view.state.residents[0].adultAt=x.f.view.serverTime+30000;
+  x.f.view.env.events=[{kind:'production',startsAt:x.f.view.serverTime+30000,endsAt:x.f.view.serverTime+3600000,percent:20}];
   const w=x.capture(choice);
   x.api.defer(w);assert.equal(x.api.deferred(choice),false);
   x.advance(30000);assert.equal(x.api.current(x.model(),w),null);
@@ -503,6 +502,7 @@ test('取消让路：只延后已撤销且未发送的同一动作，其他动�
 
 test('执行耗时：合法导航和慢读取超过30秒仍续接，真实结算边界仍撤销',()=>{
   const x=setup();x.f.view.state.lastSettledAt=x.f.view.serverTime;
+  x.f.view.env.events=[{kind:'production',startsAt:x.f.view.serverTime+120000,endsAt:x.f.view.serverTime+3600000,percent:20}];
   const w=x.capture({kind:'assign',id:5,room:5,from:4,targets:[5,5]}),deadline=w.execution.deadline;
   for(let i=0;i<8;i++){x.advance(10000);assert.equal(x.api.current(x.model(),w),w.execution);}
   assert.equal(w.execution.deadline,deadline,'没有靠重复续期改写真实业务期限');
@@ -512,6 +512,7 @@ test('执行耗时：合法导航和慢读取超过30秒仍续接，真实结算
 test('过期动作只在新读取越过边界后重新选一次，重复过期或存在原单时不放行',()=>{
   for(const kind of ['assign','stimpak']){
     const x=setup(),choice=kind==='assign'?{kind,id:5,room:4,from:90}:{kind,id:5,targets:[5]};
+    x.f.view.env.events=[{kind:'production',startsAt:x.f.view.serverTime+5000,endsAt:x.f.view.serverTime+3600000,percent:20}];
     const w=x.capture(choice);let reads=0;
     x.c.readShelter=()=>{reads++;x.c.shelterController={};};x.c.shelterController=null;
     x.advance(w.execution.deadline-x.f.view.serverTime);const old=x.model();

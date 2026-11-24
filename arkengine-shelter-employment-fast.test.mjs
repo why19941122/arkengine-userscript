@@ -16,6 +16,7 @@ function setup(){
     shelterCampaignSchedule:()=>{throw Error('Fast employment must not invoke full planning');}};
   const api=vm.runInNewContext(['shelterRooms','shelterBuildRules','campaignDefaults'].map(n=>source.match(new RegExp(`const ${n}\\s*=[^;]*;`))[0]).join('\n')+
     segment('  function shelterWorkerRate(','  function readShelter(')+segment('  const staffRoomTypes =','  function shelterExploreStep(')+
+    segment('  function shelterCampaignDeferrals(','  function shelterDailyCraftStaffing(')+
     segment('  function shelterMaintenanceSchedule(','  function shelterCampaignChoice(')+
     '\n({model:shelterModel,schedule:shelterEmploymentSchedule,idle:shelterIdleEmploymentChoice})',context);
   const choose=()=>{const m=api.model(view);return api.idle(m,api.schedule(m));};
@@ -36,12 +37,12 @@ test('fast employment: an open solo trip reserves its chosen resident but not th
   x.context.shelterCampaignSchedule=()=>({departureResidents:[selected]});
   const other=x.choose();assert.ok(other);assert.notEqual(other.id,selected);
 });
-test('fast employment: actual trainee keeps the return seat even after its deadline; no stale reservation after leaving training',()=>{
+test('fast employment: actual training does not reserve a future job, including expired historical records',()=>{
   const x=setup(),s=x.s;s.rooms.find(r=>r.id===4).width=1;
   s.rooms.push({...s.rooms[0],id:30,type:'training',trainStat:'end'});
   s.residents.push({...structuredClone(s.residents[5]),id:7,name:'在训人员',roomId:30});
   x.context.shelterState.campaign.roles=[{id:7,room:30,role:'training',purpose:'production',destination:4,until:x.view.serverTime-1}];
-  assert.equal(x.choose(),null);
+  assert.ok([5,6].includes(x.choose()?.id),'the empty production seat is usable during training');
   s.residents.find(p=>p.id===7).roomId=null;
   assert.ok([5,6].includes(x.choose()?.id),'finished/displaced trainee does not keep a phantom seat');
 });
@@ -108,7 +109,7 @@ test('fast employment: invalid population settings do not disable the separate p
   assert.equal(x.choose(),null);x.context.shelterStaffMode='production';assert.ok(x.choose());
 });
 
-test('fast employment: current historical training reserves its last return seat before an idle adult is placed',()=>{
+test('fast employment: historical training keeps its current cell without reserving the last production seat',()=>{
   const x=setup();x.context.shelterStaffMode='production';x.context.shelterState.families=[];
   Object.assign(x.context.shelterCampaign,{training:true,trainTarget:6});
   x.s.rooms.find(r=>r.id===4).width=1;
@@ -116,9 +117,9 @@ test('fast employment: current historical training reserves its last return seat
   for(const p of x.s.residents)p.stats.end=10;
   const trainee=x.s.residents[4];Object.assign(trainee,{roomId:90,training:.9});trainee.stats.end=5;
   const before=JSON.stringify(x.view),saved=JSON.stringify(x.context.shelterState),m=x.api.model(x.view),plan=x.api.schedule(m);
-  assert.ok(plan.trainingDestinations.some(d=>d.id===5&&d.room===4),'ongoing cell retains the usable return seat');
+  assert.equal(plan.trainingDestinations.length,0,'ongoing cell does not own a future seat');
   assert.ok(plan.adoptions.some(r=>r.id===5&&r.purpose==='production'&&r.destination===4));
-  const choice=x.api.idle(m,plan);assert.ok(!choice||choice.room!==4,'unrelated idle adult cannot consume that seat');
+  const choice=x.api.idle(m,plan);assert.equal(choice?.room,4,'idle adult can use the empty seat immediately');
   assert.equal(JSON.stringify(x.view),before);assert.equal(JSON.stringify(x.context.shelterState),saved);
   x.s.rooms.find(r=>r.id===4).width=2;
   assert.equal(x.choose()?.room,4,'a distinct spare seat is still available without running full planning');

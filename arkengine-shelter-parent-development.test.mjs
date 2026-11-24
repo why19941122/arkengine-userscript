@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {finishParentStats} from './arkengine-shelter-parent72.fixture.mjs';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
@@ -58,6 +59,7 @@ function pairScene(){
   for(const id of [7,8])s.residents.push({...structuredClone(s.residents[3]),id,name:`优质居民${id}`,roomId:4,parents:[]});
   s.residents[3].stats=Object.fromEntries(Object.keys(s.residents[3].stats).map(k=>[k,3]));
   s.residents[3].xp=0;s.residents[3].hp=100;
+  finishParentStats(scene.v);
   scene.choose=()=>scene.api.population(scene.api.model(scene.v),scene.context.shelterState.families,
     {eligible:p=>p.id>=4,home:()=>true,healthy:()=>true},true);
   return scene;
@@ -77,10 +79,10 @@ test('父母选择：就业落实且供应可承受时优先高属性生产者',
   const {choose,context,events}=pairScene();assert.ok(choose());
   assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
   const assessment=events.find(e=>e[0]==='shelter-population')[2].assessment;
-  assert.equal(assessment.baseTotal,56);assert.equal(assessment.midpoint.cha,8);assert.equal(assessment.romanceHours,1.25);
+  assert.equal(assessment.baseTotal,70);assert.equal(assessment.midpoint.cha,10);assert.equal(assessment.romanceHours,1);
 });
 
-test('父母比较边界：另有闲人尚待就业时先暂停新配对，不用属性或周期绕过就业',()=>{
+test('父母比较边界：另有闲人尚待就业时仍按属性和真实供给决定配对',()=>{
   const {v,choose,context,api}=pairScene();
   for(const p of v.state.residents.filter(p=>p.id>=4)){
     p.stats=Object.fromEntries(Object.keys(p.stats).map(k=>[k,p.id>=7?5:3]));
@@ -90,7 +92,9 @@ test('父母比较边界：另有闲人尚待就业时先暂停新配对，不�
   assert.ok(api.assessment(m,high).baseTotal>api.assessment(m,low).baseTotal);
   assert.ok(api.assessment(m,high).score<api.assessment(m,low).score,'reproduce the old rate-based ranking conflict');
   v.state.residents.find(p=>p.id===5).roomId=null;
-  assert.equal(choose(),null);assert.equal(context.shelterState.pair,undefined);assert.match(context.shelterPopulationNote,/岗位/);
+  assert.equal(choose(),null);finishParentStats(v);
+  assert.ok(choose());assert.deepEqual([context.shelterState.pair.a,context.shelterState.pair.b],[7,8]);
+  assert.equal(v.state.residents.find(p=>p.id===5).roomId,null,'选择不自动改写其他成人岗位');
 });
 test('父母选择：基础魅力影响周期、装备不影响评估，生产损失会降低同属性组合评分',()=>{
   const {v,api}=setup(),m=api.model(v),pair=v.state.residents.slice(4);
@@ -102,7 +106,7 @@ test('父母选择：基础魅力影响周期、装备不影响评估，生产�
 });
 test('父母选择：亲缘与供给门槛不能被高属性评分绕过，已有感情仍受保护',()=>{
   const a=pairScene();a.v.state.residents.filter(p=>[7,8].includes(p.id)).forEach(p=>p.parents=[1,2]);
-  a.choose();assert.notDeepEqual([a.context.shelterState.pair.a,a.context.shelterState.pair.b],[7,8]);
+  assert.equal(a.choose(),null);assert.equal(a.context.shelterState.pair,undefined);
   const b=pairScene();b.v.state.resources.food=0;assert.equal(b.choose(),null);assert.equal(b.context.shelterState.pair,undefined);
   const c=parents();for(const p of c.v.state.residents.slice(4))p.romance={partnerId:p.id===5?6:5};
   assert.ok(!c.run().actions.some(a=>[5,6].includes(a.id)));
@@ -392,6 +396,7 @@ test('父母训练完整轮换：实际调度读取家庭，训练到期释放�
   const id=a.id;v.serverTime=a.until;s.lastSettledAt=v.serverTime;
   a=api.campaign(api.model(v)).choice;assert.equal(a.role,'training-release');apply(a);
   assert.ok(!api.campaign(api.model(v)).actions.some(x=>x.id===id&&x.role==='training'));
+  finishParentStats(v,[5,6]);
   a=api.staff(api.model(v));assert.equal(a.id,id);assert.equal(a.room,5);assert.match(a.reason,/原配对返回/);
 });
 

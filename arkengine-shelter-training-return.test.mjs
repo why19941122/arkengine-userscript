@@ -286,14 +286,14 @@ test('生产训练：无生产空位、离岗断供和跨资源用途不会虚�
   const cross=scene('end');cross.p.roomId=2;
   assert.equal(cross.estimate().reason,'cross-resource-opportunity');
 });
-test('生产训练：同一轮两个训练者不能承诺同一个返岗空位',()=>{
+test('生产训练：同一轮可用两个训练席，不为远期产出预留岗位',()=>{
   const x=scene();x.s.residents[3].stats.end=10;
   const before=JSON.stringify(x.v),plan=x.run();
   const trained=plan.actions.filter(a=>a.purpose==='production');
-  assert.equal(trained.length,1);
+  assert.equal(trained.length,2);assert.equal(plan.trainingDestinations.length,0);
   assert.equal(trained[0].destination,4);assert.equal(JSON.stringify(x.v),before);
 });
-test('生产训练：刷新保留返岗席位，不能重新承诺给第二人',()=>{
+test('生产训练：刷新保留正在训练的居民，剩余训练席可给第二人',()=>{
   const x=scene();x.s.residents[3].stats.end=10;
   const a=x.run().actions.find(a=>a.purpose==='production');assert.ok(a);
   x.p=x.s.residents.find(p=>p.id===a.id);x.p.roomId=a.room;x.p.training=0;
@@ -301,7 +301,7 @@ test('生产训练：刷新保留返岗席位，不能重新承诺给第二人',
     purpose:a.purpose,until:a.until,windowEnd:a.windowEnd,destination:a.destination}];
   x.record=JSON.parse(JSON.stringify(x.record));
   const plan=api.plan(api.model(x.v),x.cfg,x.record,14);
-  assert.equal(plan.actions.filter(a=>a.purpose==='production').length,0);
+  assert.equal(plan.actions.filter(a=>a.purpose==='production').length,1);assert.equal(plan.trainingDestinations.length,0);
   assert.ok(plan.reserved.includes(a.id));assert.equal(api.valid(x.record),true);
 });
 
@@ -345,7 +345,7 @@ function upgradingTrainingScene(stat='end'){
   return {...context,destination};
 }
 
-test('生产训练返岗房升级：保留当前格、原席位和固定期限，不把施工房计为在产',()=>{
+test('生产训练返岗房升级：保留当前格和固定期限，不把施工房计为在产',()=>{
   for(const stat of ['str','per','end','agi','int']){
     const context=upgradingTrainingScene(stat),{v,s,p,record,destination}=context;
     const original=JSON.stringify(record),snapshot=JSON.stringify(v),started=v.serverTime;
@@ -356,7 +356,7 @@ test('生产训练返岗房升级：保留当前格、原席位和固定期限�
       assert.equal(model.production[resource],0,stat+' construction produces nothing');
       assert.ok(!plan.actions.some(action=>action.id===p.id&&action.role==='training-release'),stat);
       assert.ok(plan.reserved.includes(p.id),stat);
-      assert.ok(plan.trainingDestinations.some(seat=>seat.id===p.id&&seat.room===destination.id),stat);
+      assert.equal(plan.trainingDestinations.length,0,stat);
       assert.ok(!plan.adoptions.some(role=>role.id===p.id),stat+' no renewed deadline');
       assert.ok(plan.events.includes(destination.upgradeAt-v.serverTime),stat+' checks upgrade completion');
       assert.equal(JSON.stringify(record),original);
@@ -372,7 +372,7 @@ test('生产训练返岗房升级：保留当前格、原席位和固定期限�
   }
 });
 
-test('训练连续生命周期：返岗房升级时跨到90%的新格，保留席位且不提前计产',()=>{
+test('训练连续生命周期：返岗房升级时跨到90%的新格，不预留席位且不提前计产',()=>{
   for(const stat of ['str','per','end','agi']){
     const context=upgradingTrainingScene(stat),{v,p,record,destination}=context;
     p.stats[stat]++;p.training=.9;record.roles[0].finishCurrent=true;
@@ -380,7 +380,7 @@ test('训练连续生命周期：返岗房升级时跨到90%的新格，保留�
     const plan=context.run(),role=plan.adoptions.find(entry=>entry.id===p.id);
     assert.ok(role,stat);assert.equal(role.base,p.stats[stat]);assert.equal(role.destination,destination.id);
     assert.ok(!plan.actions.some(action=>action.id===p.id));
-    assert.ok(plan.trainingDestinations.some(seat=>seat.id===p.id&&seat.room===destination.id));
+    assert.equal(plan.trainingDestinations.length,0);
     const resource={str:'power',per:'water',end:'scrap',agi:'food'}[stat];
     assert.equal(api.model(v).production[resource],0);
     record.roles=[JSON.parse(JSON.stringify(role))];v.serverTime+=60000;
@@ -449,14 +449,14 @@ test('废土堵塞：90%进度不能越过训练开关、固定期限、供给�
   }
 });
 
-test('生产训练返岗房升级：多个训练者仍共享真实容量，不重复预留最后一席',()=>{
+test('生产训练返岗房升级：多个训练者保留当前格，完成后再竞争真实空岗',()=>{
   const context=upgradingTrainingScene(),{s,room,record,destination}=context;
   const second=s.residents[5];second.roomId=room.id;second.stats.end=2;second.training=1/6;
   record.roles.push({...record.roles[0],id:second.id});
   const plan=context.run();
-  assert.equal(plan.trainingDestinations.filter(seat=>seat.room===destination.id).length,1);
+  assert.equal(plan.trainingDestinations.length,0);
   assert.ok(plan.reserved.includes(record.roles[0].id));
-  assert.ok(plan.actions.some(action=>action.id===second.id&&action.role==='training-release'&&action.room===null));
+  assert.ok(plan.reserved.includes(second.id));assert.ok(!plan.actions.some(action=>action.id===second.id));
 });
 
 test('生产训练：训练完成、模式关闭、期限到达和原目标岗位失效时释放',()=>{

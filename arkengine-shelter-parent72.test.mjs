@@ -1,18 +1,19 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 import {readFileSync} from 'node:fs';
-import {setupParent72,replayParent72} from './arkengine-shelter-parent72.fixture.mjs';
+import {setupParent72,replayParent72,finishParentStats} from './arkengine-shelter-parent72.fixture.mjs';
 const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengine-auto-encounter.user.js',import.meta.url),'utf8');
 const plain=x=>JSON.parse(JSON.stringify(x)),hour=3600000;
 const pair=(x,ids)=>ids.map(id=>x.f.view.state.residents.find(p=>p.id===id));
 
-test('三天父母：真实新配对允许较低总属性，保守子代仍胜过原高属性组合的乐观情景',()=>{
+test('父母排序：在线选择基础属性较高组合，不运行三天材料比较',()=>{
   const x=setupParent72(source),events=[];x.context.log.add=(...args)=>events.push(args);
+  assert.equal(x.choose(),null);finishParentStats(x.f.view);
   const before=JSON.stringify(x.f.view);assert.ok(x.choose());
   const chosen=x.context.shelterState.pair,entry=events.find(e=>e[0]==='shelter-population')[2];
-  assert.deepEqual([chosen.a,chosen.b],[5,7]);assert.equal(entry.ranking,'development72-genetic-bounds');
-  assert.ok(entry.assessment.baseTotal<31);assert.ok(entry.assessment.romanceHours<10);
-  assert.ok(entry.development72.lower.end.scrap>entry.developmentComparison.baseline.upper.end.scrap);
+  assert.deepEqual([chosen.a,chosen.b],[7,8]);assert.equal(entry.ranking,'base-attributes-fallback');
+  assert.equal(entry.assessment.baseTotal,70);
+  assert.equal(entry.development72,undefined);assert.equal(entry.developmentComparison,undefined);
   assert.equal(JSON.stringify(x.f.view),before);
 });
 test('三天父母：遗传取整与上下界独立记录，不把中点当确定子代或概率',()=>{
@@ -51,15 +52,17 @@ test('三天父母：满岗位、现有训练、其他闲人、待产和施工�
   }
 });
 test('三天父母：首人已入住后属性和产出变化不另换组合，刷新继续第二步',()=>{
-  const x=setupParent72(source),first=x.choose(),chosen=plain(x.context.shelterState.pair);
+  const x=setupParent72(source);finishParentStats(x.f.view);
+  const first=x.choose(),chosen=plain(x.context.shelterState.pair);
   x.f.view.state.residents.find(p=>p.id===first.id).roomId=first.room;
-  x.f.view.state.residents.find(p=>p.id===8).stats.end=10;
+  x.f.view.state.residents.find(p=>p.id===5).stats.end=10;
   x.context.shelterState=plain(x.context.shelterState);
   const second=x.choose();assert.equal(second.id,chosen.a===first.id?chosen.b:chosen.a);assert.equal(second.room,chosen.room);
   assert.equal(x.context.shelterState.pair.a,chosen.a);assert.equal(x.context.shelterState.pair.b,chosen.b);
 });
 test('三天父母：当遗传范围与窗口不能证明优势时保持原高属性控制方案',()=>{
-  const x=setupParent72(source);for(const p of pair(x,[7,8]))p.stats.cha=9;
+  const x=setupParent72(source);finishParentStats(x.f.view);
+  pair(x,[7])[0].stats.cha=9;assert.equal(x.choose(),null);pair(x,[7])[0].stats.cha=10;
   assert.ok(x.choose());assert.deepEqual([x.context.shelterState.pair.a,x.context.shelterState.pair.b],[7,8]);
 });
 test('三天父母：独立家庭与资源结算复核孕前停产、父母回岗、出生和成年生产',()=>{

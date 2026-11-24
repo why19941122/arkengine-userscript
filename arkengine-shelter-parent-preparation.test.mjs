@@ -40,17 +40,17 @@ test('父母预培养：保存两对无亲缘候选，未达标不生育且刷�
   assert.deepEqual(plain(reloaded.context.shelterState.parentPreparation),saved);
 });
 
-test('父母预培养：无冷却也能训练，同家庭串行、另一对可接续，回执保留用途和返岗',()=>{
+test('父母预培养：无冷却也能训练，主配对同训，回执保留用途且不预留生产岗',()=>{
   const x=setupParentPreparation(source),first=training(x.schedule())[0];assert.ok(first);x.apply(first);
   assert.equal(x.api.valid(x.context.shelterState.campaign),true);
   assert.equal(x.context.shelterState.campaign.roles[0].preparation,true);
   x.tick();const next=x.schedule();
   assert.ok(!next.actions.some(a=>a.id===first.id&&a.role==='training-release'));
-  assert.equal(training(next)[0]?.id,6,'other pair can use the remaining seat');
-  assert.ok(!training(next).some(a=>a.id===5),'same pair cannot enter together');
+  assert.equal(training(next)[0]?.id,5,'main pair uses the remaining seat first');
+  assert.ok(!training(next).some(a=>a.id===6),'secondary pair yields to main pair');
   const p=x.f.view.state.residents.find(p=>p.id===first.id);p.stats.cha=4;p.training=0;x.tick();
-  const release=x.schedule().actions.find(a=>a.id===p.id&&a.role==='training-release');assert.equal(release?.room,4);
-  x.apply(release);x.tick();assert.equal(x.context.shelterState.campaign.roles.some(r=>r.id===p.id),false);
+  assert.ok(!x.schedule().actions.some(a=>a.id===p.id&&a.role==='training-release'));
+  assert.equal(p.roomId,first.room);assert.equal(x.context.shelterState.campaign.roles.find(r=>r.id===p.id).destination,undefined);
 });
 
 test('父母预培养：共同供给不足不追加，真实断供返岗而非继续培养',()=>{
@@ -59,18 +59,18 @@ test('父母预培养：共同供给不足不追加，真实断供返岗而非�
   assert.equal(training(plan).length,0);assert.ok(plan.actions.some(r=>r.id===a.id&&r.role==='training-release'));
 });
 
-test('跨格训练保护：预培养父母下一格90%继续训练，全项10门槛与原岗位保留',()=>{
+test('跨格训练保护：预培养父母下一格90%继续训练，全项10门槛保留且不占原岗位',()=>{
   const context=setupParentPreparation(source),first=training(context.schedule())[0];context.apply(first);
   const person=context.f.view.state.residents.find(entry=>entry.id===first.id);
   person.stats[first.stat]++;person.training=.9;context.tick(6);
   const plan=context.schedule(),role=context.context.shelterState.campaign.roles.find(entry=>entry.id===person.id);
   assert.ok(!plan.actions.some(action=>action.id===person.id&&action.role==='training-release'));
-  assert.equal(role.base,person.stats[first.stat]);assert.equal(role.preparation,true);assert.equal(role.destination,4);
+  assert.equal(role.base,person.stats[first.stat]);assert.equal(role.preparation,true);assert.equal(role.destination,undefined);
   assert.equal(context.api.valid(context.context.shelterState.campaign),true);
   const saved=plain(role);context.tick();context.schedule();
   assert.deepEqual(plain(context.context.shelterState.campaign.roles.find(entry=>entry.id===person.id)),saved);
   person.stats[first.stat]++;person.training=0;context.tick();
-  assert.equal(context.schedule().actions.find(action=>action.id===person.id&&action.role==='training-release')?.room,4);
+  assert.ok(!context.schedule().actions.some(action=>action.id===person.id&&action.role==='training-release'));
 });
 
 test('训练连续生命周期：父母收尾直接使用训练计时，不扫描无关生产返岗收益',()=>{
@@ -85,7 +85,7 @@ test('训练连续生命周期：父母收尾直接使用训练计时，不扫�
   const record={...context.context.shelterState.campaign,parentPreparation:context.context.shelterState.parentPreparation};
   context.context.trainingReturnEvaluations=0;
   const retained=finish(context.m(),person,room,cfg,record,role);
-  assert.equal(retained.base,person.stats[first.stat]);assert.equal(retained.preparation,true);assert.equal(retained.destination,4);
+  assert.equal(retained.base,person.stats[first.stat]);assert.equal(retained.preparation,true);assert.equal(retained.destination,undefined);
   assert.equal(context.context.trainingReturnEvaluations,0);
   assert.equal(finish(context.m(),person,room,{...cfg,parentPreparation:false},record,role),null);
 });
@@ -135,7 +135,7 @@ test('父母预培养：未知请求、人工暂停与防守期间不选择或�
 test('父母预培养：旧家庭实际返宿舍选择高属性组合，不再优先小编号',()=>{
   const x=setupParentPreparation(source);Object.assign(x.context.shelterCampaign,{training:false,parentPreparation:false});
   x.context.shelterState.families=[{a:4,b:5,room:5},{a:8,b:9,room:7}];
-  for(const p of x.f.view.state.residents.filter(p=>[8,9].includes(p.id)))p.stats.cha=6;
+  for(const p of x.f.view.state.residents.filter(p=>[8,9].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
   const a=x.api.staff(x.m());assert.equal(a.id,8);assert.equal(a.room,7);assert.match(a.reason,/原配对返回/);
 });
 

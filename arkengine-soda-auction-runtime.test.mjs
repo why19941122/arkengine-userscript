@@ -14,7 +14,7 @@ function setup(){
     localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)},
     shadow:{getElementById:()=>({})},loadState:(store,key,fallback)=>JSON.parse(store.getItem(key)||'null')??fallback,
     PREF:'automation-enabled',enabled:true,active:true,pageFrozen:false,sharedGroupPaused:()=>false,accountStopReason:()=>'',stateFault:()=>'',
-    inShelter:()=>true,auctionExclusive:true,schedule(){},captureShelterAction:null,continueShelterAction:null,
+    inShelter:()=>true,auctionExclusive:true,schedule(){},auctionRelease(){context.auctionExclusive=false;},captureShelterAction:null,continueShelterAction:null,
     captureStockAction:null,captureShelterCaravan:null,captureShelterHelp:null,
     log:{add:async(...args)=>{events.push(args);return true;}},
     createReadSession:()=>({fetch:async path=>{reads.push({path,at:context.clock});return {};},json:async()=>({}),close(){}})};
@@ -81,6 +81,7 @@ test('拍卖加固：有效原请求先持久保存，迟到或重复成功回�
   assert.equal(state.api.state.pending.key,'original-key-123');assert.equal(state.api.work.sent,true);
   receive(200,{quantity:1,unitPrice:390000});receive(200,{quantity:1,unitPrice:390000});await drain();
   assert.equal(state.api.state.pending,null);
+  assert.equal(state.context.auctionExclusive,false,'successful purchase immediately releases the visit');
   assert.equal(state.events.filter(event=>event[0]==='soda-auction-bought').length,1);
   assert.ok(state.api.state.rounds.includes(pending.round));
   assert.ok(state.api.state.rounds.includes(pending.batch));

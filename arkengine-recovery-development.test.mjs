@@ -221,7 +221,7 @@ test('追级仓储：仅充足消耗品接近满仓时先备料升级，不为�
   }
 });
 
-test('追级仓储：材料和装备空间仍可扩，明确医疗预留不足及关闭追级保持原扩仓评估',()=>{
+test('追级仓储：装备入库和明确医疗需求可扩仓，纯囤料或关闭追级不制造需求',()=>{
   for(const kind of ['scrap','parts','items','medical','disabled']){
     const v=upperStageView(),s=v.state;let m=api.model(v);
     if(kind==='items')s.items=Array.from({length:Math.ceil(.95*m.itemCap)},(_,i)=>({id:i+100,slot:'weapon',damage:[1,2]}));
@@ -230,7 +230,7 @@ test('追级仓储：材料和装备空间仍可扩，明确医疗预留不足�
     else s.resources[kind==='scrap'?'scrap':'stimpak']=.95*m.caps[kind==='scrap'?'scrap':'stimpak'];
     m=api.model(v);const cfg=kind==='medical'?{medical:true,reserve:100}:{};
     const p=api.development(m,14,api.plan(m,cfg),kind==='disabled'?0:10);
-    assert.ok(p.candidates.some(c=>c.type==='storage'&&c.priority<70),kind);
+    assert.equal(p.candidates.some(c=>c.type==='storage'&&c.storageDemand&&c.priority<70),['medical','items'].includes(kind),kind);
     if(kind==='medical')assert.ok(api.plan(m,cfg).stimpakTarget>m.caps.stimpak);
   }
 });
@@ -752,10 +752,12 @@ test('路线需求：装备扩容后仍接近满仓时保留第二项扩仓，�
   assert.ok(p.routes.some(r=>r.steps.filter(x=>x.project.type==='storage').length===2),'185件装备扩容到200格后仍达90%，第二项需求仍在');
 });
 
-test('路线需求：先消费材料已解除满仓压力时，不再把旧扩仓需求列入后续步骤',()=>{
+test('路线需求：不为囤料新增扩仓；旧路线先消费材料后也不再扩仓',()=>{
   const v=capacityRouteView(),m=api.model(v);
   const p=api.development(m,14,{enabled:true,reserved:[],projects:[]},10);
-  const storage=p.candidates.find(c=>c.type==='storage'&&c.kind==='build');assert.ok(storage);
+  assert.equal(p.candidates.some(c=>c.type==='storage'&&c.storageDemand),false);
+  const storage={kind:'build',type:'storage',floor:4,col:4,hours:1/6,cost:{scrap:256,parts:0},blocks:[],
+    storageDemand:{resources:['scrap'],equipment:false,reserves:{}}};
   const first={kind:'upgrade',type:'scrap',id:4,level:3,hours:3,cost:{scrap:480,parts:15},levelGain:1,blocks:[]};
   const routes=api.routes(m,[first,{...storage,levelGain:1}],111,first);
   assert.ok(routes.length);assert.ok(routes.every(r=>r.steps.length===1),'回收站升级已降低库存占比，后续应按实际变化再评估扩仓');
