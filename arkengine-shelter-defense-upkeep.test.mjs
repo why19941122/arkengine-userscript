@@ -77,5 +77,6 @@ test('防守收尾：没有收尾任务时继续守卫，不开启养成或新�
   const x=scene();x.record.trips[0].hours=6;
   Object.assign(x.cfg,{quests:true,training:true,radio:true,combatGear:true,development:true});
   const p=run(x);assert.equal(p.defense.busy,true);assert.equal(p.choice,null);assert.equal(p.actions.length,0);
-  assert.equal(p.defense.reserved.length,5);assert.ok(p.events.includes(5000));
+  assert.equal(p.defense.reserved.length,5);assert.ok(p.events.includes(30000));assert.ok(!p.events.includes(5000));
+  x.s.residents[0].roomId=1;assert.ok(run(x).events.includes(5000));
 });

@@ -17,6 +17,13 @@ const api=vm.runInNewContext(`${declarations}\n${code}\n${actions}\n({model:shel
 const now=2_000_000_000;
 
 const cfg=extra=>({...api.defaults,...extra});
+test('事件后普通探险补派：受灾时不出发；平息后重算空位，针量不足仍不派',()=>{
+  const view=fourExplorerView(),room=view.state.rooms[0],flags=cfg({defense:true,explore:true,stimpaks:2});
+  const starts=()=>api.plan(api.model(view),flags,{},14).actions.filter(action=>action.kind==='explore-start');
+  room.incident={kind:'raiders',hp:20,maxHp:20};assert.equal(starts().length,0);
+  room.incident=null;assert.ok(starts().length>0);
+  view.state.resources.stimpak=0;assert.equal(starts().length,0);
+});
 test('普通废土名额：27层四人、32层五人，战力优先于幸运并保留守军供给',()=>{
   for(const [depth,count] of [[27,4],[32,5]]){
     const view=fourExplorerView();view.state.depth=depth;

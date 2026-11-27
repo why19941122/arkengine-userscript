@@ -249,6 +249,16 @@ test('跨格训练保护：上一格收尾已过期，当前90%仍保留；同�
   assert.equal(context.run().actions.find(action=>action.id===p.id)?.room,3);
 });
 
+test('358日志回归：原回岗位已满、上一格过期、下一格有真实进度时不再反复撤岗',()=>{
+  const context=advancedTrainingCell(),{p,s,record,v}=context;
+  const destination=s.rooms.find(room=>room.id===record.roles[0].destination);
+  for(const other of s.residents.filter(person=>person.id!==p.id&&person.roomId===null))other.roomId=destination.id;
+  destination.width=1;p.training=.8571428571428569;
+  const plan=context.run(),adopted=plan.adoptions.find(role=>role.id===p.id);
+  assert.ok(adopted);assert.equal(adopted.base,p.stats.per);assert.ok(!plan.actions.some(action=>action.id===p.id));
+  const until=adopted.until;record.roles=[adopted];v.serverTime+=60000;context.run();assert.equal(record.roles[0].until,until);
+});
+
 test('跨格训练保护：同格超期、零进度、未知进度、关闭、断供及投资到期仍按条件释放',()=>{
   for(const condition of ['same-cell','zero','unknown','disabled','supply','window']){
     const context=advancedTrainingCell(),{v,p,cfg,record,s}=context;

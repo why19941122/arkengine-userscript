@@ -8,6 +8,20 @@ export async function shelterTests({t,setupShelter,reloadShelter,restoreReloaded
   const done = `location.pathname==='/activities/expedition' && ${state}?.nextAt>clock`;
   const waiting = `${done}&&${enabled}==='true'&&${pending}!==null&&${state}.pendingReadOnly===${pending}.id`;
   const quiet = `sm.tutorial=false;sm.dailyIncomplete=true;sm.achievementIncomplete=true;sm.view.state.rooms[0].stored=0;`;
+  await t.test('157未知窗口：长时间只读巡检，人工关闭后重新读取且只领取一次',async()=>{
+    await setupShelter(`${quiet}sm.view.state.rooms[0].stored=30;
+      const dialog=document.createElement('div');dialog.setAttribute('role','dialog');dialog.id='manual-dialog';
+      dialog.innerHTML='<h2>居民列表</h2><input><button aria-label="关闭">关闭</button>';document.body.append(dialog);
+      sm.dialogClicks=0;dialog.addEventListener('click',()=>sm.dialogClicks++);`);
+    await drive(`(${panel}.getElementById('status').textContent||'').includes('请手动处理')`,'unknown dialog protected',16);
+    const reads=await evaluate('sm.reads');await pulse(61000);
+    await drive(`sm.reads>${reads}`,'blocked dialog read-only observation',12);
+    assert.equal(await evaluate('sm.dialogClicks'),0);assert.deepEqual(await evaluate('sm.calls'),[]);
+    const observed=await evaluate('sm.reads');await pulse(1000);assert.equal(await evaluate('sm.reads'),observed);
+    await evaluate(`document.getElementById('manual-dialog').remove()`);
+    await drive(`sm.calls.some(c=>c.type==='collect_all')`,'fresh read after unknown dialog');
+    assert.ok(await evaluate('sm.reads')>observed);assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='collect_all').length`),1);
+  });
   await t.test('避难所短访问浏览器：剩20秒不切页，原远征先领取，再正常访问避难所',async()=>{
     await setupShelter(`${quiet}model.runs=model.runs.slice(0,1);window.preview=()=>({normal:0,burst:0,total:0});
       sm.originalArrival=clock+20000;

@@ -65,6 +65,18 @@ export async function shelterLog127Tests({t,setupShelter,reloadShelter,evaluate,
     assert.equal(await evaluate(`sm.view.state.residents.filter(p=>p.roomId===1).length`),['full','target'].includes(mode)?102:initial);
     assert.deepEqual(await evaluate(`${state}.campaign?.defense||[]`),[]);
   });
+  await t.test('157延迟救援按钮：已拥有的房间窗口等原生按钮渲染，只发送一次',async()=>{
+    const view=campaignView();view.state.rooms[0].incident={kind:'raiders',hp:20,maxHp:20};
+    await setupShelter(scene({view,state:record(),campaign:{defense:true},construction:disabled})+
+      `localStorage.setItem('arkengine:auto-shelter:staff:v1','off');sm.endRescue=true;
+      const original=openConstruction;window.openConstruction=(...args)=>{original(...args);
+        const button=[...document.querySelectorAll('[role="dialog"] button')].find(el=>el.textContent.includes('一键救援'));
+        if(button){const parent=button.parentElement;button.remove();sm.showRescue=()=>parent.append(button);}};`);
+    await drive(`typeof sm.showRescue==='function'`,'owned room opened without rescue button');await pulse(1000);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='rescue_incident').length`),0);
+    await evaluate('sm.showRescue()');await drive(done,'late rescue button submitted and incident ended',120);
+    assert.equal(await evaluate(`sm.calls.filter(c=>c.type==='rescue_incident').length`),1);
+  });
   const rescueScene=()=>{
     const view=campaignView();view.state.rooms[0].type='door';view.state.rooms[0].incident={kind:'raiders',hp:98,maxHp:100};
     return scene({view,state:record(),campaign:{defense:true},construction:disabled})+

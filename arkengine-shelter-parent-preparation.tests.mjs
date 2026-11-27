@@ -16,6 +16,27 @@ export async function shelterParentPreparationTests({t,setupShelter,reloadShelte
     localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(${JSON.stringify(f.campaign)}));
     localStorage.setItem('arkengine:auto-shelter:construction:v1',JSON.stringify(${JSON.stringify(f.construction)}));
     localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(${JSON.stringify({...f.state,vaultNo:77,nextAt:0,note:'parent preparation fixture'})}));${extra}`;};
+  await t.test('157生育接续：满属性原家庭先于闲置补岗，两人实际返回同一宿舍',async()=>{
+    await setupShelter(scene(`const stored=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));
+      stored.parentPreparation={version:1,pairs:[{a:8,b:9,at:clock,target:10}]};
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(stored));
+      for(const parent of sm.view.state.residents.filter(person=>[8,9].includes(person.id))){
+        parent.roomId=null;for(const stat of Object.keys(parent.stats))parent.stats[stat]=10;}
+      const flags=JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'));
+      flags.training=false;localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(flags));`));
+    await drive(`sm.view.state.residents.filter(person=>[8,9].includes(person.id)).every(person=>person.roomId===7)`,
+      'both original parents return to the same quarters',150);
+    assert.deepEqual(await evaluate(`sm.calls.filter(call=>call.type==='assign'&&[8,9].includes(call.residentId)).map(call=>call.roomId)`),[7,7]);
+  });
+  await t.test('157找不到单个居民：不发送该人调岗，下一位仍实际就业',async()=>{
+    await setupShelter(scene(`localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
+      for(const person of sm.view.state.residents.filter(person=>[8,9].includes(person.id)))person.roomId=null;
+      const render=renderShelter;window.renderShelter=()=>{render();for(const row of document.querySelectorAll('li'))
+        if(row.querySelector('button')?.textContent.includes('培养居民8'))row.remove();};`));
+    await drive(`sm.calls.some(call=>call.type==='assign'&&call.residentId===9)`,'next locatable worker employed',120);
+    assert.equal(await evaluate(`sm.calls.some(call=>call.type==='assign'&&call.residentId===8)`),false);
+    assert.ok(await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.some(event=>event.type==='shelter-resident-unlocated'&&event.data.residentId===8)`));
+  });
   const revisit=async()=>{
     await pulse(1000);
     if(await evaluate(`location.pathname!=='/shelter'`))

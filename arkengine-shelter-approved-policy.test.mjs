@@ -9,6 +9,37 @@ const setup=()=>{const x=setupParentPreparation(source);x.context.shelterPopulat
 const fn=(x,name)=>vm.runInContext(name,x.context);
 const plain=x=>structuredClone(x);
 
+test('出生后原家庭先于快速就业：仅对真实可交接的全10家庭让路',()=>{
+  const x=setup(),state=x.f.view.state,parents=state.residents.filter(person=>[8,9].includes(person.id));
+  for(const parent of parents){for(const stat of Object.keys(parent.stats))parent.stats[stat]=10;parent.roomId=null;}
+  const ready=()=>fn(x,'shelterFamilyHandoff')(x.m(),{});
+  assert.equal(ready()?.room,7);assert.equal(fn(x,'shelterIdleEmploymentChoice')(x.m(),{}),null);
+  for(const change of [{familyCooldownUntil:x.f.view.serverTime+60000},{roomId:90},{hp:1}]){
+    const before={...parents[0]};Object.assign(parents[0],change);assert.equal(ready(),null);Object.assign(parents[0],before);
+  }
+  parents[0].stats.cha=9;assert.equal(ready(),null);parents[0].stats.cha=10;
+  state.resources.food=0;assert.equal(ready(),null);
+});
+
+test('自动护士仅在已核准撤岗时直返原宿舍；不接管人工医务岗',()=>{
+  const x=setup(),state=x.f.view.state;
+  const parents=state.residents.filter(person=>[8,9].includes(person.id));
+  for(const parent of parents){for(const stat of Object.keys(parent.stats))parent.stats[stat]=10;parent.roomId=null;}
+  state.rooms.push({...state.rooms[0],id:301,type:'medbay',level:1});parents[0].roomId=301;
+  state.residents.find(person=>person.id===6).roomId=1;
+  const release={kind:'assign',role:'medical-release',id:8,from:301,room:null};
+  const choose=actions=>fn(x,'shelterFamilyHandoff')(x.m(),{actions});
+  assert.equal(choose([release]),null);
+  x.context.shelterState.campaign.roles.push({id:8,room:301,role:'medical',at:x.f.view.serverTime});
+  assert.equal(choose([]),null);assert.equal(choose([release])?.release,release);
+  assert.equal(fn(x,'shelterFamilyHandoff')(x.m(),{actions:[release],medicalDutyRequired:true}),null);
+  Object.assign(x.f.campaign,{medical:true,training:false});
+  assert.equal(x.schedule().actions.find(action=>action.role==='medical-release'&&action.id===8)?.room,7);
+  assert.ok(x.context.shelterState.families.some(family=>family.a===8&&family.b===9&&family.room===7));
+  assert.ok(!x.context.shelterState.parentPreparation.pairs.some(pair=>[8,9].includes(pair.a)!==[8,9].includes(pair.b)));
+  state.resources.stimpak=0;assert.ok(!x.schedule().actions.some(action=>action.role==='medical-release'&&action.room===7));
+});
+
 test('在线优化预算：截止或200人大矩阵不保存半成品，不缓存为无解，闲人使用已核对首选',()=>{
   const x=setup(),model=x.m(),search=fn(x,'shelterFindAllocation'),first={id:5,room:4};
   const before=JSON.stringify(x.context.shelterState),cache=search.lastNoPlan;
