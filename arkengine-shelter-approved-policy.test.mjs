@@ -40,6 +40,71 @@ test('自动护士仅在已核准撤岗时直返原宿舍；不接管人工医�
   state.resources.stimpak=0;assert.ok(!x.schedule().actions.some(action=>action.role==='medical-release'&&action.room===7));
 });
 
+function deepDigFamily(){
+  const x=setup(),s=x.f.view.state;
+  Object.assign(x.f.campaign,{medical:true,training:false,parentPreparation:false});
+  s.rooms.push({...s.rooms[0],id:301,type:'medbay',width:1,level:1});
+  for(const p of s.residents.filter(p=>[8,9].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
+  s.residents.find(p=>p.id===8).roomId=301;s.residents.find(p=>p.id===6).roomId=1;
+  s.digging={floor:40,doneAt:x.m().now+3600000};
+  x.context.shelterState.campaign.roles.push({id:8,room:301,role:'medical',at:x.m().now});return x;
+}
+
+test('深挖交班：替班只派一次，实际到岗且有回执后才让原护士返宿舍',()=>{
+  const x=deepDigFamily(),s=x.f.view.state,first=x.api.choice(x.m());
+  assert.equal(first?.role,'medical');assert.equal(first.room,301);assert.ok(![8,9].includes(first.id));
+  assert.deepEqual(x.api.choice(x.m()).targets,first.targets);
+  assert.ok(!x.schedule().actions.some(a=>a.role==='medical-release'));
+  const other=s.residents.find(p=>p.id===first.id);other.roomId=301;x.tick();
+  assert.ok(!x.schedule().actions.some(a=>a.role==='medical-release'));
+  x.apply(first);x.tick();const release=x.api.choice(x.m());
+  assert.deepEqual(plain(release?.targets),[8,7]);assert.equal(release.role,'medical-release');
+  other.roomId=first.from;x.tick();assert.ok(!x.schedule().actions.some(a=>a.role==='medical-release'));other.roomId=301;
+  other.hp=10;x.tick();assert.ok(!x.schedule().actions.some(a=>a.role==='medical-release'));
+  other.hp=100;x.apply(release);x.tick();assert.equal(other.roomId,301);
+  assert.ok(!x.schedule().actions.some(a=>a.id===other.id&&a.role==='medical-release'));
+});
+
+test('深挖交班：原医务室满员时用另一间已完工医务室，不为交班开工',()=>{
+  const x=deepDigFamily(),s=x.f.view.state;
+  Object.assign(s.residents.find(p=>p.id===4),{roomId:301,away:{kind:'explore'}});
+  const spare={...s.rooms.find(r=>r.id===301),id:302,floor:3,col:7};s.rooms.push(spare);
+  spare.unpowered=true;assert.ok(!x.schedule().actions.some(a=>a.familyMedical));
+  spare.unpowered=false;const relief=x.api.choice(x.m());assert.equal(relief?.room,302);x.apply(relief);x.tick();
+  assert.deepEqual(plain(x.api.choice(x.m())?.targets),[8,7]);
+  spare.unpowered=true;x.tick();assert.ok(!x.schedule().actions.some(a=>a.role==='medical-release'));
+});
+
+test('深挖交班：不接管人工岗位、挤占已占用席位或在缺针及供给不足时撤岗',()=>{
+  for(const gate of ['manual','historical','full','needles','power','pending','incident']){
+    const x=deepDigFamily(),s=x.f.view.state;
+    if(gate==='manual')x.context.shelterState.campaign.roles=[];
+    if(gate==='historical')x.context.shelterState.campaign.roles[0].historical=true;
+    if(gate==='full')Object.assign(s.residents.find(p=>p.id===4),{roomId:301,away:{kind:'explore'}});
+    if(gate==='needles')s.resources.stimpak=0;
+    if(gate==='power')s.resources.power=0;
+    if(gate==='pending')x.context.shelterPending={kind:'assign',targets:[4,301]};
+    if(gate==='incident')s.rooms[0].incident={kind:'raiders',hp:80,maxHp:80};
+    assert.ok(!x.schedule().actions.some(a=>a.familyMedical||a.id===8&&a.role==='medical-release'),gate);
+  }
+});
+
+test('默认建设日志：分别保留规划目标与未选生产房，未规划不臆造原因',()=>{
+  const x=setup(),m=x.m(),project={kind:'dig',type:'elevator',floor:40,title:'下挖',benefit:'增加探险位',priority:40,blocks:[],cost:{scrap:200,parts:0}},
+    production={kind:'build',type:'scrap',floor:4,col:2,title:'新建回收站',priority:51,blocks:['电力不足'],cost:{scrap:120,parts:0}},
+    plan={next:{status:'ready',project,title:'下挖',reason:'施工条件满足'},productionProject:production};
+  const check=fn(x,'shelterConstructionCheck')(m,plan,{projects:[]});
+  assert.equal(check.selected.floor,40);assert.equal(check.selected.benefit,'增加探险位');
+  assert.equal(check.production.type,'scrap');assert.ok(check.production.reasons.includes('电力不足'));
+  assert.equal(fn(x,'shelterConstructionCheck')(m,null,null).status,'unavailable');
+  const actual=x.plan(),real=fn(x,'shelterConstructionCheck')(actual.m,actual.development,actual.campaign);
+  assert.equal(real.materials.partsPerHour,actual.m.production.parts);assert.ok(Object.hasOwn(real.basis,'openFloors'));
+  assert.notEqual(real.productionStatus,'not-evaluated');
+  const events=[],context={log:{add:(...args)=>events.push(args)},localStorage:{getItem:()=>null}};
+  vm.runInNewContext(source.slice(source.indexOf('  function shelterCheckLog('),source.indexOf('  function shelterHandoffIdentity('))+';shelterCheckLog',context)('检查',{constructionCheck:check,developmentNext:plan.next});
+  assert.deepEqual(Object.keys(events[0][2]),['constructionCheck']);assert.ok(JSON.stringify(check).length<2500);
+});
+
 test('在线优化预算：截止或200人大矩阵不保存半成品，不缓存为无解，闲人使用已核对首选',()=>{
   const x=setup(),model=x.m(),search=fn(x,'shelterFindAllocation'),first={id:5,room:4};
   const before=JSON.stringify(x.context.shelterState),cache=search.lastNoPlan;

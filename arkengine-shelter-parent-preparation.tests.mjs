@@ -28,6 +28,39 @@ export async function shelterParentPreparationTests({t,setupShelter,reloadShelte
       'both original parents return to the same quarters',150);
     assert.deepEqual(await evaluate(`sm.calls.filter(call=>call.type==='assign'&&[8,9].includes(call.residentId)).map(call=>call.roomId)`),[7,7]);
   });
+  await t.test('159滚动培养：老家庭毕业，发电替班先到岗，待训家长随后入感知训练室',async()=>{
+    await setupShelter(scene(`const stored=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));
+      stored.parentPreparation={version:1,pairs:[{a:8,b:9,at:clock,target:10},{a:4,b:5,at:clock,target:10}]};
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(stored));
+      const s=sm.view.state;for(const p of s.residents.filter(p=>[4,5,8,9].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
+      s.residents.find(p=>p.id===4).stats.per=8;s.residents.find(p=>p.id===4).roomId=1;s.residents.find(p=>p.id===1).roomId=4;
+      s.residents.find(p=>p.id===8).familyCooldownUntil=clock+3600000;`));
+    await drive(`sm.calls.some(c=>c.type==='assign'&&c.residentId===4&&c.roomId===91)`,'single parent enters perception training after relief',180);
+    const moves=await evaluate(`sm.calls.filter(c=>c.type==='assign').map(c=>[c.residentId,c.roomId])`);
+    const cover=moves.findIndex(([id,room])=>id!==4&&room===1),train=moves.findIndex(([id,room])=>id===4&&room===91);
+    assert.ok(cover>=0&&cover<train,JSON.stringify(moves));
+    const stored=await evaluate(state);assert.ok(stored.families.some(f=>f.a===8&&f.b===9&&f.room===7));
+    assert.equal(stored.parentPreparation.pairs.length,2);assert.ok(!stored.parentPreparation.pairs.some(f=>[8,9].includes(f.a)||[8,9].includes(f.b)));
+  });
+  await t.test('158深挖交班：替班先到医务室，原护士和伴侣再回同一宿舍',async()=>{
+    await setupShelter(scene(`const stored=JSON.parse(localStorage.getItem('arkengine:auto-shelter:schedule:v1'));
+      stored.parentPreparation={version:1,pairs:[{a:8,b:9,at:clock,target:10}]};
+      stored.campaign.roles.push({id:8,room:301,role:'medical',at:clock});
+      localStorage.setItem('arkengine:auto-shelter:schedule:v1',JSON.stringify(stored));
+      const flags=JSON.parse(localStorage.getItem('arkengine:auto-shelter:campaign:v1'));
+      Object.assign(flags,{training:false,medical:true});localStorage.setItem('arkengine:auto-shelter:campaign:v1',JSON.stringify(flags));
+      const s=sm.view.state;s.digging={floor:40,doneAt:clock+3600000};s.rooms.push({...s.rooms[0],id:301,type:'medbay',floor:3,col:6,width:1,level:1});
+      for(const parent of s.residents.filter(p=>[8,9].includes(p.id)))for(const stat of Object.keys(parent.stats))parent.stats[stat]=10;
+      s.residents.find(p=>p.id===8).roomId=301;s.residents.find(p=>p.id===6).roomId=1;`));
+    await drive(`sm.view.state.residents.filter(p=>[8,9].includes(p.id)).every(p=>p.roomId===7)`,'nurse and partner reunited after real relief',240);
+    const moves=await evaluate(`sm.calls.filter(c=>c.type==='assign'&&(c.roomId===301||[8,9].includes(c.residentId))).map(c=>[c.residentId,c.roomId])`);
+    assert.equal(moves.length,3);assert.equal(moves[0][1],301);assert.ok(![8,9].includes(moves[0][0]));assert.deepEqual(moves.slice(1),[[8,7],[9,7]]);
+    assert.equal(await evaluate(`sm.view.state.residents.find(p=>p.id===${moves[0][0]}).roomId`),301);
+    await drive(done,'completed shelter check after relief',180);
+    const summary=await evaluate(`(await window.__arkTestLogs.read('expedition',undefined,Infinity)).events.filter(e=>e.type==='shelter-check').at(-1)?.data`);
+    assert.ok(summary?.constructionCheck?.basis);assert.ok(!Object.hasOwn(summary,'developmentNext'));
+    assert.equal(summary.constructionCheck.materials.partsPerHour,0);
+  });
   await t.test('157找不到单个居民：不发送该人调岗，下一位仍实际就业',async()=>{
     await setupShelter(scene(`localStorage.setItem('arkengine:auto-shelter:staff:v1','production');
       for(const person of sm.view.state.residents.filter(person=>[8,9].includes(person.id)))person.roomId=null;
@@ -76,7 +109,9 @@ export async function shelterParentPreparationTests({t,setupShelter,reloadShelte
     await drive(done,'all targets reached and return completed',220);await revisit();
     await drive(`sm.calls.some(c=>c.type==='assign'&&[4,5,6,7].includes(c.residentId)&&[5,7].includes(c.roomId))`,
       'prepared parents actually assigned to quarters',220);
-    assert.deepEqual(await evaluate(`${state}.parentPreparation`),saved);
+    const after=await evaluate(state),graduates=[...after.families,...(after.parentPreparation.ready||[])];
+    for(const pair of saved.pairs)assert.ok(graduates.some(f=>f.a===pair.a&&f.b===pair.b));
+    assert.ok(after.parentPreparation.pairs.every(f=>![4,5,6,7].includes(f.a)&&![4,5,6,7].includes(f.b)));
     assert.ok(await evaluate('sm.view.state.residents.filter(p=>[4,5,6,7].includes(p.id)).every(p=>Object.values(p.stats).every(v=>v>=10))'));
   });
 

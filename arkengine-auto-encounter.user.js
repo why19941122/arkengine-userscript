@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ark Engine 自动奇遇、秘境、远征与农场
 // @namespace    local.arkengine.auto-encounter
-// @version      1.17.157
+// @version      1.17.159
 // @updateURL    https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.meta.js
 // @downloadURL  https://raw.githubusercontent.com/why19941122/arkengine-userscript/main/arkengine-auto-encounter.user.js
 // @description  单页挂机：奇遇、秘境、远征、农场、避难所与股市按预约统一调度，保留原请求与七日本地日志。
@@ -1687,7 +1687,7 @@
     }
     return result;
   }
-  const SCRIPT_VERSION = '1.17.157';
+  const SCRIPT_VERSION = '1.17.159';
   function setPanelProperty(element,key,value) {
     if(element[key]!==value)element[key]=value;
   }
@@ -4101,7 +4101,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-explore"> 普通探险出发、召回与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-quests"> 周任务选队、出发与领取</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-training"> 居民训练：生产培养与父母训练</label>
-      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation" checked disabled> 父母预培养：优选两对，七项基础属性均达10后生育</label>
+      <label class="staff-option"><input type="checkbox" id="shelter-campaign-parentPreparation" checked disabled> 父母预培养：最多两对在训，全10后保留配偶并滚动补位</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-medical"> 医务室值班、伤员用针及废料救回（按实际库存，保留安全储备）</label>
       <label class="staff-option"><input type="checkbox" id="shelter-campaign-defense"> 房间一键救援（每批最多3人，目标在场101名成人，游戏自动归岗）</label>
       <label class="staff-option">出发后至少留守健康成人 <input id="shelter-campaign-guardResidents" type="number" min="0" max="200" step="1"> 人</label>
@@ -5624,7 +5624,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     setPanelProperty(shelterFields['cancel-old-assignment'],'hidden',!recoverable||!blocked);
     setPanelText(shelterFields.toggle,shelterEnabled ? '暂停避难所' : '开启避难所');
     const budget=shelterPresetBudget();
-    setPanelText(shelterFields['preset-summary'],`应用后：人口目标固定200人；两对父母七项基础属性均达10后生育，按床位和实际供给逐批准备，关闭主动广播和持续追级。${shelterUsesStockBudget(budget)?'建设按实际库存扣除未决原单预留':'保留自定义建设24小时上限 '+budget.scrapLimit+' 废料 / '+budget.partsLimit+' 零件'}，另保留 ${budget.scrapReserve} 废料 / ${budget.partsReserve} 零件。\n汽水优先：按网页资格时长召回，默认跟随网页最高已解锁区域。不清账本、不花汽水。`);
+    setPanelText(shelterFields['preset-summary'],`应用后：人口目标固定200人；最多两对同时预培养，双方七项基础属性全10后保留配偶并滚动补位；按床位和实际供给安排生育，关闭主动广播和持续追级。${shelterUsesStockBudget(budget)?'建设按实际库存扣除未决原单预留':'保留自定义建设24小时上限 '+budget.scrapLimit+' 废料 / '+budget.partsLimit+' 零件'}，另保留 ${budget.scrapReserve} 废料 / ${budget.partsReserve} 零件。\n汽水优先：按网页资格时长召回，默认跟随网页最高已解锁区域。不清账本、不花汽水。`);
     setPanelText(shelterFields['config-summary'],`当前：${({off:'仅领取',production:'生产',family:'生产与已有家庭',population:'生产与人口发展'})[shelterStaffMode]}；探险${shelterCampaign.explore?'开':'关'}、周任务${shelterCampaign.quests?'开':'关'}、训练${shelterCampaign.training?'开':'关'}、医疗${shelterCampaign.medical?'开':'关'}、电台${shelterCampaign.radio?'开':'关'}。${!enabled?'总开关已暂停，开启本模块后仍需启动总开关。':''}${!shelterUsesStockBudget(budget)&&budget.scrapLimit===0?'已保留零建设额度，不会开工。':''}`);
     setPanelText(shelterFields.advice,shelterState.advice || '首次检查后显示生产和生育建议；人员由你安排。');
     setPanelText(shelterFields.development,shelterState.development || '检查避难所后比较建造、升级和扩容。建议不会自动花费资源。');
@@ -6868,9 +6868,14 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   }
   function validShelterParentPreparation(v) {
     const id=n=>Number.isSafeInteger(n)&&n>0;
-    return objectState(v)&&v.version===1&&Array.isArray(v.pairs)&&v.pairs.length<=2&&
-      v.pairs.every(f=>objectState(f)&&id(f.a)&&id(f.b)&&f.a<f.b&&[4,10].includes(f.target)&&Number.isFinite(f.at)&&f.at>=0)&&
-      new Set(v.pairs.flatMap(f=>[f.a,f.b])).size===v.pairs.length*2;
+    if(!objectState(v)||v.version!==1||!Array.isArray(v.pairs)||v.pairs.length>2||
+        v.ready!==undefined&&(!Array.isArray(v.ready)||v.ready.length>100))return false;
+    const all=shelterParentCohorts(v);
+    return all.length<=100&&all.every(f=>objectState(f)&&id(f.a)&&id(f.b)&&f.a<f.b&&[4,10].includes(f.target)&&Number.isFinite(f.at)&&f.at>=0)&&
+      new Set(all.flatMap(f=>[f.a,f.b])).size===all.length*2;
+  }
+  function shelterParentCohorts(record) {
+    return [...(record?.ready||[]),...(record?.pairs||[])];
   }
   function shelterParentPrepared(m,f) {
     return ['a','b'].every(k=>{const p=m.state.residents.find(p=>p.id===f[k]);
@@ -6879,7 +6884,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   function shelterReadyParentPair(m,record,target) {
     const s=m.state,growth=shelterGrowthNeeds(m);
     if(growth.futureMouths>=Math.min(200,target,m.populationCap))return null;
-    for(const f of record.parentPreparation?.pairs||[]){
+    for(const f of shelterParentCohorts(record.parentPreparation)){
       if(!shelterParentPrepared(m,f))continue;
       const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id));
       if(!pair.every(p=>p&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&p.happiness>=50&&
@@ -6903,8 +6908,9 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     return [...families].sort((a,b)=>scores.get(b).total-scores.get(a).total||scores.get(b).charm-scores.get(a).charm||a.a-b.a||a.b-b.b);
   }
   function shelterParentPairAllowed(m,pair,preparation,existing=false) {
-    if(!preparation?.pairs?.length)return pair.length===2&&shelterParentPrepared(m,{a:pair[0]?.id,b:pair[1]?.id});
-    const ids=pair.map(p=>p?.id),cohort=preparation.pairs.find(f=>[f.a,f.b].some(id=>ids.includes(id)));
+    const cohorts=shelterParentCohorts(preparation),ids=pair.map(p=>p?.id);
+    if(!cohorts.length)return pair.length===2&&shelterParentPrepared(m,{a:ids[0],b:ids[1]});
+    const cohort=cohorts.find(f=>[f.a,f.b].some(id=>ids.includes(id)));
     if(cohort)return ids.includes(cohort.a)&&ids.includes(cohort.b)&&shelterParentPrepared(m,cohort);
     return existing&&pair.length===2&&shelterParentPrepared(m,{a:ids[0],b:ids[1]});
   }
@@ -6916,17 +6922,21 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     }
     const s=m.state,previous=shelterState.parentPreparation,unrelated=shelterParentKinship(s);
     if(shelterGrowthNeeds(m).futureMouths>=Math.min(200,shelterPopulationTarget))return;
-    if(previous?.pairs.some(f=>f.target!==10)){
-      saveShelter({...shelterState,parentPreparation:{...previous,pairs:previous.pairs.map(f=>({...f,target:10}))}});
-    }
-    const pairs=(previous?.pairs||[]).filter(f=>{
+    const families=shelterState.families||[],ready=[];
+    const retained=[...(previous?.pairs||[]),...(previous?.ready||[]).filter(f=>shelterParentPrepared(m,f))].filter(f=>{
       const pair=[f.a,f.b].map(id=>s.residents.find(p=>p.id===id));
       return unrelated(...pair)&&pair.every((p,i)=>!p.romance||p.romance.partnerId===pair[1-i].id)&&
         !s.births.some(b=>b.parents?.some(id=>[f.a,f.b].includes(id))&&!b.parents.every(id=>[f.a,f.b].includes(id)));
     }).map(f=>({...f,target:10}));
-    if(pairs.length===2)return;
-    const roles=shelterState.campaign?.roles||[],families=shelterState.families||[];
-    const protectedIds=new Set([...(shelterState.campaign?.defense||[]).map(r=>r.id),...pairs.flatMap(f=>[f.a,f.b])]);
+    const established=f=>families.some(other=>familyKey(other.a,other.b)===familyKey(f.a,f.b));
+    const pairs=retained.filter(f=>{
+      if(!shelterParentPrepared(m,f))return true;
+      if(!established(f))ready.push(f);return false;
+    });
+    const snapshot=()=>({version:1,pairs,...(ready.length?{ready}:{})});
+    if(pairs.length===2&&JSON.stringify(previous)===JSON.stringify(snapshot()))return;
+    const roles=shelterState.campaign?.roles||[];
+    const protectedIds=new Set([...shelterOperationHeld(shelterState.campaign,s),...(shelterState.campaign?.defense||[]).map(r=>r.id),...retained.flatMap(f=>[f.a,f.b])]);
     for(const f of families)if(shelterParentPrepared(m,f)&&unrelated(...[f.a,f.b].map(id=>s.residents.find(person=>person.id===id)))||
         [f.a,f.b].some(id=>{const p=s.residents.find(p=>p.id===id);
       return p&&(p.roomId===f.room||s.rooms.some(r=>r.id===p.roomId&&r.type==='training'));})){
@@ -6965,29 +6975,33 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     const held=new Set(pairs.flatMap(pair=>[pair.a,pair.b]));
     const compare=(left,right)=>left.finish-right.finish||left.hours-right.hours||right.total-left.total||right.charm-left.charm||left.a-right.a||left.b-right.b;
     while(pairs.length<2){
+      if(ready.length&&candidates.every(p=>held.has(p.id)||remaining.get(p.id)===0))break;
       let best=null;
       for(let index=0;index<candidates.length;index++){
         const left=candidates[index];if(held.has(left.id))continue;
         for(let other=index+1;other<candidates.length;other++){
           const right=candidates[other];if(held.has(right.id))continue;
           const leftHours=remaining.get(left.id),rightHours=remaining.get(right.id);
+          if(ready.length&&leftHours===0&&rightHours===0)continue;
           const option={a:Math.min(left.id,right.id),b:Math.max(left.id,right.id),finish:Math.max(leftHours,rightHours),hours:leftHours+rightHours,
             total:totals.get(left.id)+totals.get(right.id),charm:left.stats.cha+right.stats.cha};
           if((!best||compare(option,best)<0)&&unrelated(left,right))best=option;
         }
       }
       if(!best)break;
-      held.add(best.a);held.add(best.b);pairs.push({a:best.a,b:best.b,target:10,at:m.now});
+      held.add(best.a);held.add(best.b);
+      const nextPair={a:best.a,b:best.b,target:10,at:m.now};
+      (shelterParentPrepared(m,nextPair)?ready:pairs).push(nextPair);
     }
-    const next={version:1,pairs};
+    const next=snapshot();
     if(JSON.stringify(previous)!==JSON.stringify(next)){
       // Historical ancestry remains on residents.parents. Passive breeding
       // arrangements may be replaced; real romance, pregnancy and training were excluded.
-      const changed=new Set(pairs.flatMap(f=>[f.a,f.b]));
-      const retained=families.filter(f=>![f.a,f.b].some(id=>changed.has(id))||pairs.some(p=>p.a===f.a&&p.b===f.b));
-      saveShelter({...shelterState,families:retained,parentPreparation:next});
-      log.add('shelter-population','保存两对父母培养候选；七项基础属性均达10后才开始该配对',
-        {phase:'parent-preparation',pairs:pairs.map(f=>({...f,ready:shelterParentPrepared(m,f)})),selected:pairs.length,requested:2});
+      const cohorts=shelterParentCohorts(next),changed=new Set(cohorts.flatMap(f=>[f.a,f.b]));
+      const kept=families.filter(f=>![f.a,f.b].some(id=>changed.has(id))||cohorts.some(p=>p.a===f.a&&p.b===f.b));
+      saveShelter({...shelterState,families:kept,parentPreparation:next});
+      log.add('shelter-population','滚动补充两对在训候选；已达标配偶保留，不占培养名额',
+        {phase:'parent-preparation',pairs,ready:ready.map(f=>[f.a,f.b]),selected:pairs.length,requested:2});
     }
   }
   function shelterParentAssessment(m,pair) {
@@ -7519,7 +7533,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     const assignmentHeld=new Set([...shelterOperationHeld(record,m.state),...(record.unlocated||[])]);
     const s=m.state,now=m.now,notes=[],reserved=new Set(assignmentHeld),actions=[],projects=[],roles=[...(record.roles||[])];
     const cultivating=shelterGrowthNeeds(m).futureMouths<Math.min(200,target);
-    const preparationPairs=cultivating?record.parentPreparation?.pairs||[]:[],preparingPairs=preparationPairs.filter(f=>!shelterParentPrepared(m,f));
+    const preparationPairs=cultivating?shelterParentCohorts(record.parentPreparation):[];
+    const preparingPairs=shelterRankFamilies(m,preparationPairs.filter(f=>!shelterParentPrepared(m,f)));
     const preparationOf=p=>preparingPairs.find(f=>[f.a,f.b].includes(p.id));
     const enabled=cfg.development||['explore','quests','training','medical','radio','combatGear','defense','workshop','dailyGoals','help'].some(k=>cfg[k])||roles.some(r=>['parent','production','current'].includes(r.purpose));
     const workshopWorkers=roles.filter(r=>r.role==='workshop'&&s.residents.some(p=>p.id===r.id&&p.roomId===r.room)).map(r=>r.id);
@@ -7553,7 +7568,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     };
     const expecting=new Set(s.births.flatMap(b=>shelterBirthParents(s,b)||[]));
     const parentIds=new Set([...(cultivating?record.families||[]:[]),...preparationPairs].flatMap(f=>[f.a,f.b]));
-    if(preparationPairs.length)notes.push(`父母预培养 ${preparationPairs.length}/2 对，${preparationPairs.filter(f=>shelterParentPrepared(m,f)).length} 对七项基础属性已达10；未达标组合暂停生育，按空位分批训练，等待时继续生产。`);
+    if(preparationPairs.length)notes.push(`父母预培养 ${preparingPairs.length}/2 对，另有 ${preparationPairs.length-preparingPairs.length} 对达标待配；已有家庭独立轮换，按真实空位和供给补训。`);
     const protectedIds=new Set([...assignmentHeld,...s.residents.filter(p=>p.romance&&!shelterFamilyExpecting(s,p.id,p.romance.partnerId)).flatMap(p=>[p.id,p.romance.partnerId])]);
     for(const b of s.births)if(!shelterBirthParents(s,b)){
       for(const p of s.residents)if(p.roomId===b.roomId)protectedIds.add(p.id);
@@ -7887,7 +7902,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         if(role.role==='medical'&&s.resources.stimpak<cfg.reserve+1)reserve(p);
         else actions.push(assign(p,null,`${role.role}-release`,'当前未启用此岗位用途，释放历史值班并重新分配'));
       }
-      else if(cfg[role.role]&&!safe([]))actions.push(assign(p,null,`${role.role}-release`,'基础供应失去余量，释放自动值班人选供生产接替'));
+      else if(role.role!=='medical'&&cfg[role.role]&&!safe([]))actions.push(assign(p,null,`${role.role}-release`,'基础供应失去余量，释放自动值班人选供生产接替'));
     }
     const specialCandidate=(stat,extraSafe,minimumHealth=.9)=>pool.filter(p=>!preparationOf(p)&&!reserved.has(p.id)&&home(p).hp>=minimumHealth*home(p).max&&(!owned(p)||owned(p).role==='radio')&&safe([...projectedIds(),p.id])&&(!extraSafe||extraSafe(p)))
       .sort((a,b)=>b.stats[stat]-a.stats[stat]||loss([a.id])-loss([b.id])||a.id-b.id)[0];
@@ -7985,9 +8000,10 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       const inTraining=new Set(s.residents.filter(p=>parentIds.has(p.id)&&p.deadAt===null&&p.adultAt<=now&&trainingRooms.has(p.roomId)).map(p=>p.id));
       const trainingFamilies=[...(record.families||[]),...preparationPairs].filter(f=>inTraining.has(f.a)||inTraining.has(f.b));
       const familyBusy=new Set(trainingFamilies.filter(f=>!preparationPairs.some(pair=>pair.a===f.a&&pair.b===f.b)).flatMap(f=>[f.a,f.b]));
-      const parents=pool.filter(p=>parentIds.has(p.id)&&!familyBusy.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&home(p).hp>=.6*home(p).max&&
+      const availableParents=pool.filter(p=>parentIds.has(p.id)&&!familyBusy.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&home(p).hp>=.6*home(p).max&&
         (preparationOf(p)?trainingAt(p)===0||s.lastSettledAt>trainingAt(p):
-          p.familyCooldownUntil>now&&trainingAt(p)<p.familyCooldownUntil-6*3600000)&&safe([...projectedIds(),p.id]));
+          p.familyCooldownUntil>now&&trainingAt(p)<p.familyCooldownUntil-6*3600000));
+      const parents=availableParents.filter(p=>safe([...projectedIds(),p.id]));
       const trainees=preparationPairs.flatMap(f=>[f.a,f.b]).map(id=>s.residents.find(p=>p.id===id)).filter(p=>p&&home(p));
       const policy=record.constructionPolicy;
       const upgrades=policy?.upgrade&&!policy.pending&&s.rooms.filter(r=>r.builtAt>now||r.upgradeAt!==null).length<2?
@@ -8019,8 +8035,45 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
           shelterDevelopmentTrainingOpportunity(m,{id:p.id,hours:e.hours,stat:r.trainStat,destination:p.roomId,purpose:'parent'},
              cfg.developmentProject,record.constructionPolicy).allowed?[{p,r,...e,preparing}]:[];
       })).sort((a,b)=>Number(b.preparing)-Number(a.preparing)||
-        (a.preparing&&b.preparing?preparationPairs.indexOf(preparationOf(a.p))-preparationPairs.indexOf(preparationOf(b.p))||a.base-b.base:0)||
+        (a.preparing&&b.preparing?preparingPairs.indexOf(preparationOf(a.p))-preparingPairs.indexOf(preparationOf(b.p))||a.base-b.base:0)||
         b.value-a.value||loss([a.p.id])-loss([b.p.id])||a.p.id-b.p.id||a.r.id-b.r.id);
+      const firstTraining=options.find(option=>option.preparing),beforeTraining=firstTraining?
+        preparingPairs.slice(0,preparingPairs.indexOf(preparationOf(firstTraining.p))):preparingPairs;
+      const blocked=availableParents.filter(p=>!parents.includes(p)&&beforeTraining.includes(preparationOf(p)))
+        .sort((a,b)=>beforeTraining.indexOf(preparationOf(a))-beforeTraining.indexOf(preparationOf(b)));
+      if(blocked.length&&cfg.populationGrowth&&!record.pending&&!record.pair&&!healing&&!s.rooms.some(r=>r.incident)&&!actions.some(a=>a.role?.endsWith('-release'))){
+        const dutyIds=projectedIds(),coverPool=pool.filter(p=>!parentIds.has(p.id)&&!reserved.has(p.id)&&!owned(p)&&!expecting.has(p.id)&&
+          !p.romance&&home(p).hp>=.6*home(p).max&&(p.roomId===null||['power','water','diner','scrap'].includes(s.rooms.find(r=>r.id===p.roomId)?.type)));
+        for(const parent of blocked){
+          const origin=s.rooms.find(r=>r.id===parent.roomId),resource=origin&&shelterRooms[origin.type]?.[1];
+          if(!Object.hasOwn(committedDemand,resource)||parent.romance||expecting.has(parent.id))continue;
+          const canTrain=s.rooms.some(r=>r.type==='training'&&active(r)&&r.id!==upgrade?.room.id&&
+            parent.stats[r.trainStat]<10&&parentOccupied(r)<r.width*2&&estimate(parent,r)&&
+            shelterDevelopmentTrainingOpportunity(m,{id:parent.id,hours:estimate(parent,r).hours,stat:r.trainStat,destination:parent.roomId,purpose:'parent'},cfg.developmentProject,record.constructionPolicy).allowed);
+          const seats=s.rooms.filter(r=>r.type===origin.type&&active(r)&&s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).length<
+            r.width*2-result.trainingDestinations.filter(d=>d.room===r.id).length);
+          (result.parentTrainingSupply??=[]).push({id:parent.id,resource,room:origin.id,afterDeparture:projection([...dutyIds,parent.id])[resource],
+            required:committedDemand[resource]*1.2,trainingAvailable:canTrain,reliefRooms:seats.length});
+          if(!canTrain||!seats.length)continue;
+          let best=null;
+          for(const donor of coverPool){
+            const old=s.rooms.find(r=>r.id===donor.roomId);if(old?.type===origin.type)continue;
+            const after=projection([...dutyIds,donor.id,parent.id]),immediate=projection([...dutyIds,donor.id]);
+            for(const room of seats){
+              const rate=shelterWorkerRate(s,now,m.view.env,donor,room);
+              if(!(rate>0)||!Object.entries(committedDemand).every(([key,need])=>s.resources[key]>=need*2&&
+                  Math.min(after[key],immediate[key])+(key===resource?rate:0)>=need*1.2-1e-9))continue;
+              const cost=loss([donor.id]);
+              if(!best||cost<best.cost||cost===best.cost&&rate>best.rate)best={donor,room,cost,rate};
+            }
+          }
+          if(best){
+            reserve(best.donor);result.parentTrainingRelief={id:best.donor.id,from:best.donor.roomId,room:best.room.id,name:normalized(best.donor.name),
+              trainingReliefFor:parent.id,reason:`先接替候选父母 #${parent.id} 的${shelterResources[resource]}产出，真实到岗后再核对单人离岗训练`};
+            notes.push(result.parentTrainingRelief.reason);return;
+          }
+        }
+      }
       if(options.length){
         const selected=cfg.offlineComparison&&!options[0].preparing?shelterParentTrainingChoice(m,options,record,target,trainingTarget):
           {choice:options[0],comparison:{reason:options[0].preparing?'prepare-all-base-stats-10':'cooldown-next-cell'}};
@@ -8169,9 +8222,11 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     }
     // Settle this plan's actual needle commitments before releasing a nurse.
     // A returned trip's needles may be carried straight back out on the next trip.
+    let fundedDigDuty=false;
     if(cfg.medical){
       const needleSpend=actions.reduce((n,a)=>n+(a.kind==='explore-start'?a.targets[2]:a.kind==='stimpak'?1:0),0);
       const medNeed=s.resources.stimpak-needleSpend<medicalTarget||cfg.digMedical;
+      fundedDigDuty=cfg.digMedical&&s.resources.stimpak-needleSpend>=medicalTarget;
       result.medicalDutyRequired=Boolean(medNeed);
       if(!medicalNeededNow)support('medbay','int',medNeed,'medical',12,
         p=>cfg.digMedical||s.resources.stimpak<=cfg.reserve&&wounded.length>0||!cfg.workshopFamilyReady?.includes(p.id),
@@ -8282,6 +8337,18 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     result.idleTraining=actions.filter(a=>a.kind==='assign'&&a.role==='training'&&a.purpose==='production'&&a.from===null).map(a=>a.id);
     result.departureResidents=actions.filter(a=>a.kind==='explore-start').map(a=>a.id);
     result.reserved=[...reserved];
+    if(fundedDigDuty&&cfg.populationGrowth&&newStaffing&&!record.pending&&!healing&&!wounded.some(p=>shelterHealth(p).critical)&&
+        !s.rooms.some(r=>r.incident)&&roles.some(r=>r.role==='medical'&&!r.historical&&parentIds.has(r.id))){
+      const rooms=s.rooms.filter(r=>r.type==='medbay'&&active(r)),vacancies=rooms.filter(supportVacancy).map(r=>r.id);
+      const usable=p=>home(p)&&healthy(p)&&!parentIds.has(p.id)&&!protectedIds.has(p.id)&&!expecting.has(p.id)&&!defense.reserved.includes(p.id)&&
+        !actions.some(a=>a.id===p.id||a.team?.includes(p.id));
+      const covered=rooms.some(r=>s.residents.filter(p=>p.deadAt===null&&p.adultAt<=now&&p.roomId===r.id).slice(0,r.width*2)
+        .some(p=>usable(p)&&owned(p)?.role==='medical'&&!owned(p).historical&&shelterWorkerRate(s,now,m.view.env,p,r)>0));
+      const candidates=!covered&&vacancies.length?pool.filter(p=>usable(p)&&!reserved.has(p.id)&&!owned(p)&&
+        (p.roomId===null||['power','diner','water','scrap'].includes(s.rooms.find(r=>r.id===p.roomId)?.type))&&safe([...projectedIds(),p.id]))
+        .sort((a,b)=>b.stats.int-a.stats.int||loss([a.id])-loss([b.id])||a.id-b.id).map(p=>p.id):[];
+      result.medicalRotation={covered,vacancies,candidates};
+    }
     result.populationDefense.supply=projection(projectedIds());
     notes.unshift(`普通探险位 ${s.explorers.length}/${slots}；综合计划预留 ${reserved.size} 人。周任务最低成功率 ${cfg.chance}%，每任务每周最多 ${cfg.attempts} 次，出发间隔至少6小时。`);
     if(projects.length)notes.push(...projects.map(p=>p.benefit));
@@ -10087,7 +10154,13 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       populationAdvice:shelterPopulationAdvice(m,requestedTarget,finalLevel,campaign),
       partsTarget:partsShortages.length?s.resources.parts+Math.min(...partsShortages):levelPartsProject?levelPartsProject.cost.parts+partsReserve:0,
       partsProject:[...partsChoices].sort((a,b)=>a.cost.parts-b.cost.parts||compareProjects(a,b))[0]||levelPartsProject||null,
-      notes,next,retainedProject,levelSearch,rejectedLevel:rejectedLevel.slice(0,8),candidateTotal:candidates.length,candidates:candidates.slice(0,8)};
+      notes,next,retainedProject,levelSearch,rejectedLevel:rejectedLevel.slice(0,8),candidateTotal:candidates.length,candidates:candidates.slice(0,8),
+      productionProject:candidates.find(c=>['build','upgrade'].includes(c.kind)&&shelterRooms[c.type]?.[1])??null,
+      newProductionProject:candidates.find(c=>c.kind==='build'&&shelterRooms[c.type]?.[1])??null,
+      constructionBasis:{openFloors:layout?spots.length:null,availableAdults:idle.length,roomsUnderConstruction:construction.length,
+        requestedProduction:[...new Set(buildRequests.filter(r=>shelterRooms[r.type]?.[1]).map(r=>r.type))],
+        selectedRank:next.project&&candidates.includes(next.project)?candidates.indexOf(next.project)+1:null,
+        selection:first&&first!==preferred&&next.project===first?'主项目当前不可执行，保留其需求后选择可执行的独立工程':undefined}};
   }
   function validShelterDevelopmentTrace(value) {
     const amount=n=>Number.isFinite(n)&&n>=0,integer=n=>Number.isSafeInteger(n)&&n>=0;
@@ -11554,14 +11627,14 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     return {replaceable,rooms,candidates,unrelated:populationKinship(s)};
   }
   function populationPairingChoice(m,families,context,pair,assessment,reconsider=false) {
-    const prepared=(shelterState.parentPreparation?.pairs||[]).some(f=>pair.some(p=>p.id===f.a)&&pair.some(p=>p.id===f.b)&&shelterParentPrepared(m,f));
+    const prepared=shelterParentCohorts(shelterState.parentPreparation).some(f=>pair.some(p=>p.id===f.a)&&pair.some(p=>p.id===f.b)&&shelterParentPrepared(m,f));
     return context.rooms.map(room=>({room,replacedFamilies:families.filter(f=>f.room===room.id||[f.a,f.b].some(id=>pair.some(p=>p.id===id)))}))
       .find(c=>(!reconsider||c.replacedFamilies.length)&&c.replacedFamilies.every(f=>{
         const previous=shelterParentAssessment(m,[f.a,f.b].map(id=>m.state.residents.find(p=>p.id===id)));
         // 换届先改善遗传基础；属性相同才比较周期效率，不能为快生而换成低属性父母。
         // Stable, completed cohorts need an actual quality improvement, not a
         // second arbitrary 20% hurdle after their training investment is complete.
-        return context.replaceable.has(f)&&previous&&(assessment.baseTotal>previous.baseTotal*(prepared?1:1.2)+1e-6||
+        return context.replaceable.has(f)&&!(shelterState.parentPreparation&&shelterParentPrepared(m,f))&&previous&&(assessment.baseTotal>previous.baseTotal*(prepared?1:1.2)+1e-6||
           Math.abs(assessment.baseTotal-previous.baseTotal)<1e-6&&assessment.score>previous.score*1.2+1e-6);
       }));
   }
@@ -11750,7 +11823,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       const room=state.rooms.find(room=>room.id===family.room);
       if(!active(room)||room.type!=='quarters'||state.births.some(birth=>birth.roomId===room.id||shelterBirthParents(state,birth)?.some(id=>ids.includes(id)))||
           state.residents.some(person=>person.deadAt===null&&person.adultAt<=m.now&&person.roomId===room.id&&!ids.includes(person.id)))continue;
-      let release=null;
+      let release=null,nurse=null;
       if(!pair.every(person=>{
         const health=shelterHealth(person),post=state.rooms.find(entry=>entry.id===person.roomId);
         if(person.deadAt!==null||person.away!==null||person.adultAt>m.now||!health||health.hp<.6*health.max||
@@ -11758,19 +11831,35 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
             !shelterResidentIdentity(state,person)||person.roomId!==null&&!active(post))return false;
         if(post?.type==='medbay'){
           const action=plan.actions?.find(action=>action.kind==='assign'&&action.role==='medical-release'&&action.id===person.id&&action.from===post.id);
-          if(!action||plan.medicalDutyRequired||state.digging?.floor>=20||!roles.some(role=>role.id===person.id&&role.room===post.id&&role.role==='medical'&&!role.historical))return false;
+          if(!roles.some(role=>role.id===person.id&&role.room===post.id&&role.role==='medical'&&!role.historical))return false;
+          if(plan.medicalDutyRequired||state.digging?.floor>=20){
+            if(!plan.medicalRotation||health.hp<.9*health.max)return false;
+            nurse??=person;return true;
+          }
+          if(!action)return false;
           release??=action;return true;
         }
         return !plan.reserved?.includes(person.id)&&(person.roomId===null||person.roomId===room.id||staffRoomTypes.includes(post?.type));
       }))continue;
       const supply=populationHousingSupply(m,families,pair),absent=new Set([...supply.reservedResidents,...(plan.reserved||[])]);
       const output=shelterProductionWithout(m,absent);
-      if(supply.allowed&&supply.growthAllowed&&Object.keys(supply.demand).every(key=>output[key]>=supply.demand[key]*1.2-1e-9))return {room:room.id,pair:family,release};
+      const enough=production=>Object.keys(supply.demand).every(key=>production[key]>=supply.demand[key]*1.2-1e-9);
+      if(!supply.allowed||!supply.growthAllowed||!enough(output))continue;
+      if(!nurse)return {room:room.id,pair:family,release};
+      const rotation=plan.medicalRotation,post=rotation.vacancies.includes(nurse.roomId)?nurse.roomId:rotation.vacancies[0];
+      const replacement=rotation.covered?null:rotation.candidates.find(id=>!absent.has(id)&&!held.has(id)&&
+        enough(shelterProductionWithout(m,[...absent,id])));
+      const person=rotation.covered?nurse:state.residents.find(p=>p.id===replacement);
+      if(!person||!rotation.covered&&!post)continue;
+      const dest=rotation.covered?room.id:post;
+      return {room:room.id,pair:family,medical:{kind:'assign',id:person.id,from:person.roomId,room:dest,targets:[person.id,dest],
+        name:person.name.normalize('NFKC').replace(/\s+/g,' ').trim(),familyMedical:true,role:rotation.covered?'medical-release':'medical',
+        reason:rotation.covered?'替班护士已确认在岗，原自动护士直接返回原宿舍':'深挖仍需医疗值班，先派替班护士；确认到岗前原护士不动'}};
     }
     return null;
   }
   function shelterPreparedHandoff(m,plan) {
-    if(shelterStaffMode!=='population'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap||plan.defense?.busy||!shelterState.parentPreparation?.pairs?.length)return false;
+    if(shelterStaffMode!=='population'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap||plan.defense?.busy||!shelterParentCohorts(shelterState.parentPreparation).length)return false;
     const ready=shelterReadyParentPair(m,shelterState,shelterPopulationTarget);if(!ready)return false;
     const ids=[ready.pair.a,ready.pair.b],families=shelterState.families||[];
     if(families.some(family=>familyKey(family.a,family.b)===familyKey(...ids))||
@@ -11784,7 +11873,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     // confirmed cooldown. Keep active family duties and all role reservations intact.
     if(shelterStaffMode==='off'||shelterStaffHold||shelterPending||shelterState.pair||shelterState.swap||
       campaign.defense?.busy||['stimpak','explore-recall','quest-claim'].includes(campaign.choice?.kind)||
-      campaign.choice?.role?.endsWith('-release'))return null;
+      campaign.choice?.familyMedical||campaign.choice?.role?.endsWith('-release'))return null;
     // Fast employment must satisfy ordinary staffing's evidence contract too.
     // Leave the explanation to that path so rewards can still be collected.
     if(shelterStaffInputError(m))return null;
@@ -11803,9 +11892,12 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       (p.familyCooldownUntil==null||Number.isFinite(p.familyCooldownUntil))&&
       !p.romance&&!held.has(p.id)&&shelterHealth(p)?.hp>=.6*shelterHealth(p)?.max&&shelterResidentIdentity(s,p));
     if(!pool.length)return null;
+    if(campaign.parentTrainingRelief||campaign.fastEmployment&&shelterCampaign.training&&shelterState.parentPreparation?.pairs.some(f=>[f.a,f.b].some(id=>{
+      const p=s.residents.find(person=>person.id===id);return p&&s.rooms.some(r=>r.id===p.roomId&&['power','water','diner'].includes(r.type))&&
+        !shelterDepartureSafe(m,[id]);}))&&shelterCampaignSchedule(m).parentTrainingRelief)return null;
     if(shelterFamilyHandoff(m,campaign)||shelterPreparedHandoff(m,campaign))return null;
     if(campaign.fastEmployment&&families.some(family=>[family.a,family.b].some(id=>shelterState.campaign?.roles?.some(role=>role.id===id&&role.role==='medical'&&!role.historical)))&&
-        shelterFamilyHandoff(m,shelterCampaignSchedule(m)))return null;
+        (shelterCampaignSchedule(m).choice?.familyMedical||shelterFamilyHandoff(m,shelterCampaignSchedule(m))))return null;
     const model={...m,trainingDestinations:campaign.trainingDestinations||[]},demand=shelterGrowthNeeds(m).demand;
     const shortage=shelterSupplyShortages(m,demand);
     // Full basic stock does not remove ongoing consumption or committed growth.
@@ -12310,7 +12402,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         replacedFamilies:best.replacedFamilies.map(f=>({...f,assessment:shelterParentAssessment(m,[f.a,f.b].map(id=>s.residents.find(p=>p.id===id)))})),
         ranking:best.developmentComparison?.reason==='lower-bound-beats-control-upper-bound'?'development72-genetic-bounds':'base-attributes-fallback',
          development72:best.development72,developmentComparison:best.developmentComparison,
-         replacementThreshold:(shelterState.parentPreparation?.pairs||[]).some(f=>[a.id,b.id].includes(f.a)&&[a.id,b.id].includes(f.b))?1:1.2});
+         replacementThreshold:shelterParentCohorts(shelterState.parentPreparation).some(f=>[a.id,b.id].includes(f.a)&&[a.id,b.id].includes(f.b))?1:1.2});
     return shelterPopulationPlan(m,nextFamilies,{eligible,home,healthy});
   }
   function shelterStaffPlan(m,skippedFamilies = [],handoffOnly = false) {
@@ -12508,6 +12600,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       const next = shelterPopulationPlan(m,families,{eligible,home,healthy},true);
       if (next || shelterStaffHold) return next;
     }
+    if(campaign.parentTrainingRelief&&!preparation&&!shelterPending&&!shelterStaffHold&&!shelterCampaignHeld&&!shelterState.pair&&!shelterState.swap&&
+        shelterFamilySupplyPreserved(staffModel,[campaign.parentTrainingRelief]))return campaign.parentTrainingRelief;
     if (preparation) {
       if (planShelterSwap(staffModel,pool)) return shelterSwapStep(staffModel,eligible);
       // 一对暂时无法接替时，继续检查其他原家庭；不让第一对阻塞全部生育轮换。
@@ -13372,7 +13466,13 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       shelterDailyCraftStaffing(m,p);
       shelterWorkshopReleasePlan(m,p);
       const handoff=shelterFamilyHandoff(m,p);
-      if(handoff?.release){
+      if(handoff?.medical){
+        const action=handoff.medical;
+        const index=p.actions.findIndex(entry=>['explore-start','quest-start'].includes(entry.kind)||['training','workshop','radio','craftDaily'].includes(entry.role));
+        p.actions.splice(index<0?p.actions.length:index,0,action);
+        if(!p.reserved.includes(action.id))p.reserved.push(action.id);
+        p.choice=p.actions[0]||null;
+      }else if(handoff?.release){
         const release=handoff.release;
         const action={...release,room:handoff.room,targets:[release.id,handoff.room],reason:'医务值班已结束，供给和原家庭均已核对，直接返回宿舍'};
         p.actions=p.actions.map(entry=>entry===release?action:entry);
@@ -13488,7 +13588,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     if(s.residents.some(p=>p.roomId===room.id&&p.deadAt===null&&p.away===null&&p.adultAt<=m.now))return;
     if(s.residents.filter(p=>p.roomId===room.id&&p.deadAt===null&&p.adultAt<=m.now).length>=room.width*2)return;
     const protectedIds=new Set([...plan.reserved,...plan.dailyReserved,...plan.actions.map(a=>a.id),
-      ...(shelterGrowthNeeds(m).futureMouths<Math.min(200,shelterPopulationTarget)?shelterState.parentPreparation?.pairs||[]:[]).flatMap(f=>[f.a,f.b]),
+      ...(shelterGrowthNeeds(m).futureMouths<Math.min(200,shelterPopulationTarget)?shelterParentCohorts(shelterState.parentPreparation):[]).flatMap(f=>[f.a,f.b]),
       ...(shelterState.families||[]).flatMap(f=>[f.a,f.b]),...s.births.flatMap(b=>shelterBirthParents(s,b)||[]),
       ...s.residents.filter(p=>p.romance).flatMap(p=>[p.id,p.romance.partnerId])]);
     const demand=shelterGrowthNeeds(m,plan.populationPreparation,shelterPopulationTarget).demand;
@@ -13974,9 +14074,12 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   function shelterCampaignChoice(m,maintenanceOnly=false) {
     const plan=maintenanceOnly?shelterMaintenanceSchedule(m):shelterCampaignSchedule(m);
     let choice=plan.choice,note='';
+    if(!maintenanceOnly&&plan.parentTrainingRelief&&choice?.role==='training'&&choice.purpose==='production'){
+      choice=null;note='先安排父母单人离岗所需的生产接替，再安排普通增产训练。';
+    }
     if(!maintenanceOnly&&!plan.defense?.busy&&!shelterPending&&!shelterState.pair&&!shelterState.swap&&
         (choice?.kind==='assign'&&['training','workshop','craftDaily','radio','medical'].includes(choice.role)||['explore-start','quest-start'].includes(choice?.kind))&&
-        !(choice.role==='medical'&&m.state.resources.stimpak<=shelterCampaign.reserve)&&
+        !choice.familyMedical&&!(choice.role==='medical'&&m.state.resources.stimpak<=shelterCampaign.reserve)&&
         (shelterFamilyHandoff(m,plan)||shelterPreparedHandoff(m,plan))){
       choice=null;note='全项10主配对先完成可行的生育交接，再安排普通值班和次要培养。';
     }
@@ -13997,7 +14100,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     // Campaign assignments precede ordinary staffing in the executor. Apply the
     // construction handoff here too, including the submission-time recheck.
     // Keep existing training, releases, healing and trip completion untouched.
-    const elective=choice?.kind==='assign'&&['training','radio','medical'].includes(choice.role)&&
+    const elective=choice?.kind==='assign'&&!choice.familyMedical&&['training','radio','medical'].includes(choice.role)&&
       (choice.role!=='medical'||!m.state.residents.some(p=>p.deadAt===null&&p.away===null&&p.adultAt<=m.now&&
         shelterHealth(p)?.hp<.9*shelterHealth(p)?.max));
     if(!maintenanceOnly&&elective&&!shelterStaffHold&&!shelterCampaignHeld&&!plan.defense?.busy&&
@@ -14927,7 +15030,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         collection:collect||null});
     }
     for(const family of population?.families||[])rows.push({kind:'family',...family});
-    for(const family of shelterState.parentPreparation?.pairs||[])rows.push({kind:'parent-preparation',...family,
+    for(const family of shelterParentCohorts(shelterState.parentPreparation))rows.push({kind:'parent-preparation',...family,
       ready:shelterParentPrepared(m,family),people:[family.a,family.b].map(id=>{const p=s.residents.find(p=>p.id===id);
         return {id,name:p?.name,missing:['str','per','end','cha','int','agi','lck'].filter(k=>!p||p.stats[k]<family.target)};})});
     for(const birth of s.births)rows.push({kind:'birth',...pick(birth,['roomId','dueAt','parents'])});
@@ -14977,7 +15080,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
   }
   function shelterCheckLog(note,data) {
     if(typeof localStorage!=='undefined'&&localStorage.getItem('arkengine:auto-shelter:diagnostics:v1')!=='true'){
-      const keys=['nextAt','actions','confirmedActions','staffMode','staffHeld','pendingPair','pendingSwap','pendingReadOnly','population','populationTarget','recovering','births','familyCheck','exploreCheck'];
+      const keys=['nextAt','actions','confirmedActions','staffMode','staffHeld','pendingPair','pendingSwap','pendingReadOnly','population','populationTarget','recovering','births','familyCheck','exploreCheck','constructionCheck'];
       log.add('shelter-check',note,Object.fromEntries(keys.filter(k=>data[k]!==undefined).map(k=>[k,data[k]])));return;
     }
     if(logBytes(data)<=28000){log.add('shelter-check',note,data);return;}
@@ -15149,10 +15252,15 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       staffMode:shelterStaffMode,staffHeld:shelterStaffHold,staffNote:shelterStaffNote,
       gearEnabled:shelterGear,optimizeEnabled:shelterOptimize,pendingSwap:Boolean(shelterState.swap),
       populationTarget:shelterPopulationTarget,pendingPair:Boolean(shelterState.pair),populationNote:shelterPopulationNote,populationDiagnostics,
-      familyCheck:m&&shelterStaffMode==='population'?[...(shelterState.parentPreparation?.pairs||[]),...(shelterState.families||[])]
-        .filter((pair,index,all)=>all.findIndex(other=>familyKey(other.a,other.b)===familyKey(pair.a,pair.b))===index).slice(0,2).map(pair=>{
+      familyCheck:m&&shelterStaffMode==='population'?[...(shelterState.parentPreparation?.pairs||[]),...(shelterState.parentPreparation?.ready||[]).slice(0,2),...(shelterState.families||[])]
+        .filter((pair,index,all)=>all.findIndex(other=>familyKey(other.a,other.b)===familyKey(pair.a,pair.b))===index).slice(0,6).map(pair=>{
           const family=populationDiagnostics?.families.find(other=>familyKey(other.a,other.b)===familyKey(pair.a,pair.b));
-          return {ids:[pair.a,pair.b],room:family?.room??null,reasons:family?.reasons.slice(0,6).map(reason=>reason.slice(0,160)),
+          const relief=diagnosticCampaign?.parentTrainingRelief;
+          const trainingSupply=diagnosticCampaign?.parentTrainingSupply?.filter(row=>[pair.a,pair.b].includes(row.id));
+          return {ids:[pair.a,pair.b],stage:shelterState.parentPreparation?.pairs.includes(pair)?'preparing':shelterState.parentPreparation?.ready?.includes(pair)?'graduated':'family',
+            ...(trainingSupply?.length?{trainingSupply}:{}),
+            ...(relief&&[pair.a,pair.b].includes(relief.trainingReliefFor)?{proposedRelief:{for:relief.trainingReliefFor,id:relief.id,room:relief.room}}:{}),
+            room:family?.room??null,reasons:family?.reasons.slice(0,6).map(reason=>reason.slice(0,160)),
             people:[pair.a,pair.b].map(id=>{const person=m.state.residents.find(entry=>entry.id===id);
               return person?{room:person.roomId,reserved:Boolean(diagnosticCampaign?.reserved?.includes(id)||diagnosticCampaign?.dailyReserved?.includes(id)),
                 cooldownMinutes:Math.max(0,Math.ceil(((person.familyCooldownUntil||0)-m.now)/60000)),
@@ -15162,6 +15270,7 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
         next:diagnosticCampaign?.choice?.kind??null,
         reasons:diagnosticCampaign?.notes.filter(note=>/探险|携针|汽水/.test(note)).slice(-3).map(note=>note.slice(0,160))}:undefined,
       exploreClaimEnabled:shelterExploreClaim,exploreNote:shelterExploreNote,collection,developmentNext,
+      constructionCheck:m?shelterConstructionCheck(m,diagnosticPlan,diagnosticCampaign):undefined,
       developmentStage:validShelterDevelopmentTrace(developmentTrace)?{active:developmentTrace.active,last:developmentTrace.history.at(-1)||null}:null,
       construction:shelterConstruction,constructionNote:shelterConstructionNote,digObservation:m?shelterDigObservation(m):null,
       campaign:shelterCampaign,campaignNote:shelterCampaignNote,trips:m?shelterCampaignSchedule(m).trips:[],levelProgress,
@@ -15501,16 +15610,8 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
     if(allowPlanningWait&&next.kind==='level-planning')return {kind:'development-wait',reason:next.reason};
     const reason=next.status!=='ready'?`${next.title}：${next.reason}`:
       shelterConstructionAllowance(c,m,shelterConstruction,shelterState,shelterPending,Date.now());
-    if(reason){shelterConstructionNote=reason;return null;}
-    const productionType=c.kind==='build'?c.type:c.kind==='dig'?c.purpose?.type:null,gain=c.kind==='build'?c.gain:c.purpose?.gain;
-    const materialBuild=c.kind==='build'&&c.type==='workshop'&&campaign.workshopPreparation?.project===c;
-    if(c.strategy&&!materialBuild&&!campaign.projects.some(p=>p.type===c.strategy.type&&p.person===c.strategy.person&&p.trainStat===c.strategy.trainStat&&p.upgradeId===c.strategy.upgradeId)){
-      shelterConstructionNote='综合发展预留人手已变化，重新规划';return null;
-    }
-    if(!c.strategy&&productionType&&shelterRooms[productionType]?.[1]&&
-      (!(gain>0)||!staffRoomTypes.includes(productionType)||shelterStaffMode==='off'||shelterStaffHold)){
-      shelterConstructionNote='新生产房间尚无可自动到岗的人手，先核对人员安排，不为空房消费';return null;
-    }
+    const blocked=reason||shelterConstructionStaffBlock(c,campaign);
+    if(blocked){shelterConstructionNote=blocked;return null;}
     const original=campaign.workshopPreparation?.project===c?campaign.workshopPreparation.original:null;
     // 为明确等级工程投入工坊扩产时，原目标随本次建设保存；全部已有工人留岗也不会漏掉归属。
     // 只在实际开工确认后写入，取消或结果未知不提前绑定。
@@ -15521,6 +15622,39 @@ function createCultivationAutomation({ host, shadow, ownsLock, automationEnabled
       ...(c.levelInvestment&&c.levelDecision?{levelInvestment:true,levelDecision:structuredClone(c.levelDecision)}:{}),
       ...(c.storageDemand?{storageDemand:c.storageDemand}:{}),
       ...(validShelterMaterials(materials)?{materials}:{})};
+  }
+  function shelterConstructionStaffBlock(c,campaign) {
+    const productionType=c.kind==='build'?c.type:c.kind==='dig'?c.purpose?.type:null,gain=c.kind==='build'?c.gain:c.purpose?.gain;
+    const materialBuild=c.kind==='build'&&c.type==='workshop'&&campaign.workshopPreparation?.project===c;
+    if(c.strategy&&!materialBuild&&!campaign.projects.some(p=>p.type===c.strategy.type&&p.person===c.strategy.person&&p.trainStat===c.strategy.trainStat&&p.upgradeId===c.strategy.upgradeId))
+      return '综合发展预留人手已变化，重新规划';
+    if(!c.strategy&&productionType&&shelterRooms[productionType]?.[1]&&
+      (!(gain>0)||!staffRoomTypes.includes(productionType)||shelterStaffMode==='off'||shelterStaffHold))
+      return '新生产房间尚无可自动到岗的人手，先核对人员安排，不为空房消费';
+    return '';
+  }
+  function shelterConstructionCheck(m,plan,campaign) {
+    if(!plan?.next||!campaign)return {status:'unavailable',reason:'本次检查没有取得建设规划'};
+    const next=plan.next,now=Date.now(),text=value=>value?.slice(0,144);
+    const brief=c=>{
+      if(!c)return null;
+      const project=['build','upgrade','dig'].includes(c.kind),reasons=[...(c.blocks||[]),
+        ...Object.entries(c.shortage||{}).filter(([,amount])=>amount>0).map(([key,amount])=>`尚缺 ${amount} ${shelterResources[key]}`)];
+      if(project){
+        const allowance=shelterConstructionAllowance(c,m,shelterConstruction,shelterState,shelterPending,now),staff=shelterConstructionStaffBlock(c,campaign);
+        if(allowance&&(!c.blocks?.length||!shelterConstruction[c.kind]))reasons.push(allowance);
+        if(staff)reasons.push(staff);
+      }
+      return {kind:c.kind,type:c.type,id:c.id,floor:c.floor,col:c.col,title:text(c.title),benefit:text(c.benefit),priority:c.priority,
+        cost:c.cost&&{scrap:c.cost.scrap,parts:c.cost.parts},reasons:[...new Set(reasons)].slice(0,5).map(text)};
+    };
+    const selected=brief(next.project),production=plan.productionProject===next.project?selected:brief(plan.productionProject);
+    const blocked=next.status==='ready'&&selected?.reasons.length?selected.reasons[0]:null;
+    return {status:blocked?'blocked':next.status,title:text(next.title),reason:blocked||text(next.reason),selected,basis:plan.constructionBasis,
+      materials:{scrap:m.state.resources.scrap,parts:m.state.resources.parts,scrapPerHour:m.production.scrap,partsPerHour:m.production.parts},
+      productionStatus:plan.productionProject===undefined?'not-evaluated':!production?'none':plan.productionProject===next.project?'selected':
+        production.reasons.length?'blocked':'not-selected',production,
+      newProduction:plan.newProductionProject&&plan.newProductionProject===plan.productionProject?'same':brief(plan.newProductionProject)};
   }
   function shelterBuildTitle(c,m) {
     if(c.kind==='build')return `在第 ${c.floor} 层建造`;

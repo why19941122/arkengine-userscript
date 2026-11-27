@@ -7,6 +7,70 @@ const source=readFileSync(process.env.ARKENGINE_TEST_SOURCE||new URL('./arkengin
 const plain=x=>JSON.parse(JSON.stringify(x));
 const training=p=>p.actions.filter(a=>a.preparation);
 
+function singleTrainingSupply(){
+  const x=setupParentPreparation(source),s=x.f.view.state,at=x.m().now;
+  x.context.shelterState.parentPreparation={version:1,pairs:[{a:4,b:5,target:10,at},{a:6,b:7,target:10,at}]};
+  for(const person of s.residents.filter(p=>[4,5].includes(p.id)))for(const stat of Object.keys(person.stats))person.stats[stat]=10;
+  const trainee=s.residents.find(p=>p.id===4);trainee.roomId=1;trainee.stats.per=8;s.residents.find(p=>p.id===1).roomId=4;
+  return x;
+}
+
+test('滚动培养：接替单个发电家长，真实到岗后送训，不要求伴侣同时离岗',()=>{
+  const x=singleTrainingSupply(),s=x.f.view.state,plan=x.schedule();
+  assert.ok(!training(plan).some(a=>a.id===4));const move=x.api.staff(x.m());
+  assert.equal(move?.trainingReliefFor,4);assert.equal(move.room,1);assert.ok(![4,5,6,7].includes(move.id));
+  assert.ok(!training(x.schedule()).some(a=>a.id===4));s.residents.find(p=>p.id===move.id).roomId=move.room;x.tick();
+  const assigned=training(x.schedule())[0];assert.equal(assigned?.id,4);assert.equal(assigned.stat,'per');
+  assert.equal(s.residents.find(p=>p.id===5).roomId,4);
+});
+
+test('滚动培养：供电无空位、无感知训练席或不足两小时储备时不借人',()=>{
+  for(const gate of ['power-seat','training-seat','stock']){
+    const x=singleTrainingSupply(),s=x.f.view.state;
+    if(gate==='power-seat')Object.assign(s.residents[0],{roomId:1,away:{kind:'explore'}});
+    if(gate==='training-seat')s.rooms.find(r=>r.trainStat==='per').unpowered=true;
+    if(gate==='stock')s.resources.food=0;
+    const plan=x.schedule();assert.ok(!plan.parentTrainingRelief,gate);assert.ok(!training(plan).some(a=>a.id===4),gate);
+    const evidence=plan.parentTrainingSupply.find(row=>row.id===4);assert.ok(evidence.afterDeparture<evidence.required);
+    if(gate==='power-seat')assert.equal(evidence.reliefRooms,0);
+    if(gate==='training-seat')assert.equal(evidence.trainingAvailable,false);
+  }
+});
+
+test('滚动培养：夫妻同在发电岗，单人离开已安全就直接补感知，不等两人共同离岗',()=>{
+  const x=singleTrainingSupply(),s=x.f.view.state;s.residents.find(p=>p.id===5).roomId=1;
+  const after=vm.runInContext('shelterProductionWithout',x.context),m=x.m();
+  assert.ok(after(m,[4]).power>=m.demand.power*1.2);assert.ok(after(m,[4,5]).power<m.demand.power*1.2);
+  const plan=x.schedule();assert.equal(plan.parentTrainingRelief,undefined);
+  assert.deepEqual(training(plan).map(a=>[a.id,a.stat]).flat().join(','),'4,per');
+});
+
+test('滚动培养：满属性原家庭保持配偶和宿舍，毕业腾出名额并实际启动下一对',()=>{
+  const x=setupParentPreparation(source),s=x.f.view.state,store=x.context.shelterState;
+  for(const p of s.residents.filter(p=>[8,9].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
+  store.parentPreparation={version:1,pairs:[{a:8,b:9,target:10,at:1},{a:4,b:5,target:10,at:1}]};
+  x.schedule();const current=x.context.shelterState;
+  assert.deepEqual(plain(current.families),[{a:8,b:9,room:7}]);
+  assert.deepEqual(plain(current.parentPreparation.pairs.map(f=>[f.a,f.b])),[[4,5],[6,7]]);
+  for(const p of s.residents.filter(p=>[4,5].includes(p.id)))p.hp=50;
+  x.tick();const next=training(x.schedule())[0];assert.ok([6,7].includes(next?.id));x.apply(next);
+  assert.equal(s.residents.find(p=>p.id===next.id).roomId,next.room);
+  assert.ok(x.api.pairAllowed(x.m(),s.residents.filter(p=>[8,9].includes(p.id)),current.parentPreparation,true));
+});
+
+test('滚动培养：没有宿舍的毕业配对跨刷新不拆散，不占两个在训名额',()=>{
+  const x=setupParentPreparation(source),s=x.f.view.state;
+  x.context.shelterState.families=[];x.context.shelterState.parentPreparation={version:1,pairs:[{a:8,b:9,target:10,at:1}]};
+  for(const p of s.residents.filter(p=>[8,9].includes(p.id)))for(const stat of Object.keys(p.stats))p.stats[stat]=10;
+  x.schedule();const saved=plain(x.context.shelterState.parentPreparation);
+  assert.deepEqual(saved.ready.map(f=>[f.a,f.b]),[[8,9]]);assert.equal(saved.pairs.length,2);
+  assert.equal(x.api.validPreparation(saved),true);assert.equal(x.api.validPreparation({...saved,ready:[saved.pairs[0]]}),false);
+  const reload=setupParentPreparation(source,{...x.f,state:plain(x.context.shelterState)});reload.schedule();
+  assert.deepEqual(plain(reload.context.shelterState.parentPreparation),saved);
+  const people=s.residents.filter(p=>[8,9].includes(p.id));assert.ok(x.api.pairAllowed(x.m(),people,saved));
+  assert.ok(!x.api.pairAllowed(x.m(),[people[0],s.residents[0]],saved));
+});
+
 test('父母预培养：失效宿舍释放被动家庭，真实感情、待产和当前训练保留',()=>{
   for(const protection of ['none','romance','birth','unknown-birth','training']){
     const x=setupParentPreparation(source),s=x.f.view.state;
